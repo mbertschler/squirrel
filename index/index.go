@@ -64,16 +64,59 @@ type resultItem struct {
 // relative to root; root itself is stored on each row as the absolute path
 // passed in (a later config milestone will replace this with a logical name).
 func Index(ctx context.Context, s *store.Store, root string, opts Options) (Report, error) {
+	idx, err := newIndexer(ctx, s, root, opts)
+	if err != nil {
+		return Report{}, err
+	}
+
+	idx.startWorkers()
+	idx.startWalker()
+
+	report, err := idx.collect()
+	if err != nil {
+		return report, err
+	}
+	if err := idx.waitForWalker(); err != nil {
+		return report, err
+	}
+	if err := idx.finalizeMissing(&report); err != nil {
+		return report, err
+	}
+	return report, nil
+}
+
+// indexer holds the state of one Index() invocation. It owns the worker pool,
+// the walker goroutine, and the channels connecting them.
+type indexer struct {
+	ctx       context.Context
+	store     *store.Store
+	absRoot   string
+	opts      Options
+	startedAt int64
+
+	workers int
+	work    chan workItem
+	results chan resultItem
+
+	workerWG  sync.WaitGroup
+	walkErrCh chan error
+
+	// seen is populated only in DryRun mode; finalizeMissing uses it to count
+	// rows that exist in the DB but were not encountered during the walk.
+	seen map[string]struct{}
+}
+
+func newIndexer(ctx context.Context, s *store.Store, root string, opts Options) (*indexer, error) {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
-		return Report{}, fmt.Errorf("resolve root: %w", err)
+		return nil, fmt.Errorf("resolve root: %w", err)
 	}
 	info, err := os.Stat(absRoot)
 	if err != nil {
-		return Report{}, fmt.Errorf("stat root: %w", err)
+		return nil, fmt.Errorf("stat root: %w", err)
 	}
 	if !info.IsDir() {
-		return Report{}, fmt.Errorf("root %q is not a directory", absRoot)
+		return nil, fmt.Errorf("root %q is not a directory", absRoot)
 	}
 
 	workers := opts.Workers
@@ -85,158 +128,201 @@ func Index(ctx context.Context, s *store.Store, root string, opts Options) (Repo
 		queueDepth = workers * 4
 	}
 
-	startedAt := store.Now()
-
-	work := make(chan workItem, queueDepth)
-	results := make(chan resultItem, queueDepth)
-
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for w := range work {
-				results <- processFile(ctx, s, absRoot, w, opts, startedAt)
-			}
-		}()
+	idx := &indexer{
+		ctx:       ctx,
+		store:     s,
+		absRoot:   absRoot,
+		opts:      opts,
+		startedAt: store.Now(),
+		workers:   workers,
+		work:      make(chan workItem, queueDepth),
+		results:   make(chan resultItem, queueDepth),
+		walkErrCh: make(chan error, 1),
 	}
-
-	walkErrCh := make(chan error, 1)
-	go func() {
-		defer close(work)
-		err := filepath.WalkDir(absRoot, func(path string, d os.DirEntry, walkErr error) error {
-			if walkErr != nil {
-				select {
-				case results <- resultItem{err: fmt.Errorf("walk %s: %w", path, walkErr)}:
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-				if d != nil && d.IsDir() {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if d.Type()&os.ModeSymlink != 0 {
-				return nil
-			}
-			if d.IsDir() {
-				return nil
-			}
-			if !d.Type().IsRegular() {
-				return nil
-			}
-			fi, err := d.Info()
-			if err != nil {
-				select {
-				case results <- resultItem{err: fmt.Errorf("stat %s: %w", path, err)}:
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-				return nil
-			}
-			relPath, err := filepath.Rel(absRoot, path)
-			if err != nil {
-				select {
-				case results <- resultItem{err: fmt.Errorf("rel %s: %w", path, err)}:
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-				return nil
-			}
-			select {
-			case work <- workItem{
-				absPath:   path,
-				relPath:   filepath.ToSlash(relPath),
-				sizeBytes: fi.Size(),
-				mtimeNs:   fi.ModTime().UnixNano(),
-			}:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-			return nil
-		})
-		walkErrCh <- err
-	}()
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	report := Report{}
-	var seen map[string]struct{}
 	if opts.DryRun {
-		seen = make(map[string]struct{})
+		idx.seen = make(map[string]struct{})
 	}
-	for r := range results {
+	return idx, nil
+}
+
+func (i *indexer) startWorkers() {
+	for n := 0; n < i.workers; n++ {
+		i.workerWG.Add(1)
+		go i.worker()
+	}
+	go func() {
+		i.workerWG.Wait()
+		close(i.results)
+	}()
+}
+
+func (i *indexer) worker() {
+	defer i.workerWG.Done()
+	for w := range i.work {
+		i.results <- i.process(w)
+	}
+}
+
+func (i *indexer) startWalker() {
+	go func() {
+		defer close(i.work)
+		i.walkErrCh <- filepath.WalkDir(i.absRoot, i.visit)
+	}()
+}
+
+// visit is the filepath.WalkDir callback. It filters entries we don't index
+// and hands the rest off to the worker pool via the work channel.
+func (i *indexer) visit(path string, d os.DirEntry, walkErr error) error {
+	if walkErr != nil {
+		i.sendErr(fmt.Errorf("walk %s: %w", path, walkErr))
+		if d != nil && d.IsDir() {
+			return filepath.SkipDir
+		}
+		return nil
+	}
+	if err := i.ctx.Err(); err != nil {
+		return err
+	}
+	if !shouldIndex(d) {
+		return nil
+	}
+	fi, err := d.Info()
+	if err != nil {
+		i.sendErr(fmt.Errorf("stat %s: %w", path, err))
+		return nil
+	}
+	relPath, err := filepath.Rel(i.absRoot, path)
+	if err != nil {
+		i.sendErr(fmt.Errorf("rel %s: %w", path, err))
+		return nil
+	}
+	return i.sendWork(workItem{
+		absPath:   path,
+		relPath:   filepath.ToSlash(relPath),
+		sizeBytes: fi.Size(),
+		mtimeNs:   fi.ModTime().UnixNano(),
+	})
+}
+
+// shouldIndex reports whether the entry is a regular file (not a directory,
+// not a symlink, not a device).
+func shouldIndex(d os.DirEntry) bool {
+	if d.IsDir() {
+		return false
+	}
+	t := d.Type()
+	return t&os.ModeSymlink == 0 && t.IsRegular()
+}
+
+// sendErr pushes a per-entry error into the results stream, respecting
+// context cancellation so the walker can unwind cleanly.
+func (i *indexer) sendErr(err error) {
+	select {
+	case i.results <- resultItem{err: err}:
+	case <-i.ctx.Done():
+	}
+}
+
+// sendWork hands a work item to the worker pool, returning ctx.Err() if the
+// context is cancelled. Returning the error stops the WalkDir traversal.
+func (i *indexer) sendWork(w workItem) error {
+	select {
+	case i.work <- w:
+		return nil
+	case <-i.ctx.Done():
+		return i.ctx.Err()
+	}
+}
+
+// collect drains the results channel, updates the report, and writes to the
+// store (or records seen paths for dry-run). Returns the partial report
+// alongside any fatal write error.
+func (i *indexer) collect() (Report, error) {
+	report := Report{}
+	for r := range i.results {
 		if r.err != nil {
 			report.Errors++
 			report.ErrorList = append(report.ErrorList, r.err)
 			continue
 		}
-		switch r.kind {
-		case kindAdded:
-			report.Added++
-		case kindModified:
-			report.Modified++
-		case kindUnchanged:
-			report.Unchanged++
-		}
-		if opts.DryRun {
-			seen[r.row.Path] = struct{}{}
+		tally(&report, r.kind)
+		if i.opts.DryRun {
+			i.seen[r.row.Path] = struct{}{}
 			continue
 		}
-		if r.kind == kindUnchanged {
-			if err := s.TouchSeen(ctx, r.row.Root, r.row.Path, startedAt); err != nil {
-				return report, fmt.Errorf("touch %s/%s: %w", r.row.Root, r.row.Path, err)
-			}
-		} else {
-			if err := s.Upsert(ctx, r.row); err != nil {
-				return report, fmt.Errorf("upsert %s/%s: %w", r.row.Root, r.row.Path, err)
-			}
+		if err := i.persist(r); err != nil {
+			return report, err
 		}
 	}
-
-	if err := <-walkErrCh; err != nil && !errors.Is(err, context.Canceled) {
-		return report, fmt.Errorf("walk: %w", err)
-	}
-
-	if !opts.DryRun {
-		n, err := s.MarkMissing(ctx, absRoot, startedAt)
-		if err != nil {
-			return report, fmt.Errorf("mark missing: %w", err)
-		}
-		report.Missing = int(n)
-	} else {
-		present, err := s.ListPresentPathsUnder(ctx, absRoot)
-		if err != nil {
-			return report, fmt.Errorf("list present: %w", err)
-		}
-		for p := range present {
-			if _, ok := seen[p]; !ok {
-				report.Missing++
-			}
-		}
-	}
-
 	return report, nil
 }
 
-func processFile(ctx context.Context, s *store.Store, absRoot string, w workItem, opts Options, startedAt int64) resultItem {
-	existing, err := s.GetByPath(ctx, absRoot, w.relPath)
+func tally(report *Report, kind changeKind) {
+	switch kind {
+	case kindAdded:
+		report.Added++
+	case kindModified:
+		report.Modified++
+	case kindUnchanged:
+		report.Unchanged++
+	}
+}
+
+func (i *indexer) persist(r resultItem) error {
+	if r.kind == kindUnchanged {
+		if err := i.store.TouchSeen(i.ctx, r.row.Root, r.row.Path, i.startedAt); err != nil {
+			return fmt.Errorf("touch %s/%s: %w", r.row.Root, r.row.Path, err)
+		}
+		return nil
+	}
+	if err := i.store.Upsert(i.ctx, r.row); err != nil {
+		return fmt.Errorf("upsert %s/%s: %w", r.row.Root, r.row.Path, err)
+	}
+	return nil
+}
+
+func (i *indexer) waitForWalker() error {
+	err := <-i.walkErrCh
+	if err != nil && !errors.Is(err, context.Canceled) {
+		return fmt.Errorf("walk: %w", err)
+	}
+	return nil
+}
+
+// finalizeMissing flips DB rows under absRoot that we did not encounter to
+// status='missing' (or counts what would be flipped, in DryRun mode).
+func (i *indexer) finalizeMissing(report *Report) error {
+	if !i.opts.DryRun {
+		n, err := i.store.MarkMissing(i.ctx, i.absRoot, i.startedAt)
+		if err != nil {
+			return fmt.Errorf("mark missing: %w", err)
+		}
+		report.Missing = int(n)
+		return nil
+	}
+	present, err := i.store.ListPresentPathsUnder(i.ctx, i.absRoot)
+	if err != nil {
+		return fmt.Errorf("list present: %w", err)
+	}
+	for p := range present {
+		if _, ok := i.seen[p]; !ok {
+			report.Missing++
+		}
+	}
+	return nil
+}
+
+// process is the per-file decision: shallow shortcut, hash, classify as
+// added/modified/unchanged.
+func (i *indexer) process(w workItem) resultItem {
+	existing, err := i.store.GetByPath(i.ctx, i.absRoot, w.relPath)
 	hasExisting := err == nil
 	if err != nil && !store.IsNotFound(err) {
-		return resultItem{err: fmt.Errorf("lookup %s/%s: %w", absRoot, w.relPath, err)}
+		return resultItem{err: fmt.Errorf("lookup %s/%s: %w", i.absRoot, w.relPath, err)}
 	}
 
-	if hasExisting && existing.Status == store.StatusPresent &&
-		existing.SizeBytes == w.sizeBytes && existing.MtimeNs == w.mtimeNs {
-		if opts.Shallow {
-			return resultItem{row: existing, kind: kindUnchanged}
-		}
+	if i.opts.Shallow && hasExisting && metadataMatches(existing, w) {
+		return resultItem{row: existing, kind: kindUnchanged}
 	}
 
 	digest, err := hashFile(w.absPath)
@@ -244,17 +330,7 @@ func processFile(ctx context.Context, s *store.Store, absRoot string, w workItem
 		return resultItem{err: fmt.Errorf("hash %s: %w", w.absPath, err)}
 	}
 
-	row := store.FileRow{
-		Root:       absRoot,
-		Path:       w.relPath,
-		Blake3:     digest,
-		SizeBytes:  w.sizeBytes,
-		MtimeNs:    w.mtimeNs,
-		Status:     store.StatusPresent,
-		LastSeenAt: startedAt,
-		IndexedAt:  store.Now(),
-	}
-
+	row := i.rowFor(w, digest)
 	if !hasExisting {
 		return resultItem{row: row, kind: kindAdded}
 	}
@@ -262,6 +338,28 @@ func processFile(ctx context.Context, s *store.Store, absRoot string, w workItem
 		return resultItem{row: existing, kind: kindUnchanged}
 	}
 	return resultItem{row: row, kind: kindModified}
+}
+
+// metadataMatches reports whether the on-disk size and mtime agree with the
+// stored row's metadata and the row is currently 'present'. This is the
+// signal --shallow uses to skip re-hashing.
+func metadataMatches(existing store.FileRow, w workItem) bool {
+	return existing.Status == store.StatusPresent &&
+		existing.SizeBytes == w.sizeBytes &&
+		existing.MtimeNs == w.mtimeNs
+}
+
+func (i *indexer) rowFor(w workItem, digest []byte) store.FileRow {
+	return store.FileRow{
+		Root:       i.absRoot,
+		Path:       w.relPath,
+		Blake3:     digest,
+		SizeBytes:  w.sizeBytes,
+		MtimeNs:    w.mtimeNs,
+		Status:     store.StatusPresent,
+		LastSeenAt: i.startedAt,
+		IndexedAt:  store.Now(),
+	}
 }
 
 func hashFile(path string) ([]byte, error) {
