@@ -51,6 +51,22 @@ func TestOpenRoundTripVersion(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsDSNInjection(t *testing.T) {
+	cases := []string{
+		"foo.db?_pragma=journal_mode(DELETE)",
+		"foo.db#fragment",
+		"file:foo.db",
+		"sqlite://foo.db",
+	}
+	for _, p := range cases {
+		t.Run(p, func(t *testing.T) {
+			if _, err := Open(p); err == nil {
+				t.Fatalf("Open(%q) succeeded, want rejection", p)
+			}
+		})
+	}
+}
+
 func TestRefuseFutureSchema(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "test.db")
 	s, err := Open(dsn)

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -92,6 +93,9 @@ func newIndexCmd() *cobra.Command {
 				return err
 			}
 
+			for _, e := range rep.ErrorList {
+				fmt.Fprintln(cmd.ErrOrStderr(), "error:", e)
+			}
 			prefix := ""
 			if dryRun {
 				prefix = "(dry-run) "
@@ -152,7 +156,19 @@ func newQueryCmd() *cobra.Command {
 
 func queryArg(cmd *cobra.Command, s *store.Store, arg string) error {
 	out := cmd.OutOrStdout()
-	if isHashLike(arg) {
+
+	// Disambiguation: if the argument exists on disk OR contains a path
+	// separator, treat it as a path. Only otherwise consider hash interpretation.
+	// This protects content-addressed workloads where filenames are themselves
+	// 64-char hex digests.
+	looksLikePath := strings.ContainsAny(arg, string(filepath.Separator)+"/")
+	if !looksLikePath {
+		if _, err := os.Stat(arg); err == nil {
+			looksLikePath = true
+		}
+	}
+
+	if !looksLikePath && isHashLike(arg) {
 		digest, err := hex.DecodeString(arg)
 		if err != nil {
 			return fmt.Errorf("decode hash: %w", err)

@@ -99,6 +99,46 @@ func TestCLIIndexAndQueryRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCLIQueryPrefersExistingPathOverHashLike(t *testing.T) {
+	// A file whose name is exactly 64 hex chars must be routable as a path,
+	// not silently interpreted as a digest. This is the workload of any
+	// content-addressed store and exactly where the disambiguation matters.
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hexName := strings.Repeat("a", 64)
+	hashLikePath := filepath.Join(src, hexName)
+	writeTestFile(t, hashLikePath, "payload")
+
+	db := filepath.Join(tmp, "test.db")
+	runCLI(t, "index", "--db", db, src)
+
+	// Absolute path with the hex-named file: must route to path lookup.
+	out := runCLI(t, "query", "--db", db, hashLikePath)
+	if !strings.Contains(out, "path:") || !strings.Contains(out, hexName) {
+		t.Fatalf("absolute hex-named path lookup failed; output:\n%s", out)
+	}
+
+	// Bare relative arg that exists on disk in cwd: also route to path.
+	// Use os.Chdir-free approach: pass the absolute file via os.Stat already
+	// handled above. Here we verify a 64-hex string that does NOT exist falls
+	// through to the hash branch.
+	bogusHex := strings.Repeat("b", 64)
+	var buf bytes.Buffer
+	root := newRootCmd()
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+	root.SetArgs([]string{"query", "--db", db, bogusHex})
+	if err := root.Execute(); err == nil {
+		t.Fatalf("expected error for unknown hash %q, got nil; output: %s", bogusHex, buf.String())
+	}
+	if !strings.Contains(buf.String(), "no rows for blake3") {
+		t.Fatalf("expected hash-branch error message, got:\n%s", buf.String())
+	}
+}
+
 func TestCLIQueryUnknownPath(t *testing.T) {
 	tmp := t.TempDir()
 	db := filepath.Join(tmp, "test.db")

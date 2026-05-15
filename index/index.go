@@ -25,8 +25,6 @@ type Options struct {
 	Workers int
 	// QueueDepth: maximum pending entries between walker and workers. 0 means 4 * Workers.
 	QueueDepth int
-	// FollowSymlinks: traverse into symlinked directories. Always skipped for now.
-	FollowSymlinks bool
 }
 
 type Report struct {
@@ -34,7 +32,11 @@ type Report struct {
 	Modified  int
 	Unchanged int
 	Missing   int
-	Errors    int
+	// Errors is the count of per-file errors encountered during the walk.
+	Errors int
+	// ErrorList contains the actual errors. Callers (CLI, tests) decide how
+	// to surface them; this package never writes to os.Stderr directly.
+	ErrorList []error
 }
 
 type changeKind int
@@ -172,7 +174,7 @@ func Index(ctx context.Context, s *store.Store, root string, opts Options) (Repo
 	for r := range results {
 		if r.err != nil {
 			report.Errors++
-			fmt.Fprintln(os.Stderr, "error:", r.err)
+			report.ErrorList = append(report.ErrorList, r.err)
 			continue
 		}
 		switch r.kind {

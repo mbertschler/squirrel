@@ -307,7 +307,7 @@ func TestEmptyDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Index: %v", err)
 	}
-	if rep != (Report{}) {
+	if !isZeroReport(rep) {
 		t.Fatalf("report = %+v, want zero", rep)
 	}
 
@@ -316,8 +316,38 @@ func TestEmptyDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("re-Index: %v", err)
 	}
-	if rep != (Report{}) {
+	if !isZeroReport(rep) {
 		t.Fatalf("re-index report = %+v, want zero", rep)
+	}
+}
+
+func isZeroReport(r Report) bool {
+	return r.Added == 0 && r.Modified == 0 && r.Unchanged == 0 && r.Missing == 0 && r.Errors == 0 && len(r.ErrorList) == 0
+}
+
+func TestReportSurfacesPerFileErrors(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "ok.txt"), "hello")
+	unreadable := filepath.Join(root, "denied.txt")
+	writeFile(t, unreadable, "secret")
+	if err := os.Chmod(unreadable, 0o000); err != nil {
+		t.Skipf("chmod 000 not supported: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(unreadable, 0o644) })
+
+	s := setupStore(t)
+	rep, err := Index(context.Background(), s, root, Options{})
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	if rep.Errors != 1 || len(rep.ErrorList) != 1 {
+		t.Fatalf("expected exactly one error in Report, got %+v", rep)
+	}
+	if !strings.Contains(rep.ErrorList[0].Error(), "denied.txt") {
+		t.Fatalf("error %q does not reference the unreadable file", rep.ErrorList[0])
+	}
+	if rep.Added != 1 {
+		t.Fatalf("Added = %d, want 1 (the readable file)", rep.Added)
 	}
 }
 

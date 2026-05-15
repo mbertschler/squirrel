@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -36,11 +37,21 @@ const (
 	StatusMissing = "missing"
 )
 
-// Open opens (or creates) the SQLite database at dsn and ensures the schema is
-// at the version this binary expects. Returns an error if the database's
+// Open opens (or creates) the SQLite database at the given filesystem path
+// and ensures the schema is at the version this binary expects. The path must
+// be a plain filesystem path (no '?' query string and no URI scheme prefix);
+// DSN parameters are managed internally so callers cannot override pragmas
+// like journal_mode or busy_timeout. Returns an error if the database's
 // schema version is newer than SchemaVersion.
-func Open(dsn string) (*Store, error) {
-	db, err := sql.Open("sqlite", dsn+"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+func Open(path string) (*Store, error) {
+	if strings.ContainsAny(path, "?#") {
+		return nil, fmt.Errorf("db path %q must not contain '?' or '#'", path)
+	}
+	if strings.Contains(path, "://") || strings.HasPrefix(path, "file:") {
+		return nil, fmt.Errorf("db path %q must be a plain filesystem path, not a URI", path)
+	}
+	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
@@ -100,7 +111,9 @@ func applyV1(ctx context.Context, db *sql.DB) error {
 			PRIMARY KEY (root, path)
 		)`,
 		`CREATE INDEX idx_files_blake3 ON files(blake3)`,
-		`CREATE INDEX idx_files_status ON files(status)`,
+		// Partial index: status='missing' is the only rare/selective value.
+		// 'present' covers ~all rows and an index there would only inflate writes.
+		`CREATE INDEX idx_files_missing ON files(root, path) WHERE status = 'missing'`,
 		`INSERT INTO schema_version (version) VALUES (1)`,
 	}
 	for _, q := range stmts {
@@ -236,12 +249,6 @@ func (s *Store) CurrentSchemaVersion(ctx context.Context) (int, error) {
 	var v int
 	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&v)
 	return v, err
-}
-
-// SetSchemaVersion forces a schema version. Test-only helper for round-trip checks.
-func (s *Store) SetSchemaVersion(ctx context.Context, v int) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (?)`, v)
-	return err
 }
 
 func scanRow(scan func(...any) error) (FileRow, error) {
