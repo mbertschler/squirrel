@@ -206,3 +206,109 @@ func TestListDuplicates(t *testing.T) {
 		t.Fatalf("unexpected dups: %+v", dups)
 	}
 }
+
+func TestCheckConstraintsRejectBadRows(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	cases := []struct {
+		name string
+		row  FileRow
+	}{
+		{"short blake3", FileRow{Root: "/r", Path: "a", Blake3: bytes.Repeat([]byte{1}, 31), Status: StatusPresent}},
+		{"long blake3", FileRow{Root: "/r", Path: "b", Blake3: bytes.Repeat([]byte{1}, 33), Status: StatusPresent}},
+		{"empty blake3", FileRow{Root: "/r", Path: "c", Blake3: nil, Status: StatusPresent}},
+		{"invalid status", FileRow{Root: "/r", Path: "d", Blake3: digest(0x01), Status: "weird"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := s.Upsert(ctx, tc.row); err == nil {
+				t.Fatalf("Upsert(%+v) succeeded, want CHECK constraint failure", tc.row)
+			}
+		})
+	}
+}
+
+func TestCrossRootDuplicates(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	shared := digest(0x42)
+	rows := []FileRow{
+		{Root: "/A", Path: "x", Blake3: shared, Status: StatusPresent, LastSeenAt: 1, IndexedAt: 1},
+		{Root: "/B", Path: "y", Blake3: shared, Status: StatusPresent, LastSeenAt: 1, IndexedAt: 1},
+		{Root: "/A", Path: "z", Blake3: digest(0x99), Status: StatusPresent, LastSeenAt: 1, IndexedAt: 1},
+	}
+	for _, r := range rows {
+		if err := s.Upsert(ctx, r); err != nil {
+			t.Fatalf("Upsert: %v", err)
+		}
+	}
+
+	dups, err := s.ListDuplicates(ctx)
+	if err != nil {
+		t.Fatalf("ListDuplicates: %v", err)
+	}
+	if len(dups) != 2 {
+		t.Fatalf("dups = %d, want 2 (one per root)", len(dups))
+	}
+	roots := map[string]bool{dups[0].Root: true, dups[1].Root: true}
+	if !roots["/A"] || !roots["/B"] {
+		t.Fatalf("expected duplicates across /A and /B, got %+v", dups)
+	}
+}
+
+func TestTouchSeenUpdatesStatusAndTimestamp(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	r := FileRow{Root: "/r", Path: "a", Blake3: digest(0x01), Status: StatusMissing, LastSeenAt: 100, IndexedAt: 100}
+	if err := s.Upsert(ctx, r); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if err := s.TouchSeen(ctx, "/r", "a", 500); err != nil {
+		t.Fatalf("TouchSeen: %v", err)
+	}
+	got, err := s.GetByPath(ctx, "/r", "a")
+	if err != nil {
+		t.Fatalf("GetByPath: %v", err)
+	}
+	if got.Status != StatusPresent {
+		t.Fatalf("Status = %s, want present", got.Status)
+	}
+	if got.LastSeenAt != 500 {
+		t.Fatalf("LastSeenAt = %d, want 500", got.LastSeenAt)
+	}
+}
+
+func TestGetByAbsolutePathNotUnderAnyRoot(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	if err := s.Upsert(ctx, FileRow{Root: "/r", Path: "a", Blake3: digest(0x01), Status: StatusPresent, LastSeenAt: 1, IndexedAt: 1}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if _, err := s.GetByAbsolutePath(ctx, "/somewhere/else"); !IsNotFound(err) {
+		t.Fatalf("got err=%v, want sql.ErrNoRows", err)
+	}
+}

@@ -227,3 +227,107 @@ func TestSymlinksSkipped(t *testing.T) {
 		t.Fatalf("Added = %d, want 1 (symlink should be skipped)", rep.Added)
 	}
 }
+
+func TestFullReindexReportsUnchanged(t *testing.T) {
+	// Without --shallow we re-hash every file but the result should still
+	// classify as Unchanged when the content matches the stored digest.
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), "hello")
+	writeFile(t, filepath.Join(root, "b.txt"), "world")
+
+	s := setupStore(t)
+	ctx := context.Background()
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("first Index: %v", err)
+	}
+	rep, err := Index(ctx, s, root, Options{Shallow: false})
+	if err != nil {
+		t.Fatalf("second Index: %v", err)
+	}
+	if rep.Unchanged != 2 || rep.Added != 0 || rep.Modified != 0 {
+		t.Fatalf("full re-index report = %+v, want Unchanged=2", rep)
+	}
+}
+
+func TestMissingFileRestored(t *testing.T) {
+	root := t.TempDir()
+	a := filepath.Join(root, "a.txt")
+	writeFile(t, a, "hello")
+
+	s := setupStore(t)
+	ctx := context.Background()
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("first Index: %v", err)
+	}
+
+	// Delete the file; should flip to missing.
+	if err := os.Remove(a); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("second Index: %v", err)
+	}
+	absRoot, _ := filepath.Abs(root)
+	row, err := s.GetByPath(ctx, absRoot, "a.txt")
+	if err != nil {
+		t.Fatalf("GetByPath after delete: %v", err)
+	}
+	if row.Status != store.StatusMissing {
+		t.Fatalf("status after delete = %s, want missing", row.Status)
+	}
+
+	// Restore with the same content; status should flip back to present.
+	writeFile(t, a, "hello")
+	rep, err := Index(ctx, s, root, Options{})
+	if err != nil {
+		t.Fatalf("third Index: %v", err)
+	}
+	// Same digest + previously-missing row hits the Modified branch in
+	// processFile because existing.Status != Present.
+	if rep.Modified != 1 {
+		t.Fatalf("restore report = %+v, want Modified=1", rep)
+	}
+	row, err = s.GetByPath(ctx, absRoot, "a.txt")
+	if err != nil {
+		t.Fatalf("GetByPath after restore: %v", err)
+	}
+	if row.Status != store.StatusPresent {
+		t.Fatalf("status after restore = %s, want present", row.Status)
+	}
+}
+
+func TestDryRunReportsMissingCount(t *testing.T) {
+	root := t.TempDir()
+	a := filepath.Join(root, "a.txt")
+	b := filepath.Join(root, "b.txt")
+	writeFile(t, a, "hello")
+	writeFile(t, b, "world")
+
+	s := setupStore(t)
+	ctx := context.Background()
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("first Index: %v", err)
+	}
+
+	// Remove one file then dry-run; the report should show Missing=1 without
+	// actually flipping the DB row.
+	if err := os.Remove(b); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	rep, err := Index(ctx, s, root, Options{DryRun: true})
+	if err != nil {
+		t.Fatalf("dry-run Index: %v", err)
+	}
+	if rep.Missing != 1 {
+		t.Fatalf("dry-run Missing = %d, want 1", rep.Missing)
+	}
+
+	absRoot, _ := filepath.Abs(root)
+	row, err := s.GetByPath(ctx, absRoot, "b.txt")
+	if err != nil {
+		t.Fatalf("GetByPath b after dry-run: %v", err)
+	}
+	if row.Status != store.StatusPresent {
+		t.Fatalf("dry-run mutated DB: status = %s, want present (untouched)", row.Status)
+	}
+}
