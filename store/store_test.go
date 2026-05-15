@@ -10,6 +10,16 @@ import (
 
 func digest(b byte) []byte { return bytes.Repeat([]byte{b}, 32) }
 
+// writeSchemaVersion forces a schema version row. Used to construct DB
+// states the migration code wouldn't normally produce — e.g., a "future"
+// version we expect Open to refuse.
+func writeSchemaVersion(t *testing.T, s *Store, v int) {
+	t.Helper()
+	if _, err := s.db.ExecContext(context.Background(), `INSERT INTO schema_version (version) VALUES (?)`, v); err != nil {
+		t.Fatalf("write schema_version %d: %v", v, err)
+	}
+}
+
 func TestOpenCreatesSchema(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "test.db")
 	s, err := Open(dsn)
@@ -73,9 +83,7 @@ func TestRefuseFutureSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if err := s.SetSchemaVersion(context.Background(), SchemaVersion+5); err != nil {
-		t.Fatalf("SetSchemaVersion: %v", err)
-	}
+	writeSchemaVersion(t, s, SchemaVersion+5)
 	s.Close()
 
 	_, err = Open(dsn)
