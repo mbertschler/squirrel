@@ -3,8 +3,10 @@ package index
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -293,6 +295,86 @@ func TestMissingFileRestored(t *testing.T) {
 	}
 	if row.Status != store.StatusPresent {
 		t.Fatalf("status after restore = %s, want present", row.Status)
+	}
+}
+
+func TestEmptyDirectory(t *testing.T) {
+	root := t.TempDir()
+	s := setupStore(t)
+	ctx := context.Background()
+
+	rep, err := Index(ctx, s, root, Options{})
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	if rep != (Report{}) {
+		t.Fatalf("report = %+v, want zero", rep)
+	}
+
+	// Re-indexing should also be a clean no-op.
+	rep, err = Index(ctx, s, root, Options{})
+	if err != nil {
+		t.Fatalf("re-Index: %v", err)
+	}
+	if rep != (Report{}) {
+		t.Fatalf("re-index report = %+v, want zero", rep)
+	}
+}
+
+func TestWorkerCountDoesNotAffectResult(t *testing.T) {
+	// Index the same tree under Workers=1 and Workers=8; the resulting row set
+	// (paths + digests) must match. This is the canary for races in the
+	// walker/worker/DB-writer plumbing.
+	build := func() string {
+		root := t.TempDir()
+		// Mix of file sizes and a nested directory to exercise both small
+		// and larger hashing paths.
+		writeFile(t, filepath.Join(root, "a.txt"), "alpha")
+		writeFile(t, filepath.Join(root, "b.txt"), "beta")
+		writeFile(t, filepath.Join(root, "sub", "c.txt"), strings.Repeat("c", 4096))
+		writeFile(t, filepath.Join(root, "sub", "d.txt"), strings.Repeat("d", 200_000))
+		writeFile(t, filepath.Join(root, "sub", "nested", "e.txt"), "eps")
+		return root
+	}
+
+	collect := func(workers int) map[string]string {
+		t.Helper()
+		root := build()
+		s := setupStore(t)
+		ctx := context.Background()
+		rep, err := Index(ctx, s, root, Options{Workers: workers})
+		if err != nil {
+			t.Fatalf("Index(workers=%d): %v", workers, err)
+		}
+		if rep.Added != 5 {
+			t.Fatalf("workers=%d: Added=%d, want 5", workers, rep.Added)
+		}
+		absRoot, _ := filepath.Abs(root)
+		paths, err := s.ListPresentPathsUnder(ctx, absRoot)
+		if err != nil {
+			t.Fatalf("ListPresentPathsUnder: %v", err)
+		}
+		out := make(map[string]string, len(paths))
+		for p := range paths {
+			row, err := s.GetByPath(ctx, absRoot, p)
+			if err != nil {
+				t.Fatalf("GetByPath %s: %v", p, err)
+			}
+			out[p] = fmt.Sprintf("%x", row.Blake3)
+		}
+		return out
+	}
+
+	single := collect(1)
+	many := collect(8)
+
+	if len(single) != len(many) {
+		t.Fatalf("row count differs: workers=1 has %d, workers=8 has %d", len(single), len(many))
+	}
+	for path, digest := range single {
+		if many[path] != digest {
+			t.Fatalf("digest differs at %q: workers=1 %s, workers=8 %s", path, digest, many[path])
+		}
 	}
 }
 
