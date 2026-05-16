@@ -3,6 +3,7 @@ module github.com/mbertschler/squirrel
 go 1.26.1
 
 require (
+	github.com/pelletier/go-toml/v2 v2.3.1
 	github.com/spf13/cobra v1.10.2
 	github.com/zeebo/blake3 v0.2.4
 	modernc.org/sqlite v1.50.1
