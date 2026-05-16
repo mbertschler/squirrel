@@ -119,14 +119,16 @@ func formatDuration(startedAtNs int64, endedAtNs sql.NullInt64) string {
 
 // truncateError shortens an error message to a single tabular cell. NULL
 // errors render as empty; long messages are cut with an ellipsis so one bad
-// run doesn't ruin the layout.
+// run doesn't ruin the layout. The cut is rune-aware so a multibyte
+// character cannot be sliced in half (which would print an invalid rune).
 func truncateError(errVal sql.NullString) string {
 	if !errVal.Valid {
 		return ""
 	}
-	const maxLen = 60
-	if len(errVal.String) <= maxLen {
+	const maxRunes = 60
+	runes := []rune(errVal.String)
+	if len(runes) <= maxRunes {
 		return errVal.String
 	}
-	return errVal.String[:maxLen-1] + "…"
+	return string(runes[:maxRunes-1]) + "…"
 }

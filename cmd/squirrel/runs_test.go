@@ -1,11 +1,45 @@
 package main
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
+
+// TestTruncateErrorRuneAware guards against slicing a multibyte UTF-8 rune
+// in half when an error message exceeds the column budget — that would
+// embed an invalid rune in the output that some terminals render as the
+// replacement character. Cut on a rune boundary instead.
+func TestTruncateErrorRuneAware(t *testing.T) {
+	// 70 copies of the 3-byte é → 210 bytes, 70 runes. The byte-slicing
+	// implementation would land mid-rune; the rune-aware one must produce
+	// only valid UTF-8.
+	long := strings.Repeat("é", 70)
+	got := truncateError(sql.NullString{String: long, Valid: true})
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncated output is not valid UTF-8: %q", got)
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Fatalf("expected ellipsis suffix, got %q", got)
+	}
+	if utf8.RuneCountInString(got) > 60 {
+		t.Fatalf("output has %d runes, want ≤ 60", utf8.RuneCountInString(got))
+	}
+
+	// Below the limit: returned verbatim, no ellipsis.
+	short := "boom"
+	if g := truncateError(sql.NullString{String: short, Valid: true}); g != short {
+		t.Fatalf("short message changed: %q → %q", short, g)
+	}
+
+	// NULL → empty.
+	if g := truncateError(sql.NullString{}); g != "" {
+		t.Fatalf("NULL string rendered as %q, want empty", g)
+	}
+}
 
 func TestCLIRunsListsRecentFirst(t *testing.T) {
 	tmp := t.TempDir()
