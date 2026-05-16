@@ -62,10 +62,15 @@ type resultItem struct {
 
 // Index walks root, hashes regular files, and updates s. Paths are stored
 // relative to root; the volume for root is resolved (or created) up front and
-// then referenced by ID on every row.
+// then referenced by ID on every row. Each non-dry-run invocation creates a
+// row in the runs table that is finalised to 'success' / 'partial' / 'failed'
+// before Index returns.
 func Index(ctx context.Context, s *store.Store, root string, opts Options) (Report, error) {
 	idx, err := newIndexer(ctx, s, root, opts)
 	if err != nil {
+		return Report{}, err
+	}
+	if err := idx.beginRun(); err != nil {
 		return Report{}, err
 	}
 
@@ -74,14 +79,18 @@ func Index(ctx context.Context, s *store.Store, root string, opts Options) (Repo
 
 	report, err := idx.collect()
 	if err != nil {
+		idx.finishRun(&report, err)
 		return report, err
 	}
 	if err := idx.waitForWalker(); err != nil {
+		idx.finishRun(&report, err)
 		return report, err
 	}
 	if err := idx.finalizeMissing(&report); err != nil {
+		idx.finishRun(&report, err)
 		return report, err
 	}
+	idx.finishRun(&report, nil)
 	return report, nil
 }
 
@@ -95,6 +104,9 @@ type indexer struct {
 	volumeExists bool
 	opts         Options
 	startedAtNs  int64
+	// runID is the row in the runs table for this invocation. Zero in DryRun
+	// mode; non-dry-run callers must always have a valid run.
+	runID int64
 
 	workers int
 	work    chan workItem
@@ -152,6 +164,51 @@ func newIndexer(ctx context.Context, s *store.Store, root string, opts Options) 
 		idx.seen = make(map[string]struct{})
 	}
 	return idx, nil
+}
+
+// beginRun records the start of this index run in the store, unless the
+// indexer is operating in DryRun mode (which never touches the database).
+// The resulting run id is what every per-row write is tagged with.
+func (i *indexer) beginRun() error {
+	if i.opts.DryRun {
+		return nil
+	}
+	id, err := i.store.BeginRun(i.ctx, store.RunKindIndex, i.volumeID)
+	if err != nil {
+		return fmt.Errorf("begin run: %w", err)
+	}
+	i.runID = id
+	return nil
+}
+
+// finishRun closes out the runs row for this invocation. It is a no-op in
+// DryRun mode. The terminal status is derived from the fatal error (if any)
+// and the per-file error count: a fatal failure yields 'failed', per-file
+// errors with a clean walk yield 'partial', and an entirely clean run yields
+// 'success'.
+func (i *indexer) finishRun(report *Report, fatalErr error) {
+	if i.opts.DryRun || i.runID == 0 {
+		return
+	}
+	status, errMsg := runStatus(report, fatalErr)
+	fileCount := report.Added + report.Modified + report.Unchanged
+	if err := i.store.FinishRun(i.ctx, i.runID, status, errMsg, fileCount); err != nil {
+		// Surface as a per-run error rather than swallowing silently. The
+		// outer caller has already accepted a report and a fatal error (if
+		// any); we can only append.
+		report.Errors++
+		report.ErrorList = append(report.ErrorList, fmt.Errorf("finish run %d: %w", i.runID, err))
+	}
+}
+
+func runStatus(report *Report, fatalErr error) (string, string) {
+	if fatalErr != nil {
+		return store.RunStatusFailed, fatalErr.Error()
+	}
+	if report.Errors > 0 {
+		return store.RunStatusPartial, ""
+	}
+	return store.RunStatusSuccess, ""
 }
 
 func (i *indexer) startWorkers() {
@@ -279,7 +336,7 @@ func tally(report *Report, kind changeKind) {
 
 func (i *indexer) persist(r resultItem) error {
 	if r.kind == kindUnchanged {
-		if err := i.store.TouchSeen(i.ctx, r.row.VolumeID, r.row.Path, i.startedAtNs); err != nil {
+		if err := i.store.TouchSeen(i.ctx, r.row.VolumeID, r.row.Path, i.runID); err != nil {
 			return fmt.Errorf("touch %s/%s: %w", i.absRoot, r.row.Path, err)
 		}
 		return nil
@@ -306,7 +363,7 @@ func (i *indexer) finalizeMissing(report *Report) error {
 		return nil
 	}
 	if !i.opts.DryRun {
-		n, err := i.store.MarkMissing(i.ctx, i.volumeID, i.startedAtNs)
+		n, err := i.store.MarkMissing(i.ctx, i.volumeID, i.runID)
 		if err != nil {
 			return fmt.Errorf("mark missing: %w", err)
 		}
@@ -370,14 +427,15 @@ func metadataMatches(existing store.FileRow, w workItem) bool {
 
 func (i *indexer) rowFor(w workItem, digest []byte) store.FileRow {
 	return store.FileRow{
-		VolumeID:     i.volumeID,
-		Path:         w.relPath,
-		Blake3:       digest,
-		SizeBytes:    w.sizeBytes,
-		MtimeNs:      w.mtimeNs,
-		Status:       store.StatusPresent,
-		LastSeenAtNs: i.startedAtNs,
-		IndexedAtNs:  store.NowNs(),
+		VolumeID:       i.volumeID,
+		Path:           w.relPath,
+		Blake3:         digest,
+		SizeBytes:      w.sizeBytes,
+		MtimeNs:        w.mtimeNs,
+		Status:         store.StatusPresent,
+		FirstSeenRunID: i.runID,
+		LastSeenRunID:  i.runID,
+		IndexedAtNs:    store.NowNs(),
 	}
 }
 

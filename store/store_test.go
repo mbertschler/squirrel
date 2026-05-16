@@ -32,6 +32,18 @@ func makeVolume(t *testing.T, s *Store, path string) int64 {
 	return v.ID
 }
 
+// makeRun is a test helper that opens an index run against the given volume
+// and returns its id. Tests use it to satisfy the files table's FK to runs
+// when constructing FileRow literals directly.
+func makeRun(t *testing.T, s *Store, volumeID int64) int64 {
+	t.Helper()
+	id, err := s.BeginRun(context.Background(), RunKindIndex, volumeID)
+	if err != nil {
+		t.Fatalf("BeginRun: %v", err)
+	}
+	return id
+}
+
 func TestOpenCreatesSchema(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "test.db")
 	s, err := Open(dsn)
@@ -231,10 +243,12 @@ func TestUpsertAndGet(t *testing.T) {
 
 	xID := makeVolume(t, s, "/x")
 	yID := makeVolume(t, s, "/y")
+	xRun := makeRun(t, s, xID)
+	yRun := makeRun(t, s, yID)
 
 	r := FileRow{
 		VolumeID: xID, Path: "a", Blake3: digest(0xab), SizeBytes: 10, MtimeNs: 1, Status: StatusPresent,
-		LastSeenAtNs: 100, IndexedAtNs: 100,
+		FirstSeenRunID: xRun, LastSeenRunID: xRun, IndexedAtNs: 100,
 	}
 	if err := s.Upsert(ctx, r); err != nil {
 		t.Fatalf("Upsert: %v", err)
@@ -252,6 +266,8 @@ func TestUpsertAndGet(t *testing.T) {
 	r2 := r
 	r2.VolumeID = yID
 	r2.Blake3 = digest(0xcd)
+	r2.FirstSeenRunID = yRun
+	r2.LastSeenRunID = yRun
 	if err := s.Upsert(ctx, r2); err != nil {
 		t.Fatalf("Upsert /y/a: %v", err)
 	}
@@ -297,10 +313,17 @@ func TestMarkMissingScopedToVolume(t *testing.T) {
 	rootID := makeVolume(t, s, "/root")
 	otherID := makeVolume(t, s, "/other")
 
+	// Two runs against /root: an older one for the row that should age out,
+	// then a newer one for the row that should stay present. The /other
+	// volume gets its own run so MarkMissing on /root cannot touch it.
+	rootOldRun := makeRun(t, s, rootID)
+	rootCurRun := makeRun(t, s, rootID)
+	otherRun := makeRun(t, s, otherID)
+
 	rows := []FileRow{
-		{VolumeID: rootID, Path: "a", Blake3: digest(0x01), SizeBytes: 1, MtimeNs: 1, Status: StatusPresent, LastSeenAtNs: 50, IndexedAtNs: 50},
-		{VolumeID: rootID, Path: "b", Blake3: digest(0x02), SizeBytes: 1, MtimeNs: 1, Status: StatusPresent, LastSeenAtNs: 200, IndexedAtNs: 200},
-		{VolumeID: otherID, Path: "c", Blake3: digest(0x03), SizeBytes: 1, MtimeNs: 1, Status: StatusPresent, LastSeenAtNs: 50, IndexedAtNs: 50},
+		{VolumeID: rootID, Path: "a", Blake3: digest(0x01), SizeBytes: 1, MtimeNs: 1, Status: StatusPresent, FirstSeenRunID: rootOldRun, LastSeenRunID: rootOldRun, IndexedAtNs: 50},
+		{VolumeID: rootID, Path: "b", Blake3: digest(0x02), SizeBytes: 1, MtimeNs: 1, Status: StatusPresent, FirstSeenRunID: rootCurRun, LastSeenRunID: rootCurRun, IndexedAtNs: 200},
+		{VolumeID: otherID, Path: "c", Blake3: digest(0x03), SizeBytes: 1, MtimeNs: 1, Status: StatusPresent, FirstSeenRunID: otherRun, LastSeenRunID: otherRun, IndexedAtNs: 50},
 	}
 	for _, r := range rows {
 		if err := s.Upsert(ctx, r); err != nil {
@@ -308,7 +331,7 @@ func TestMarkMissingScopedToVolume(t *testing.T) {
 		}
 	}
 
-	n, err := s.MarkMissing(ctx, rootID, 100)
+	n, err := s.MarkMissing(ctx, rootID, rootCurRun)
 	if err != nil {
 		t.Fatalf("MarkMissing: %v", err)
 	}
@@ -340,10 +363,11 @@ func TestListDuplicates(t *testing.T) {
 	ctx := context.Background()
 
 	rID := makeVolume(t, s, "/r")
+	run := makeRun(t, s, rID)
 	rows := []FileRow{
-		{VolumeID: rID, Path: "a", Blake3: digest(0x11), Status: StatusPresent, LastSeenAtNs: 1, IndexedAtNs: 1},
-		{VolumeID: rID, Path: "b", Blake3: digest(0x11), Status: StatusPresent, LastSeenAtNs: 1, IndexedAtNs: 1},
-		{VolumeID: rID, Path: "c", Blake3: digest(0x22), Status: StatusPresent, LastSeenAtNs: 1, IndexedAtNs: 1},
+		{VolumeID: rID, Path: "a", Blake3: digest(0x11), Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1},
+		{VolumeID: rID, Path: "b", Blake3: digest(0x11), Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1},
+		{VolumeID: rID, Path: "c", Blake3: digest(0x22), Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1},
 	}
 	for _, r := range rows {
 		if err := s.Upsert(ctx, r); err != nil {
@@ -373,14 +397,15 @@ func TestCheckConstraintsRejectBadRows(t *testing.T) {
 	ctx := context.Background()
 
 	rID := makeVolume(t, s, "/r")
+	run := makeRun(t, s, rID)
 	cases := []struct {
 		name string
 		row  FileRow
 	}{
-		{"short blake3", FileRow{VolumeID: rID, Path: "a", Blake3: bytes.Repeat([]byte{1}, 31), Status: StatusPresent}},
-		{"long blake3", FileRow{VolumeID: rID, Path: "b", Blake3: bytes.Repeat([]byte{1}, 33), Status: StatusPresent}},
-		{"empty blake3", FileRow{VolumeID: rID, Path: "c", Blake3: nil, Status: StatusPresent}},
-		{"invalid status", FileRow{VolumeID: rID, Path: "d", Blake3: digest(0x01), Status: "weird"}},
+		{"short blake3", FileRow{VolumeID: rID, Path: "a", Blake3: bytes.Repeat([]byte{1}, 31), Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run}},
+		{"long blake3", FileRow{VolumeID: rID, Path: "b", Blake3: bytes.Repeat([]byte{1}, 33), Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run}},
+		{"empty blake3", FileRow{VolumeID: rID, Path: "c", Blake3: nil, Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run}},
+		{"invalid status", FileRow{VolumeID: rID, Path: "d", Blake3: digest(0x01), Status: "weird", FirstSeenRunID: run, LastSeenRunID: run}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -402,11 +427,13 @@ func TestCrossVolumeDuplicates(t *testing.T) {
 
 	aID := makeVolume(t, s, "/A")
 	bID := makeVolume(t, s, "/B")
+	aRun := makeRun(t, s, aID)
+	bRun := makeRun(t, s, bID)
 	shared := digest(0x42)
 	rows := []FileRow{
-		{VolumeID: aID, Path: "x", Blake3: shared, Status: StatusPresent, LastSeenAtNs: 1, IndexedAtNs: 1},
-		{VolumeID: bID, Path: "y", Blake3: shared, Status: StatusPresent, LastSeenAtNs: 1, IndexedAtNs: 1},
-		{VolumeID: aID, Path: "z", Blake3: digest(0x99), Status: StatusPresent, LastSeenAtNs: 1, IndexedAtNs: 1},
+		{VolumeID: aID, Path: "x", Blake3: shared, Status: StatusPresent, FirstSeenRunID: aRun, LastSeenRunID: aRun, IndexedAtNs: 1},
+		{VolumeID: bID, Path: "y", Blake3: shared, Status: StatusPresent, FirstSeenRunID: bRun, LastSeenRunID: bRun, IndexedAtNs: 1},
+		{VolumeID: aID, Path: "z", Blake3: digest(0x99), Status: StatusPresent, FirstSeenRunID: aRun, LastSeenRunID: aRun, IndexedAtNs: 1},
 	}
 	for _, r := range rows {
 		if err := s.Upsert(ctx, r); err != nil {
@@ -437,11 +464,13 @@ func TestTouchSeenUpdatesStatusAndTimestamp(t *testing.T) {
 	ctx := context.Background()
 
 	rID := makeVolume(t, s, "/r")
-	r := FileRow{VolumeID: rID, Path: "a", Blake3: digest(0x01), Status: StatusMissing, LastSeenAtNs: 100, IndexedAtNs: 100}
+	oldRun := makeRun(t, s, rID)
+	newRun := makeRun(t, s, rID)
+	r := FileRow{VolumeID: rID, Path: "a", Blake3: digest(0x01), Status: StatusMissing, FirstSeenRunID: oldRun, LastSeenRunID: oldRun, IndexedAtNs: 100}
 	if err := s.Upsert(ctx, r); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
-	if err := s.TouchSeen(ctx, rID, "a", 500); err != nil {
+	if err := s.TouchSeen(ctx, rID, "a", newRun); err != nil {
 		t.Fatalf("TouchSeen: %v", err)
 	}
 	got, err := s.GetByPath(ctx, rID, "a")
@@ -451,8 +480,11 @@ func TestTouchSeenUpdatesStatusAndTimestamp(t *testing.T) {
 	if got.Status != StatusPresent {
 		t.Fatalf("Status = %s, want present", got.Status)
 	}
-	if got.LastSeenAtNs != 500 {
-		t.Fatalf("LastSeenAtNs = %d, want 500", got.LastSeenAtNs)
+	if got.LastSeenRunID != newRun {
+		t.Fatalf("LastSeenRunID = %d, want %d", got.LastSeenRunID, newRun)
+	}
+	if got.FirstSeenRunID != oldRun {
+		t.Fatalf("FirstSeenRunID = %d, want %d (must not change on TouchSeen)", got.FirstSeenRunID, oldRun)
 	}
 }
 
@@ -466,7 +498,8 @@ func TestGetByAbsolutePathNotUnderAnyVolume(t *testing.T) {
 	ctx := context.Background()
 
 	rID := makeVolume(t, s, "/r")
-	if err := s.Upsert(ctx, FileRow{VolumeID: rID, Path: "a", Blake3: digest(0x01), Status: StatusPresent, LastSeenAtNs: 1, IndexedAtNs: 1}); err != nil {
+	run := makeRun(t, s, rID)
+	if err := s.Upsert(ctx, FileRow{VolumeID: rID, Path: "a", Blake3: digest(0x01), Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1}); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
 	if _, err := s.GetByAbsolutePath(ctx, "/somewhere/else"); !IsNotFound(err) {
@@ -488,12 +521,14 @@ func TestGetByAbsolutePathLongestPrefixWins(t *testing.T) {
 
 	outer := makeVolume(t, s, "/a")
 	inner := makeVolume(t, s, "/a/sub")
+	outerRun := makeRun(t, s, outer)
+	innerRun := makeRun(t, s, inner)
 
 	// Same file path "x" upserted under each volume with a distinguishing digest.
-	if err := s.Upsert(ctx, FileRow{VolumeID: outer, Path: "sub/x", Blake3: digest(0x01), Status: StatusPresent, LastSeenAtNs: 1, IndexedAtNs: 1}); err != nil {
+	if err := s.Upsert(ctx, FileRow{VolumeID: outer, Path: "sub/x", Blake3: digest(0x01), Status: StatusPresent, FirstSeenRunID: outerRun, LastSeenRunID: outerRun, IndexedAtNs: 1}); err != nil {
 		t.Fatalf("upsert outer: %v", err)
 	}
-	if err := s.Upsert(ctx, FileRow{VolumeID: inner, Path: "x", Blake3: digest(0x02), Status: StatusPresent, LastSeenAtNs: 1, IndexedAtNs: 1}); err != nil {
+	if err := s.Upsert(ctx, FileRow{VolumeID: inner, Path: "x", Blake3: digest(0x02), Status: StatusPresent, FirstSeenRunID: innerRun, LastSeenRunID: innerRun, IndexedAtNs: 1}); err != nil {
 		t.Fatalf("upsert inner: %v", err)
 	}
 
@@ -506,5 +541,213 @@ func TestGetByAbsolutePathLongestPrefixWins(t *testing.T) {
 	}
 	if !bytes.Equal(fv.File.Blake3, digest(0x02)) {
 		t.Fatalf("expected inner digest, got %x", fv.File.Blake3)
+	}
+}
+
+// TestRunLifecycleTracks verifies that BeginRun + FinishRun produce a runs
+// row with the expected terminal state, and that the file rows reference the
+// run id rather than a wall-clock timestamp.
+func TestRunLifecycleTracks(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	vID := makeVolume(t, s, "/v")
+	runID, err := s.BeginRun(ctx, RunKindIndex, vID)
+	if err != nil {
+		t.Fatalf("BeginRun: %v", err)
+	}
+	if runID == 0 {
+		t.Fatalf("BeginRun returned 0 id")
+	}
+
+	row := FileRow{
+		VolumeID: vID, Path: "a", Blake3: digest(0x42), SizeBytes: 1, MtimeNs: 1,
+		Status: StatusPresent, FirstSeenRunID: runID, LastSeenRunID: runID, IndexedAtNs: 1,
+	}
+	if err := s.Upsert(ctx, row); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	if err := s.FinishRun(ctx, runID, RunStatusSuccess, "", 1); err != nil {
+		t.Fatalf("FinishRun: %v", err)
+	}
+
+	var kind, status string
+	var endedAt sql.NullInt64
+	var errStr sql.NullString
+	var fileCount int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT kind, status, ended_at_ns, error, file_count FROM runs WHERE id = ?`, runID).
+		Scan(&kind, &status, &endedAt, &errStr, &fileCount); err != nil {
+		t.Fatalf("query run: %v", err)
+	}
+	if kind != RunKindIndex || status != RunStatusSuccess {
+		t.Fatalf("run kind=%q status=%q, want index/success", kind, status)
+	}
+	if !endedAt.Valid {
+		t.Fatalf("ended_at_ns was NULL after FinishRun")
+	}
+	if errStr.Valid {
+		t.Fatalf("error column = %q, want NULL on success", errStr.String)
+	}
+	if fileCount != 1 {
+		t.Fatalf("file_count = %d, want 1", fileCount)
+	}
+
+	got, err := s.GetByPath(ctx, vID, "a")
+	if err != nil {
+		t.Fatalf("GetByPath: %v", err)
+	}
+	if got.FirstSeenRunID != runID || got.LastSeenRunID != runID {
+		t.Fatalf("file run refs = (%d,%d), want (%d,%d)", got.FirstSeenRunID, got.LastSeenRunID, runID, runID)
+	}
+}
+
+// TestFinishRunPropagatesErrorMessage verifies that a non-empty error message
+// passed to FinishRun lands in the runs.error column.
+func TestFinishRunPropagatesErrorMessage(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	vID := makeVolume(t, s, "/v")
+	runID, err := s.BeginRun(ctx, RunKindIndex, vID)
+	if err != nil {
+		t.Fatalf("BeginRun: %v", err)
+	}
+	if err := s.FinishRun(ctx, runID, RunStatusFailed, "walk: permission denied", 0); err != nil {
+		t.Fatalf("FinishRun: %v", err)
+	}
+	var status string
+	var errStr sql.NullString
+	if err := s.db.QueryRowContext(ctx, `SELECT status, error FROM runs WHERE id = ?`, runID).
+		Scan(&status, &errStr); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if status != RunStatusFailed {
+		t.Fatalf("status = %q, want failed", status)
+	}
+	if !errStr.Valid || !strings.Contains(errStr.String, "permission denied") {
+		t.Fatalf("error column = %+v, want failure message", errStr)
+	}
+}
+
+// TestMigrateV2ToV3 builds a v2-shape database by hand, then opens it via
+// Open() to trigger the migration. The migration must (a) create the runs
+// table with one synthetic 'index' run per volume, (b) point every file at
+// that run, and (c) drop the old last_seen_at_ns column.
+func TestMigrateV2ToV3(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	rawDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("raw sql.Open: %v", err)
+	}
+	v2DDL := []string{
+		`CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)`,
+		`CREATE TABLE volumes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL)`,
+		`CREATE TABLE files (
+			volume_id     INTEGER NOT NULL REFERENCES volumes(id),
+			path          TEXT NOT NULL,
+			blake3        BLOB NOT NULL CHECK (length(blake3) = 32),
+			size_bytes    INTEGER NOT NULL,
+			mtime_ns      INTEGER NOT NULL,
+			status        TEXT NOT NULL CHECK (status IN ('present','missing')),
+			last_seen_at_ns INTEGER NOT NULL,
+			indexed_at_ns INTEGER NOT NULL,
+			PRIMARY KEY (volume_id, path)
+		)`,
+		`INSERT INTO schema_version (version) VALUES (2)`,
+		`INSERT INTO volumes (id, name, path) VALUES (1, 'photos', '/photos'), (2, 'videos', '/videos')`,
+	}
+	for _, q := range v2DDL {
+		if _, err := rawDB.Exec(q); err != nil {
+			t.Fatalf("v2 DDL %q: %v", q, err)
+		}
+	}
+	d := digest(0x77)
+	if _, err := rawDB.Exec(
+		`INSERT INTO files (volume_id, path, blake3, size_bytes, mtime_ns, status, last_seen_at_ns, indexed_at_ns)
+		 VALUES (?, ?, ?, ?, ?, 'present', ?, ?), (?, ?, ?, ?, ?, 'present', ?, ?)`,
+		1, "a.txt", d, 5, 10, 100, 100,
+		2, "clip.mp4", d, 99, 20, 200, 200,
+	); err != nil {
+		t.Fatalf("seed files: %v", err)
+	}
+	rawDB.Close()
+
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open (should migrate): %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	v, err := s.CurrentSchemaVersion(ctx)
+	if err != nil {
+		t.Fatalf("CurrentSchemaVersion: %v", err)
+	}
+	if v != 3 {
+		t.Fatalf("schema_version = %d, want 3", v)
+	}
+
+	var runCount int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs`).Scan(&runCount); err != nil {
+		t.Fatalf("count runs: %v", err)
+	}
+	if runCount != 2 {
+		t.Fatalf("runs count = %d, want 2 (one per volume)", runCount)
+	}
+
+	// Each file row points to the run synthesized for its volume.
+	for _, p := range []struct {
+		vID int64
+		rel string
+	}{{1, "a.txt"}, {2, "clip.mp4"}} {
+		row, err := s.GetByPath(ctx, p.vID, p.rel)
+		if err != nil {
+			t.Fatalf("GetByPath: %v", err)
+		}
+		if row.FirstSeenRunID == 0 || row.LastSeenRunID == 0 {
+			t.Fatalf("file %s missing run refs: %+v", p.rel, row)
+		}
+		if row.FirstSeenRunID != row.LastSeenRunID {
+			t.Fatalf("file %s first/last differ: %+v", p.rel, row)
+		}
+		var volID sql.NullInt64
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT volume_id FROM runs WHERE id = ?`, row.LastSeenRunID).Scan(&volID); err != nil {
+			t.Fatalf("lookup run %d: %v", row.LastSeenRunID, err)
+		}
+		if !volID.Valid || volID.Int64 != p.vID {
+			t.Fatalf("synthesized run for %s has volume_id=%+v, want %d", p.rel, volID, p.vID)
+		}
+	}
+
+	// The migration must drop last_seen_at_ns. Confirm via PRAGMA.
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(files)`)
+	if err != nil {
+		t.Fatalf("PRAGMA table_info: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			t.Fatalf("scan PRAGMA: %v", err)
+		}
+		if name == "last_seen_at_ns" {
+			t.Fatalf("v2 column last_seen_at_ns still present after migration")
+		}
 	}
 }

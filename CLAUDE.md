@@ -1,3 +1,9 @@
+# Core principle: never lose track of content
+
+Squirrel indexes **content** (BLAKE3 hashes), not paths. A hash that has ever been observed must remain retrievable from the index. Paths are observations of content; content is the entity.
+
+In practice: never overwrite `blake3` on an existing row when a file's content changes — supersede the old row and insert a new one. Any future schema change, pruning policy, sync feature, or dedup query must preserve this rule.
+
 # Code quality reminders
 
 Don't:

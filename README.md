@@ -4,6 +4,10 @@ Backup tool for your own NAS + cloud offsite storage.
 
 This first milestone is a local content-addressed file indexer: walk a directory tree, hash each file with BLAKE3, store the result in SQLite, and answer queries about duplicates and missing files.
 
+## Principle
+
+Squirrel indexes **content**, not paths. A BLAKE3 hash that has ever been observed must stay retrievable — paths are observations of content, not the other way around. Today's schema is a simplified form of this; the next schema revision (see [issue #6](https://github.com/mbertschler/squirrel/issues/6)) makes content history append-only so a file getting rewritten never loses the prior hash.
+
 ## Install
 
 ```
@@ -31,6 +35,8 @@ squirrel index --db ~/.squirrel/pictures.db ~/Pictures
 ```
 
 Re-running `squirrel index` updates the index incrementally — new files are added, modified files re-hashed, and files no longer on disk are flagged as missing (rows are not deleted). Pass `--shallow` to skip re-hashing files whose `(size, mtime)` already match the stored row, or `--dry-run` to see what would change without writing to the database.
+
+Every non-dry-run `index` invocation records a row in the `runs` table (kind, volume, started/ended timestamps, terminal status, error, file count) and each `files` row carries `first_seen_run_id` / `last_seen_run_id` pointing into that history. Dry runs intentionally leave the runs table untouched.
 
 Look up a file by its BLAKE3 hex hash:
 

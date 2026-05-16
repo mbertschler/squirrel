@@ -114,7 +114,8 @@ func queryByPath(cmd *cobra.Command, s *store.Store, arg string) error {
 	fmt.Fprintf(out, "size_bytes:    %d\n", fv.File.SizeBytes)
 	fmt.Fprintf(out, "mtime_ns:      %d\n", fv.File.MtimeNs)
 	fmt.Fprintf(out, "status:        %s\n", fv.File.Status)
-	fmt.Fprintf(out, "last_seen_ns:  %d\n", fv.File.LastSeenAtNs)
+	fmt.Fprintf(out, "first_seen_run: %d\n", fv.File.FirstSeenRunID)
+	fmt.Fprintf(out, "last_seen_run:  %d\n", fv.File.LastSeenRunID)
 	fmt.Fprintf(out, "indexed_at_ns: %d\n", fv.File.IndexedAtNs)
 	return nil
 }

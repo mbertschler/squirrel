@@ -424,6 +424,113 @@ func TestWorkerCountDoesNotAffectResult(t *testing.T) {
 	}
 }
 
+func TestIndexRecordsRuns(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), "hello")
+
+	s := setupStore(t)
+	ctx := context.Background()
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("first Index: %v", err)
+	}
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("second Index: %v", err)
+	}
+
+	absRoot, _ := filepath.Abs(root)
+	vol := volumeFor(t, s, absRoot)
+	runs, err := s.ListRunsForVolume(ctx, vol.ID)
+	if err != nil {
+		t.Fatalf("ListRunsForVolume: %v", err)
+	}
+	if len(runs) != 2 {
+		t.Fatalf("got %d run rows, want 2: %+v", len(runs), runs)
+	}
+	for i, r := range runs {
+		if r.Kind != store.RunKindIndex {
+			t.Fatalf("run %d kind = %q, want %q", i, r.Kind, store.RunKindIndex)
+		}
+		if r.Status != store.RunStatusSuccess {
+			t.Fatalf("run %d status = %q, want %q", i, r.Status, store.RunStatusSuccess)
+		}
+		if !r.EndedAtNs.Valid {
+			t.Fatalf("run %d ended_at_ns NULL, want set", i)
+		}
+		if r.FileCount != 1 {
+			t.Fatalf("run %d file_count = %d, want 1", i, r.FileCount)
+		}
+	}
+
+	// The file row's last_seen_run_id must advance to the second run while
+	// first_seen_run_id stays at the first.
+	row, err := s.GetByPath(ctx, vol.ID, "a.txt")
+	if err != nil {
+		t.Fatalf("GetByPath: %v", err)
+	}
+	if row.FirstSeenRunID != runs[0].ID {
+		t.Fatalf("FirstSeenRunID = %d, want %d", row.FirstSeenRunID, runs[0].ID)
+	}
+	if row.LastSeenRunID != runs[1].ID {
+		t.Fatalf("LastSeenRunID = %d, want %d (second run)", row.LastSeenRunID, runs[1].ID)
+	}
+}
+
+func TestIndexPartialRunOnPerFileError(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "ok.txt"), "hello")
+	unreadable := filepath.Join(root, "denied.txt")
+	writeFile(t, unreadable, "secret")
+	if err := os.Chmod(unreadable, 0o000); err != nil {
+		t.Skipf("chmod 000 not supported: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(unreadable, 0o644) })
+
+	s := setupStore(t)
+	ctx := context.Background()
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	absRoot, _ := filepath.Abs(root)
+	vol := volumeFor(t, s, absRoot)
+	runs, err := s.ListRunsForVolume(ctx, vol.ID)
+	if err != nil {
+		t.Fatalf("ListRunsForVolume: %v", err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("runs = %d, want 1", len(runs))
+	}
+	if runs[0].Status != store.RunStatusPartial {
+		t.Fatalf("status = %q, want partial (per-file error during a completed walk)", runs[0].Status)
+	}
+}
+
+func TestDryRunDoesNotRecordRun(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), "hello")
+
+	s := setupStore(t)
+	ctx := context.Background()
+	if _, err := Index(ctx, s, root, Options{DryRun: true}); err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	// Dry-run skips volume creation, so any runs we recorded would necessarily
+	// be cross-volume / orphan rows. The cleanest check: look up the absent
+	// volume; if it really doesn't exist, the runs table has nothing pointing
+	// at it. As a stronger assertion we also query the volume id 0 (impossible
+	// match) to confirm ListRunsForVolume returns empty for missing volumes.
+	absRoot, _ := filepath.Abs(root)
+	if _, err := s.GetVolumeByPath(ctx, absRoot); !store.IsNotFound(err) {
+		t.Fatalf("dry-run created a volume row: %v", err)
+	}
+	runs, err := s.ListRunsForVolume(ctx, 0)
+	if err != nil {
+		t.Fatalf("ListRunsForVolume: %v", err)
+	}
+	if len(runs) != 0 {
+		t.Fatalf("expected no runs after dry-run, got %+v", runs)
+	}
+}
+
 func TestDryRunReportsMissingCount(t *testing.T) {
 	root := t.TempDir()
 	a := filepath.Join(root, "a.txt")
