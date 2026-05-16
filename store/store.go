@@ -88,7 +88,14 @@ func Open(path string) (*Store, error) {
 	if strings.Contains(path, "://") || strings.HasPrefix(path, "file:") {
 		return nil, fmt.Errorf("db path %q must be a plain filesystem path, not a URI", path)
 	}
-	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+	// _txlock=immediate makes BeginTx start with `BEGIN IMMEDIATE`, acquiring
+	// the write lock at transaction start. Without it, a transaction that
+	// only reads first and then upgrades to a write (which is exactly what
+	// Upsert's state machine does) can race against another writer and lose
+	// the "supersede prior live row" step. With MaxOpenConns=1 today this is
+	// theoretical, but the schema-level invariants would still let a buggy
+	// future change land bad state — IMMEDIATE keeps the contract explicit.
+	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
@@ -201,9 +208,18 @@ func schemaV4Stmts() []string {
 		// number of past content changes per path. Indexing 'present' (covers
 		// ~all rows) would only inflate writes.
 		`CREATE INDEX idx_files_missing ON files(volume_id, path) WHERE status = 'missing'`,
-		// Partial index that lets the path-level state machine in Upsert
-		// locate the single non-superseded row at (volume, path) cheaply.
-		`CREATE INDEX idx_files_live ON files(volume_id, path) WHERE status IN ('present','missing')`,
+		// Partial UNIQUE index enforces the path-level invariant: at most one
+		// non-superseded row per (volume_id, path). Doubles as the lookup
+		// index that Upsert's state machine uses to find the live row.
+		`CREATE UNIQUE INDEX uniq_files_live_per_path ON files(volume_id, path) WHERE status != 'superseded'`,
+		// Schema-level enforcement of the "blake3 is immutable" rule. Any
+		// UPDATE that mentions the blake3 column in its SET clause aborts.
+		// The only sanctioned way to record new content at a path is to
+		// supersede the prior row and INSERT a new one (see Upsert).
+		`CREATE TRIGGER files_blake3_immutable BEFORE UPDATE OF blake3 ON files
+		 BEGIN
+		     SELECT RAISE(ABORT, 'blake3 is immutable; supersede the row and insert a new one');
+		 END`,
 	}
 }
 
@@ -346,7 +362,11 @@ func migrateV3ToV4(ctx context.Context, db *sql.DB) error {
 		`ALTER TABLE files_v4 RENAME TO files`,
 		`CREATE INDEX idx_files_blake3 ON files(blake3, volume_id, path)`,
 		`CREATE INDEX idx_files_missing ON files(volume_id, path) WHERE status = 'missing'`,
-		`CREATE INDEX idx_files_live ON files(volume_id, path) WHERE status IN ('present','missing')`,
+		`CREATE UNIQUE INDEX uniq_files_live_per_path ON files(volume_id, path) WHERE status != 'superseded'`,
+		`CREATE TRIGGER files_blake3_immutable BEFORE UPDATE OF blake3 ON files
+		 BEGIN
+		     SELECT RAISE(ABORT, 'blake3 is immutable; supersede the row and insert a new one');
+		 END`,
 		`INSERT INTO schema_version (version) VALUES (4)`,
 	}
 	for _, q := range stmts {

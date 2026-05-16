@@ -1018,6 +1018,147 @@ func TestUpsertRevertContent(t *testing.T) {
 	}
 }
 
+// TestTriggerRejectsBlake3Update guards the schema-level "blake3 is
+// immutable" rule. The trigger must reject any UPDATE that mentions blake3
+// in its SET clause, even if invoked outside of Upsert (e.g. via raw SQL in
+// some future code path).
+func TestTriggerRejectsBlake3Update(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	vID := makeVolume(t, s, "/v")
+	run := makeRun(t, s, vID)
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: vID, Path: "x", Blake3: digest(0xaa), SizeBytes: 1, MtimeNs: 1,
+		Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1,
+	}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	// Direct UPDATE bypassing the Upsert state machine — the trigger must
+	// abort it.
+	_, err = s.db.ExecContext(ctx,
+		`UPDATE files SET blake3 = ? WHERE volume_id = ? AND path = ?`,
+		digest(0xbb), vID, "x")
+	if err == nil {
+		t.Fatalf("direct UPDATE of blake3 succeeded; trigger did not fire")
+	}
+	if !strings.Contains(err.Error(), "blake3 is immutable") {
+		t.Fatalf("got error %q, want one mentioning blake3 immutability", err)
+	}
+
+	// Untouched: the original row still has its original hash.
+	row, err := s.GetByPath(ctx, vID, "x")
+	if err != nil {
+		t.Fatalf("GetByPath: %v", err)
+	}
+	if !bytes.Equal(row.Blake3, digest(0xaa)) {
+		t.Fatalf("blake3 = %x, want %x (trigger should have aborted the UPDATE)", row.Blake3, digest(0xaa))
+	}
+}
+
+// TestUniqueIndexRejectsSecondLiveRow guards the path-level invariant that
+// at most one non-superseded row exists per (volume_id, path), enforced by
+// the partial UNIQUE index. The Upsert state machine should never produce
+// two live rows, but if a future code path tried to via direct SQL, the
+// index must reject it.
+func TestUniqueIndexRejectsSecondLiveRow(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	vID := makeVolume(t, s, "/v")
+	run := makeRun(t, s, vID)
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: vID, Path: "x", Blake3: digest(0xaa), SizeBytes: 1, MtimeNs: 1,
+		Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1,
+	}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	// Try to insert a second live row at the same (volume, path) without
+	// superseding the first. The UNIQUE index must abort this.
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO files (volume_id, path, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
+		VALUES (?, ?, ?, ?, ?, 'present', ?, ?, ?)
+	`, vID, "x", digest(0xbb), 1, 2, run, run, 2)
+	if err == nil {
+		t.Fatalf("direct INSERT of second live row succeeded; unique index did not fire")
+	}
+	if !strings.Contains(err.Error(), "UNIQUE") {
+		t.Fatalf("got error %q, want one mentioning UNIQUE constraint", err)
+	}
+
+	// Inserting a 'superseded' row at the same (V, P) is allowed — superseded
+	// rows are exempt from the partial unique constraint, so the schema
+	// supports unbounded historical depth per path.
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO files (volume_id, path, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
+		VALUES (?, ?, ?, ?, ?, 'superseded', ?, ?, ?)
+	`, vID, "x", digest(0xcc), 1, 3, run, run, 3); err != nil {
+		t.Fatalf("inserting superseded row should be allowed, got: %v", err)
+	}
+}
+
+// TestMigrateV3ToV4InstallsSchemaGuards verifies that a v3 database upgraded
+// to v4 ends up with the trigger and the partial unique index, not just the
+// widened PK and the superseded status. Without these, the migration would
+// leave existing databases lacking the enforcement that fresh installs get.
+func TestMigrateV3ToV4InstallsSchemaGuards(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	rawDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("raw sql.Open: %v", err)
+	}
+	v3DDL := []string{
+		`CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)`,
+		`CREATE TABLE volumes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL)`,
+		`CREATE TABLE runs (id INTEGER PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('index','sync')), volume_id INTEGER REFERENCES volumes(id), started_at_ns INTEGER NOT NULL, ended_at_ns INTEGER, status TEXT NOT NULL CHECK (status IN ('running','success','failed','partial')), error TEXT, file_count INTEGER NOT NULL DEFAULT 0)`,
+		`CREATE TABLE files (volume_id INTEGER NOT NULL REFERENCES volumes(id), path TEXT NOT NULL, blake3 BLOB NOT NULL CHECK (length(blake3) = 32), size_bytes INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, status TEXT NOT NULL CHECK (status IN ('present','missing')), first_seen_run_id INTEGER NOT NULL REFERENCES runs(id), last_seen_run_id INTEGER NOT NULL REFERENCES runs(id), indexed_at_ns INTEGER NOT NULL, PRIMARY KEY (volume_id, path))`,
+		`INSERT INTO schema_version (version) VALUES (3)`,
+		`INSERT INTO volumes (id, name, path) VALUES (1, 'v', '/v')`,
+		`INSERT INTO runs (id, kind, volume_id, started_at_ns, status) VALUES (1, 'index', 1, 1, 'success')`,
+		`INSERT INTO files (volume_id, path, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns) VALUES (1, 'x', X'` + strings.Repeat("aa", 32) + `', 1, 1, 'present', 1, 1, 1)`,
+	}
+	for _, q := range v3DDL {
+		if _, err := rawDB.Exec(q); err != nil {
+			t.Fatalf("v3 DDL %q: %v", q, err)
+		}
+	}
+	rawDB.Close()
+
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open (migrates v3→v4): %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	// Trigger must reject blake3 updates on the migrated DB.
+	_, err = s.db.ExecContext(ctx, `UPDATE files SET blake3 = ? WHERE volume_id = 1 AND path = 'x'`, digest(0xbb))
+	if err == nil || !strings.Contains(err.Error(), "blake3 is immutable") {
+		t.Fatalf("trigger missing after migration; err = %v", err)
+	}
+
+	// Partial UNIQUE index must reject a second live row at the same (V, P).
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO files (volume_id, path, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
+		VALUES (1, 'x', ?, 1, 2, 'present', 1, 1, 2)
+	`, digest(0xcc))
+	if err == nil || !strings.Contains(err.Error(), "UNIQUE") {
+		t.Fatalf("unique index missing after migration; err = %v", err)
+	}
+}
+
 // TestMarkMissingIgnoresSupersededRows guards that MarkMissing only touches
 // 'present' rows. Superseded rows hold historical content and should never
 // transition to 'missing' regardless of how stale their last_seen_run_id is.
