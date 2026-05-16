@@ -376,6 +376,25 @@ func TestCheckMinVersionBranches(t *testing.T) {
 	}
 }
 
+// TestRestoreRefusesOnVolumePathMismatch documents the parity with
+// index.resolveNamedVolume: a DB row whose volumes.path no longer
+// matches what config declares causes restore to refuse rather than
+// silently writing the run row against the stale path.
+func TestRestoreRefusesOnVolumePathMismatch(t *testing.T) {
+	f := setupFixture(t)
+	// Bypass index and CreateVolume manually with a path that differs
+	// from f.vol.Path. (Both paths exist on disk so the failure mode
+	// is unambiguously the mismatch check.)
+	staleDir := t.TempDir()
+	if _, err := f.store.CreateVolume(context.Background(), f.vol.Name, staleDir); err != nil {
+		t.Fatalf("seed stale volume row: %v", err)
+	}
+	_, err := Restore(context.Background(), f.store, f.rcl, f.vol, f.dest, RestoreOptions{})
+	if err == nil || !strings.Contains(err.Error(), "resolve the conflict") {
+		t.Fatalf("expected path-mismatch error, got %v", err)
+	}
+}
+
 func TestPairsForFiltering(t *testing.T) {
 	cfgBody := `
 [destinations.a]

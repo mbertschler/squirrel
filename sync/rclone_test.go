@@ -40,6 +40,55 @@ func TestVersionParses(t *testing.T) {
 	}
 }
 
+// TestParseJSONLogCapturesObjectlessErrors confirms that level=error
+// events without an Object field — auth failures, listing errors, the
+// terminal "Failed to copy: ..." line — end up in FailedFiles so the
+// runs row's error column can be populated from them. Retry-summary
+// lines ("Attempt N/M failed ...") are filtered to avoid logging the
+// same underlying failure three times.
+func TestParseJSONLogCapturesObjectlessErrors(t *testing.T) {
+	stream := strings.Join([]string{
+		`{"level":"error","msg":"Failed to authenticate: 401 Unauthorized","source":"x"}`,
+		`{"level":"error","msg":"error reading source root: nope","object":"FS at /x","source":"x"}`,
+		`{"level":"error","msg":"Attempt 1/3 failed with 1 errors and: nope","source":"x"}`,
+		`{"level":"error","msg":"Attempt 2/3 failed with 1 errors and: nope","source":"x"}`,
+		`{"stats":{"errors":1,"fatalError":true,"totalTransfers":0,"totalChecks":0,"bytes":0}}`,
+	}, "\n")
+	var r RunResult
+	parseJSONLog(strings.NewReader(stream), &r)
+
+	if len(r.FailedFiles) != 2 {
+		t.Fatalf("FailedFiles = %+v, want 2 (auth + reading; retry summaries dropped)", r.FailedFiles)
+	}
+	if r.FailedFiles[0].Object != "" || !strings.Contains(r.FailedFiles[0].Message, "authenticate") {
+		t.Fatalf("first FailedFile = %+v, want object-less auth message", r.FailedFiles[0])
+	}
+	if r.FailedFiles[1].Object == "" {
+		t.Fatalf("second FailedFile lost its object: %+v", r.FailedFiles[1])
+	}
+	if !r.FatalError {
+		t.Fatalf("FatalError = false, want true")
+	}
+}
+
+func TestIsRetrySummary(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"Attempt 1/3 failed with 1 errors and: nope", true},
+		{"Attempt 10/12 failed with 4 errors", true},
+		{"Failed to copy: nope", false},
+		{"error reading source root: nope", false},
+		{"Attempt to do something but not a summary", false}, // missing N/M
+	}
+	for _, c := range cases {
+		if got := isRetrySummary(c.in); got != c.want {
+			t.Errorf("isRetrySummary(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
 func TestVersionAtLeast(t *testing.T) {
 	// Pure-logic check independent of the installed binary.
 	v := func(major, minor, patch int) Version {
@@ -106,6 +155,37 @@ password = "p"
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("rclone.conf missing %q:\n%s", want, body)
 		}
+	}
+}
+
+// TestWriteRcloneConfigTightensExistingPermissions exercises the chmod
+// path. OpenFile's perm argument is only honored on create, so a file
+// that already exists with looser perms (e.g., 0644 from a previous
+// version of squirrel) would otherwise keep those perms. We pre-create
+// the file at 0644 and verify the write tightens it to 0600.
+func TestWriteRcloneConfigTightensExistingPermissions(t *testing.T) {
+	cfg := writeFakeConfig(t, `
+[destinations.nas]
+type = "sftp"
+host = "nas.local"
+user = "martin"
+root = "/data"
+password = "p"
+`)
+	target := filepath.Join(t.TempDir(), "rclone.conf")
+	if err := os.WriteFile(target, []byte("stale"), 0o644); err != nil {
+		t.Fatalf("seed loose-perm file: %v", err)
+	}
+	r := &Rclone{}
+	if err := r.WriteRcloneConfig(target, cfg.Destinations); err != nil {
+		t.Fatalf("WriteRcloneConfig: %v", err)
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("perm = %o, want 0600 (chmod on existing file failed)", info.Mode().Perm())
 	}
 }
 

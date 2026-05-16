@@ -360,6 +360,14 @@ func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volum
 
 func getOrCreateVolumeForRestore(ctx context.Context, s *store.Store, vol *config.Volume) (store.Volume, error) {
 	if v, err := s.GetVolumeByName(ctx, vol.Name); err == nil {
+		// Mirror index.resolveNamedVolume's mismatch guard: a stale
+		// volumes.path would otherwise cause the next `squirrel index`
+		// to refuse with the same conflict, leaving the user wondering
+		// when the drift was introduced. Surface it here at the moment
+		// of writing into the run row.
+		if v.Path != vol.Path {
+			return store.Volume{}, fmt.Errorf("volume %q is at %q in the DB but config says %q — resolve the conflict before restoring", vol.Name, v.Path, vol.Path)
+		}
 		return v, nil
 	} else if !store.IsNotFound(err) {
 		return store.Volume{}, fmt.Errorf("lookup volume: %w", err)

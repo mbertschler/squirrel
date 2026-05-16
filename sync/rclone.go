@@ -123,6 +123,13 @@ func (r *Rclone) WriteRcloneConfig(path string, dests map[string]*config.Destina
 		return fmt.Errorf("open rclone config for write: %w", err)
 	}
 	defer f.Close()
+	// OpenFile's perm only applies on create; if the file already exists
+	// (e.g., created by a previous version that used 0644) the existing
+	// mode is preserved. Force 0600 unconditionally — this file contains
+	// resolved secrets.
+	if err := f.Chmod(0o600); err != nil {
+		return fmt.Errorf("chmod rclone config: %w", err)
+	}
 
 	// Stable section order so repeat writes produce identical bytes.
 	names := make([]string, 0, len(dests))
@@ -262,6 +269,14 @@ type rcloneStats struct {
 	FatalError     bool  `json:"fatalError"`
 }
 
+// retrySummaryRE matches rclone's "Attempt N/M failed with K errors …"
+// lines. rclone emits one of these per retry attempt; the underlying
+// per-file error is already captured separately, so logging the
+// per-attempt summary as well would produce N duplicates per failure.
+var retrySummaryRE = regexp.MustCompile(`^Attempt \d+/\d+ failed`)
+
+func isRetrySummary(msg string) bool { return retrySummaryRE.MatchString(msg) }
+
 // parseJSONLog reads JSON-per-line events from r and updates result in
 // place. Non-JSON lines (e.g. an early startup notice on an older rclone)
 // are skipped — we cannot make decisions on them and surfacing them as
@@ -293,7 +308,12 @@ func parseJSONLog(r io.Reader, result *RunResult) {
 			}
 			continue
 		}
-		if ev.Level == "error" && ev.Object != "" {
+		if ev.Level == "error" && !isRetrySummary(ev.Msg) {
+			// Capture object-less errors too: auth failures, listing
+			// errors, "Failed to copy: …" diagnostics carry no Object
+			// but are exactly the messages we want in runs.error. Filter
+			// out per-attempt retry summaries to avoid 3x noise on a
+			// single underlying failure.
 			if int64(len(result.FailedFiles)) < maxFailedFiles {
 				result.FailedFiles = append(result.FailedFiles, FailedFile{
 					Object: ev.Object, Message: ev.Msg,

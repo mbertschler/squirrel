@@ -101,7 +101,13 @@ func printSyncReport(w io.Writer, rep sync.Report, runErr error) {
 		r.Transferred, r.Checked, r.Errors, r.Bytes, rep.RunID,
 	)
 	for _, ff := range r.FailedFiles {
-		fmt.Fprintf(w, "  error %s: %s\n", ff.Object, ff.Message)
+		// Some rclone errors (auth, listing, fatal copy) have no Object.
+		// Render those as a bare "error: ..." rather than "error : ...".
+		if ff.Object == "" {
+			fmt.Fprintf(w, "  error: %s\n", ff.Message)
+		} else {
+			fmt.Fprintf(w, "  error %s: %s\n", ff.Object, ff.Message)
+		}
 	}
 	if rep.FinishErr != nil {
 		// Distinct from rclone errors: the data is at the destination, but
