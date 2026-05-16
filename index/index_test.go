@@ -439,9 +439,9 @@ func TestIndexRecordsRuns(t *testing.T) {
 
 	absRoot, _ := filepath.Abs(root)
 	vol := volumeFor(t, s, absRoot)
-	runs, err := s.ListRunsForVolume(ctx, vol.ID)
+	runs, err := s.ListRuns(ctx, store.ListRunsOpts{VolumeID: &vol.ID})
 	if err != nil {
-		t.Fatalf("ListRunsForVolume: %v", err)
+		t.Fatalf("ListRuns: %v", err)
 	}
 	if len(runs) != 2 {
 		t.Fatalf("got %d run rows, want 2: %+v", len(runs), runs)
@@ -492,9 +492,9 @@ func TestIndexPartialRunOnPerFileError(t *testing.T) {
 	}
 	absRoot, _ := filepath.Abs(root)
 	vol := volumeFor(t, s, absRoot)
-	runs, err := s.ListRunsForVolume(ctx, vol.ID)
+	runs, err := s.ListRuns(ctx, store.ListRunsOpts{VolumeID: &vol.ID})
 	if err != nil {
-		t.Fatalf("ListRunsForVolume: %v", err)
+		t.Fatalf("ListRuns: %v", err)
 	}
 	if len(runs) != 1 {
 		t.Fatalf("runs = %d, want 1", len(runs))
@@ -617,15 +617,14 @@ func TestDryRunDoesNotRecordRun(t *testing.T) {
 	// Dry-run skips volume creation, so any runs we recorded would necessarily
 	// be cross-volume / orphan rows. The cleanest check: look up the absent
 	// volume; if it really doesn't exist, the runs table has nothing pointing
-	// at it. As a stronger assertion we also query the volume id 0 (impossible
-	// match) to confirm ListRunsForVolume returns empty for missing volumes.
+	// at it. A stronger assertion is that ListRuns(nil filter) returns nothing.
 	absRoot, _ := filepath.Abs(root)
 	if _, err := s.GetVolumeByPath(ctx, absRoot); !store.IsNotFound(err) {
 		t.Fatalf("dry-run created a volume row: %v", err)
 	}
-	runs, err := s.ListRunsForVolume(ctx, 0)
+	runs, err := s.ListRuns(ctx, store.ListRunsOpts{})
 	if err != nil {
-		t.Fatalf("ListRunsForVolume: %v", err)
+		t.Fatalf("ListRuns: %v", err)
 	}
 	if len(runs) != 0 {
 		t.Fatalf("expected no runs after dry-run, got %+v", runs)
@@ -687,9 +686,9 @@ func TestIndexWalkErrorReachesRun(t *testing.T) {
 	}
 	absRoot, _ := filepath.Abs(root)
 	vol := volumeFor(t, s, absRoot)
-	runs, err := s.ListRunsForVolume(ctx, vol.ID)
+	runs, err := s.ListRuns(ctx, store.ListRunsOpts{VolumeID: &vol.ID})
 	if err != nil {
-		t.Fatalf("ListRunsForVolume: %v", err)
+		t.Fatalf("ListRuns: %v", err)
 	}
 	if len(runs) != 1 || runs[0].Status != store.RunStatusPartial {
 		t.Fatalf("got runs %+v, want one partial run", runs)

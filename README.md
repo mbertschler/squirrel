@@ -62,13 +62,28 @@ List paths previously indexed but no longer on disk:
 squirrel query --missing
 ```
 
+Inspect the content history of a single path — the live row plus every superseded predecessor:
+
+```
+squirrel query --history ~/Pictures/foo.jpg
+```
+
+List recent index runs (most recent first):
+
+```
+squirrel runs
+squirrel runs --volume pictures --limit 5
+```
+
 ## CLI reference
 
 ```
 squirrel index <path> [--db PATH] [--shallow] [--dry-run] [--workers N]
-squirrel query <hash-or-path> [--db PATH]
+squirrel query <hash-or-path> [--db PATH] [--history]
 squirrel query --duplicates [--db PATH]
 squirrel query --missing [--db PATH]
+squirrel runs [--db PATH] [--volume NAME] [--limit N]
+squirrel volumes [--db PATH]
 ```
 
 | Flag         | Default                      | Meaning                                              |

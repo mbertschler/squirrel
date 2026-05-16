@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 
@@ -19,6 +20,7 @@ func newQueryCmd() *cobra.Command {
 	var (
 		duplicates bool
 		missing    bool
+		history    bool
 	)
 	cmd := &cobra.Command{
 		Use:   "query [<hash-or-path>]",
@@ -46,12 +48,13 @@ func newQueryCmd() *cobra.Command {
 				if len(args) != 1 {
 					return errors.New("query requires <hash>, <path>, --duplicates, or --missing")
 				}
-				return queryArg(cmd, s, args[0])
+				return queryArg(cmd, s, args[0], history)
 			}
 		},
 	}
 	cmd.Flags().BoolVar(&duplicates, "duplicates", false, "list hashes that appear at more than one path")
 	cmd.Flags().BoolVar(&missing, "missing", false, "list previously-indexed paths no longer on disk")
+	cmd.Flags().BoolVar(&history, "history", false, "when querying a path, also print the full content history at that path")
 	return cmd
 }
 
@@ -59,11 +62,16 @@ func newQueryCmd() *cobra.Command {
 // 64-char hex string that exists on disk (or contains a path separator) is
 // treated as a path; otherwise it is interpreted as a BLAKE3 digest. This
 // protects content-addressed workloads where filenames are themselves hex.
-func queryArg(cmd *cobra.Command, s *store.Store, arg string) error {
+// withHistory is only meaningful for path queries — hash lookups already
+// list every row for the digest.
+func queryArg(cmd *cobra.Command, s *store.Store, arg string, withHistory bool) error {
 	if !looksLikePath(arg) && isHashLike(arg) {
+		if withHistory {
+			return errors.New("--history applies to path queries, not hash queries (hash queries already list every row)")
+		}
 		return queryByHash(cmd, s, arg)
 	}
-	return queryByPath(cmd, s, arg)
+	return queryByPath(cmd, s, arg, withHistory)
 }
 
 func looksLikePath(arg string) bool {
@@ -93,7 +101,7 @@ func queryByHash(cmd *cobra.Command, s *store.Store, hexDigest string) error {
 	return nil
 }
 
-func queryByPath(cmd *cobra.Command, s *store.Store, arg string) error {
+func queryByPath(cmd *cobra.Command, s *store.Store, arg string, withHistory bool) error {
 	absPath, err := filepath.Abs(arg)
 	if err != nil {
 		return err
@@ -117,7 +125,35 @@ func queryByPath(cmd *cobra.Command, s *store.Store, arg string) error {
 	fmt.Fprintf(out, "first_seen_run: %d\n", fv.File.FirstSeenRunID)
 	fmt.Fprintf(out, "last_seen_run:  %d\n", fv.File.LastSeenRunID)
 	fmt.Fprintf(out, "indexed_at_ns: %d\n", fv.File.IndexedAtNs)
+
+	if withHistory {
+		if err := printPathHistory(cmd, s, fv.Volume.ID, fv.File.Path); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// printPathHistory appends a table of every row in the path's content
+// history — the live row from the block above plus any superseded
+// predecessors. Useful for inspecting "what content has lived at this
+// path?" without dropping into SQL.
+func printPathHistory(cmd *cobra.Command, s *store.Store, volumeID int64, relPath string) error {
+	history, err := s.ListHistoryByPath(cmd.Context(), volumeID, relPath)
+	if err != nil {
+		return fmt.Errorf("list history: %w", err)
+	}
+	out := cmd.OutOrStdout()
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "history:")
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "  STATUS\tBLAKE3\tSIZE\tFIRST_SEEN_RUN\tLAST_SEEN_RUN\tINDEXED_AT_NS")
+	for _, r := range history {
+		fmt.Fprintf(tw, "  %s\t%s\t%d\t%d\t%d\t%d\n",
+			r.Status, hex.EncodeToString(r.Blake3), r.SizeBytes,
+			r.FirstSeenRunID, r.LastSeenRunID, r.IndexedAtNs)
+	}
+	return tw.Flush()
 }
 
 func queryDuplicates(cmd *cobra.Command, s *store.Store) error {

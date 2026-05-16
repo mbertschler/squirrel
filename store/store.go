@@ -433,6 +433,16 @@ func (s *Store) GetVolumeByID(ctx context.Context, id int64) (Volume, error) {
 	return v, err
 }
 
+// GetVolumeByName returns the volume with the given name, or sql.ErrNoRows.
+// Names are UNIQUE per the schema so this lookup is unambiguous.
+func (s *Store) GetVolumeByName(ctx context.Context, name string) (Volume, error) {
+	var v Volume
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, name, path FROM volumes WHERE name = ?`, name).
+		Scan(&v.ID, &v.Name, &v.Path)
+	return v, err
+}
+
 // GetVolumeByPath returns the volume whose path equals absPath, or
 // sql.ErrNoRows. When multiple volumes share the same path (allowed by the
 // schema), the lowest id wins.
