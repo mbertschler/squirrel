@@ -504,6 +504,52 @@ func TestIndexPartialRunOnPerFileError(t *testing.T) {
 	}
 }
 
+// TestPartialRunDoesNotMarkErroredFilesMissing guards a subtle correctness
+// rule: a file that errored during hashing did not have its last_seen_run_id
+// bumped this run, so a naive MarkMissing call would flip it to 'missing'
+// even though the file still exists on disk. finalizeMissing must skip the
+// flip when report.Errors > 0.
+func TestPartialRunDoesNotMarkErroredFilesMissing(t *testing.T) {
+	root := t.TempDir()
+	a := filepath.Join(root, "a.txt")
+	b := filepath.Join(root, "b.txt")
+	writeFile(t, a, "alpha")
+	writeFile(t, b, "beta")
+
+	s := setupStore(t)
+	ctx := context.Background()
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("first Index: %v", err)
+	}
+
+	// Make b unreadable so the second run errors on it. b is still on disk,
+	// so it must NOT be flagged as missing.
+	if err := os.Chmod(b, 0o000); err != nil {
+		t.Skipf("chmod 000 not supported: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(b, 0o644) })
+
+	rep, err := Index(ctx, s, root, Options{})
+	if err != nil {
+		t.Fatalf("second Index: %v", err)
+	}
+	if rep.Errors == 0 {
+		t.Fatalf("expected per-file error on unreadable b, got %+v", rep)
+	}
+	if rep.Missing != 0 {
+		t.Fatalf("Missing=%d on partial run, want 0 (skipped for safety)", rep.Missing)
+	}
+	absRoot, _ := filepath.Abs(root)
+	vol := volumeFor(t, s, absRoot)
+	bRow, err := s.GetByPath(ctx, vol.ID, "b.txt")
+	if err != nil {
+		t.Fatalf("GetByPath b: %v", err)
+	}
+	if bRow.Status != store.StatusPresent {
+		t.Fatalf("b.Status = %s, want present (file still on disk, was just unreadable)", bRow.Status)
+	}
+}
+
 func TestDryRunDoesNotRecordRun(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "a.txt"), "hello")

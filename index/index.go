@@ -3,7 +3,6 @@ package index
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -187,7 +186,7 @@ func (i *indexer) finishRun(report *Report, fatalErr error) {
 		return
 	}
 	status, errMsg := runStatus(report, fatalErr)
-	fileCount := report.Added + report.Modified + report.Unchanged
+	fileCount := int64(report.Added + report.Modified + report.Unchanged)
 	if err := i.store.FinishRun(i.ctx, i.runID, status, errMsg, fileCount); err != nil {
 		// Surface as a per-run error rather than swallowing silently. The
 		// outer caller has already accepted a report and a fatal error (if
@@ -345,17 +344,30 @@ func (i *indexer) persist(r resultItem) error {
 
 func (i *indexer) waitForWalker() error {
 	err := <-i.walkErrCh
-	if err != nil && !errors.Is(err, context.Canceled) {
-		return fmt.Errorf("walk: %w", err)
+	if err == nil {
+		return nil
 	}
-	return nil
+	// Treat context cancellation as a fatal failure rather than silently
+	// declaring success: if the walk was cut short, we have not seen every
+	// file, and running MarkMissing afterwards would flip live rows to
+	// missing. The deferred finishRun in Index() classifies this as
+	// RunStatusFailed via the propagated error.
+	return fmt.Errorf("walk: %w", err)
 }
 
 // finalizeMissing flips DB rows in this volume that we did not encounter to
-// status='missing' (or counts what would be flipped, in DryRun mode). A
-// brand-new dry-run volume (volumeExists=false) has no rows to flip.
+// status='missing' (or counts what would be flipped, in DryRun mode). It is
+// only safe to call after a fully clean walk: a partial walk (per-file
+// errors) leaves some files un-touched even though they exist on disk, so
+// MarkMissing is skipped and report.Missing stays at zero in that case. The
+// caller surfaces partial-ness via the run's status='partial'.
+//
+// A brand-new dry-run volume (volumeExists=false) has no rows to flip.
 func (i *indexer) finalizeMissing(report *Report) error {
 	if !i.volumeExists {
+		return nil
+	}
+	if report.Errors > 0 {
 		return nil
 	}
 	if !i.opts.DryRun {

@@ -454,7 +454,7 @@ func TestCrossVolumeDuplicates(t *testing.T) {
 	}
 }
 
-func TestTouchSeenUpdatesStatusAndTimestamp(t *testing.T) {
+func TestTouchSeenUpdatesStatusAndLastSeenRun(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "test.db")
 	s, err := Open(dsn)
 	if err != nil {
@@ -682,6 +682,28 @@ func TestFinishRunPropagatesErrorMessage(t *testing.T) {
 	}
 	if !errStr.Valid || !strings.Contains(errStr.String, "permission denied") {
 		t.Fatalf("error column = %+v, want failure message", errStr)
+	}
+}
+
+// TestFinishRunUnknownIDErrors guards against silently losing a run
+// finalisation when the caller passes a runID that doesn't exist (e.g. typo
+// in test plumbing, double-finalise, row deleted out from under us). Without
+// the RowsAffected check, a run could be left stuck in 'running' forever.
+func TestFinishRunUnknownIDErrors(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	err = s.FinishRun(ctx, 99999, RunStatusSuccess, "", 0)
+	if err == nil {
+		t.Fatalf("FinishRun on unknown id returned nil, want error")
+	}
+	if !strings.Contains(err.Error(), "no such run") {
+		t.Fatalf("error = %q, want 'no such run'", err)
 	}
 }
 
