@@ -251,12 +251,10 @@ func (r *Rclone) Run(ctx context.Context, args ...string) (RunResult, error) {
 // failed-file lists), and the stats object that rclone emits at the end of
 // a run. Everything else is dropped silently.
 type rcloneEvent struct {
-	Level  string         `json:"level"`
-	Msg    string         `json:"msg"`
-	Object string         `json:"object"`
-	Stats  *rcloneStats   `json:"stats,omitempty"`
-	Source string         `json:"source"`
-	Extra  map[string]any `json:"-"`
+	Level  string       `json:"level"`
+	Msg    string       `json:"msg"`
+	Object string       `json:"object"`
+	Stats  *rcloneStats `json:"stats,omitempty"`
 }
 
 // rcloneStats matches the keys of the stats object rclone emits at the end
