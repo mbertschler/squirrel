@@ -273,7 +273,9 @@ func (s *Store) GetByAbsolutePath(ctx context.Context, abs string) (FileWithVolu
 
 // relPathUnder returns the path of abs relative to base, with ok=false when
 // abs is not equal to or under base. base is expected to be an absolute path
-// without a trailing slash.
+// without a trailing slash. The separator is hard-coded to '/' because the
+// rest of the codebase stores file paths via filepath.ToSlash; Windows is
+// not currently supported.
 func relPathUnder(base, abs string) (string, bool) {
 	if abs == base {
 		return ".", true

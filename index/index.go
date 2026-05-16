@@ -88,12 +88,13 @@ func Index(ctx context.Context, s *store.Store, root string, opts Options) (Repo
 // indexer holds the state of one Index() invocation. It owns the worker pool,
 // the walker goroutine, and the channels connecting them.
 type indexer struct {
-	ctx         context.Context
-	store       *store.Store
-	absRoot     string
-	volumeID    int64
-	opts        Options
-	startedAtNs int64
+	ctx          context.Context
+	store        *store.Store
+	absRoot      string
+	volumeID     int64
+	volumeExists bool
+	opts         Options
+	startedAtNs  int64
 
 	workers int
 	work    chan workItem
@@ -129,22 +130,23 @@ func newIndexer(ctx context.Context, s *store.Store, root string, opts Options) 
 		queueDepth = workers * 4
 	}
 
-	vol, err := resolveVolume(ctx, s, absRoot, opts.DryRun)
+	vol, exists, err := resolveVolume(ctx, s, absRoot, opts.DryRun)
 	if err != nil {
 		return nil, err
 	}
 
 	idx := &indexer{
-		ctx:         ctx,
-		store:       s,
-		absRoot:     absRoot,
-		volumeID:    vol.ID,
-		opts:        opts,
-		startedAtNs: store.NowNs(),
-		workers:     workers,
-		work:        make(chan workItem, queueDepth),
-		results:     make(chan resultItem, queueDepth),
-		walkErrCh:   make(chan error, 1),
+		ctx:          ctx,
+		store:        s,
+		absRoot:      absRoot,
+		volumeID:     vol.ID,
+		volumeExists: exists,
+		opts:         opts,
+		startedAtNs:  store.NowNs(),
+		workers:      workers,
+		work:         make(chan workItem, queueDepth),
+		results:      make(chan resultItem, queueDepth),
+		walkErrCh:    make(chan error, 1),
 	}
 	if opts.DryRun {
 		idx.seen = make(map[string]struct{})
@@ -297,8 +299,12 @@ func (i *indexer) waitForWalker() error {
 }
 
 // finalizeMissing flips DB rows in this volume that we did not encounter to
-// status='missing' (or counts what would be flipped, in DryRun mode).
+// status='missing' (or counts what would be flipped, in DryRun mode). A
+// brand-new dry-run volume (volumeExists=false) has no rows to flip.
 func (i *indexer) finalizeMissing(report *Report) error {
+	if !i.volumeExists {
+		return nil
+	}
 	if !i.opts.DryRun {
 		n, err := i.store.MarkMissing(i.ctx, i.volumeID, i.startedAtNs)
 		if err != nil {
@@ -322,10 +328,16 @@ func (i *indexer) finalizeMissing(report *Report) error {
 // process is the per-file decision: shallow shortcut, hash, classify as
 // added/modified/unchanged.
 func (i *indexer) process(w workItem) resultItem {
-	existing, err := i.store.GetByPath(i.ctx, i.volumeID, w.relPath)
-	hasExisting := err == nil
-	if err != nil && !store.IsNotFound(err) {
-		return resultItem{err: fmt.Errorf("lookup %s/%s: %w", i.absRoot, w.relPath, err)}
+	var existing store.FileRow
+	var hasExisting bool
+	if i.volumeExists {
+		row, err := i.store.GetByPath(i.ctx, i.volumeID, w.relPath)
+		if err != nil && !store.IsNotFound(err) {
+			return resultItem{err: fmt.Errorf("lookup %s/%s: %w", i.absRoot, w.relPath, err)}
+		}
+		if err == nil {
+			existing, hasExisting = row, true
+		}
 	}
 
 	if i.opts.Shallow && hasExisting && metadataMatches(existing, w) {
@@ -369,25 +381,26 @@ func (i *indexer) rowFor(w workItem, digest []byte) store.FileRow {
 	}
 }
 
-// resolveVolume returns the volume for absRoot. In dry-run mode the volume
-// is looked up but not created, so a never-indexed path produces a synthetic
-// Volume{ID: 0} that owns no rows in the DB.
-func resolveVolume(ctx context.Context, s *store.Store, absRoot string, dryRun bool) (store.Volume, error) {
+// resolveVolume returns the volume for absRoot and whether it already exists
+// in the database. In dry-run mode against a never-indexed path the returned
+// Volume has no row backing it (exists=false); callers must avoid issuing
+// volume-scoped DB queries against it.
+func resolveVolume(ctx context.Context, s *store.Store, absRoot string, dryRun bool) (store.Volume, bool, error) {
 	if !dryRun {
 		v, err := s.GetOrCreateVolume(ctx, absRoot)
 		if err != nil {
-			return store.Volume{}, fmt.Errorf("resolve volume: %w", err)
+			return store.Volume{}, false, fmt.Errorf("resolve volume: %w", err)
 		}
-		return v, nil
+		return v, true, nil
 	}
 	v, err := s.GetVolumeByPath(ctx, absRoot)
 	if err == nil {
-		return v, nil
+		return v, true, nil
 	}
 	if !store.IsNotFound(err) {
-		return store.Volume{}, fmt.Errorf("lookup volume: %w", err)
+		return store.Volume{}, false, fmt.Errorf("lookup volume: %w", err)
 	}
-	return store.Volume{ID: 0, Path: absRoot}, nil
+	return store.Volume{Path: absRoot}, false, nil
 }
 
 func hashFile(path string) ([]byte, error) {
