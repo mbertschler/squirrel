@@ -270,3 +270,105 @@ type Pair struct {
 	Destination *config.Destination
 }
 
+// RestoreOptions shape one Restore invocation. ToPath overrides the local
+// target directory; when empty, the volume's declared path is used. The
+// override is for "pull a recovery copy somewhere else" — squirrel won't
+// silently clobber the live volume unless explicitly pointed at it.
+type RestoreOptions struct {
+	ToPath  string
+	Shallow bool
+	DryRun  bool
+}
+
+// Restore reverses Sync: it copies from the destination's per-volume tree
+// back to the local filesystem. Like Sync it records a runs row, but with
+// kind='restore'. Restore is the opposite of additive — the rclone copy
+// will overwrite whatever exists at the target path on a hash mismatch.
+// Callers are expected to point ToPath at an empty / scratch directory
+// unless they explicitly intend to restore in place.
+func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, dest *config.Destination, opts RestoreOptions) (rep Report, err error) {
+	rep = Report{Volume: vol.Name, Destination: dest.Name}
+
+	// We deliberately don't require an existing index for restore: the
+	// destination is the source of truth in this direction, and a fresh
+	// laptop may have no DB rows yet. We still create a volumes row so
+	// the runs row's FK resolves.
+	v, err := getOrCreateVolumeForRestore(ctx, s, vol)
+	if err != nil {
+		return rep, err
+	}
+
+	runID, err := beginRestoreRun(ctx, s, opts.DryRun, v.ID, dest.Name)
+	if err != nil {
+		return rep, err
+	}
+	rep.RunID = runID
+	defer func() {
+		finishSyncRun(ctx, s, opts.DryRun, runID, &rep)
+	}()
+
+	args := buildRestoreArgs(vol, dest, opts)
+	rep.RcloneResult, err = rcl.Run(ctx, args...)
+	if err != nil && rep.RcloneResult.Errors == 0 && !rep.RcloneResult.FatalError {
+		rep.RcloneResult.FatalError = true
+	}
+	if err != nil {
+		return rep, fmt.Errorf("rclone: %w", err)
+	}
+	return rep, nil
+}
+
+func getOrCreateVolumeForRestore(ctx context.Context, s *store.Store, vol *config.Volume) (store.Volume, error) {
+	if v, err := s.GetVolumeByName(ctx, vol.Name); err == nil {
+		return v, nil
+	} else if !store.IsNotFound(err) {
+		return store.Volume{}, fmt.Errorf("lookup volume: %w", err)
+	}
+	v, err := s.CreateVolume(ctx, vol.Name, vol.Path)
+	if err != nil {
+		return store.Volume{}, fmt.Errorf("create volume %q: %w", vol.Name, err)
+	}
+	return v, nil
+}
+
+func beginRestoreRun(ctx context.Context, s *store.Store, dryRun bool, volID int64, destName string) (int64, error) {
+	if dryRun {
+		return 0, nil
+	}
+	id, err := s.BeginRun(ctx, store.RunKindRestore, volID, destName)
+	if err != nil {
+		return 0, fmt.Errorf("begin restore run: %w", err)
+	}
+	return id, nil
+}
+
+// buildRestoreArgs flips the source/destination of sync: source is
+// <dest>:<root>/<volume>/, destination is the local volume path (or
+// override). The same .squirrel-history filter applies — we don't want
+// the destination's historical snapshots to land in the user's tree.
+// Restore does not pass --backup-dir: the local target is the recovery
+// surface, and the user opted in to overwrites by invoking restore.
+// Squirrel-side append-only semantics live in the destination tree, not
+// on the local filesystem.
+func buildRestoreArgs(vol *config.Volume, dest *config.Destination, opts RestoreOptions) []string {
+	srcArg := destinationVolumeURI(dest, vol.Name)
+	target := vol.Path
+	if opts.ToPath != "" {
+		target = opts.ToPath
+	}
+	dstArg := withTrailingSlash(target)
+
+	args := []string{
+		"copy",
+		"--filter", "- /" + HistoryDirName + "/**",
+	}
+	if !opts.Shallow {
+		args = append(args, "--checksum", "--hash", "blake3")
+	}
+	if opts.DryRun {
+		args = append(args, "--dry-run")
+	}
+	args = append(args, srcArg, dstArg)
+	return args
+}
+

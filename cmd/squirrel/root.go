@@ -35,6 +35,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newRunsCmd())
 	root.AddCommand(newVolumesCmd())
 	root.AddCommand(newSyncCmd())
+	root.AddCommand(newRestoreCmd())
 	return root
 }
 
