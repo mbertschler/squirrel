@@ -6,7 +6,7 @@ This first milestone is a local content-addressed file indexer: walk a directory
 
 ## Principle
 
-Squirrel indexes **content**, not paths. A BLAKE3 hash that has ever been observed must stay retrievable — paths are observations of content, not the other way around. Today's schema is a simplified form of this; the next schema revision (see [issue #6](https://github.com/mbertschler/squirrel/issues/6)) makes content history append-only so a file getting rewritten never loses the prior hash.
+Squirrel indexes **content**, not paths. A BLAKE3 hash that has ever been observed stays retrievable — paths are observations of content, not the other way around. When content at a path changes, the prior row is flipped to `superseded` and a new row is inserted; the old hash is never rewritten in place. `squirrel query <hash>` will still find a hash whose path now holds different content.
 
 ## Install
 
