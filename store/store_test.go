@@ -761,8 +761,9 @@ func TestMigrateV2ToV3(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CurrentSchemaVersion: %v", err)
 	}
-	if v != 3 {
-		t.Fatalf("schema_version = %d, want 3", v)
+	// v2 databases now chain through v3 and land at v4 on Open.
+	if v != SchemaVersion {
+		t.Fatalf("schema_version = %d, want %d", v, SchemaVersion)
 	}
 
 	var runCount int
@@ -815,5 +816,401 @@ func TestMigrateV2ToV3(t *testing.T) {
 		if name == "last_seen_at_ns" {
 			t.Fatalf("v2 column last_seen_at_ns still present after migration")
 		}
+	}
+}
+
+// TestMigrateV3ToV4 builds a v3-shape database by hand, opens it via Open()
+// to trigger only the v3→v4 step, and verifies (a) the PK is widened to
+// include blake3, (b) the status CHECK accepts 'superseded', and (c) row
+// data is preserved verbatim.
+func TestMigrateV3ToV4(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	rawDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("raw sql.Open: %v", err)
+	}
+	v3DDL := []string{
+		`CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)`,
+		`CREATE TABLE volumes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL)`,
+		`CREATE TABLE runs (
+			id INTEGER PRIMARY KEY,
+			kind TEXT NOT NULL CHECK (kind IN ('index','sync')),
+			volume_id INTEGER REFERENCES volumes(id),
+			started_at_ns INTEGER NOT NULL,
+			ended_at_ns INTEGER,
+			status TEXT NOT NULL CHECK (status IN ('running','success','failed','partial')),
+			error TEXT,
+			file_count INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE files (
+			volume_id INTEGER NOT NULL REFERENCES volumes(id),
+			path TEXT NOT NULL,
+			blake3 BLOB NOT NULL CHECK (length(blake3) = 32),
+			size_bytes INTEGER NOT NULL,
+			mtime_ns INTEGER NOT NULL,
+			status TEXT NOT NULL CHECK (status IN ('present','missing')),
+			first_seen_run_id INTEGER NOT NULL REFERENCES runs(id),
+			last_seen_run_id INTEGER NOT NULL REFERENCES runs(id),
+			indexed_at_ns INTEGER NOT NULL,
+			PRIMARY KEY (volume_id, path)
+		)`,
+		`INSERT INTO schema_version (version) VALUES (3)`,
+		`INSERT INTO volumes (id, name, path) VALUES (1, 'photos', '/photos')`,
+		`INSERT INTO runs (id, kind, volume_id, started_at_ns, status) VALUES (1, 'index', 1, 100, 'success')`,
+	}
+	for _, q := range v3DDL {
+		if _, err := rawDB.Exec(q); err != nil {
+			t.Fatalf("v3 DDL %q: %v", q, err)
+		}
+	}
+	d := digest(0x55)
+	if _, err := rawDB.Exec(
+		`INSERT INTO files (volume_id, path, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
+		 VALUES (1, 'photo.jpg', ?, 1024, 50, 'present', 1, 1, 50)`, d,
+	); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	rawDB.Close()
+
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open (should migrate v3→v4): %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	if v, _ := s.CurrentSchemaVersion(ctx); v != 4 {
+		t.Fatalf("schema_version = %d, want 4", v)
+	}
+
+	// PK should now include blake3 — confirm by inserting a second row at the
+	// same (volume_id, path) but different blake3, which would have collided
+	// pre-migration.
+	d2 := digest(0x66)
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO files (volume_id, path, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
+		VALUES (1, 'photo.jpg', ?, 1024, 60, 'superseded', 1, 1, 60)
+	`, d2); err != nil {
+		t.Fatalf("insert second blake3 at same path failed (PK not widened?): %v", err)
+	}
+
+	// Status CHECK should accept 'superseded'.
+	row, err := s.GetByPath(ctx, 1, "photo.jpg")
+	if err != nil {
+		t.Fatalf("GetByPath: %v", err)
+	}
+	if !bytes.Equal(row.Blake3, d) || row.Status != StatusPresent {
+		t.Fatalf("live row = %+v, want original d=%x status=present", row, d)
+	}
+}
+
+// TestUpsertContentChangePreservesOldHash is the core append-only guarantee:
+// when content at a path changes, the old hash must remain in the database
+// as a superseded row rather than being overwritten in place.
+func TestUpsertContentChangePreservesOldHash(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	vID := makeVolume(t, s, "/v")
+	run1 := makeRun(t, s, vID)
+	run2 := makeRun(t, s, vID)
+
+	hashA := digest(0xaa)
+	hashB := digest(0xbb)
+
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: vID, Path: "doc.txt", Blake3: hashA, SizeBytes: 10, MtimeNs: 1,
+		Status: StatusPresent, FirstSeenRunID: run1, LastSeenRunID: run1, IndexedAtNs: 1,
+	}); err != nil {
+		t.Fatalf("first Upsert: %v", err)
+	}
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: vID, Path: "doc.txt", Blake3: hashB, SizeBytes: 20, MtimeNs: 2,
+		Status: StatusPresent, FirstSeenRunID: run2, LastSeenRunID: run2, IndexedAtNs: 2,
+	}); err != nil {
+		t.Fatalf("second Upsert: %v", err)
+	}
+
+	history, err := s.ListHistoryByPath(ctx, vID, "doc.txt")
+	if err != nil {
+		t.Fatalf("ListHistoryByPath: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("history has %d rows, want 2 (old superseded + new present)", len(history))
+	}
+	if !bytes.Equal(history[0].Blake3, hashA) || history[0].Status != StatusSuperseded {
+		t.Fatalf("history[0] = %+v, want hashA superseded", history[0])
+	}
+	if !bytes.Equal(history[1].Blake3, hashB) || history[1].Status != StatusPresent {
+		t.Fatalf("history[1] = %+v, want hashB present", history[1])
+	}
+	// The first-seen run on the surviving record of the original content
+	// must be preserved at run1, not overwritten by run2.
+	if history[0].FirstSeenRunID != run1 {
+		t.Fatalf("superseded row FirstSeenRunID = %d, want %d", history[0].FirstSeenRunID, run1)
+	}
+
+	live, err := s.GetByPath(ctx, vID, "doc.txt")
+	if err != nil {
+		t.Fatalf("GetByPath: %v", err)
+	}
+	if !bytes.Equal(live.Blake3, hashB) {
+		t.Fatalf("GetByPath returned blake3 %x, want hashB %x (should skip superseded rows)", live.Blake3, hashB)
+	}
+}
+
+// TestUpsertRevertContent verifies the round-trip case: content goes A → B → A
+// at a path. The original A row should resurface as live and the B row
+// should be superseded. There should still be just two physical rows (the
+// revert reuses the original A row rather than appending a third).
+func TestUpsertRevertContent(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	vID := makeVolume(t, s, "/v")
+	r1 := makeRun(t, s, vID)
+	r2 := makeRun(t, s, vID)
+	r3 := makeRun(t, s, vID)
+	hashA := digest(0xaa)
+	hashB := digest(0xbb)
+	mkRow := func(hash []byte, run int64, mtime int64) FileRow {
+		return FileRow{
+			VolumeID: vID, Path: "doc.txt", Blake3: hash, SizeBytes: 10, MtimeNs: mtime,
+			Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: mtime,
+		}
+	}
+	for _, r := range []FileRow{mkRow(hashA, r1, 1), mkRow(hashB, r2, 2), mkRow(hashA, r3, 3)} {
+		if err := s.Upsert(ctx, r); err != nil {
+			t.Fatalf("Upsert: %v", err)
+		}
+	}
+
+	history, err := s.ListHistoryByPath(ctx, vID, "doc.txt")
+	if err != nil {
+		t.Fatalf("ListHistoryByPath: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("history has %d rows, want 2 (revert reuses original A row)", len(history))
+	}
+	// Reverted A is live; B is superseded.
+	if !bytes.Equal(history[0].Blake3, hashA) || history[0].Status != StatusPresent {
+		t.Fatalf("history[0] = %+v, want hashA present (revert resurrects original)", history[0])
+	}
+	if !bytes.Equal(history[1].Blake3, hashB) || history[1].Status != StatusSuperseded {
+		t.Fatalf("history[1] = %+v, want hashB superseded", history[1])
+	}
+	// The revived row must keep its original first-seen run (r1), not r3.
+	if history[0].FirstSeenRunID != r1 {
+		t.Fatalf("revived row FirstSeenRunID = %d, want %d (must not be rewritten on revert)", history[0].FirstSeenRunID, r1)
+	}
+	if history[0].LastSeenRunID != r3 {
+		t.Fatalf("revived row LastSeenRunID = %d, want %d (should advance to revert run)", history[0].LastSeenRunID, r3)
+	}
+}
+
+// TestTriggerRejectsBlake3Update guards the schema-level "blake3 is
+// immutable" rule. The trigger must reject any UPDATE that mentions blake3
+// in its SET clause, even if invoked outside of Upsert (e.g. via raw SQL in
+// some future code path).
+func TestTriggerRejectsBlake3Update(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	vID := makeVolume(t, s, "/v")
+	run := makeRun(t, s, vID)
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: vID, Path: "x", Blake3: digest(0xaa), SizeBytes: 1, MtimeNs: 1,
+		Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1,
+	}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	// Direct UPDATE bypassing the Upsert state machine — the trigger must
+	// abort it.
+	_, err = s.db.ExecContext(ctx,
+		`UPDATE files SET blake3 = ? WHERE volume_id = ? AND path = ?`,
+		digest(0xbb), vID, "x")
+	if err == nil {
+		t.Fatalf("direct UPDATE of blake3 succeeded; trigger did not fire")
+	}
+	if !strings.Contains(err.Error(), "blake3 is immutable") {
+		t.Fatalf("got error %q, want one mentioning blake3 immutability", err)
+	}
+
+	// Untouched: the original row still has its original hash.
+	row, err := s.GetByPath(ctx, vID, "x")
+	if err != nil {
+		t.Fatalf("GetByPath: %v", err)
+	}
+	if !bytes.Equal(row.Blake3, digest(0xaa)) {
+		t.Fatalf("blake3 = %x, want %x (trigger should have aborted the UPDATE)", row.Blake3, digest(0xaa))
+	}
+}
+
+// TestUniqueIndexRejectsSecondLiveRow guards the path-level invariant that
+// at most one non-superseded row exists per (volume_id, path), enforced by
+// the partial UNIQUE index. The Upsert state machine should never produce
+// two live rows, but if a future code path tried to via direct SQL, the
+// index must reject it.
+func TestUniqueIndexRejectsSecondLiveRow(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	vID := makeVolume(t, s, "/v")
+	run := makeRun(t, s, vID)
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: vID, Path: "x", Blake3: digest(0xaa), SizeBytes: 1, MtimeNs: 1,
+		Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1,
+	}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	// Try to insert a second live row at the same (volume, path) without
+	// superseding the first. The UNIQUE index must abort this.
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO files (volume_id, path, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
+		VALUES (?, ?, ?, ?, ?, 'present', ?, ?, ?)
+	`, vID, "x", digest(0xbb), 1, 2, run, run, 2)
+	if err == nil {
+		t.Fatalf("direct INSERT of second live row succeeded; unique index did not fire")
+	}
+	if !strings.Contains(err.Error(), "UNIQUE") {
+		t.Fatalf("got error %q, want one mentioning UNIQUE constraint", err)
+	}
+
+	// Inserting a 'superseded' row at the same (V, P) is allowed — superseded
+	// rows are exempt from the partial unique constraint, so the schema
+	// supports unbounded historical depth per path.
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO files (volume_id, path, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
+		VALUES (?, ?, ?, ?, ?, 'superseded', ?, ?, ?)
+	`, vID, "x", digest(0xcc), 1, 3, run, run, 3); err != nil {
+		t.Fatalf("inserting superseded row should be allowed, got: %v", err)
+	}
+}
+
+// TestMigrateV3ToV4InstallsSchemaGuards verifies that a v3 database upgraded
+// to v4 ends up with the trigger and the partial unique index, not just the
+// widened PK and the superseded status. Without these, the migration would
+// leave existing databases lacking the enforcement that fresh installs get.
+func TestMigrateV3ToV4InstallsSchemaGuards(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	rawDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("raw sql.Open: %v", err)
+	}
+	v3DDL := []string{
+		`CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)`,
+		`CREATE TABLE volumes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL)`,
+		`CREATE TABLE runs (id INTEGER PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('index','sync')), volume_id INTEGER REFERENCES volumes(id), started_at_ns INTEGER NOT NULL, ended_at_ns INTEGER, status TEXT NOT NULL CHECK (status IN ('running','success','failed','partial')), error TEXT, file_count INTEGER NOT NULL DEFAULT 0)`,
+		`CREATE TABLE files (volume_id INTEGER NOT NULL REFERENCES volumes(id), path TEXT NOT NULL, blake3 BLOB NOT NULL CHECK (length(blake3) = 32), size_bytes INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, status TEXT NOT NULL CHECK (status IN ('present','missing')), first_seen_run_id INTEGER NOT NULL REFERENCES runs(id), last_seen_run_id INTEGER NOT NULL REFERENCES runs(id), indexed_at_ns INTEGER NOT NULL, PRIMARY KEY (volume_id, path))`,
+		`INSERT INTO schema_version (version) VALUES (3)`,
+		`INSERT INTO volumes (id, name, path) VALUES (1, 'v', '/v')`,
+		`INSERT INTO runs (id, kind, volume_id, started_at_ns, status) VALUES (1, 'index', 1, 1, 'success')`,
+		`INSERT INTO files (volume_id, path, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns) VALUES (1, 'x', X'` + strings.Repeat("aa", 32) + `', 1, 1, 'present', 1, 1, 1)`,
+	}
+	for _, q := range v3DDL {
+		if _, err := rawDB.Exec(q); err != nil {
+			t.Fatalf("v3 DDL %q: %v", q, err)
+		}
+	}
+	rawDB.Close()
+
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open (migrates v3→v4): %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	// Trigger must reject blake3 updates on the migrated DB.
+	_, err = s.db.ExecContext(ctx, `UPDATE files SET blake3 = ? WHERE volume_id = 1 AND path = 'x'`, digest(0xbb))
+	if err == nil || !strings.Contains(err.Error(), "blake3 is immutable") {
+		t.Fatalf("trigger missing after migration; err = %v", err)
+	}
+
+	// Partial UNIQUE index must reject a second live row at the same (V, P).
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO files (volume_id, path, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
+		VALUES (1, 'x', ?, 1, 2, 'present', 1, 1, 2)
+	`, digest(0xcc))
+	if err == nil || !strings.Contains(err.Error(), "UNIQUE") {
+		t.Fatalf("unique index missing after migration; err = %v", err)
+	}
+}
+
+// TestMarkMissingIgnoresSupersededRows guards that MarkMissing only touches
+// 'present' rows. Superseded rows hold historical content and should never
+// transition to 'missing' regardless of how stale their last_seen_run_id is.
+func TestMarkMissingIgnoresSupersededRows(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	vID := makeVolume(t, s, "/v")
+	oldRun := makeRun(t, s, vID)
+	curRun := makeRun(t, s, vID)
+	// Two upserts at the same path with different hashes — the first becomes
+	// superseded once the second lands.
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: vID, Path: "p", Blake3: digest(0x01), SizeBytes: 1, MtimeNs: 1,
+		Status: StatusPresent, FirstSeenRunID: oldRun, LastSeenRunID: oldRun, IndexedAtNs: 1,
+	}); err != nil {
+		t.Fatalf("first Upsert: %v", err)
+	}
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: vID, Path: "p", Blake3: digest(0x02), SizeBytes: 1, MtimeNs: 2,
+		Status: StatusPresent, FirstSeenRunID: curRun, LastSeenRunID: curRun, IndexedAtNs: 2,
+	}); err != nil {
+		t.Fatalf("second Upsert: %v", err)
+	}
+
+	// Call MarkMissing with a brand-new run id that doesn't match anyone — both
+	// rows have stale last_seen_run_id but only the live present row should flip.
+	newerRun := makeRun(t, s, vID)
+	n, err := s.MarkMissing(ctx, vID, newerRun)
+	if err != nil {
+		t.Fatalf("MarkMissing: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("MarkMissing affected %d rows, want 1 (only the live present row)", n)
+	}
+
+	history, err := s.ListHistoryByPath(ctx, vID, "p")
+	if err != nil {
+		t.Fatalf("ListHistoryByPath: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("history has %d rows, want 2", len(history))
+	}
+	if history[0].Status != StatusSuperseded {
+		t.Fatalf("old row status = %q, want superseded (must not be flipped to missing)", history[0].Status)
+	}
+	if history[1].Status != StatusMissing {
+		t.Fatalf("live row status = %q, want missing", history[1].Status)
 	}
 }

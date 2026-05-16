@@ -14,7 +14,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 3
+const SchemaVersion = 4
 
 type Store struct {
 	db *sql.DB
@@ -53,8 +53,9 @@ type FileWithVolume struct {
 }
 
 const (
-	StatusPresent = "present"
-	StatusMissing = "missing"
+	StatusPresent    = "present"
+	StatusMissing    = "missing"
+	StatusSuperseded = "superseded"
 )
 
 // Run kinds. The runs.volume_id column is nullable so a future sync run can
@@ -87,7 +88,14 @@ func Open(path string) (*Store, error) {
 	if strings.Contains(path, "://") || strings.HasPrefix(path, "file:") {
 		return nil, fmt.Errorf("db path %q must be a plain filesystem path, not a URI", path)
 	}
-	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+	// _txlock=immediate makes BeginTx start with `BEGIN IMMEDIATE`, acquiring
+	// the write lock at transaction start. Without it, a transaction that
+	// only reads first and then upgrades to a write (which is exactly what
+	// Upsert's state machine does) can race against another writer and lose
+	// the "supersede prior live row" step. With MaxOpenConns=1 today this is
+	// theoretical, but the schema-level invariants would still let a buggy
+	// future change land bad state — IMMEDIATE keeps the contract explicit.
+	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
@@ -118,45 +126,53 @@ func (s *Store) migrate(ctx context.Context) error {
 	if current > SchemaVersion {
 		return fmt.Errorf("database schema version %d is newer than binary version %d; upgrade the binary", current, SchemaVersion)
 	}
-	switch current {
-	case 0:
-		if err := applyV3(ctx, s.db); err != nil {
-			return fmt.Errorf("apply schema v3: %w", err)
-		}
-	case 1:
+	if current == 1 {
 		return fmt.Errorf("database schema version 1 is no longer supported (binary expects v%d); delete the database and re-index", SchemaVersion)
-	case 2:
+	}
+	if current == 0 {
+		if err := applyV4(ctx, s.db); err != nil {
+			return fmt.Errorf("apply schema v4: %w", err)
+		}
+		return nil
+	}
+	// Chained upgrades — each step is a self-contained transaction.
+	if current == 2 {
 		if err := migrateV2ToV3(ctx, s.db); err != nil {
 			return fmt.Errorf("migrate schema v2→v3: %w", err)
 		}
-	case SchemaVersion:
-		// up to date
+		current = 3
+	}
+	if current == 3 {
+		if err := migrateV3ToV4(ctx, s.db); err != nil {
+			return fmt.Errorf("migrate schema v3→v4: %w", err)
+		}
 	}
 	return nil
 }
 
-func applyV3(ctx context.Context, db *sql.DB) error {
+func applyV4(ctx context.Context, db *sql.DB) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	for _, q := range schemaV3Stmts() {
+	for _, q := range schemaV4Stmts() {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("exec %q: %w", q, err)
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (3)`); err != nil {
-		return fmt.Errorf("record schema v3: %w", err)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (4)`); err != nil {
+		return fmt.Errorf("record schema v4: %w", err)
 	}
 	return tx.Commit()
 }
 
-// schemaV3Stmts returns the DDL for a fresh v3 database (no data). The
-// migration path reuses the runs/index definitions but rebuilds files via a
-// temporary table.
-func schemaV3Stmts() []string {
+// schemaV4Stmts returns the DDL for a fresh v4 database. The files table's
+// primary key is widened to (volume_id, path, blake3) so content history at a
+// path is append-only: when a file is rewritten with different content, a new
+// row is inserted and the prior row is marked 'superseded'.
+func schemaV4Stmts() []string {
 	return []string{
 		`CREATE TABLE volumes (
 			id   INTEGER PRIMARY KEY,
@@ -180,17 +196,30 @@ func schemaV3Stmts() []string {
 			blake3            BLOB NOT NULL CHECK (length(blake3) = 32),
 			size_bytes        INTEGER NOT NULL,
 			mtime_ns          INTEGER NOT NULL,
-			status            TEXT NOT NULL CHECK (status IN ('present','missing')),
+			status            TEXT NOT NULL CHECK (status IN ('present','missing','superseded')),
 			first_seen_run_id INTEGER NOT NULL REFERENCES runs(id),
 			last_seen_run_id  INTEGER NOT NULL REFERENCES runs(id),
 			indexed_at_ns     INTEGER NOT NULL,
-			PRIMARY KEY (volume_id, path)
+			PRIMARY KEY (volume_id, path, blake3)
 		)`,
 		// Covering index for blake3 lookups and cross-volume duplicate detection.
 		`CREATE INDEX idx_files_blake3 ON files(blake3, volume_id, path)`,
-		// Partial index: 'missing' is the rare/selective state. 'present' covers
-		// ~all rows and an index there would only inflate writes.
+		// Partial index: 'missing' is rare and 'superseded' is bounded by the
+		// number of past content changes per path. Indexing 'present' (covers
+		// ~all rows) would only inflate writes.
 		`CREATE INDEX idx_files_missing ON files(volume_id, path) WHERE status = 'missing'`,
+		// Partial UNIQUE index enforces the path-level invariant: at most one
+		// non-superseded row per (volume_id, path). Doubles as the lookup
+		// index that Upsert's state machine uses to find the live row.
+		`CREATE UNIQUE INDEX uniq_files_live_per_path ON files(volume_id, path) WHERE status != 'superseded'`,
+		// Schema-level enforcement of the "blake3 is immutable" rule. Any
+		// UPDATE that mentions the blake3 column in its SET clause aborts.
+		// The only sanctioned way to record new content at a path is to
+		// supersede the prior row and INSERT a new one (see Upsert).
+		`CREATE TRIGGER files_blake3_immutable BEFORE UPDATE OF blake3 ON files
+		 BEGIN
+		     SELECT RAISE(ABORT, 'blake3 is immutable; supersede the row and insert a new one');
+		 END`,
 	}
 }
 
@@ -298,6 +327,56 @@ func rebuildFilesAsV3(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
+// migrateV3ToV4 widens the files PK from (volume_id, path) to
+// (volume_id, path, blake3) and adds 'superseded' to the status check. Every
+// existing v3 row has a unique blake3 at its (volume, path), so the widening
+// is conflict-free and existing rows carry over verbatim.
+func migrateV3ToV4(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`CREATE TABLE files_v4 (
+			volume_id         INTEGER NOT NULL REFERENCES volumes(id),
+			path              TEXT NOT NULL,
+			blake3            BLOB NOT NULL CHECK (length(blake3) = 32),
+			size_bytes        INTEGER NOT NULL,
+			mtime_ns          INTEGER NOT NULL,
+			status            TEXT NOT NULL CHECK (status IN ('present','missing','superseded')),
+			first_seen_run_id INTEGER NOT NULL REFERENCES runs(id),
+			last_seen_run_id  INTEGER NOT NULL REFERENCES runs(id),
+			indexed_at_ns     INTEGER NOT NULL,
+			PRIMARY KEY (volume_id, path, blake3)
+		)`,
+		`INSERT INTO files_v4 (
+			volume_id, path, blake3, size_bytes, mtime_ns, status,
+			first_seen_run_id, last_seen_run_id, indexed_at_ns
+		)
+		SELECT volume_id, path, blake3, size_bytes, mtime_ns, status,
+		       first_seen_run_id, last_seen_run_id, indexed_at_ns
+		FROM files`,
+		`DROP TABLE files`,
+		`ALTER TABLE files_v4 RENAME TO files`,
+		`CREATE INDEX idx_files_blake3 ON files(blake3, volume_id, path)`,
+		`CREATE INDEX idx_files_missing ON files(volume_id, path) WHERE status = 'missing'`,
+		`CREATE UNIQUE INDEX uniq_files_live_per_path ON files(volume_id, path) WHERE status != 'superseded'`,
+		`CREATE TRIGGER files_blake3_immutable BEFORE UPDATE OF blake3 ON files
+		 BEGIN
+		     SELECT RAISE(ABORT, 'blake3 is immutable; supersede the row and insert a new one');
+		 END`,
+		`INSERT INTO schema_version (version) VALUES (4)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("widen files PK: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
 // --- Volume APIs ---
 
 // GetOrCreateVolume returns the volume whose path equals absPath, or creates
@@ -317,7 +396,7 @@ func (s *Store) GetOrCreateVolume(ctx context.Context, absPath string) (Volume, 
 
 	base := filepath.Base(absPath)
 	const maxAttempts = 1000
-	for i := 0; i < maxAttempts; i++ {
+	for i := range maxAttempts {
 		name := base
 		if i > 0 {
 			name = fmt.Sprintf("%s-%d", base, i+1)
@@ -387,11 +466,48 @@ func (s *Store) ListVolumes(ctx context.Context) ([]Volume, error) {
 
 const fileColumns = `volume_id, path, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns`
 
-// GetByPath returns the row for (volumeID, relPath) or sql.ErrNoRows.
+// GetByPath returns the currently-live row for (volumeID, relPath) — i.e.
+// the row with status='present' or status='missing'. Superseded rows
+// (historical content at this path) are skipped; use ListHistoryByPath to
+// see them. Returns sql.ErrNoRows when no live row exists for the path.
+//
+// The path-level invariant (at most one non-superseded row per
+// (volume_id, path)) is enforced by Upsert and the v4 PK widening, so this
+// query is unambiguous despite touching a non-unique key.
 func (s *Store) GetByPath(ctx context.Context, volumeID int64, relPath string) (FileRow, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT `+fileColumns+` FROM files WHERE volume_id = ? AND path = ?`, volumeID, relPath)
+		`SELECT `+fileColumns+` FROM files
+		 WHERE volume_id = ? AND path = ? AND status != 'superseded'`,
+		volumeID, relPath)
 	return scanFileRow(row.Scan)
+}
+
+// ListHistoryByPath returns every row ever recorded at (volumeID, relPath),
+// ordered by first_seen_run_id ascending (i.e. the order in which each
+// distinct content was first observed at this path). Useful for inspecting
+// the content history of a path. Note: the live row is *not* guaranteed to
+// be last — after a content revert (A → B → A), row A is reused and stays
+// at its original first_seen position even though it is now live again.
+// Filter on Status to find the live row, or use GetByPath.
+func (s *Store) ListHistoryByPath(ctx context.Context, volumeID int64, relPath string) ([]FileRow, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+fileColumns+` FROM files
+		 WHERE volume_id = ? AND path = ?
+		 ORDER BY first_seen_run_id`,
+		volumeID, relPath)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FileRow
+	for rows.Next() {
+		r, err := scanFileRow(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // GetByAbsolutePath finds the file whose volume.path + '/' + file.path equals
@@ -452,29 +568,120 @@ func (s *Store) GetByBlake3(ctx context.Context, digest []byte) ([]FileWithVolum
 	return collectJoined(rows)
 }
 
-// Upsert inserts or updates a file row. On insert, first_seen_run_id is set
-// from the row; on conflict it is left untouched so the original first-seen
-// run is preserved across re-observations.
+// Upsert records an observation of content at a path. It is the only
+// supported write path for the files table because it enforces the
+// "never overwrite a hash" rule: blake3 on an existing row is immutable.
+//
+// There are three cases, all handled atomically in a single transaction:
+//
+//  1. A row with the exact (volume_id, path, blake3) already exists and is
+//     the live row — update its mutable fields (touch / restore from
+//     missing). first_seen_run_id is preserved.
+//  2. A row with the exact (volume_id, path, blake3) exists but is
+//     superseded (content has reverted to a previously-seen value) — flip
+//     the currently-live row at this path to 'superseded' and revive the
+//     matched row to the requested status (first_seen_run_id preserved).
+//  3. No row exists at (volume_id, path, blake3) — flip the currently-live
+//     row at (volume_id, path), if any, to 'superseded' and insert the new
+//     row.
+//
+// In all cases, blake3 is never rewritten in place; content history at a
+// path grows append-only.
 func (s *Store) Upsert(ctx context.Context, r FileRow) error {
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO files (volume_id, path, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(volume_id, path) DO UPDATE SET
-			blake3 = excluded.blake3,
-			size_bytes = excluded.size_bytes,
-			mtime_ns = excluded.mtime_ns,
-			status = excluded.status,
-			last_seen_run_id = excluded.last_seen_run_id,
-			indexed_at_ns = excluded.indexed_at_ns
-	`, r.VolumeID, r.Path, r.Blake3, r.SizeBytes, r.MtimeNs, r.Status, r.FirstSeenRunID, r.LastSeenRunID, r.IndexedAtNs)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin upsert: %w", err)
+	}
+	defer tx.Rollback()
+
+	var existingStatus string
+	err = tx.QueryRowContext(ctx,
+		`SELECT status FROM files WHERE volume_id = ? AND path = ? AND blake3 = ?`,
+		r.VolumeID, r.Path, r.Blake3).Scan(&existingStatus)
+
+	switch {
+	case err == nil && existingStatus != StatusSuperseded:
+		// Case 1: exact row exists and is live — touch it.
+		if err := updateLiveRow(ctx, tx, r); err != nil {
+			return err
+		}
+	case err == nil && existingStatus == StatusSuperseded:
+		// Case 2: content revert — supersede whatever is live now, then
+		// revive the matched (formerly superseded) row.
+		if err := supersedeLiveRow(ctx, tx, r.VolumeID, r.Path); err != nil {
+			return err
+		}
+		if err := updateLiveRow(ctx, tx, r); err != nil {
+			return err
+		}
+	case errors.Is(err, sql.ErrNoRows):
+		// Case 3: brand new content at this path (possibly first-ever).
+		if err := supersedeLiveRow(ctx, tx, r.VolumeID, r.Path); err != nil {
+			return err
+		}
+		if err := insertNewRow(ctx, tx, r); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("lookup existing: %w", err)
+	}
+
+	return tx.Commit()
 }
 
-// TouchSeen sets last_seen_run_id and flips status to 'present' for
-// (volumeID, relPath). first_seen_run_id is never modified.
+// supersedeLiveRow flips the single non-superseded row at (volumeID, relPath)
+// (if any) to status='superseded'. A no-op when there is no live row, e.g.
+// the very first observation of a path. last_seen_run_id stays frozen at the
+// value it had — that is the run during which the row was last seen alive.
+func supersedeLiveRow(ctx context.Context, tx *sql.Tx, volumeID int64, relPath string) error {
+	_, err := tx.ExecContext(ctx, `
+		UPDATE files SET status = 'superseded'
+		WHERE volume_id = ? AND path = ? AND status != 'superseded'
+	`, volumeID, relPath)
+	if err != nil {
+		return fmt.Errorf("supersede live row: %w", err)
+	}
+	return nil
+}
+
+// updateLiveRow refreshes the mutable fields on an existing row matching
+// (volume_id, path, blake3). blake3 and first_seen_run_id are never touched.
+func updateLiveRow(ctx context.Context, tx *sql.Tx, r FileRow) error {
+	_, err := tx.ExecContext(ctx, `
+		UPDATE files SET
+			size_bytes = ?, mtime_ns = ?, status = ?,
+			last_seen_run_id = ?, indexed_at_ns = ?
+		WHERE volume_id = ? AND path = ? AND blake3 = ?
+	`, r.SizeBytes, r.MtimeNs, r.Status, r.LastSeenRunID, r.IndexedAtNs,
+		r.VolumeID, r.Path, r.Blake3)
+	if err != nil {
+		return fmt.Errorf("update live row: %w", err)
+	}
+	return nil
+}
+
+func insertNewRow(ctx context.Context, tx *sql.Tx, r FileRow) error {
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO files (
+			volume_id, path, blake3, size_bytes, mtime_ns, status,
+			first_seen_run_id, last_seen_run_id, indexed_at_ns
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, r.VolumeID, r.Path, r.Blake3, r.SizeBytes, r.MtimeNs, r.Status,
+		r.FirstSeenRunID, r.LastSeenRunID, r.IndexedAtNs)
+	if err != nil {
+		return fmt.Errorf("insert new row: %w", err)
+	}
+	return nil
+}
+
+// TouchSeen sets last_seen_run_id on the live row at (volumeID, relPath) and
+// flips its status to 'present'. Used by the indexer when it re-observed the
+// exact same content as the stored row (kindUnchanged). first_seen_run_id is
+// never modified. Does not touch superseded rows.
 func (s *Store) TouchSeen(ctx context.Context, volumeID int64, relPath string, runID int64) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE files SET last_seen_run_id = ?, status = 'present' WHERE volume_id = ? AND path = ?`,
+		`UPDATE files SET last_seen_run_id = ?, status = 'present'
+		 WHERE volume_id = ? AND path = ? AND status != 'superseded'`,
 		runID, volumeID, relPath)
 	return err
 }

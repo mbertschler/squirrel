@@ -550,6 +550,61 @@ func TestPartialRunDoesNotMarkErroredFilesMissing(t *testing.T) {
 	}
 }
 
+// TestReindexModifiedFilePreservesOldHash is the end-to-end version of the
+// append-only guarantee: write content A, index, change to content B,
+// re-index. The original hash A must still be queryable from the index as a
+// superseded row, not silently dropped.
+func TestReindexModifiedFilePreservesOldHash(t *testing.T) {
+	root := t.TempDir()
+	doc := filepath.Join(root, "doc.txt")
+	writeFile(t, doc, "version A")
+
+	s := setupStore(t)
+	ctx := context.Background()
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("first Index: %v", err)
+	}
+	absRoot, _ := filepath.Abs(root)
+	vol := volumeFor(t, s, absRoot)
+	first, err := s.GetByPath(ctx, vol.ID, "doc.txt")
+	if err != nil {
+		t.Fatalf("GetByPath after first: %v", err)
+	}
+	hashA := append([]byte(nil), first.Blake3...)
+
+	writeFile(t, doc, "version B is different")
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("second Index: %v", err)
+	}
+
+	history, err := s.ListHistoryByPath(ctx, vol.ID, "doc.txt")
+	if err != nil {
+		t.Fatalf("ListHistoryByPath: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("history = %d rows, want 2 (A superseded + B present)", len(history))
+	}
+	if !bytes.Equal(history[0].Blake3, hashA) || history[0].Status != store.StatusSuperseded {
+		t.Fatalf("history[0] = %+v, want hashA superseded", history[0])
+	}
+	if history[1].Status != store.StatusPresent {
+		t.Fatalf("history[1].Status = %s, want present", history[1].Status)
+	}
+	if bytes.Equal(history[1].Blake3, hashA) {
+		t.Fatalf("history[1].Blake3 still matches hashA — old hash was overwritten in place")
+	}
+
+	// Looking up by the original hash must still find the path (now via the
+	// superseded row).
+	matches, err := s.GetByBlake3(ctx, hashA)
+	if err != nil {
+		t.Fatalf("GetByBlake3: %v", err)
+	}
+	if len(matches) != 1 || matches[0].File.Status != store.StatusSuperseded {
+		t.Fatalf("GetByBlake3(hashA) = %+v, want one superseded row", matches)
+	}
+}
+
 func TestDryRunDoesNotRecordRun(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "a.txt"), "hello")
