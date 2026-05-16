@@ -30,9 +30,9 @@ func TestIsHashLike(t *testing.T) {
 	}
 }
 
-func TestJoinRootPath(t *testing.T) {
+func TestJoinVolumePath(t *testing.T) {
 	cases := []struct {
-		root, rel, want string
+		volume, rel, want string
 	}{
 		{"/a", "b", "/a/b"},
 		{"/a/b", "c/d", "/a/b/c/d"},
@@ -40,8 +40,8 @@ func TestJoinRootPath(t *testing.T) {
 		{"/root", "", "/root"},  // empty rel
 	}
 	for _, c := range cases {
-		if got := joinRootPath(c.root, c.rel); got != c.want {
-			t.Errorf("joinRootPath(%q, %q) = %q, want %q", c.root, c.rel, got, c.want)
+		if got := joinVolumePath(c.volume, c.rel); got != c.want {
+			t.Errorf("joinVolumePath(%q, %q) = %q, want %q", c.volume, c.rel, got, c.want)
 		}
 	}
 }

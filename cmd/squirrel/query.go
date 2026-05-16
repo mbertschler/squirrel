@@ -88,7 +88,7 @@ func queryByHash(cmd *cobra.Command, s *store.Store, hexDigest string) error {
 	}
 	out := cmd.OutOrStdout()
 	for _, r := range rows {
-		fmt.Fprintf(out, "%s\t%s\t%d\n", r.Status, joinRootPath(r.Root, r.Path), r.SizeBytes)
+		fmt.Fprintf(out, "%s\t%s\t%d\n", r.File.Status, joinVolumePath(r.Volume.Path, r.File.Path), r.File.SizeBytes)
 	}
 	return nil
 }
@@ -98,23 +98,24 @@ func queryByPath(cmd *cobra.Command, s *store.Store, arg string) error {
 	if err != nil {
 		return err
 	}
-	row, err := s.GetByAbsolutePath(cmd.Context(), absPath)
+	fv, err := s.GetByAbsolutePath(cmd.Context(), absPath)
 	if err != nil {
 		if store.IsNotFound(err) {
-			return fmt.Errorf("no row for path %s (not under any indexed root)", absPath)
+			return fmt.Errorf("no row for path %s (not under any indexed volume)", absPath)
 		}
 		return err
 	}
 	out := cmd.OutOrStdout()
-	fmt.Fprintf(out, "root:        %s\n", row.Root)
-	fmt.Fprintf(out, "path:        %s\n", row.Path)
-	fmt.Fprintf(out, "full:        %s\n", joinRootPath(row.Root, row.Path))
-	fmt.Fprintf(out, "blake3:      %s\n", hex.EncodeToString(row.Blake3))
-	fmt.Fprintf(out, "size_bytes:  %d\n", row.SizeBytes)
-	fmt.Fprintf(out, "mtime_ns:    %d\n", row.MtimeNs)
-	fmt.Fprintf(out, "status:      %s\n", row.Status)
-	fmt.Fprintf(out, "last_seen:   %d\n", row.LastSeenAt)
-	fmt.Fprintf(out, "indexed_at:  %d\n", row.IndexedAt)
+	fmt.Fprintf(out, "volume:        %s\n", fv.Volume.Name)
+	fmt.Fprintf(out, "volume_path:   %s\n", fv.Volume.Path)
+	fmt.Fprintf(out, "path:          %s\n", fv.File.Path)
+	fmt.Fprintf(out, "full:          %s\n", joinVolumePath(fv.Volume.Path, fv.File.Path))
+	fmt.Fprintf(out, "blake3:        %s\n", hex.EncodeToString(fv.File.Blake3))
+	fmt.Fprintf(out, "size_bytes:    %d\n", fv.File.SizeBytes)
+	fmt.Fprintf(out, "mtime_ns:      %d\n", fv.File.MtimeNs)
+	fmt.Fprintf(out, "status:        %s\n", fv.File.Status)
+	fmt.Fprintf(out, "last_seen_ns:  %d\n", fv.File.LastSeenAtNs)
+	fmt.Fprintf(out, "indexed_at_ns: %d\n", fv.File.IndexedAtNs)
 	return nil
 }
 
@@ -126,7 +127,7 @@ func queryDuplicates(cmd *cobra.Command, s *store.Store) error {
 	out := cmd.OutOrStdout()
 	var lastHex string
 	for _, r := range rows {
-		h := hex.EncodeToString(r.Blake3)
+		h := hex.EncodeToString(r.File.Blake3)
 		if h != lastHex {
 			if lastHex != "" {
 				fmt.Fprintln(out)
@@ -134,7 +135,7 @@ func queryDuplicates(cmd *cobra.Command, s *store.Store) error {
 			fmt.Fprintf(out, "%s\n", h)
 			lastHex = h
 		}
-		fmt.Fprintf(out, "  %s\n", joinRootPath(r.Root, r.Path))
+		fmt.Fprintf(out, "  %s\n", joinVolumePath(r.Volume.Path, r.File.Path))
 	}
 	return nil
 }
@@ -146,18 +147,18 @@ func queryMissing(cmd *cobra.Command, s *store.Store) error {
 	}
 	out := cmd.OutOrStdout()
 	for _, r := range rows {
-		fmt.Fprintf(out, "%s\t%s\n", hex.EncodeToString(r.Blake3), joinRootPath(r.Root, r.Path))
+		fmt.Fprintf(out, "%s\t%s\n", hex.EncodeToString(r.File.Blake3), joinVolumePath(r.Volume.Path, r.File.Path))
 	}
 	return nil
 }
 
-// joinRootPath reconstructs an absolute filesystem path from a stored
-// (root, relative) pair. Returns the root itself when rel is empty or ".".
-func joinRootPath(root, rel string) string {
+// joinVolumePath reconstructs an absolute filesystem path from a stored
+// (volume.path, file.path) pair. Returns volumePath when rel is empty or ".".
+func joinVolumePath(volumePath, rel string) string {
 	if rel == "" || rel == "." {
-		return root
+		return volumePath
 	}
-	return filepath.Join(root, rel)
+	return filepath.Join(volumePath, rel)
 }
 
 // isHashLike reports whether s is a 64-character hex string (the textual form
