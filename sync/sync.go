@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path"
 	"path/filepath"
 	"strconv"
@@ -41,6 +42,16 @@ type Report struct {
 	RunID        int64
 	RcloneResult RunResult
 	Status       string // success / partial / failed
+	// FinishErr captures a failure to write the runs row's terminal state.
+	// It is independent of rclone success — the bytes may have transferred
+	// correctly but the audit-trail row got stuck in 'running'. Callers
+	// should surface this distinctly from RcloneResult errors.
+	FinishErr error
+	// Warnings is a list of non-fatal advisories the CLI should surface.
+	// Currently used for "source volume contains a reserved
+	// .squirrel-history directory" so the user knows that content was
+	// silently filtered from the upload.
+	Warnings []string
 }
 
 // Sync runs one (volume, destination) pair via rclone. It:
@@ -52,6 +63,9 @@ type Report struct {
 //  4. Invokes rclone via the wrapper and finalises the run.
 func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, dest *config.Destination, opts Options) (rep Report, err error) {
 	rep = Report{Volume: vol.Name, Destination: dest.Name}
+	if w := historyDirInSourceWarning(vol); w != "" {
+		rep.Warnings = append(rep.Warnings, w)
+	}
 
 	volID, err := requireIndexedVolume(ctx, s, vol)
 	if err != nil {
@@ -113,10 +127,10 @@ func beginSyncRun(ctx context.Context, s *store.Store, dryRun bool, volID int64,
 	return id, nil
 }
 
-// finishSyncRun is the deferred terminal-state writer. It is intentionally
-// silent on its own errors: the caller already has rep.Status and the
-// underlying rclone output; corrupting the report with a FinishRun failure
-// helps no one. Surfacing via stderr is the CLI layer's job.
+// finishSyncRun is the deferred terminal-state writer. A FinishRun failure
+// would otherwise leave the run row stuck in 'running' and only surface
+// during the next `squirrel runs` listing; recording it on rep.FinishErr
+// lets the CLI surface it next to the rclone outcome on this very run.
 func finishSyncRun(ctx context.Context, s *store.Store, dryRun bool, runID int64, rep *Report) {
 	rep.Status = deriveStatus(rep.RcloneResult)
 	if dryRun || runID == 0 {
@@ -127,7 +141,22 @@ func finishSyncRun(ctx context.Context, s *store.Store, dryRun bool, runID int64
 		errMsg = rep.RcloneResult.FailedFiles[0].Message
 	}
 	fileCount := rep.RcloneResult.Transferred + rep.RcloneResult.Checked
-	_ = s.FinishRun(ctx, runID, rep.Status, errMsg, fileCount)
+	if err := s.FinishRun(ctx, runID, rep.Status, errMsg, fileCount); err != nil {
+		rep.FinishErr = err
+	}
+}
+
+// historyDirInSourceWarning returns a one-line advisory when the source
+// volume already contains a literal .squirrel-history directory. Sync
+// filters it out of the rclone transfer so it can't pollute the
+// destination tree, but the user should know that some local content is
+// being silently skipped under the reserved name.
+func historyDirInSourceWarning(vol *config.Volume) string {
+	if _, err := os.Stat(filepath.Join(vol.Path, HistoryDirName)); err != nil {
+		return ""
+	}
+	return fmt.Sprintf("volume %q contains a reserved %s/ directory in its source tree — its contents will not be uploaded; rename or move the directory if you want it synced",
+		vol.Name, HistoryDirName)
 }
 
 func deriveStatus(r RunResult) string {
@@ -210,19 +239,30 @@ func backupDirURI(dest *config.Destination, volumeName string, runID int64, dryR
 	}
 }
 
-// EnsureMinVersion verifies the installed rclone is at MinRcloneVersion or
-// above; below that, --hash blake3 won't work. A version below the floor
-// is logged as a warning (not a hard error) so users can still attempt a
-// shallow sync without the integrity flags.
-func EnsureMinVersion(ctx context.Context, rcl *Rclone, out io.Writer) error {
+// EnsureMinVersion checks the installed rclone against MinRcloneVersion.
+// When shallow=true the integrity flags are not used, so a below-floor
+// rclone is acceptable and we only warn. When shallow=false we'd be
+// about to invoke --hash blake3, which only exists in rclone ≥ 1.66;
+// refuse rather than hand off a doomed invocation to rclone for a
+// confusing stderr message. The actual decision lives in
+// checkMinVersion so tests don't need a rclone-binary-that-lies fixture.
+func EnsureMinVersion(ctx context.Context, rcl *Rclone, out io.Writer, shallow bool) error {
 	v, err := rcl.Version(ctx)
 	if err != nil {
 		return err
 	}
-	if !v.AtLeast(MinRcloneVersion) {
-		fmt.Fprintf(out, "warning: rclone %s is below the supported floor %s — --hash blake3 will fail; consider --shallow or upgrade rclone\n", v, MinRcloneVersion)
+	return checkMinVersion(v, out, shallow)
+}
+
+func checkMinVersion(v Version, out io.Writer, shallow bool) error {
+	if v.AtLeast(MinRcloneVersion) {
+		return nil
 	}
-	return nil
+	if shallow {
+		fmt.Fprintf(out, "warning: rclone %s is below the supported floor %s; --shallow keeps this run working but consider upgrading\n", v, MinRcloneVersion)
+		return nil
+	}
+	return fmt.Errorf("rclone %s is below the supported floor %s — --hash blake3 is unavailable; upgrade rclone or pass --shallow", v, MinRcloneVersion)
 }
 
 // PairsFor builds the list of (volume, destination) pairs to sync given

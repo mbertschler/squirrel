@@ -88,6 +88,29 @@ func TestCLIRestoreRecordsRunsRowWithKindRestore(t *testing.T) {
 	}
 }
 
+// TestCLIRestoreInfersDestinationWhenUnambiguous: a volume that syncs
+// to exactly one destination doesn't need --from on restore — the only
+// candidate is picked automatically. This is the common case and the
+// counterpart to TestCLIRestoreNeedsExplicitFromWhenAmbiguous.
+func TestCLIRestoreInfersDestinationWhenUnambiguous(t *testing.T) {
+	requireRcloneCLI(t)
+	f := writeSyncFixture(t)
+	writeTestFile(t, filepath.Join(f.volumeDir, "a.txt"), "alpha")
+
+	runCLI(t, "--config", f.configPath, "index", f.volumeName)
+	runCLI(t, "--config", f.configPath, "sync", "pics")
+
+	target := filepath.Join(t.TempDir(), "recovered")
+	// No --from: only one destination in sync_to, so it's picked.
+	out := runCLI(t, "--config", f.configPath, "restore", "pics", "--to", target)
+	if !strings.Contains(out, "status=success") {
+		t.Fatalf("restore did not succeed:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(target, "a.txt")); err != nil {
+		t.Fatalf("recovered a.txt missing: %v", err)
+	}
+}
+
 // TestCLIRestoreNeedsExplicitFromWhenAmbiguous: when a volume syncs to
 // multiple destinations and the user does not pass --from, the command
 // must error and tell the user to disambiguate.

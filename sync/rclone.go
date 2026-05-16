@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"sync"
 
@@ -128,7 +129,7 @@ func (r *Rclone) WriteRcloneConfig(path string, dests map[string]*config.Destina
 	for name := range dests {
 		names = append(names, name)
 	}
-	sortStrings(names)
+	sort.Strings(names)
 	first := true
 	for _, name := range names {
 		section := dests[name].RcloneSection()
@@ -150,16 +151,6 @@ func (r *Rclone) WriteRcloneConfig(path string, dests map[string]*config.Destina
 	}
 	r.Config = path
 	return nil
-}
-
-func sortStrings(s []string) {
-	// One-time small slice — insertion sort is fine and saves importing
-	// the sort package here.
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j-1] > s[j]; j-- {
-			s[j-1], s[j] = s[j], s[j-1]
-		}
-	}
 }
 
 // RunResult summarises the outcome of one rclone invocation as parsed from

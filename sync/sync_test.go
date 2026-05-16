@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -273,6 +274,105 @@ func TestSyncFiltersOutHistoryFromSource(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(f.dest.Root, f.vol.Name, HistoryDirName, "secret.txt")); err == nil {
 		t.Fatalf("user-source .squirrel-history was copied; should be filtered")
+	}
+}
+
+// TestSyncDryRunPath confirms --dry-run produces a Report (so the CLI
+// can echo what would happen) but never inserts a runs row, never moves
+// bytes, and never errors on the source-validation prerequisite.
+func TestSyncDryRunPath(t *testing.T) {
+	f := setupFixture(t)
+	if err := os.WriteFile(filepath.Join(f.vol.Path, "a.txt"), []byte("alpha"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.runIndex(t)
+
+	beforeRuns, _ := f.store.ListRuns(context.Background(), store.ListRunsOpts{})
+	rep, err := Sync(context.Background(), f.store, f.rcl, f.vol, f.dest, Options{DryRun: true})
+	if err != nil {
+		t.Fatalf("Sync --dry-run: %v", err)
+	}
+	if rep.RunID != 0 {
+		t.Fatalf("dry-run produced RunID = %d, want 0", rep.RunID)
+	}
+	afterRuns, _ := f.store.ListRuns(context.Background(), store.ListRunsOpts{})
+	if len(afterRuns) != len(beforeRuns) {
+		t.Fatalf("dry-run inserted %d new runs rows, want 0", len(afterRuns)-len(beforeRuns))
+	}
+	// rclone --dry-run still reports what *would* be transferred via the
+	// stats summary, so Transferred can be non-zero; we just verify no
+	// physical bytes landed at the destination.
+	if _, err := os.Stat(filepath.Join(f.dest.Root, f.vol.Name, "a.txt")); err == nil {
+		t.Fatalf("dry-run wrote to destination; want no-op")
+	}
+}
+
+// TestSyncWarnsAboutHistoryDirInSource exercises the advisory path: a
+// user with a literal .squirrel-history dir in their volume gets a
+// warning surfaced via Report.Warnings, but the sync proceeds and the
+// dir's contents are filtered (not uploaded).
+func TestSyncWarnsAboutHistoryDirInSource(t *testing.T) {
+	f := setupFixture(t)
+	if err := os.MkdirAll(filepath.Join(f.vol.Path, HistoryDirName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(f.vol.Path, HistoryDirName, "secret.txt"), []byte("nope"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(f.vol.Path, "ok.txt"), []byte("yep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.runIndex(t)
+
+	rep, err := Sync(context.Background(), f.store, f.rcl, f.vol, f.dest, Options{})
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if len(rep.Warnings) == 0 {
+		t.Fatalf("expected a warning about %s in source; got none", HistoryDirName)
+	}
+	found := false
+	for _, w := range rep.Warnings {
+		if strings.Contains(w, HistoryDirName) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("warnings = %v; expected one mentioning %s", rep.Warnings, HistoryDirName)
+	}
+}
+
+// TestCheckMinVersionBranches covers the three branches of the
+// version-floor gate without needing a stubbed rclone binary.
+func TestCheckMinVersionBranches(t *testing.T) {
+	v := func(maj, min, pat int) Version {
+		return Version{Major: maj, Minor: min, Patch: pat,
+			Raw: fmt.Sprintf("rclone v%d.%d.%d", maj, min, pat)}
+	}
+	cases := []struct {
+		name      string
+		version   Version
+		shallow   bool
+		wantErr   bool
+		wantWarn  bool
+	}{
+		{"at floor, !shallow", v(1, 66, 0), false, false, false},
+		{"above floor, !shallow", v(1, 80, 0), false, false, false},
+		{"below floor, !shallow → error", v(1, 65, 9), false, true, false},
+		{"below floor, shallow → warn only", v(1, 65, 9), true, false, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var buf strings.Builder
+			err := checkMinVersion(c.version, &buf, c.shallow)
+			if (err != nil) != c.wantErr {
+				t.Fatalf("err = %v, wantErr = %v", err, c.wantErr)
+			}
+			if got := strings.Contains(buf.String(), "warning"); got != c.wantWarn {
+				t.Fatalf("warning emitted = %v, want %v (out: %q)", got, c.wantWarn, buf.String())
+			}
+		})
 	}
 }
 

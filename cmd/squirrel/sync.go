@@ -62,7 +62,7 @@ func runSync(cmd *cobra.Command, volumeName, destinationName string, opts sync.O
 		return err
 	}
 	out := cmd.OutOrStdout()
-	if err := sync.EnsureMinVersion(cmd.Context(), rcl, out); err != nil {
+	if err := sync.EnsureMinVersion(cmd.Context(), rcl, out, opts.Shallow); err != nil {
 		return err
 	}
 	if err := rcl.WriteRcloneConfig(rcloneConfigPathFor(cfg), cfg.Destinations); err != nil {
@@ -93,12 +93,20 @@ func rcloneConfigPathFor(cfg *config.Config) string {
 
 func printSyncReport(w io.Writer, rep sync.Report, runErr error) {
 	r := rep.RcloneResult
+	for _, msg := range rep.Warnings {
+		fmt.Fprintf(w, "warning: %s\n", msg)
+	}
 	fmt.Fprintf(w, "%s → %s  status=%s transferred=%d checked=%d errors=%d bytes=%d run=%d\n",
 		rep.Volume, rep.Destination, rep.Status,
 		r.Transferred, r.Checked, r.Errors, r.Bytes, rep.RunID,
 	)
 	for _, ff := range r.FailedFiles {
 		fmt.Fprintf(w, "  error %s: %s\n", ff.Object, ff.Message)
+	}
+	if rep.FinishErr != nil {
+		// Distinct from rclone errors: the data is at the destination, but
+		// the runs row is stuck in 'running' until manually reconciled.
+		fmt.Fprintf(w, "  warning: failed to record terminal run state: %v\n", rep.FinishErr)
 	}
 	if runErr != nil {
 		fmt.Fprintf(w, "  %v\n", runErr)

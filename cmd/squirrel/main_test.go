@@ -159,3 +159,64 @@ func TestCLIIndexRequiresConfig(t *testing.T) {
 		t.Fatalf("expected missing-config error, got %v", err)
 	}
 }
+
+// TestCLIDBFlagOverridesConfigDB exercises the precedence rule: an
+// explicit --db should win over config.db. We point config.db at an
+// unwritable path so a precedence regression would surface as an error
+// rather than silently writing to the config-declared DB.
+func TestCLIDBFlagOverridesConfigDB(t *testing.T) {
+	src := t.TempDir()
+	writeTestFile(t, filepath.Join(src, "a.txt"), "hello")
+
+	// Build a config where db points at a deliberately bogus path under
+	// /dev/null/... — opening the DB at that path would fail. If --db
+	// overrides correctly we never touch it.
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	body := "" +
+		"db = \"/dev/null/cannot-be-a-db\"\n\n" +
+		"[volumes.src]\npath = \"" + src + "\"\n"
+	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	overrideDB := filepath.Join(dir, "override.db")
+
+	out := runCLI(t, "--config", cfgPath, "--db", overrideDB, "index", "src")
+	if !strings.Contains(out, "added=1") {
+		t.Fatalf("index didn't run against the --db override: %s", out)
+	}
+	if _, err := os.Stat(overrideDB); err != nil {
+		t.Fatalf("override DB was not created at %s: %v", overrideDB, err)
+	}
+}
+
+// TestCLIOrphanVolumeWarning checks that a volume present in the DB but
+// not declared in config triggers a stderr advisory on the next
+// config-aware command. We bootstrap an orphan by indexing one volume,
+// then re-running with a slimmer config that omits it.
+func TestCLIOrphanVolumeWarning(t *testing.T) {
+	srcA := t.TempDir()
+	srcB := t.TempDir()
+	writeTestFile(t, filepath.Join(srcA, "a.txt"), "alpha")
+	writeTestFile(t, filepath.Join(srcB, "b.txt"), "beta")
+
+	// First config has both volumes; index both.
+	full := writeConfigFor(t, map[string]string{"a": srcA, "b": srcB})
+	runCLI(t, "--config", full.configPath, "index", "a")
+	runCLI(t, "--config", full.configPath, "index", "b")
+
+	// Second config drops 'b' but reuses the same DB so the b row is
+	// orphaned. We point --db at the original DB to share state.
+	dir := t.TempDir()
+	slim := filepath.Join(dir, "config.toml")
+	body := "" +
+		"db = \"" + full.dbPath + "\"\n\n" +
+		"[volumes.a]\npath = \"" + srcA + "\"\n"
+	if err := os.WriteFile(slim, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := runCLI(t, "--config", slim, "index", "a")
+	if !strings.Contains(out, `warning: volume "b"`) {
+		t.Fatalf("orphan-volume warning missing for 'b':\n%s", out)
+	}
+}

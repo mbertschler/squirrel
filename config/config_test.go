@@ -298,6 +298,63 @@ func TestDefaultPathEnv(t *testing.T) {
 	}
 }
 
+// TestRcloneSectionRenderingPerType exercises the rclone.conf bodies we
+// emit for each supported non-local destination type. Beyond catching
+// regressions in the per-type field set, this is the only place we
+// verify that S3 and B2 secrets round-trip through env-var resolution
+// into the ini output.
+func TestRcloneSectionRenderingPerType(t *testing.T) {
+	t.Setenv("S3_KEY", "AK123")
+	t.Setenv("S3_SECRET", "sssh")
+	t.Setenv("B2_KEY_ID", "0001")
+	t.Setenv("B2_KEY", "appkey")
+
+	body := `
+[destinations.s3]
+type              = "s3"
+provider          = "AWS"
+region            = "eu-central-1"
+bucket            = "squirrel"
+root              = "/p"
+access_key_id     = { env = "S3_KEY" }
+secret_access_key = { env = "S3_SECRET" }
+
+[destinations.b2]
+type            = "b2"
+bucket          = "squirrel"
+root            = "/p"
+account_id      = { env = "B2_KEY_ID" }
+application_key = { env = "B2_KEY" }
+
+[destinations.gcs]
+type   = "gcs"
+bucket = "squirrel"
+root   = "/p"
+`
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	cases := []struct {
+		name  string
+		wants []string
+	}{
+		{"s3", []string{"[s3]", "type = s3", "provider = AWS", "bucket = squirrel", "region = eu-central-1", "access_key_id = AK123", "secret_access_key = sssh"}},
+		{"b2", []string{"[b2]", "type = b2", "bucket = squirrel", "account_id = 0001", "application_key = appkey"}},
+		{"gcs", []string{"[gcs]", "type = gcs", "bucket = squirrel"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out := cfg.Destinations[c.name].RcloneSection()
+			for _, want := range c.wants {
+				if !strings.Contains(out, want) {
+					t.Fatalf("section missing %q:\n%s", want, out)
+				}
+			}
+		})
+	}
+}
+
 func TestMissingErrorWrappingChain(t *testing.T) {
 	// MissingError must be detectable both via IsMissing and errors.As so
 	// callers can choose either ergonomic form.

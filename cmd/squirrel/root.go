@@ -70,10 +70,13 @@ func requireConfig(cmd *cobra.Command) (*config.Config, error) {
 }
 
 // tryLoadConfig returns the parsed Config or nil if the file does not
-// exist. Real parse failures (syntactically invalid TOML, unknown fields)
-// still propagate as errors. Subcommands that operate on the DB without
-// needing config — query, runs, volumes — call this so the user can pick
-// up config.DB if a config exists, without making the config mandatory.
+// exist *and* --config was left at its default. When the user passed
+// --config explicitly, a missing file is an error: silent degradation on
+// a typo'd flag would hide the user's intent. Real parse failures
+// (syntactically invalid TOML, unknown fields) always propagate.
+// Subcommands that operate on the DB without needing config — query,
+// runs, volumes — call this so they pick up config.DB if a config exists
+// without making the config mandatory.
 func tryLoadConfig(cmd *cobra.Command) (*config.Config, error) {
 	path, err := cmd.Flags().GetString("config")
 	if err != nil {
@@ -81,7 +84,7 @@ func tryLoadConfig(cmd *cobra.Command) (*config.Config, error) {
 	}
 	cfg, err := config.Load(path)
 	if err != nil {
-		if config.IsMissing(err) {
+		if config.IsMissing(err) && !cmd.Flags().Changed("config") {
 			return nil, nil
 		}
 		return nil, err
@@ -100,7 +103,34 @@ func openStore(cmd *cobra.Command, cfg *config.Config) (*store.Store, error) {
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create db directory: %w", err)
 	}
-	return store.Open(dbPath)
+	s, err := store.Open(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	if cfg != nil {
+		warnOrphanVolumes(cmd, s, cfg)
+	}
+	return s, nil
+}
+
+// warnOrphanVolumes prints a stderr advisory for each volume that exists
+// in the DB but isn't declared in the current config. This catches the
+// "I removed a volume from config but the DB rows are still around"
+// case so the user notices state drift. Errors during the listing are
+// swallowed — this is a diagnostic, not a hard prerequisite.
+func warnOrphanVolumes(cmd *cobra.Command, s *store.Store, cfg *config.Config) {
+	vols, err := s.ListVolumes(cmd.Context())
+	if err != nil {
+		return
+	}
+	for _, v := range vols {
+		if _, ok := cfg.Volumes[v.Name]; ok {
+			continue
+		}
+		fmt.Fprintf(cmd.ErrOrStderr(),
+			"warning: volume %q exists in the index but is not declared in %s\n",
+			v.Name, cfg.Path)
+	}
 }
 
 func resolveDBPath(cmd *cobra.Command, cfg *config.Config) (string, error) {

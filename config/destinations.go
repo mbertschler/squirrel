@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 )
 
 // destSchema declares the parameter schema for one destination type. The
@@ -210,40 +211,28 @@ func (d *Destination) RcloneSection() string {
 	if schema.rcloneType == "" {
 		return ""
 	}
-	var sb stringBuilder
-	sb.printf("[%s]\n", d.Name)
-	sb.printf("type = %s\n", schema.rcloneType)
+	var b strings.Builder
+	fmt.Fprintf(&b, "[%s]\n", d.Name)
+	fmt.Fprintf(&b, "type = %s\n", schema.rcloneType)
 	// Stable ordering: required → optional → secret, alphabetical within
 	// each band. Stable output makes the rendered file diffable.
 	for _, key := range sortedSubset(schema.requiredString) {
 		if v, ok := d.Params[key]; ok {
-			sb.printf("%s = %s\n", key, v)
+			fmt.Fprintf(&b, "%s = %s\n", key, v)
 		}
 	}
 	for _, key := range sortedSubset(schema.optionalString) {
 		if v, ok := d.Params[key]; ok {
-			sb.printf("%s = %s\n", key, v)
+			fmt.Fprintf(&b, "%s = %s\n", key, v)
 		}
 	}
 	for _, key := range sortedSubset(schema.secretFields) {
 		if v, ok := d.Params[key]; ok {
-			sb.printf("%s = %s\n", key, v)
+			fmt.Fprintf(&b, "%s = %s\n", key, v)
 		}
 	}
-	return sb.String()
+	return b.String()
 }
-
-// stringBuilder wraps strings.Builder to make printf-style appends terse
-// inside RcloneSection. Errors from Builder.WriteString are documented as
-// always nil so we ignore them.
-type stringBuilder struct {
-	b []byte
-}
-
-func (s *stringBuilder) printf(format string, args ...any) {
-	s.b = append(s.b, fmt.Sprintf(format, args...)...)
-}
-func (s *stringBuilder) String() string { return string(s.b) }
 
 func sortedSubset(in []string) []string {
 	out := append([]string(nil), in...)

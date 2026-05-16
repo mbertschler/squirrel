@@ -117,6 +117,41 @@ func TestCLISyncRequiresConfig(t *testing.T) {
 	}
 }
 
+// TestCLISyncDryRun is the CLI counterpart to the dry-run sync test in
+// sync/. We verify (a) the command succeeds and prints a report, (b)
+// nothing lands at the destination, and (c) no new runs row is recorded.
+func TestCLISyncDryRun(t *testing.T) {
+	requireRcloneCLI(t)
+	f := writeSyncFixture(t)
+	writeTestFile(t, filepath.Join(f.volumeDir, "a.txt"), "alpha")
+	runCLI(t, "--config", f.configPath, "index", f.volumeName)
+
+	runsBefore := runCLI(t, "--config", f.configPath, "runs")
+	out := runCLI(t, "--config", f.configPath, "sync", "pics", "--dry-run")
+	if !strings.Contains(out, "pics → scratch") {
+		t.Fatalf("dry-run did not print pair line:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(f.destDir, f.volumeName, "a.txt")); err == nil {
+		t.Fatalf("dry-run wrote to destination; want no-op")
+	}
+	runsAfter := runCLI(t, "--config", f.configPath, "runs")
+	if runsBefore != runsAfter {
+		t.Fatalf("dry-run added a runs row:\nbefore:\n%s\nafter:\n%s", runsBefore, runsAfter)
+	}
+}
+
+// TestCLISyncMissingExplicitConfigErrors checks the tryLoadConfig
+// disambiguation: a user-supplied --config path that doesn't exist must
+// be an error rather than silently degrading to no-config behavior.
+// This also indirectly covers the path-validation message format.
+func TestCLISyncMissingExplicitConfigErrors(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "nope.toml")
+	err, _ := runCLIExpectErr(t, "--config", missing, "query", "--db", filepath.Join(t.TempDir(), "x.db"), "abc")
+	if !strings.Contains(err.Error(), "no config at") {
+		t.Fatalf("expected missing-config error when --config is explicit, got %v", err)
+	}
+}
+
 func TestCLISyncRunsRowVisibleViaRunsCommand(t *testing.T) {
 	requireRcloneCLI(t)
 	f := writeSyncFixture(t)
