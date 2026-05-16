@@ -75,6 +75,57 @@ func TestCLIQueryPrefersExistingPathOverHashLike(t *testing.T) {
 	}
 }
 
+// TestCLIQueryHistoryShowsSupersededRows checks the --history flag adds a
+// per-row history table for a path. After two indexings of a modified file
+// the table should contain both the live and the superseded content.
+func TestCLIQueryHistoryShowsSupersededRows(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	doc := filepath.Join(src, "doc.txt")
+	writeTestFile(t, doc, "version A")
+	db := filepath.Join(tmp, "test.db")
+	runCLI(t, "index", "--db", db, src)
+	writeTestFile(t, doc, "version B is different")
+	runCLI(t, "index", "--db", db, src)
+
+	out := runCLI(t, "query", "--db", db, "--history", doc)
+	if !strings.Contains(out, "history:") {
+		t.Fatalf("expected history: section, got:\n%s", out)
+	}
+	// At least the live row plus one superseded row should appear.
+	if !strings.Contains(out, "superseded") {
+		t.Fatalf("expected a superseded row in history, got:\n%s", out)
+	}
+	if !strings.Contains(out, "present") {
+		t.Fatalf("expected a present row in history, got:\n%s", out)
+	}
+}
+
+// TestCLIQueryHistoryRejectsHashLookup confirms the flag is not meaningful
+// for hash queries (those already return every row for the digest).
+func TestCLIQueryHistoryRejectsHashLookup(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(src, "a.txt"), "hello")
+	db := filepath.Join(tmp, "test.db")
+	runCLI(t, "index", "--db", db, src)
+
+	// Lift the blake3 hash out via a normal path query.
+	out := runCLI(t, "query", "--db", db, filepath.Join(src, "a.txt"))
+	hex := extractField(t, out, "blake3:")
+
+	err, msg := runCLIExpectErr(t, "query", "--db", db, "--history", hex)
+	if !strings.Contains(err.Error(), "applies to path queries") {
+		t.Fatalf("unexpected error %v; output:\n%s", err, msg)
+	}
+}
+
 func TestCLIQueryUnknownPath(t *testing.T) {
 	tmp := t.TempDir()
 	db := filepath.Join(tmp, "test.db")

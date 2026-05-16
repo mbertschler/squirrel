@@ -68,14 +68,40 @@ func (s *Store) FinishRun(ctx context.Context, runID int64, status string, errMs
 	return nil
 }
 
-// ListRunsForVolume returns the runs row history for a volume, ordered by id
-// ascending (which is also start order).
-func (s *Store) ListRunsForVolume(ctx context.Context, volumeID int64) ([]Run, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, kind, volume_id, started_at_ns, ended_at_ns, status, error, file_count
-		FROM runs
-		WHERE volume_id = ?
-		ORDER BY id`, volumeID)
+// ListRunsOpts filters and shapes the result of ListRuns. The zero value
+// returns every run, oldest first, with no cap.
+type ListRunsOpts struct {
+	// VolumeID, when non-nil, restricts results to runs against that volume.
+	// A nil VolumeID returns runs across every volume (including any future
+	// cross-volume sync runs, which have a NULL volume_id).
+	VolumeID *int64
+	// Limit caps the result count. Zero (or negative) means no cap.
+	Limit int
+	// Descending sorts by id descending (most recent first). Defaults to
+	// ascending so callers that walk history get start-order chronological
+	// output without thinking about it.
+	Descending bool
+}
+
+// ListRuns returns runs matching opts. See ListRunsOpts for filter and
+// ordering semantics.
+func (s *Store) ListRuns(ctx context.Context, opts ListRunsOpts) ([]Run, error) {
+	query := `SELECT id, kind, volume_id, started_at_ns, ended_at_ns, status, error, file_count FROM runs`
+	var args []any
+	if opts.VolumeID != nil {
+		query += ` WHERE volume_id = ?`
+		args = append(args, *opts.VolumeID)
+	}
+	if opts.Descending {
+		query += ` ORDER BY id DESC`
+	} else {
+		query += ` ORDER BY id`
+	}
+	if opts.Limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, opts.Limit)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list runs: %w", err)
 	}

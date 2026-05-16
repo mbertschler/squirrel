@@ -629,9 +629,9 @@ func TestListRunsForVolumeScopedAndOrdered(t *testing.T) {
 		t.Fatalf("FinishRun r2: %v", err)
 	}
 
-	runs, err := s.ListRunsForVolume(ctx, a)
+	runs, err := s.ListRuns(ctx, ListRunsOpts{VolumeID: &a})
 	if err != nil {
-		t.Fatalf("ListRunsForVolume(a): %v", err)
+		t.Fatalf("ListRuns(a): %v", err)
 	}
 	if len(runs) != 2 || runs[0].ID != r1 || runs[1].ID != r3 {
 		t.Fatalf("got runs %+v, want ids [%d %d] in order", runs, r1, r3)
@@ -643,12 +643,21 @@ func TestListRunsForVolumeScopedAndOrdered(t *testing.T) {
 		t.Fatalf("r1 status = %q, want %q", runs[0].Status, RunStatusRunning)
 	}
 
-	other, err := s.ListRunsForVolume(ctx, b)
+	other, err := s.ListRuns(ctx, ListRunsOpts{VolumeID: &b})
 	if err != nil {
-		t.Fatalf("ListRunsForVolume(b): %v", err)
+		t.Fatalf("ListRuns(b): %v", err)
 	}
 	if len(other) != 1 || other[0].ID != r2 {
 		t.Fatalf("got runs %+v, want single id %d", other, r2)
+	}
+
+	// Descending + limit: most recent run across both volumes.
+	desc, err := s.ListRuns(ctx, ListRunsOpts{Limit: 1, Descending: true})
+	if err != nil {
+		t.Fatalf("ListRuns desc: %v", err)
+	}
+	if len(desc) != 1 || desc[0].ID != r3 {
+		t.Fatalf("ListRuns desc limit 1 = %+v, want id %d", desc, r3)
 	}
 }
 
