@@ -396,7 +396,7 @@ func (s *Store) GetOrCreateVolume(ctx context.Context, absPath string) (Volume, 
 
 	base := filepath.Base(absPath)
 	const maxAttempts = 1000
-	for i := 0; i < maxAttempts; i++ {
+	for i := range maxAttempts {
 		name := base
 		if i > 0 {
 			name = fmt.Sprintf("%s-%d", base, i+1)
@@ -483,9 +483,12 @@ func (s *Store) GetByPath(ctx context.Context, volumeID int64, relPath string) (
 }
 
 // ListHistoryByPath returns every row ever recorded at (volumeID, relPath),
-// ordered by first_seen_run_id ascending (oldest first). Useful for
-// inspecting the content history of a path; the last row in the slice (if
-// any) is the live row reported by GetByPath.
+// ordered by first_seen_run_id ascending (i.e. the order in which each
+// distinct content was first observed at this path). Useful for inspecting
+// the content history of a path. Note: the live row is *not* guaranteed to
+// be last — after a content revert (A → B → A), row A is reused and stays
+// at its original first_seen position even though it is now live again.
+// Filter on Status to find the live row, or use GetByPath.
 func (s *Store) ListHistoryByPath(ctx context.Context, volumeID int64, relPath string) ([]FileRow, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT `+fileColumns+` FROM files
