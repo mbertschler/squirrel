@@ -27,7 +27,11 @@ func newQueryCmd() *cobra.Command {
 		Short: "Look up the index by hash, path, or list duplicates/missing",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			s, err := openStore(cmd)
+			cfg, err := tryLoadConfig(cmd)
+			if err != nil {
+				return err
+			}
+			s, err := openStore(cmd, cfg)
 			if err != nil {
 				return err
 			}

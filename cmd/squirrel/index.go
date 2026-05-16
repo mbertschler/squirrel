@@ -8,9 +8,10 @@ import (
 	"github.com/mbertschler/squirrel/index"
 )
 
-// newIndexCmd returns the `squirrel index <path>` cobra command. The command
-// walks the given directory, hashes regular files with BLAKE3, and updates
-// the SQLite index incrementally.
+// newIndexCmd returns the `squirrel index <volume>` cobra command. The
+// volume name is looked up in the config to resolve the absolute path
+// that will be walked. Indexing by path is no longer supported — declare
+// the volume in config first.
 func newIndexCmd() *cobra.Command {
 	var (
 		shallow bool
@@ -18,8 +19,8 @@ func newIndexCmd() *cobra.Command {
 		workers int
 	)
 	cmd := &cobra.Command{
-		Use:   "index <path>",
-		Short: "Walk a directory, hash regular files, and update the index",
+		Use:   "index <volume>",
+		Short: "Walk a config-declared volume, hash regular files, and update the index",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runIndex(cmd, args[0], index.Options{
@@ -35,14 +36,24 @@ func newIndexCmd() *cobra.Command {
 	return cmd
 }
 
-func runIndex(cmd *cobra.Command, path string, opts index.Options) error {
-	s, err := openStore(cmd)
+func runIndex(cmd *cobra.Command, volumeName string, opts index.Options) error {
+	cfg, err := requireConfig(cmd)
+	if err != nil {
+		return err
+	}
+	vol, ok := cfg.Volumes[volumeName]
+	if !ok {
+		return fmt.Errorf("unknown volume %q (declare it in %s)", volumeName, cfg.Path)
+	}
+	opts.Name = vol.Name
+
+	s, err := openStore(cmd, cfg)
 	if err != nil {
 		return err
 	}
 	defer s.Close()
 
-	rep, err := index.Index(cmd.Context(), s, path, opts)
+	rep, err := index.Index(cmd.Context(), s, vol.Path, opts)
 	if err != nil {
 		return err
 	}

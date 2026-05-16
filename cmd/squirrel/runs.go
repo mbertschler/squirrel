@@ -36,7 +36,11 @@ func newRunsCmd() *cobra.Command {
 }
 
 func runRuns(cmd *cobra.Command, volumeName string, limit int) error {
-	s, err := openStore(cmd)
+	cfg, err := tryLoadConfig(cmd)
+	if err != nil {
+		return err
+	}
+	s, err := openStore(cmd, cfg)
 	if err != nil {
 		return err
 	}
@@ -80,16 +84,24 @@ func loadVolumeNames(cmd *cobra.Command, s *store.Store) (map[int64]string, erro
 
 func printRuns(out io.Writer, runs []store.Run, volumes map[int64]string) error {
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tKIND\tVOLUME\tSTARTED\tDURATION\tSTATUS\tFILES\tERROR")
+	fmt.Fprintln(tw, "ID\tKIND\tVOLUME\tDESTINATION\tSTARTED\tDURATION\tSTATUS\tFILES\tERROR")
 	for _, r := range runs {
-		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
+		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
 			r.ID, r.Kind, volumeLabel(r.VolumeID, volumes),
+			destinationLabel(r.Destination),
 			formatStarted(r.StartedAtNs),
 			formatDuration(r.StartedAtNs, r.EndedAtNs),
 			r.Status, r.FileCount, truncateError(r.Error),
 		)
 	}
 	return tw.Flush()
+}
+
+func destinationLabel(d sql.NullString) string {
+	if !d.Valid {
+		return "—"
+	}
+	return d.String
 }
 
 func volumeLabel(volumeID sql.NullInt64, volumes map[int64]string) string {

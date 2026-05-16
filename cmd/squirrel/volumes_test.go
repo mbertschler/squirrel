@@ -16,7 +16,7 @@ func TestCLIVolumesEmpty(t *testing.T) {
 	}
 }
 
-func TestCLIVolumesListsImplicitlyCreated(t *testing.T) {
+func TestCLIVolumesListsConfigDeclaredVolumesAfterIndex(t *testing.T) {
 	tmp := t.TempDir()
 	a := filepath.Join(tmp, "a")
 	b := filepath.Join(tmp, "b")
@@ -26,11 +26,11 @@ func TestCLIVolumesListsImplicitlyCreated(t *testing.T) {
 		}
 		writeTestFile(t, filepath.Join(dir, "f.txt"), "hi")
 	}
-	db := filepath.Join(tmp, "test.db")
-	runCLI(t, "index", "--db", db, a)
-	runCLI(t, "index", "--db", db, b)
+	f := writeConfigFor(t, map[string]string{"a": a, "b": b})
+	runCLI(t, "--config", f.configPath, "index", "a")
+	runCLI(t, "--config", f.configPath, "index", "b")
 
-	out := runCLI(t, "volumes", "--db", db)
+	out := runCLI(t, "--config", f.configPath, "volumes")
 	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
 	if len(lines) != 2 {
 		t.Fatalf("expected 2 volume lines, got %d:\n%s", len(lines), out)
@@ -46,26 +46,32 @@ func TestCLIVolumesListsImplicitlyCreated(t *testing.T) {
 	}
 }
 
-// Two volumes with the same basename get a numeric suffix on the second one.
-func TestCLIVolumesBasenameCollision(t *testing.T) {
+// Two volumes can share a basename when each gets a distinct config name —
+// in config-strict mode there is no auto-suffix because the name comes
+// directly from the user's config and cannot collide (TOML map keys are
+// unique). The DB volume name equals the config name.
+func TestCLIVolumesDistinctNamesSharedBasename(t *testing.T) {
 	tmp := t.TempDir()
-	dir1 := filepath.Join(tmp, "alpha", "pictures")
-	dir2 := filepath.Join(tmp, "beta", "pictures")
-	for _, d := range []string{dir1, dir2} {
+	alpha := filepath.Join(tmp, "alpha", "pictures")
+	beta := filepath.Join(tmp, "beta", "pictures")
+	for _, d := range []string{alpha, beta} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
 		writeTestFile(t, filepath.Join(d, "f.txt"), "x")
 	}
-	db := filepath.Join(tmp, "test.db")
-	runCLI(t, "index", "--db", db, dir1)
-	runCLI(t, "index", "--db", db, dir2)
+	f := writeConfigFor(t, map[string]string{
+		"alpha-pictures": alpha,
+		"beta-pictures":  beta,
+	})
+	runCLI(t, "--config", f.configPath, "index", "alpha-pictures")
+	runCLI(t, "--config", f.configPath, "index", "beta-pictures")
 
-	out := runCLI(t, "volumes", "--db", db)
-	if !strings.Contains(out, "\tpictures\t") {
-		t.Fatalf("expected first volume 'pictures' in output:\n%s", out)
+	out := runCLI(t, "--config", f.configPath, "volumes")
+	if !strings.Contains(out, "\talpha-pictures\t") {
+		t.Fatalf("expected 'alpha-pictures' in output:\n%s", out)
 	}
-	if !strings.Contains(out, "\tpictures-2\t") {
-		t.Fatalf("expected suffixed volume 'pictures-2' in output:\n%s", out)
+	if !strings.Contains(out, "\tbeta-pictures\t") {
+		t.Fatalf("expected 'beta-pictures' in output:\n%s", out)
 	}
 }

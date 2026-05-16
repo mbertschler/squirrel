@@ -14,7 +14,11 @@ func newVolumesCmd() *cobra.Command {
 		Short: "List known indexing volumes",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			s, err := openStore(cmd)
+			cfg, err := tryLoadConfig(cmd)
+			if err != nil {
+				return err
+			}
+			s, err := openStore(cmd, cfg)
 			if err != nil {
 				return err
 			}

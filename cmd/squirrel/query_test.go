@@ -1,7 +1,6 @@
 package main
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -50,26 +49,22 @@ func TestJoinVolumePath(t *testing.T) {
 // routed as a path, not silently interpreted as a digest. Content-addressed
 // workloads (exactly this tool's target) make this a real case.
 func TestCLIQueryPrefersExistingPathOverHashLike(t *testing.T) {
-	tmp := t.TempDir()
-	src := filepath.Join(tmp, "src")
-	if err := os.MkdirAll(src, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	src := t.TempDir()
 	hexName := strings.Repeat("a", 64)
 	hashLikePath := filepath.Join(src, hexName)
 	writeTestFile(t, hashLikePath, "payload")
 
-	db := filepath.Join(tmp, "test.db")
-	runCLI(t, "index", "--db", db, src)
+	f := writeConfigFor(t, map[string]string{"src": src})
+	runCLI(t, "--config", f.configPath, "index", "src")
 
-	out := runCLI(t, "query", "--db", db, hashLikePath)
+	out := runCLI(t, "--config", f.configPath, "query", hashLikePath)
 	if !strings.Contains(out, "path:") || !strings.Contains(out, hexName) {
 		t.Fatalf("absolute hex-named path lookup failed; output:\n%s", out)
 	}
 
 	// A 64-hex string with no file on disk falls through to the hash branch.
 	bogusHex := strings.Repeat("b", 64)
-	_, output := runCLIExpectErr(t, "query", "--db", db, bogusHex)
+	_, output := runCLIExpectErr(t, "--config", f.configPath, "query", bogusHex)
 	if !strings.Contains(output, "no rows for blake3") {
 		t.Fatalf("expected hash-branch error message, got:\n%s", output)
 	}
@@ -79,19 +74,15 @@ func TestCLIQueryPrefersExistingPathOverHashLike(t *testing.T) {
 // per-row history table for a path. After two indexings of a modified file
 // the table should contain both the live and the superseded content.
 func TestCLIQueryHistoryShowsSupersededRows(t *testing.T) {
-	tmp := t.TempDir()
-	src := filepath.Join(tmp, "src")
-	if err := os.MkdirAll(src, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	src := t.TempDir()
 	doc := filepath.Join(src, "doc.txt")
 	writeTestFile(t, doc, "version A")
-	db := filepath.Join(tmp, "test.db")
-	runCLI(t, "index", "--db", db, src)
+	f := writeConfigFor(t, map[string]string{"src": src})
+	runCLI(t, "--config", f.configPath, "index", "src")
 	writeTestFile(t, doc, "version B is different")
-	runCLI(t, "index", "--db", db, src)
+	runCLI(t, "--config", f.configPath, "index", "src")
 
-	out := runCLI(t, "query", "--db", db, "--history", doc)
+	out := runCLI(t, "--config", f.configPath, "query", "--history", doc)
 	if !strings.Contains(out, "history:") {
 		t.Fatalf("expected history: section, got:\n%s", out)
 	}
@@ -107,20 +98,16 @@ func TestCLIQueryHistoryShowsSupersededRows(t *testing.T) {
 // TestCLIQueryHistoryRejectsHashLookup confirms the flag is not meaningful
 // for hash queries (those already return every row for the digest).
 func TestCLIQueryHistoryRejectsHashLookup(t *testing.T) {
-	tmp := t.TempDir()
-	src := filepath.Join(tmp, "src")
-	if err := os.MkdirAll(src, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	src := t.TempDir()
 	writeTestFile(t, filepath.Join(src, "a.txt"), "hello")
-	db := filepath.Join(tmp, "test.db")
-	runCLI(t, "index", "--db", db, src)
+	f := writeConfigFor(t, map[string]string{"src": src})
+	runCLI(t, "--config", f.configPath, "index", "src")
 
 	// Lift the blake3 hash out via a normal path query.
-	out := runCLI(t, "query", "--db", db, filepath.Join(src, "a.txt"))
+	out := runCLI(t, "--config", f.configPath, "query", filepath.Join(src, "a.txt"))
 	hex := extractField(t, out, "blake3:")
 
-	err, msg := runCLIExpectErr(t, "query", "--db", db, "--history", hex)
+	err, msg := runCLIExpectErr(t, "--config", f.configPath, "query", "--history", hex)
 	if !strings.Contains(err.Error(), "applies to path queries") {
 		t.Fatalf("unexpected error %v; output:\n%s", err, msg)
 	}

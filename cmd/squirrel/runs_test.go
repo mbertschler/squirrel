@@ -42,18 +42,14 @@ func TestTruncateErrorRuneAware(t *testing.T) {
 }
 
 func TestCLIRunsListsRecentFirst(t *testing.T) {
-	tmp := t.TempDir()
-	src := filepath.Join(tmp, "src")
-	if err := os.MkdirAll(src, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	src := t.TempDir()
 	writeTestFile(t, filepath.Join(src, "a.txt"), "hello")
-	db := filepath.Join(tmp, "test.db")
+	f := writeConfigFor(t, map[string]string{"src": src})
 
-	runCLI(t, "index", "--db", db, src)
-	runCLI(t, "index", "--db", db, src)
+	runCLI(t, "--config", f.configPath, "index", "src")
+	runCLI(t, "--config", f.configPath, "index", "src")
 
-	out := runCLI(t, "runs", "--db", db)
+	out := runCLI(t, "--config", f.configPath, "runs")
 	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
 	if len(lines) != 3 {
 		t.Fatalf("got %d lines (1 header + N rows), want 3:\n%s", len(lines), out)
@@ -86,12 +82,12 @@ func TestCLIRunsVolumeFilter(t *testing.T) {
 		}
 		writeTestFile(t, filepath.Join(d, "f.txt"), "content")
 	}
-	db := filepath.Join(tmp, "test.db")
-	runCLI(t, "index", "--db", db, dirA)
-	runCLI(t, "index", "--db", db, dirB)
-	runCLI(t, "index", "--db", db, dirA)
+	f := writeConfigFor(t, map[string]string{"a": dirA, "b": dirB})
+	runCLI(t, "--config", f.configPath, "index", "a")
+	runCLI(t, "--config", f.configPath, "index", "b")
+	runCLI(t, "--config", f.configPath, "index", "a")
 
-	out := runCLI(t, "runs", "--db", db, "--volume", "a")
+	out := runCLI(t, "--config", f.configPath, "runs", "--volume", "a")
 	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
 	if len(lines) != 3 {
 		t.Fatalf("expected 2 runs for volume a, got lines:\n%s", out)
@@ -107,18 +103,14 @@ func TestCLIRunsVolumeFilter(t *testing.T) {
 }
 
 func TestCLIRunsLimit(t *testing.T) {
-	tmp := t.TempDir()
-	src := filepath.Join(tmp, "src")
-	if err := os.MkdirAll(src, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	src := t.TempDir()
 	writeTestFile(t, filepath.Join(src, "a.txt"), "hello")
-	db := filepath.Join(tmp, "test.db")
+	f := writeConfigFor(t, map[string]string{"src": src})
 	for range 5 {
-		runCLI(t, "index", "--db", db, src)
+		runCLI(t, "--config", f.configPath, "index", "src")
 	}
 
-	out := runCLI(t, "runs", "--db", db, "--limit", "2")
+	out := runCLI(t, "--config", f.configPath, "runs", "--limit", "2")
 	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
 	const wantLines = 3 // header + 2 capped rows
 	if len(lines) != wantLines {
@@ -127,17 +119,13 @@ func TestCLIRunsLimit(t *testing.T) {
 }
 
 func TestCLIRunsUnknownVolume(t *testing.T) {
-	tmp := t.TempDir()
-	db := filepath.Join(tmp, "test.db")
 	// Open the DB once via an index command so the schema exists.
-	src := filepath.Join(tmp, "src")
-	if err := os.MkdirAll(src, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	src := t.TempDir()
 	writeTestFile(t, filepath.Join(src, "a.txt"), "hello")
-	runCLI(t, "index", "--db", db, src)
+	f := writeConfigFor(t, map[string]string{"src": src})
+	runCLI(t, "--config", f.configPath, "index", "src")
 
-	err, _ := runCLIExpectErr(t, "runs", "--db", db, "--volume", "no-such-volume")
+	err, _ := runCLIExpectErr(t, "--config", f.configPath, "runs", "--volume", "no-such-volume")
 	if !strings.Contains(err.Error(), "no volume named") {
 		t.Fatalf("unexpected error: %v", err)
 	}

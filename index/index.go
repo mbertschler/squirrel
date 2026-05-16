@@ -16,6 +16,11 @@ import (
 )
 
 type Options struct {
+	// Name pins the volume name in the DB so it matches what config
+	// declares. When empty, the volume name is derived from the path
+	// basename (the historical, pre-config behaviour). New callers should
+	// always set it; legacy callers and tests may leave it blank.
+	Name string
 	// Shallow: skip rehashing if (size, mtime) match the stored row.
 	Shallow bool
 	// DryRun: do not write to the database; only compute and report.
@@ -137,7 +142,7 @@ func newIndexer(ctx context.Context, s *store.Store, root string, opts Options) 
 		queueDepth = workers * 4
 	}
 
-	vol, exists, err := resolveVolume(ctx, s, absRoot, opts.DryRun)
+	vol, exists, err := resolveVolume(ctx, s, opts.Name, absRoot, opts.DryRun)
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +173,7 @@ func (i *indexer) beginRun() error {
 	if i.opts.DryRun {
 		return nil
 	}
-	id, err := i.store.BeginRun(i.ctx, store.RunKindIndex, i.volumeID)
+	id, err := i.store.BeginRun(i.ctx, store.RunKindIndex, i.volumeID, "")
 	if err != nil {
 		return fmt.Errorf("begin run: %w", err)
 	}
@@ -448,10 +453,15 @@ func (i *indexer) rowFor(w workItem, digest []byte) store.FileRow {
 }
 
 // resolveVolume returns the volume for absRoot and whether it already exists
-// in the database. In dry-run mode against a never-indexed path the returned
-// Volume has no row backing it (exists=false); callers must avoid issuing
-// volume-scoped DB queries against it.
-func resolveVolume(ctx context.Context, s *store.Store, absRoot string, dryRun bool) (store.Volume, bool, error) {
+// in the database. When name is non-empty, the lookup is by name first;
+// otherwise the legacy path-keyed behaviour applies. In dry-run mode against
+// a never-indexed path the returned Volume has no row backing it
+// (exists=false); callers must avoid issuing volume-scoped DB queries
+// against it.
+func resolveVolume(ctx context.Context, s *store.Store, name, absRoot string, dryRun bool) (store.Volume, bool, error) {
+	if name != "" {
+		return resolveNamedVolume(ctx, s, name, absRoot, dryRun)
+	}
 	if !dryRun {
 		v, err := s.GetOrCreateVolume(ctx, absRoot)
 		if err != nil {
@@ -467,6 +477,32 @@ func resolveVolume(ctx context.Context, s *store.Store, absRoot string, dryRun b
 		return store.Volume{}, false, fmt.Errorf("lookup volume: %w", err)
 	}
 	return store.Volume{Path: absRoot}, false, nil
+}
+
+// resolveNamedVolume is the config-aware path: the caller passes a volume
+// name (from config) plus the absolute path declared for that name. If a
+// volume row already exists under this name, its path must match — a
+// mismatch indicates the config moved the volume to a new location, which
+// the user must resolve explicitly (re-name in config or migrate the DB).
+func resolveNamedVolume(ctx context.Context, s *store.Store, name, absRoot string, dryRun bool) (store.Volume, bool, error) {
+	v, err := s.GetVolumeByName(ctx, name)
+	if err == nil {
+		if v.Path != absRoot {
+			return store.Volume{}, false, fmt.Errorf("volume %q is at %q in the DB but config says %q — resolve the conflict before re-indexing", name, v.Path, absRoot)
+		}
+		return v, true, nil
+	}
+	if !store.IsNotFound(err) {
+		return store.Volume{}, false, fmt.Errorf("lookup volume by name: %w", err)
+	}
+	if dryRun {
+		return store.Volume{Name: name, Path: absRoot}, false, nil
+	}
+	created, err := s.CreateVolume(ctx, name, absRoot)
+	if err != nil {
+		return store.Volume{}, false, fmt.Errorf("create volume %q: %w", name, err)
+	}
+	return created, true, nil
 }
 
 func hashFile(path string) ([]byte, error) {
