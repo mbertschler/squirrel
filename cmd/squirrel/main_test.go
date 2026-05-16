@@ -8,10 +8,21 @@ import (
 	"testing"
 )
 
+// isolateConfig points SQUIRREL_CONFIG at a path inside t.TempDir that
+// will never exist. Without this, runCLI would inherit the developer's
+// real ~/.squirrel/config.toml when a test doesn't pass --config, which
+// would silently leak host state (volumes, destinations, db path) into
+// tests. t.Setenv ensures the variable is reverted at test end.
+func isolateConfig(t *testing.T) {
+	t.Helper()
+	t.Setenv("SQUIRREL_CONFIG", filepath.Join(t.TempDir(), "no-config.toml"))
+}
+
 // runCLI executes the cobra root with the given args and returns combined
 // stdout+stderr. Shared by the per-subcommand tests in this package.
 func runCLI(t *testing.T, args ...string) string {
 	t.Helper()
+	isolateConfig(t)
 	var buf bytes.Buffer
 	root := newRootCmd()
 	root.SetOut(&buf)
@@ -27,6 +38,7 @@ func runCLI(t *testing.T, args ...string) string {
 // returns (err, captured output).
 func runCLIExpectErr(t *testing.T, args ...string) (error, string) {
 	t.Helper()
+	isolateConfig(t)
 	var buf bytes.Buffer
 	root := newRootCmd()
 	root.SetOut(&buf)

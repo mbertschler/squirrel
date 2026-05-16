@@ -515,6 +515,25 @@ func (s *Store) GetOrCreateVolume(ctx context.Context, absPath string) (Volume, 
 	return Volume{}, fmt.Errorf("could not allocate unique volume name for %q after %d attempts", absPath, maxAttempts)
 }
 
+// CreateVolume inserts a new volume row with the given name and absolute
+// path. Returns the inserted row. Fails when the name already exists
+// (UNIQUE) — callers should look up first via GetVolumeByName and decide
+// how to handle that case. Used by the indexer when a config-declared
+// volume is indexed for the first time and we want the DB name to match
+// the config name exactly (not the basename of the path).
+func (s *Store) CreateVolume(ctx context.Context, name, absPath string) (Volume, error) {
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO volumes (name, path) VALUES (?, ?)`, name, absPath)
+	if err != nil {
+		return Volume{}, fmt.Errorf("insert volume %q: %w", name, err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return Volume{}, fmt.Errorf("volume last insert id: %w", err)
+	}
+	return Volume{ID: id, Name: name, Path: absPath}, nil
+}
+
 // GetVolumeByID returns the volume with the given id, or sql.ErrNoRows.
 func (s *Store) GetVolumeByID(ctx context.Context, id int64) (Volume, error) {
 	var v Volume

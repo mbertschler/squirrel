@@ -36,7 +36,11 @@ func newIndexCmd() *cobra.Command {
 }
 
 func runIndex(cmd *cobra.Command, path string, opts index.Options) error {
-	s, err := openStore(cmd)
+	cfg, err := tryLoadConfig(cmd)
+	if err != nil {
+		return err
+	}
+	s, err := openStore(cmd, cfg)
 	if err != nil {
 		return err
 	}
