@@ -9,11 +9,14 @@ import (
 // Run is one entry in the runs table. VolumeID uses sql.NullInt64 because the
 // column is nullable (cross-volume sync runs in the future); EndedAtNs and
 // Error are likewise nullable while a run is still in-flight or finished
-// without an error. FileCount is int64 to match the SQLite INTEGER column.
+// without an error. Destination is NULL for index runs and required for
+// sync/restore runs (enforced by a CHECK in the schema). FileCount is int64
+// to match the SQLite INTEGER column.
 type Run struct {
 	ID          int64
 	Kind        string
 	VolumeID    sql.NullInt64
+	Destination sql.NullString
 	StartedAtNs int64
 	EndedAtNs   sql.NullInt64
 	Status      string
@@ -21,16 +24,21 @@ type Run struct {
 	FileCount   int64
 }
 
-// BeginRun records the start of an index or sync run and returns its id.
-// Callers must pair it with FinishRun (typically via defer with an error
-// pointer or an explicit terminal call). volumeID must reference an existing
-// volume; the schema column is nullable in anticipation of cross-volume sync
-// but no current caller relies on that.
-func (s *Store) BeginRun(ctx context.Context, kind string, volumeID int64) (int64, error) {
+// BeginRun records the start of a run and returns its id. Callers must pair
+// it with FinishRun (typically via defer with an error pointer or an explicit
+// terminal call). volumeID must reference an existing volume. destination
+// must be a non-empty name for kind='sync' or 'restore' and the empty string
+// for kind='index' — the schema-level CHECK rejects mismatches, which
+// surfaces here as an Exec error.
+func (s *Store) BeginRun(ctx context.Context, kind string, volumeID int64, destination string) (int64, error) {
+	var destVal sql.NullString
+	if destination != "" {
+		destVal = sql.NullString{String: destination, Valid: true}
+	}
 	res, err := s.db.ExecContext(ctx, `
-		INSERT INTO runs (kind, volume_id, started_at_ns, status, file_count)
-		VALUES (?, ?, ?, 'running', 0)
-	`, kind, volumeID, NowNs())
+		INSERT INTO runs (kind, volume_id, destination, started_at_ns, status, file_count)
+		VALUES (?, ?, ?, ?, 'running', 0)
+	`, kind, volumeID, destVal, NowNs())
 	if err != nil {
 		return 0, fmt.Errorf("insert run: %w", err)
 	}
@@ -86,7 +94,7 @@ type ListRunsOpts struct {
 // ListRuns returns runs matching opts. See ListRunsOpts for filter and
 // ordering semantics.
 func (s *Store) ListRuns(ctx context.Context, opts ListRunsOpts) ([]Run, error) {
-	query := `SELECT id, kind, volume_id, started_at_ns, ended_at_ns, status, error, file_count FROM runs`
+	query := `SELECT id, kind, volume_id, destination, started_at_ns, ended_at_ns, status, error, file_count FROM runs`
 	var args []any
 	if opts.VolumeID != nil {
 		query += ` WHERE volume_id = ?`
@@ -109,10 +117,28 @@ func (s *Store) ListRuns(ctx context.Context, opts ListRunsOpts) ([]Run, error) 
 	var out []Run
 	for rows.Next() {
 		var r Run
-		if err := rows.Scan(&r.ID, &r.Kind, &r.VolumeID, &r.StartedAtNs, &r.EndedAtNs, &r.Status, &r.Error, &r.FileCount); err != nil {
+		if err := rows.Scan(&r.ID, &r.Kind, &r.VolumeID, &r.Destination, &r.StartedAtNs, &r.EndedAtNs, &r.Status, &r.Error, &r.FileCount); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// LatestSuccessfulIndexRun returns the most recent index run for the given
+// volume that finished in status 'success' or 'partial'. Used by the sync
+// command as a prerequisite check: refusing to sync a volume that has never
+// been indexed protects the user from pushing stale or untracked state.
+// Returns sql.ErrNoRows when no such run exists.
+func (s *Store) LatestSuccessfulIndexRun(ctx context.Context, volumeID int64) (Run, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, kind, volume_id, destination, started_at_ns, ended_at_ns, status, error, file_count
+		FROM runs
+		WHERE kind = 'index' AND volume_id = ?
+		  AND status IN ('success','partial')
+		ORDER BY id DESC LIMIT 1
+	`, volumeID)
+	var r Run
+	err := row.Scan(&r.ID, &r.Kind, &r.VolumeID, &r.Destination, &r.StartedAtNs, &r.EndedAtNs, &r.Status, &r.Error, &r.FileCount)
+	return r, err
 }

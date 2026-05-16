@@ -14,7 +14,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 4
+const SchemaVersion = 5
 
 type Store struct {
 	db *sql.DB
@@ -59,10 +59,13 @@ const (
 )
 
 // Run kinds. The runs.volume_id column is nullable so a future sync run can
-// span volumes; index runs are always scoped to a single volume.
+// span volumes; index runs are always scoped to a single volume. Sync and
+// restore runs additionally carry a non-empty runs.destination naming the
+// rclone destination; index runs leave destination NULL.
 const (
-	RunKindIndex = "index"
-	RunKindSync  = "sync"
+	RunKindIndex   = "index"
+	RunKindSync    = "sync"
+	RunKindRestore = "restore"
 )
 
 // Run statuses. A run begins in 'running' and is moved to a terminal state by
@@ -130,8 +133,8 @@ func (s *Store) migrate(ctx context.Context) error {
 		return fmt.Errorf("database schema version 1 is no longer supported (binary expects v%d); delete the database and re-index", SchemaVersion)
 	}
 	if current == 0 {
-		if err := applyV4(ctx, s.db); err != nil {
-			return fmt.Errorf("apply schema v4: %w", err)
+		if err := applyV5(ctx, s.db); err != nil {
+			return fmt.Errorf("apply schema v5: %w", err)
 		}
 		return nil
 	}
@@ -146,33 +149,40 @@ func (s *Store) migrate(ctx context.Context) error {
 		if err := migrateV3ToV4(ctx, s.db); err != nil {
 			return fmt.Errorf("migrate schema v3→v4: %w", err)
 		}
+		current = 4
+	}
+	if current == 4 {
+		if err := migrateV4ToV5(ctx, s.db); err != nil {
+			return fmt.Errorf("migrate schema v4→v5: %w", err)
+		}
 	}
 	return nil
 }
 
-func applyV4(ctx context.Context, db *sql.DB) error {
+func applyV5(ctx context.Context, db *sql.DB) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	for _, q := range schemaV4Stmts() {
+	for _, q := range schemaV5Stmts() {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("exec %q: %w", q, err)
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (4)`); err != nil {
-		return fmt.Errorf("record schema v4: %w", err)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (5)`); err != nil {
+		return fmt.Errorf("record schema v5: %w", err)
 	}
 	return tx.Commit()
 }
 
-// schemaV4Stmts returns the DDL for a fresh v4 database. The files table's
-// primary key is widened to (volume_id, path, blake3) so content history at a
-// path is append-only: when a file is rewritten with different content, a new
-// row is inserted and the prior row is marked 'superseded'.
-func schemaV4Stmts() []string {
+// schemaV5Stmts returns the DDL for a fresh v5 database. The runs table
+// gains a destination TEXT column and 'restore' as a valid kind; a CHECK
+// constraint enforces that destination is set iff kind is 'sync' or
+// 'restore'. The files table is unchanged from v4 — its (volume_id, path,
+// blake3) PK still enforces the append-only content history.
+func schemaV5Stmts() []string {
 	return []string{
 		`CREATE TABLE volumes (
 			id   INTEGER PRIMARY KEY,
@@ -181,15 +191,21 @@ func schemaV4Stmts() []string {
 		)`,
 		`CREATE TABLE runs (
 			id            INTEGER PRIMARY KEY,
-			kind          TEXT NOT NULL CHECK (kind IN ('index','sync')),
+			kind          TEXT NOT NULL CHECK (kind IN ('index','sync','restore')),
 			volume_id     INTEGER REFERENCES volumes(id),
+			destination   TEXT,
 			started_at_ns INTEGER NOT NULL,
 			ended_at_ns   INTEGER,
 			status        TEXT NOT NULL CHECK (status IN ('running','success','failed','partial')),
 			error         TEXT,
-			file_count    INTEGER NOT NULL DEFAULT 0
+			file_count    INTEGER NOT NULL DEFAULT 0,
+			CHECK (
+				(kind = 'index' AND destination IS NULL) OR
+				(kind IN ('sync','restore') AND destination IS NOT NULL AND destination != '')
+			)
 		)`,
 		`CREATE INDEX idx_runs_volume_started ON runs(volume_id, started_at_ns)`,
+		`CREATE INDEX idx_runs_destination ON runs(destination) WHERE destination IS NOT NULL`,
 		`CREATE TABLE files (
 			volume_id         INTEGER NOT NULL REFERENCES volumes(id),
 			path              TEXT NOT NULL,
@@ -325,6 +341,81 @@ func rebuildFilesAsV3(ctx context.Context, tx *sql.Tx) error {
 		}
 	}
 	return nil
+}
+
+// migrateV4ToV5 rebuilds the runs table to add the destination column,
+// widen the kind CHECK to include 'restore', and add the kind↔destination
+// coupling CHECK. Existing v4 rows are all kind='index' with a non-NULL
+// volume_id, so they carry over verbatim with destination = NULL.
+func migrateV4ToV5(ctx context.Context, db *sql.DB) error {
+	// Rebuild of a *parent* table referenced by FKs from another table.
+	// The standard SQLite recipe is: PRAGMA foreign_keys=OFF, rebuild,
+	// verify with foreign_key_check, then PRAGMA foreign_keys=ON. We pin a
+	// single Conn so the PRAGMA is guaranteed to apply to the same session
+	// that runs the migration transaction.
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire conn: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+		return fmt.Errorf("disable foreign keys: %w", err)
+	}
+	defer func() { _, _ = conn.ExecContext(ctx, `PRAGMA foreign_keys = ON`) }()
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`CREATE TABLE runs_v5 (
+			id            INTEGER PRIMARY KEY,
+			kind          TEXT NOT NULL CHECK (kind IN ('index','sync','restore')),
+			volume_id     INTEGER REFERENCES volumes(id),
+			destination   TEXT,
+			started_at_ns INTEGER NOT NULL,
+			ended_at_ns   INTEGER,
+			status        TEXT NOT NULL CHECK (status IN ('running','success','failed','partial')),
+			error         TEXT,
+			file_count    INTEGER NOT NULL DEFAULT 0,
+			CHECK (
+				(kind = 'index' AND destination IS NULL) OR
+				(kind IN ('sync','restore') AND destination IS NOT NULL AND destination != '')
+			)
+		)`,
+		`INSERT INTO runs_v5 (
+			id, kind, volume_id, destination,
+			started_at_ns, ended_at_ns, status, error, file_count
+		)
+		SELECT id, kind, volume_id, NULL,
+		       started_at_ns, ended_at_ns, status, error, file_count
+		FROM runs`,
+		`DROP TABLE runs`,
+		`ALTER TABLE runs_v5 RENAME TO runs`,
+		`CREATE INDEX idx_runs_volume_started ON runs(volume_id, started_at_ns)`,
+		`CREATE INDEX idx_runs_destination ON runs(destination) WHERE destination IS NOT NULL`,
+		`INSERT INTO schema_version (version) VALUES (5)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("rebuild runs: %w", err)
+		}
+	}
+	// foreign_key_check is the explicit verification step the SQLite docs
+	// require when rebuilding with FKs off: anything in violation surfaces
+	// here as a row, not at commit. With the run ids preserved by SELECT,
+	// existing references in files remain valid.
+	if rows, err := tx.QueryContext(ctx, `PRAGMA foreign_key_check`); err != nil {
+		return fmt.Errorf("foreign_key_check: %w", err)
+	} else {
+		defer rows.Close()
+		if rows.Next() {
+			return errors.New("v4→v5 left dangling FK references; refusing to commit")
+		}
+	}
+	return tx.Commit()
 }
 
 // migrateV3ToV4 widens the files PK from (volume_id, path) to

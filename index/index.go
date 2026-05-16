@@ -168,7 +168,7 @@ func (i *indexer) beginRun() error {
 	if i.opts.DryRun {
 		return nil
 	}
-	id, err := i.store.BeginRun(i.ctx, store.RunKindIndex, i.volumeID)
+	id, err := i.store.BeginRun(i.ctx, store.RunKindIndex, i.volumeID, "")
 	if err != nil {
 		return fmt.Errorf("begin run: %w", err)
 	}

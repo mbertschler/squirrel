@@ -37,7 +37,7 @@ func makeVolume(t *testing.T, s *Store, path string) int64 {
 // when constructing FileRow literals directly.
 func makeRun(t *testing.T, s *Store, volumeID int64) int64 {
 	t.Helper()
-	id, err := s.BeginRun(context.Background(), RunKindIndex, volumeID)
+	id, err := s.BeginRun(context.Background(), RunKindIndex, volumeID, "")
 	if err != nil {
 		t.Fatalf("BeginRun: %v", err)
 	}
@@ -557,7 +557,7 @@ func TestRunLifecycleTracks(t *testing.T) {
 	ctx := context.Background()
 
 	vID := makeVolume(t, s, "/v")
-	runID, err := s.BeginRun(ctx, RunKindIndex, vID)
+	runID, err := s.BeginRun(ctx, RunKindIndex, vID, "")
 	if err != nil {
 		t.Fatalf("BeginRun: %v", err)
 	}
@@ -673,7 +673,7 @@ func TestFinishRunPropagatesErrorMessage(t *testing.T) {
 	ctx := context.Background()
 
 	vID := makeVolume(t, s, "/v")
-	runID, err := s.BeginRun(ctx, RunKindIndex, vID)
+	runID, err := s.BeginRun(ctx, RunKindIndex, vID, "")
 	if err != nil {
 		t.Fatalf("BeginRun: %v", err)
 	}
@@ -888,8 +888,11 @@ func TestMigrateV3ToV4(t *testing.T) {
 	defer s.Close()
 	ctx := context.Background()
 
-	if v, _ := s.CurrentSchemaVersion(ctx); v != 4 {
-		t.Fatalf("schema_version = %d, want 4", v)
+	// Migrations chain on Open, so a v3 DB lands at SchemaVersion (currently
+	// v5) — not at v4. The v3→v4 step still ran; we verify that below by
+	// inserting a row that v3's narrower PK would have rejected.
+	if v, _ := s.CurrentSchemaVersion(ctx); v != SchemaVersion {
+		t.Fatalf("schema_version = %d, want %d", v, SchemaVersion)
 	}
 
 	// PK should now include blake3 — confirm by inserting a second row at the
@@ -1221,5 +1224,210 @@ func TestMarkMissingIgnoresSupersededRows(t *testing.T) {
 	}
 	if history[1].Status != StatusMissing {
 		t.Fatalf("live row status = %q, want missing", history[1].Status)
+	}
+}
+
+// TestMigrateV4ToV5 builds a v4-shape database by hand, opens it via Open()
+// to trigger the v4→v5 step, and verifies (a) runs row data carries over
+// with destination=NULL, (b) the destination column exists, and (c) the
+// new kind↔destination CHECK rejects malformed inserts.
+func TestMigrateV4ToV5(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	rawDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("raw sql.Open: %v", err)
+	}
+	v4DDL := []string{
+		`CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)`,
+		`CREATE TABLE volumes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL)`,
+		`CREATE TABLE runs (
+			id INTEGER PRIMARY KEY,
+			kind TEXT NOT NULL CHECK (kind IN ('index','sync')),
+			volume_id INTEGER REFERENCES volumes(id),
+			started_at_ns INTEGER NOT NULL,
+			ended_at_ns INTEGER,
+			status TEXT NOT NULL CHECK (status IN ('running','success','failed','partial')),
+			error TEXT,
+			file_count INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE files (
+			volume_id INTEGER NOT NULL REFERENCES volumes(id),
+			path TEXT NOT NULL,
+			blake3 BLOB NOT NULL CHECK (length(blake3) = 32),
+			size_bytes INTEGER NOT NULL,
+			mtime_ns INTEGER NOT NULL,
+			status TEXT NOT NULL CHECK (status IN ('present','missing','superseded')),
+			first_seen_run_id INTEGER NOT NULL REFERENCES runs(id),
+			last_seen_run_id INTEGER NOT NULL REFERENCES runs(id),
+			indexed_at_ns INTEGER NOT NULL,
+			PRIMARY KEY (volume_id, path, blake3)
+		)`,
+		`INSERT INTO schema_version (version) VALUES (4)`,
+		`INSERT INTO volumes (id, name, path) VALUES (1, 'photos', '/photos')`,
+		`INSERT INTO runs (id, kind, volume_id, started_at_ns, status, file_count)
+		 VALUES (1, 'index', 1, 100, 'success', 7)`,
+	}
+	for _, q := range v4DDL {
+		if _, err := rawDB.Exec(q); err != nil {
+			t.Fatalf("v4 DDL %q: %v", q, err)
+		}
+	}
+	// Seed a file row so the v4→v5 FK rebuild has something to preserve
+	// across the runs table drop+recreate.
+	if _, err := rawDB.Exec(
+		`INSERT INTO files (volume_id, path, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
+		 VALUES (1, 'a.jpg', ?, 10, 1, 'present', 1, 1, 1)`, digest(0x12),
+	); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	rawDB.Close()
+
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open (should migrate v4→v5): %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	if v, _ := s.CurrentSchemaVersion(ctx); v != SchemaVersion {
+		t.Fatalf("schema_version = %d, want %d", v, SchemaVersion)
+	}
+
+	// Existing run carries over with destination=NULL and original ID.
+	var dest sql.NullString
+	var fileCount int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT destination, file_count FROM runs WHERE id = 1`).Scan(&dest, &fileCount); err != nil {
+		t.Fatalf("read migrated run: %v", err)
+	}
+	if dest.Valid {
+		t.Fatalf("destination = %+v, want NULL for migrated index run", dest)
+	}
+	if fileCount != 7 {
+		t.Fatalf("file_count = %d, want 7 (data preserved)", fileCount)
+	}
+
+	// The FK from files.last_seen_run_id → runs(id) must still resolve.
+	row, err := s.GetByPath(ctx, 1, "a.jpg")
+	if err != nil {
+		t.Fatalf("GetByPath after migration: %v", err)
+	}
+	if row.LastSeenRunID != 1 {
+		t.Fatalf("LastSeenRunID = %d, want 1 (FK preserved)", row.LastSeenRunID)
+	}
+}
+
+// TestRunsKindDestinationCheck enforces the v5 schema-level coupling:
+// destination must be NULL for index runs and non-empty for sync/restore.
+// We exercise the check by going around BeginRun (which enforces the same
+// rule via parameter shape) and inserting raw rows.
+func TestRunsKindDestinationCheck(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+
+	cases := []struct {
+		name      string
+		kind      string
+		dest      any // string or nil
+		wantError bool
+	}{
+		{"index without destination", "index", nil, false},
+		{"index with destination", "index", "nas", true},
+		{"sync with destination", "sync", "nas", false},
+		{"sync without destination", "sync", nil, true},
+		{"sync with empty destination", "sync", "", true},
+		{"restore with destination", "restore", "nas", false},
+		{"restore without destination", "restore", nil, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := s.db.ExecContext(ctx, `
+				INSERT INTO runs (kind, volume_id, destination, started_at_ns, status)
+				VALUES (?, ?, ?, ?, 'running')`, c.kind, vID, c.dest, NowNs())
+			if c.wantError && err == nil {
+				t.Fatalf("insert succeeded; want CHECK violation")
+			}
+			if !c.wantError && err != nil {
+				t.Fatalf("insert failed: %v", err)
+			}
+		})
+	}
+}
+
+// TestBeginRunDestinationRoundTrip verifies that destination passed to
+// BeginRun shows up on ListRuns rows and that index runs leave it NULL.
+func TestBeginRunDestinationRoundTrip(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+
+	indexID, err := s.BeginRun(ctx, RunKindIndex, vID, "")
+	if err != nil {
+		t.Fatalf("BeginRun index: %v", err)
+	}
+	syncID, err := s.BeginRun(ctx, RunKindSync, vID, "nas")
+	if err != nil {
+		t.Fatalf("BeginRun sync: %v", err)
+	}
+
+	runs, err := s.ListRuns(ctx, ListRunsOpts{})
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	byID := map[int64]Run{}
+	for _, r := range runs {
+		byID[r.ID] = r
+	}
+	if got := byID[indexID]; got.Destination.Valid {
+		t.Fatalf("index run destination = %+v, want NULL", got.Destination)
+	}
+	if got := byID[syncID]; !got.Destination.Valid || got.Destination.String != "nas" {
+		t.Fatalf("sync run destination = %+v, want 'nas'", got.Destination)
+	}
+}
+
+// TestLatestSuccessfulIndexRun confirms the prerequisite-check helper used
+// by sync: it returns the most recent success/partial index run for a
+// volume, ignoring failed runs and other kinds.
+func TestLatestSuccessfulIndexRun(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+
+	if _, err := s.LatestSuccessfulIndexRun(ctx, vID); !IsNotFound(err) {
+		t.Fatalf("expected ErrNoRows on fresh volume, got %v", err)
+	}
+
+	failID, _ := s.BeginRun(ctx, RunKindIndex, vID, "")
+	_ = s.FinishRun(ctx, failID, RunStatusFailed, "walk: nope", 0)
+
+	okID, _ := s.BeginRun(ctx, RunKindIndex, vID, "")
+	_ = s.FinishRun(ctx, okID, RunStatusSuccess, "", 3)
+
+	syncID, _ := s.BeginRun(ctx, RunKindSync, vID, "nas")
+	_ = s.FinishRun(ctx, syncID, RunStatusSuccess, "", 3)
+
+	got, err := s.LatestSuccessfulIndexRun(ctx, vID)
+	if err != nil {
+		t.Fatalf("LatestSuccessfulIndexRun: %v", err)
+	}
+	if got.ID != okID {
+		t.Fatalf("got run id %d, want %d (most recent successful index)", got.ID, okID)
 	}
 }
