@@ -207,9 +207,23 @@ func migrateV2ToV3(ctx context.Context, db *sql.DB) error {
 	}
 	defer tx.Rollback()
 
-	now := time.Now().UnixNano()
+	if err := createV3Runs(ctx, tx); err != nil {
+		return err
+	}
+	if err := seedImportRunsForExistingVolumes(ctx, tx); err != nil {
+		return err
+	}
+	if err := rebuildFilesAsV3(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (3)`); err != nil {
+		return fmt.Errorf("record schema v3: %w", err)
+	}
+	return tx.Commit()
+}
 
-	createRuns := []string{
+func createV3Runs(ctx context.Context, tx *sql.Tx) error {
+	stmts := []string{
 		`CREATE TABLE runs (
 			id            INTEGER PRIMARY KEY,
 			kind          TEXT NOT NULL CHECK (kind IN ('index','sync')),
@@ -222,24 +236,35 @@ func migrateV2ToV3(ctx context.Context, db *sql.DB) error {
 		)`,
 		`CREATE INDEX idx_runs_volume_started ON runs(volume_id, started_at_ns)`,
 	}
-	for _, q := range createRuns {
+	for _, q := range stmts {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("create runs: %w", err)
 		}
 	}
+	return nil
+}
 
-	// One synthetic successful run per existing volume. Per-row history wasn't
-	// recorded in v2 so we collapse it into a single "import" point.
-	if _, err := tx.ExecContext(ctx, `
+// seedImportRunsForExistingVolumes inserts one synthetic successful 'index'
+// run per existing volume. Per-row history wasn't recorded in v2 so we
+// collapse it into a single import point pinned to migration time.
+func seedImportRunsForExistingVolumes(ctx context.Context, tx *sql.Tx) error {
+	now := time.Now().UnixNano()
+	_, err := tx.ExecContext(ctx, `
 		INSERT INTO runs (kind, volume_id, started_at_ns, ended_at_ns, status, file_count)
 		SELECT 'index', v.id, ?, ?, 'success',
 		       (SELECT COUNT(*) FROM files f WHERE f.volume_id = v.id)
 		FROM volumes v
-	`, now, now); err != nil {
+	`, now, now)
+	if err != nil {
 		return fmt.Errorf("seed import runs: %w", err)
 	}
+	return nil
+}
 
-	rebuild := []string{
+// rebuildFilesAsV3 creates the v3 files table, copies every v2 row into it
+// joined against the per-volume synthetic run, and drops the old table.
+func rebuildFilesAsV3(ctx context.Context, tx *sql.Tx) error {
+	stmts := []string{
 		`CREATE TABLE files_v3 (
 			volume_id         INTEGER NOT NULL REFERENCES volumes(id),
 			path              TEXT NOT NULL,
@@ -264,14 +289,13 @@ func migrateV2ToV3(ctx context.Context, db *sql.DB) error {
 		`ALTER TABLE files_v3 RENAME TO files`,
 		`CREATE INDEX idx_files_blake3 ON files(blake3, volume_id, path)`,
 		`CREATE INDEX idx_files_missing ON files(volume_id, path) WHERE status = 'missing'`,
-		`INSERT INTO schema_version (version) VALUES (3)`,
 	}
-	for _, q := range rebuild {
+	for _, q := range stmts {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("rebuild files: %w", err)
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 // --- Volume APIs ---

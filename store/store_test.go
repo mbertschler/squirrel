@@ -608,6 +608,50 @@ func TestRunLifecycleTracks(t *testing.T) {
 	}
 }
 
+// TestListRunsForVolumeScopedAndOrdered verifies that ListRunsForVolume
+// returns only the runs against the requested volume and orders them
+// ascending by id (i.e. by start time).
+func TestListRunsForVolumeScopedAndOrdered(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	a := makeVolume(t, s, "/a")
+	b := makeVolume(t, s, "/b")
+	r1 := makeRun(t, s, a)
+	r2 := makeRun(t, s, b)
+	r3 := makeRun(t, s, a)
+	if err := s.FinishRun(ctx, r2, RunStatusSuccess, "", 0); err != nil {
+		t.Fatalf("FinishRun r2: %v", err)
+	}
+
+	runs, err := s.ListRunsForVolume(ctx, a)
+	if err != nil {
+		t.Fatalf("ListRunsForVolume(a): %v", err)
+	}
+	if len(runs) != 2 || runs[0].ID != r1 || runs[1].ID != r3 {
+		t.Fatalf("got runs %+v, want ids [%d %d] in order", runs, r1, r3)
+	}
+	if runs[0].EndedAtNs.Valid {
+		t.Fatalf("r1 should still be in-flight, got ended_at = %+v", runs[0].EndedAtNs)
+	}
+	if runs[0].Status != RunStatusRunning {
+		t.Fatalf("r1 status = %q, want %q", runs[0].Status, RunStatusRunning)
+	}
+
+	other, err := s.ListRunsForVolume(ctx, b)
+	if err != nil {
+		t.Fatalf("ListRunsForVolume(b): %v", err)
+	}
+	if len(other) != 1 || other[0].ID != r2 {
+		t.Fatalf("got runs %+v, want single id %d", other, r2)
+	}
+}
+
 // TestFinishRunPropagatesErrorMessage verifies that a non-empty error message
 // passed to FinishRun lands in the runs.error column.
 func TestFinishRunPropagatesErrorMessage(t *testing.T) {

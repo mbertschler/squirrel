@@ -65,7 +65,7 @@ type resultItem struct {
 // then referenced by ID on every row. Each non-dry-run invocation creates a
 // row in the runs table that is finalised to 'success' / 'partial' / 'failed'
 // before Index returns.
-func Index(ctx context.Context, s *store.Store, root string, opts Options) (Report, error) {
+func Index(ctx context.Context, s *store.Store, root string, opts Options) (report Report, err error) {
 	idx, err := newIndexer(ctx, s, root, opts)
 	if err != nil {
 		return Report{}, err
@@ -73,24 +73,20 @@ func Index(ctx context.Context, s *store.Store, root string, opts Options) (Repo
 	if err := idx.beginRun(); err != nil {
 		return Report{}, err
 	}
+	defer func() { idx.finishRun(&report, err) }()
 
 	idx.startWorkers()
 	idx.startWalker()
 
-	report, err := idx.collect()
-	if err != nil {
-		idx.finishRun(&report, err)
+	if report, err = idx.collect(); err != nil {
 		return report, err
 	}
-	if err := idx.waitForWalker(); err != nil {
-		idx.finishRun(&report, err)
+	if err = idx.waitForWalker(); err != nil {
 		return report, err
 	}
-	if err := idx.finalizeMissing(&report); err != nil {
-		idx.finishRun(&report, err)
+	if err = idx.finalizeMissing(&report); err != nil {
 		return report, err
 	}
-	idx.finishRun(&report, nil)
 	return report, nil
 }
 
