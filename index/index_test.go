@@ -34,6 +34,17 @@ func writeFile(t *testing.T, path, content string) {
 	}
 }
 
+// volumeFor resolves the volume for an absolute path, failing the test if
+// the volume hasn't been created by the indexer yet.
+func volumeFor(t *testing.T, s *store.Store, absPath string) store.Volume {
+	t.Helper()
+	v, err := s.GetVolumeByPath(context.Background(), absPath)
+	if err != nil {
+		t.Fatalf("GetVolumeByPath(%q): %v", absPath, err)
+	}
+	return v
+}
+
 func TestFullIndex(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "a.txt"), "hello")
@@ -52,17 +63,18 @@ func TestFullIndex(t *testing.T) {
 	}
 
 	absRoot, _ := filepath.Abs(root)
+	vol := volumeFor(t, s, absRoot)
 
 	// All three rows present.
-	a, err := s.GetByPath(ctx, absRoot, "a.txt")
+	a, err := s.GetByPath(ctx, vol.ID, "a.txt")
 	if err != nil {
 		t.Fatalf("GetByPath a: %v", err)
 	}
 	if a.Status != store.StatusPresent {
 		t.Fatalf("a.Status = %s", a.Status)
 	}
-	if a.Root != absRoot {
-		t.Fatalf("a.Root = %q, want %q", a.Root, absRoot)
+	if a.VolumeID != vol.ID {
+		t.Fatalf("a.VolumeID = %d, want %d", a.VolumeID, vol.ID)
 	}
 	if a.Path != "a.txt" {
 		t.Fatalf("a.Path = %q, want %q", a.Path, "a.txt")
@@ -79,7 +91,7 @@ func TestFullIndex(t *testing.T) {
 	if len(dups) != 2 {
 		t.Fatalf("dups = %d, want 2", len(dups))
 	}
-	if !bytes.Equal(dups[0].Blake3, dups[1].Blake3) {
+	if !bytes.Equal(dups[0].File.Blake3, dups[1].File.Blake3) {
 		t.Fatalf("dup blake3 digests differ: %+v", dups)
 	}
 }
@@ -143,9 +155,10 @@ func TestIncrementalAddModifyDelete(t *testing.T) {
 	}
 
 	absRoot, _ := filepath.Abs(root)
+	vol := volumeFor(t, s, absRoot)
 
 	// b should be present in DB but flagged missing.
-	row, err := s.GetByPath(ctx, absRoot, "b.txt")
+	row, err := s.GetByPath(ctx, vol.ID, "b.txt")
 	if err != nil {
 		t.Fatalf("GetByPath b: %v", err)
 	}
@@ -157,7 +170,7 @@ func TestIncrementalAddModifyDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListMissing: %v", err)
 	}
-	if len(missing) != 1 || missing[0].Path != "b.txt" || missing[0].Root != absRoot {
+	if len(missing) != 1 || missing[0].File.Path != "b.txt" || missing[0].Volume.Path != absRoot {
 		t.Fatalf("ListMissing = %+v", missing)
 	}
 }
@@ -178,9 +191,9 @@ func TestDryRunDoesNotWrite(t *testing.T) {
 	}
 
 	absRoot, _ := filepath.Abs(root)
-	// DB should be empty.
-	if _, err := s.GetByPath(ctx, absRoot, "a.txt"); !store.IsNotFound(err) {
-		t.Fatalf("expected not found after dry-run, got err=%v", err)
+	// DB should be empty — no volume registered, no files written.
+	if _, err := s.GetVolumeByPath(ctx, absRoot); !store.IsNotFound(err) {
+		t.Fatalf("dry-run created a volume row: %v", err)
 	}
 }
 
@@ -197,7 +210,8 @@ func TestQueryByHash(t *testing.T) {
 	}
 
 	absRoot, _ := filepath.Abs(root)
-	x, err := s.GetByPath(ctx, absRoot, "x")
+	vol := volumeFor(t, s, absRoot)
+	x, err := s.GetByPath(ctx, vol.ID, "x")
 	if err != nil {
 		t.Fatalf("GetByPath x: %v", err)
 	}
@@ -270,7 +284,8 @@ func TestMissingFileRestored(t *testing.T) {
 		t.Fatalf("second Index: %v", err)
 	}
 	absRoot, _ := filepath.Abs(root)
-	row, err := s.GetByPath(ctx, absRoot, "a.txt")
+	vol := volumeFor(t, s, absRoot)
+	row, err := s.GetByPath(ctx, vol.ID, "a.txt")
 	if err != nil {
 		t.Fatalf("GetByPath after delete: %v", err)
 	}
@@ -289,7 +304,7 @@ func TestMissingFileRestored(t *testing.T) {
 	if rep.Modified != 1 {
 		t.Fatalf("restore report = %+v, want Modified=1", rep)
 	}
-	row, err = s.GetByPath(ctx, absRoot, "a.txt")
+	row, err = s.GetByPath(ctx, vol.ID, "a.txt")
 	if err != nil {
 		t.Fatalf("GetByPath after restore: %v", err)
 	}
@@ -380,13 +395,14 @@ func TestWorkerCountDoesNotAffectResult(t *testing.T) {
 			t.Fatalf("workers=%d: Added=%d, want 5", workers, rep.Added)
 		}
 		absRoot, _ := filepath.Abs(root)
-		paths, err := s.ListPresentPathsUnder(ctx, absRoot)
+		vol := volumeFor(t, s, absRoot)
+		paths, err := s.ListPresentPathsUnder(ctx, vol.ID)
 		if err != nil {
 			t.Fatalf("ListPresentPathsUnder: %v", err)
 		}
 		out := make(map[string]string, len(paths))
 		for p := range paths {
-			row, err := s.GetByPath(ctx, absRoot, p)
+			row, err := s.GetByPath(ctx, vol.ID, p)
 			if err != nil {
 				t.Fatalf("GetByPath %s: %v", p, err)
 			}
@@ -435,7 +451,8 @@ func TestDryRunReportsMissingCount(t *testing.T) {
 	}
 
 	absRoot, _ := filepath.Abs(root)
-	row, err := s.GetByPath(ctx, absRoot, "b.txt")
+	vol := volumeFor(t, s, absRoot)
+	row, err := s.GetByPath(ctx, vol.ID, "b.txt")
 	if err != nil {
 		t.Fatalf("GetByPath b after dry-run: %v", err)
 	}
