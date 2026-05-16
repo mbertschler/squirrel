@@ -82,7 +82,7 @@ func TestCLISyncHappyPath(t *testing.T) {
 	writeTestFile(t, filepath.Join(f.volumeDir, "a.txt"), "alpha")
 	writeTestFile(t, filepath.Join(f.volumeDir, "b.txt"), "beta")
 
-	runCLI(t, "--config", f.configPath, "index", f.volumeDir)
+	runCLI(t, "--config", f.configPath, "index", f.volumeName)
 	out := runCLI(t, "--config", f.configPath, "sync", "pics")
 	if !strings.Contains(out, "status=success") {
 		t.Fatalf("sync did not report success: %s", out)
@@ -122,7 +122,7 @@ func TestCLISyncRunsRowVisibleViaRunsCommand(t *testing.T) {
 	f := writeSyncFixture(t)
 	writeTestFile(t, filepath.Join(f.volumeDir, "a.txt"), "alpha")
 
-	runCLI(t, "--config", f.configPath, "index", f.volumeDir)
+	runCLI(t, "--config", f.configPath, "index", f.volumeName)
 	runCLI(t, "--config", f.configPath, "sync", "pics")
 
 	// `squirrel runs` should now show one sync row with destination=scratch.

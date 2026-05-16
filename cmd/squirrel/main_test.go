@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -58,6 +60,41 @@ func writeTestFile(t *testing.T, path, content string) {
 	}
 }
 
+// configFixture is the result of writeConfigFor: paths the test can pass
+// via --config to the CLI, plus the resolved DB path it also wrote into
+// the config so tests don't need to also pass --db.
+type configFixture struct {
+	configPath string
+	dbPath     string
+}
+
+// writeConfigFor builds a minimal squirrel config containing the given
+// volumes (name → absolute path) and a temp DB path. Used by the existing
+// CLI tests that previously relied on `squirrel index <path>` — the new
+// CLI takes volume names, so the volumes must exist in config first.
+func writeConfigFor(t *testing.T, volumes map[string]string) configFixture {
+	t.Helper()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "index.db")
+	configPath := filepath.Join(dir, "config.toml")
+
+	names := make([]string, 0, len(volumes))
+	for n := range volumes {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+
+	var body strings.Builder
+	fmt.Fprintf(&body, "db = %q\n\n", dbPath)
+	for _, n := range names {
+		fmt.Fprintf(&body, "[volumes.%s]\npath = %q\n\n", n, volumes[n])
+	}
+	if err := os.WriteFile(configPath, []byte(body.String()), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return configFixture{configPath: configPath, dbPath: dbPath}
+}
+
 func extractField(t *testing.T, out, prefix string) string {
 	t.Helper()
 	for line := range strings.SplitSeq(out, "\n") {
@@ -79,30 +116,46 @@ func TestCLIIndexAndQueryRoundTrip(t *testing.T) {
 	writeTestFile(t, filepath.Join(src, "b.txt"), "world")
 	writeTestFile(t, filepath.Join(src, "c.txt"), "world") // duplicate of b
 
-	db := filepath.Join(tmp, "test.db")
+	f := writeConfigFor(t, map[string]string{"src": src})
 
-	out := runCLI(t, "index", "--db", db, src)
+	out := runCLI(t, "--config", f.configPath, "index", "src")
 	if !strings.Contains(out, "added=3") {
 		t.Fatalf("index output missing added=3: %s", out)
 	}
 
 	// query by path returns blake3 line; pull the hex out.
-	out = runCLI(t, "query", "--db", db, filepath.Join(src, "a.txt"))
+	out = runCLI(t, "--config", f.configPath, "query", filepath.Join(src, "a.txt"))
 	hex := extractField(t, out, "blake3:")
 	if len(hex) != 64 {
 		t.Fatalf("blake3 hex length = %d, want 64: %q", len(hex), hex)
 	}
 
 	// query by hex round-trips back to a row with the same path.
-	out = runCLI(t, "query", "--db", db, hex)
+	out = runCLI(t, "--config", f.configPath, "query", hex)
 	if !strings.Contains(out, filepath.Join(src, "a.txt")) {
 		t.Fatalf("hex lookup missing path: %s", out)
 	}
 
 	// duplicates lists b and c under one hex header.
-	out = runCLI(t, "query", "--db", db, "--duplicates")
+	out = runCLI(t, "--config", f.configPath, "query", "--duplicates")
 	if !strings.Contains(out, filepath.Join(src, "b.txt")) ||
 		!strings.Contains(out, filepath.Join(src, "c.txt")) {
 		t.Fatalf("duplicates missing expected paths:\n%s", out)
+	}
+}
+
+func TestCLIIndexUnknownVolume(t *testing.T) {
+	f := writeConfigFor(t, map[string]string{"declared": t.TempDir()})
+	err, _ := runCLIExpectErr(t, "--config", f.configPath, "index", "missing")
+	if !strings.Contains(err.Error(), `unknown volume "missing"`) {
+		t.Fatalf("expected unknown-volume error, got %v", err)
+	}
+}
+
+func TestCLIIndexRequiresConfig(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "no-config.toml")
+	err, _ := runCLIExpectErr(t, "--config", missing, "index", "src")
+	if !strings.Contains(err.Error(), "no config at") {
+		t.Fatalf("expected missing-config error, got %v", err)
 	}
 }
