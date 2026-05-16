@@ -531,6 +531,70 @@ func TestDryRunDoesNotRecordRun(t *testing.T) {
 	}
 }
 
+func TestRunStatus(t *testing.T) {
+	boom := fmt.Errorf("boom")
+	cases := []struct {
+		name      string
+		fatalErr  error
+		errors    int
+		wantState string
+		wantMsg   string
+	}{
+		{"clean", nil, 0, store.RunStatusSuccess, ""},
+		{"per-file errors only", nil, 2, store.RunStatusPartial, ""},
+		{"fatal alone", boom, 0, store.RunStatusFailed, "boom"},
+		{"fatal trumps per-file", boom, 3, store.RunStatusFailed, "boom"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, msg := runStatus(&Report{Errors: c.errors}, c.fatalErr)
+			if got != c.wantState {
+				t.Fatalf("status = %q, want %q", got, c.wantState)
+			}
+			if msg != c.wantMsg {
+				t.Fatalf("msg = %q, want %q", msg, c.wantMsg)
+			}
+		})
+	}
+}
+
+// TestIndexWalkErrorReachesRun verifies that a directory we can't descend
+// into (chmod 0o000) reaches sendErr via filepath.WalkDir's error callback
+// and that the resulting run still finishes as 'partial' (the walk completed
+// for the parts we could see).
+func TestIndexWalkErrorReachesRun(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "visible.txt"), "hello")
+	hidden := filepath.Join(root, "no-entry")
+	if err := os.MkdirAll(hidden, 0o755); err != nil {
+		t.Fatalf("mkdir hidden: %v", err)
+	}
+	writeFile(t, filepath.Join(hidden, "inside.txt"), "secret")
+	if err := os.Chmod(hidden, 0o000); err != nil {
+		t.Skipf("chmod 000 on dir not supported: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(hidden, 0o755) })
+
+	s := setupStore(t)
+	ctx := context.Background()
+	rep, err := Index(ctx, s, root, Options{})
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	if rep.Errors == 0 {
+		t.Fatalf("expected at least one per-entry error from blocked dir, got %+v", rep)
+	}
+	absRoot, _ := filepath.Abs(root)
+	vol := volumeFor(t, s, absRoot)
+	runs, err := s.ListRunsForVolume(ctx, vol.ID)
+	if err != nil {
+		t.Fatalf("ListRunsForVolume: %v", err)
+	}
+	if len(runs) != 1 || runs[0].Status != store.RunStatusPartial {
+		t.Fatalf("got runs %+v, want one partial run", runs)
+	}
+}
+
 func TestDryRunReportsMissingCount(t *testing.T) {
 	root := t.TempDir()
 	a := filepath.Join(root, "a.txt")
