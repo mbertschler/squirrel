@@ -14,7 +14,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 2
+const SchemaVersion = 3
 
 type Store struct {
 	db *sql.DB
@@ -30,16 +30,19 @@ type Volume struct {
 }
 
 // FileRow is a single indexed file. Path is stored relative to the volume's
-// path. VolumeID references volumes(id).
+// path. VolumeID references volumes(id). FirstSeenRunID is the run that first
+// inserted this row and is never overwritten on subsequent updates;
+// LastSeenRunID advances on every observation.
 type FileRow struct {
-	VolumeID     int64
-	Path         string
-	Blake3       []byte // raw 32-byte BLAKE3-256 digest
-	SizeBytes    int64
-	MtimeNs      int64
-	Status       string
-	LastSeenAtNs int64
-	IndexedAtNs  int64
+	VolumeID       int64
+	Path           string
+	Blake3         []byte // raw 32-byte BLAKE3-256 digest
+	SizeBytes      int64
+	MtimeNs        int64
+	Status         string
+	FirstSeenRunID int64
+	LastSeenRunID  int64
+	IndexedAtNs    int64
 }
 
 // FileWithVolume bundles a file row with its volume, returned by read APIs
@@ -52,6 +55,22 @@ type FileWithVolume struct {
 const (
 	StatusPresent = "present"
 	StatusMissing = "missing"
+)
+
+// Run kinds. The runs.volume_id column is nullable so a future sync run can
+// span volumes; index runs are always scoped to a single volume.
+const (
+	RunKindIndex = "index"
+	RunKindSync  = "sync"
+)
+
+// Run statuses. A run begins in 'running' and is moved to a terminal state by
+// FinishRun. 'partial' means the walk completed but some files errored.
+const (
+	RunStatusRunning = "running"
+	RunStatusSuccess = "success"
+	RunStatusFailed  = "failed"
+	RunStatusPartial = "partial"
 )
 
 // Open opens (or creates) the SQLite database at the given filesystem path
@@ -99,39 +118,72 @@ func (s *Store) migrate(ctx context.Context) error {
 	if current > SchemaVersion {
 		return fmt.Errorf("database schema version %d is newer than binary version %d; upgrade the binary", current, SchemaVersion)
 	}
-	if current > 0 && current < SchemaVersion {
-		return fmt.Errorf("database schema version %d is no longer supported (binary expects v%d); delete the database and re-index", current, SchemaVersion)
-	}
-	if current == 0 {
-		if err := applyV2(ctx, s.db); err != nil {
-			return fmt.Errorf("apply schema v2: %w", err)
+	switch current {
+	case 0:
+		if err := applyV3(ctx, s.db); err != nil {
+			return fmt.Errorf("apply schema v3: %w", err)
 		}
+	case 1:
+		return fmt.Errorf("database schema version 1 is no longer supported (binary expects v%d); delete the database and re-index", SchemaVersion)
+	case 2:
+		if err := migrateV2ToV3(ctx, s.db); err != nil {
+			return fmt.Errorf("migrate schema v2→v3: %w", err)
+		}
+	case SchemaVersion:
+		// up to date
 	}
 	return nil
 }
 
-func applyV2(ctx context.Context, db *sql.DB) error {
+func applyV3(ctx context.Context, db *sql.DB) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	stmts := []string{
+	for _, q := range schemaV3Stmts() {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("exec %q: %w", q, err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (3)`); err != nil {
+		return fmt.Errorf("record schema v3: %w", err)
+	}
+	return tx.Commit()
+}
+
+// schemaV3Stmts returns the DDL for a fresh v3 database (no data). The
+// migration path reuses the runs/index definitions but rebuilds files via a
+// temporary table.
+func schemaV3Stmts() []string {
+	return []string{
 		`CREATE TABLE volumes (
 			id   INTEGER PRIMARY KEY,
 			name TEXT NOT NULL UNIQUE,
 			path TEXT NOT NULL
 		)`,
+		`CREATE TABLE runs (
+			id            INTEGER PRIMARY KEY,
+			kind          TEXT NOT NULL CHECK (kind IN ('index','sync')),
+			volume_id     INTEGER REFERENCES volumes(id),
+			started_at_ns INTEGER NOT NULL,
+			ended_at_ns   INTEGER,
+			status        TEXT NOT NULL CHECK (status IN ('running','success','failed','partial')),
+			error         TEXT,
+			file_count    INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX idx_runs_volume_started ON runs(volume_id, started_at_ns)`,
 		`CREATE TABLE files (
-			volume_id     INTEGER NOT NULL REFERENCES volumes(id),
-			path          TEXT NOT NULL,
-			blake3        BLOB NOT NULL CHECK (length(blake3) = 32),
-			size_bytes    INTEGER NOT NULL,
-			mtime_ns      INTEGER NOT NULL,
-			status        TEXT NOT NULL CHECK (status IN ('present','missing')),
-			last_seen_at_ns INTEGER NOT NULL,
-			indexed_at_ns INTEGER NOT NULL,
+			volume_id         INTEGER NOT NULL REFERENCES volumes(id),
+			path              TEXT NOT NULL,
+			blake3            BLOB NOT NULL CHECK (length(blake3) = 32),
+			size_bytes        INTEGER NOT NULL,
+			mtime_ns          INTEGER NOT NULL,
+			status            TEXT NOT NULL CHECK (status IN ('present','missing')),
+			first_seen_run_id INTEGER NOT NULL REFERENCES runs(id),
+			last_seen_run_id  INTEGER NOT NULL REFERENCES runs(id),
+			indexed_at_ns     INTEGER NOT NULL,
 			PRIMARY KEY (volume_id, path)
 		)`,
 		// Covering index for blake3 lookups and cross-volume duplicate detection.
@@ -139,14 +191,111 @@ func applyV2(ctx context.Context, db *sql.DB) error {
 		// Partial index: 'missing' is the rare/selective state. 'present' covers
 		// ~all rows and an index there would only inflate writes.
 		`CREATE INDEX idx_files_missing ON files(volume_id, path) WHERE status = 'missing'`,
-		`INSERT INTO schema_version (version) VALUES (2)`,
+	}
+}
+
+// migrateV2ToV3 upgrades an existing v2 database. It synthesizes one
+// successful 'index' run per existing volume to stand in for the history we
+// don't have, then rebuilds the files table with first_seen_run_id and
+// last_seen_run_id columns referencing those runs. The drop of
+// last_seen_at_ns is done via table rebuild (cleaner than ALTER ... DROP
+// COLUMN, which requires SQLite 3.35+ and would leave dangling indices).
+func migrateV2ToV3(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := createV3Runs(ctx, tx); err != nil {
+		return err
+	}
+	if err := seedImportRunsForExistingVolumes(ctx, tx); err != nil {
+		return err
+	}
+	if err := rebuildFilesAsV3(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (3)`); err != nil {
+		return fmt.Errorf("record schema v3: %w", err)
+	}
+	return tx.Commit()
+}
+
+func createV3Runs(ctx context.Context, tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE runs (
+			id            INTEGER PRIMARY KEY,
+			kind          TEXT NOT NULL CHECK (kind IN ('index','sync')),
+			volume_id     INTEGER REFERENCES volumes(id),
+			started_at_ns INTEGER NOT NULL,
+			ended_at_ns   INTEGER,
+			status        TEXT NOT NULL CHECK (status IN ('running','success','failed','partial')),
+			error         TEXT,
+			file_count    INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX idx_runs_volume_started ON runs(volume_id, started_at_ns)`,
 	}
 	for _, q := range stmts {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
-			return fmt.Errorf("exec %q: %w", q, err)
+			return fmt.Errorf("create runs: %w", err)
 		}
 	}
-	return tx.Commit()
+	return nil
+}
+
+// seedImportRunsForExistingVolumes inserts one synthetic successful 'index'
+// run per existing volume. Per-row history wasn't recorded in v2 so we
+// collapse it into a single import point pinned to migration time.
+func seedImportRunsForExistingVolumes(ctx context.Context, tx *sql.Tx) error {
+	now := time.Now().UnixNano()
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO runs (kind, volume_id, started_at_ns, ended_at_ns, status, file_count)
+		SELECT 'index', v.id, ?, ?, 'success',
+		       (SELECT COUNT(*) FROM files f WHERE f.volume_id = v.id)
+		FROM volumes v
+	`, now, now)
+	if err != nil {
+		return fmt.Errorf("seed import runs: %w", err)
+	}
+	return nil
+}
+
+// rebuildFilesAsV3 creates the v3 files table, copies every v2 row into it
+// joined against the per-volume synthetic run, and drops the old table.
+func rebuildFilesAsV3(ctx context.Context, tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE files_v3 (
+			volume_id         INTEGER NOT NULL REFERENCES volumes(id),
+			path              TEXT NOT NULL,
+			blake3            BLOB NOT NULL CHECK (length(blake3) = 32),
+			size_bytes        INTEGER NOT NULL,
+			mtime_ns          INTEGER NOT NULL,
+			status            TEXT NOT NULL CHECK (status IN ('present','missing')),
+			first_seen_run_id INTEGER NOT NULL REFERENCES runs(id),
+			last_seen_run_id  INTEGER NOT NULL REFERENCES runs(id),
+			indexed_at_ns     INTEGER NOT NULL,
+			PRIMARY KEY (volume_id, path)
+		)`,
+		`INSERT INTO files_v3 (
+			volume_id, path, blake3, size_bytes, mtime_ns, status,
+			first_seen_run_id, last_seen_run_id, indexed_at_ns
+		)
+		SELECT f.volume_id, f.path, f.blake3, f.size_bytes, f.mtime_ns, f.status,
+		       r.id, r.id, f.indexed_at_ns
+		FROM files f
+		JOIN runs r ON r.volume_id = f.volume_id`,
+		`DROP TABLE files`,
+		`ALTER TABLE files_v3 RENAME TO files`,
+		`CREATE INDEX idx_files_blake3 ON files(blake3, volume_id, path)`,
+		`CREATE INDEX idx_files_missing ON files(volume_id, path) WHERE status = 'missing'`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("rebuild files: %w", err)
+		}
+	}
+	return nil
 }
 
 // --- Volume APIs ---
@@ -236,7 +385,7 @@ func (s *Store) ListVolumes(ctx context.Context) ([]Volume, error) {
 
 // --- File APIs ---
 
-const fileColumns = `volume_id, path, blake3, size_bytes, mtime_ns, status, last_seen_at_ns, indexed_at_ns`
+const fileColumns = `volume_id, path, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns`
 
 // GetByPath returns the row for (volumeID, relPath) or sql.ErrNoRows.
 func (s *Store) GetByPath(ctx context.Context, volumeID int64, relPath string) (FileRow, error) {
@@ -303,37 +452,46 @@ func (s *Store) GetByBlake3(ctx context.Context, digest []byte) ([]FileWithVolum
 	return collectJoined(rows)
 }
 
-// Upsert inserts or updates a file row.
+// Upsert inserts or updates a file row. On insert, first_seen_run_id is set
+// from the row; on conflict it is left untouched so the original first-seen
+// run is preserved across re-observations.
 func (s *Store) Upsert(ctx context.Context, r FileRow) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO files (volume_id, path, blake3, size_bytes, mtime_ns, status, last_seen_at_ns, indexed_at_ns)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO files (volume_id, path, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(volume_id, path) DO UPDATE SET
 			blake3 = excluded.blake3,
 			size_bytes = excluded.size_bytes,
 			mtime_ns = excluded.mtime_ns,
 			status = excluded.status,
-			last_seen_at_ns = excluded.last_seen_at_ns,
+			last_seen_run_id = excluded.last_seen_run_id,
 			indexed_at_ns = excluded.indexed_at_ns
-	`, r.VolumeID, r.Path, r.Blake3, r.SizeBytes, r.MtimeNs, r.Status, r.LastSeenAtNs, r.IndexedAtNs)
+	`, r.VolumeID, r.Path, r.Blake3, r.SizeBytes, r.MtimeNs, r.Status, r.FirstSeenRunID, r.LastSeenRunID, r.IndexedAtNs)
 	return err
 }
 
-// TouchSeen updates last_seen_at_ns and status='present' for (volumeID, relPath).
-func (s *Store) TouchSeen(ctx context.Context, volumeID int64, relPath string, lastSeenAtNs int64) error {
+// TouchSeen sets last_seen_run_id and flips status to 'present' for
+// (volumeID, relPath). first_seen_run_id is never modified.
+func (s *Store) TouchSeen(ctx context.Context, volumeID int64, relPath string, runID int64) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE files SET last_seen_at_ns = ?, status = 'present' WHERE volume_id = ? AND path = ?`,
-		lastSeenAtNs, volumeID, relPath)
+		`UPDATE files SET last_seen_run_id = ?, status = 'present' WHERE volume_id = ? AND path = ?`,
+		runID, volumeID, relPath)
 	return err
 }
 
-// MarkMissing flips every row in the given volume with last_seen_at_ns < cutoffNs
-// and status='present' to status='missing'. Returns the number of rows changed.
-func (s *Store) MarkMissing(ctx context.Context, volumeID int64, cutoffNs int64) (int64, error) {
+// MarkMissing flips every row in the given volume that was not touched by the
+// given run (last_seen_run_id != currentRunID) and is currently 'present' to
+// 'missing'. The caller is responsible for only invoking this after the run
+// has fully scanned the volume: any path the run failed to visit (per-file
+// error, context cancellation, fatal walk failure) will look "missing" to
+// this query even when it still exists on disk. The indexer enforces this by
+// skipping MarkMissing whenever report.Errors > 0 or the walk returned an
+// error.
+func (s *Store) MarkMissing(ctx context.Context, volumeID int64, currentRunID int64) (int64, error) {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE files SET status = 'missing'
-		WHERE status = 'present' AND volume_id = ? AND last_seen_at_ns < ?
-	`, volumeID, cutoffNs)
+		WHERE status = 'present' AND volume_id = ? AND last_seen_run_id != ?
+	`, volumeID, currentRunID)
 	if err != nil {
 		return 0, err
 	}
@@ -402,11 +560,11 @@ func (s *Store) CurrentSchemaVersion(ctx context.Context) (int, error) {
 	return v, err
 }
 
-const joinedColumns = `f.volume_id, f.path, f.blake3, f.size_bytes, f.mtime_ns, f.status, f.last_seen_at_ns, f.indexed_at_ns, v.id, v.name, v.path`
+const joinedColumns = `f.volume_id, f.path, f.blake3, f.size_bytes, f.mtime_ns, f.status, f.first_seen_run_id, f.last_seen_run_id, f.indexed_at_ns, v.id, v.name, v.path`
 
 func scanFileRow(scan func(...any) error) (FileRow, error) {
 	var r FileRow
-	err := scan(&r.VolumeID, &r.Path, &r.Blake3, &r.SizeBytes, &r.MtimeNs, &r.Status, &r.LastSeenAtNs, &r.IndexedAtNs)
+	err := scan(&r.VolumeID, &r.Path, &r.Blake3, &r.SizeBytes, &r.MtimeNs, &r.Status, &r.FirstSeenRunID, &r.LastSeenRunID, &r.IndexedAtNs)
 	return r, err
 }
 
@@ -416,7 +574,7 @@ func collectJoined(rows *sql.Rows) ([]FileWithVolume, error) {
 		var fv FileWithVolume
 		if err := rows.Scan(
 			&fv.File.VolumeID, &fv.File.Path, &fv.File.Blake3, &fv.File.SizeBytes,
-			&fv.File.MtimeNs, &fv.File.Status, &fv.File.LastSeenAtNs, &fv.File.IndexedAtNs,
+			&fv.File.MtimeNs, &fv.File.Status, &fv.File.FirstSeenRunID, &fv.File.LastSeenRunID, &fv.File.IndexedAtNs,
 			&fv.Volume.ID, &fv.Volume.Name, &fv.Volume.Path,
 		); err != nil {
 			return nil, err

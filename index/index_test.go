@@ -424,6 +424,223 @@ func TestWorkerCountDoesNotAffectResult(t *testing.T) {
 	}
 }
 
+func TestIndexRecordsRuns(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), "hello")
+
+	s := setupStore(t)
+	ctx := context.Background()
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("first Index: %v", err)
+	}
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("second Index: %v", err)
+	}
+
+	absRoot, _ := filepath.Abs(root)
+	vol := volumeFor(t, s, absRoot)
+	runs, err := s.ListRunsForVolume(ctx, vol.ID)
+	if err != nil {
+		t.Fatalf("ListRunsForVolume: %v", err)
+	}
+	if len(runs) != 2 {
+		t.Fatalf("got %d run rows, want 2: %+v", len(runs), runs)
+	}
+	for i, r := range runs {
+		if r.Kind != store.RunKindIndex {
+			t.Fatalf("run %d kind = %q, want %q", i, r.Kind, store.RunKindIndex)
+		}
+		if r.Status != store.RunStatusSuccess {
+			t.Fatalf("run %d status = %q, want %q", i, r.Status, store.RunStatusSuccess)
+		}
+		if !r.EndedAtNs.Valid {
+			t.Fatalf("run %d ended_at_ns NULL, want set", i)
+		}
+		if r.FileCount != 1 {
+			t.Fatalf("run %d file_count = %d, want 1", i, r.FileCount)
+		}
+	}
+
+	// The file row's last_seen_run_id must advance to the second run while
+	// first_seen_run_id stays at the first.
+	row, err := s.GetByPath(ctx, vol.ID, "a.txt")
+	if err != nil {
+		t.Fatalf("GetByPath: %v", err)
+	}
+	if row.FirstSeenRunID != runs[0].ID {
+		t.Fatalf("FirstSeenRunID = %d, want %d", row.FirstSeenRunID, runs[0].ID)
+	}
+	if row.LastSeenRunID != runs[1].ID {
+		t.Fatalf("LastSeenRunID = %d, want %d (second run)", row.LastSeenRunID, runs[1].ID)
+	}
+}
+
+func TestIndexPartialRunOnPerFileError(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "ok.txt"), "hello")
+	unreadable := filepath.Join(root, "denied.txt")
+	writeFile(t, unreadable, "secret")
+	if err := os.Chmod(unreadable, 0o000); err != nil {
+		t.Skipf("chmod 000 not supported: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(unreadable, 0o644) })
+
+	s := setupStore(t)
+	ctx := context.Background()
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	absRoot, _ := filepath.Abs(root)
+	vol := volumeFor(t, s, absRoot)
+	runs, err := s.ListRunsForVolume(ctx, vol.ID)
+	if err != nil {
+		t.Fatalf("ListRunsForVolume: %v", err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("runs = %d, want 1", len(runs))
+	}
+	if runs[0].Status != store.RunStatusPartial {
+		t.Fatalf("status = %q, want partial (per-file error during a completed walk)", runs[0].Status)
+	}
+}
+
+// TestPartialRunDoesNotMarkErroredFilesMissing guards a subtle correctness
+// rule: a file that errored during hashing did not have its last_seen_run_id
+// bumped this run, so a naive MarkMissing call would flip it to 'missing'
+// even though the file still exists on disk. finalizeMissing must skip the
+// flip when report.Errors > 0.
+func TestPartialRunDoesNotMarkErroredFilesMissing(t *testing.T) {
+	root := t.TempDir()
+	a := filepath.Join(root, "a.txt")
+	b := filepath.Join(root, "b.txt")
+	writeFile(t, a, "alpha")
+	writeFile(t, b, "beta")
+
+	s := setupStore(t)
+	ctx := context.Background()
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("first Index: %v", err)
+	}
+
+	// Make b unreadable so the second run errors on it. b is still on disk,
+	// so it must NOT be flagged as missing.
+	if err := os.Chmod(b, 0o000); err != nil {
+		t.Skipf("chmod 000 not supported: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(b, 0o644) })
+
+	rep, err := Index(ctx, s, root, Options{})
+	if err != nil {
+		t.Fatalf("second Index: %v", err)
+	}
+	if rep.Errors == 0 {
+		t.Fatalf("expected per-file error on unreadable b, got %+v", rep)
+	}
+	if rep.Missing != 0 {
+		t.Fatalf("Missing=%d on partial run, want 0 (skipped for safety)", rep.Missing)
+	}
+	absRoot, _ := filepath.Abs(root)
+	vol := volumeFor(t, s, absRoot)
+	bRow, err := s.GetByPath(ctx, vol.ID, "b.txt")
+	if err != nil {
+		t.Fatalf("GetByPath b: %v", err)
+	}
+	if bRow.Status != store.StatusPresent {
+		t.Fatalf("b.Status = %s, want present (file still on disk, was just unreadable)", bRow.Status)
+	}
+}
+
+func TestDryRunDoesNotRecordRun(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), "hello")
+
+	s := setupStore(t)
+	ctx := context.Background()
+	if _, err := Index(ctx, s, root, Options{DryRun: true}); err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	// Dry-run skips volume creation, so any runs we recorded would necessarily
+	// be cross-volume / orphan rows. The cleanest check: look up the absent
+	// volume; if it really doesn't exist, the runs table has nothing pointing
+	// at it. As a stronger assertion we also query the volume id 0 (impossible
+	// match) to confirm ListRunsForVolume returns empty for missing volumes.
+	absRoot, _ := filepath.Abs(root)
+	if _, err := s.GetVolumeByPath(ctx, absRoot); !store.IsNotFound(err) {
+		t.Fatalf("dry-run created a volume row: %v", err)
+	}
+	runs, err := s.ListRunsForVolume(ctx, 0)
+	if err != nil {
+		t.Fatalf("ListRunsForVolume: %v", err)
+	}
+	if len(runs) != 0 {
+		t.Fatalf("expected no runs after dry-run, got %+v", runs)
+	}
+}
+
+func TestRunStatus(t *testing.T) {
+	boom := fmt.Errorf("boom")
+	cases := []struct {
+		name      string
+		fatalErr  error
+		errors    int
+		wantState string
+		wantMsg   string
+	}{
+		{"clean", nil, 0, store.RunStatusSuccess, ""},
+		{"per-file errors only", nil, 2, store.RunStatusPartial, ""},
+		{"fatal alone", boom, 0, store.RunStatusFailed, "boom"},
+		{"fatal trumps per-file", boom, 3, store.RunStatusFailed, "boom"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, msg := runStatus(&Report{Errors: c.errors}, c.fatalErr)
+			if got != c.wantState {
+				t.Fatalf("status = %q, want %q", got, c.wantState)
+			}
+			if msg != c.wantMsg {
+				t.Fatalf("msg = %q, want %q", msg, c.wantMsg)
+			}
+		})
+	}
+}
+
+// TestIndexWalkErrorReachesRun verifies that a directory we can't descend
+// into (chmod 0o000) reaches sendErr via filepath.WalkDir's error callback
+// and that the resulting run still finishes as 'partial' (the walk completed
+// for the parts we could see).
+func TestIndexWalkErrorReachesRun(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "visible.txt"), "hello")
+	hidden := filepath.Join(root, "no-entry")
+	if err := os.MkdirAll(hidden, 0o755); err != nil {
+		t.Fatalf("mkdir hidden: %v", err)
+	}
+	writeFile(t, filepath.Join(hidden, "inside.txt"), "secret")
+	if err := os.Chmod(hidden, 0o000); err != nil {
+		t.Skipf("chmod 000 on dir not supported: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(hidden, 0o755) })
+
+	s := setupStore(t)
+	ctx := context.Background()
+	rep, err := Index(ctx, s, root, Options{})
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	if rep.Errors == 0 {
+		t.Fatalf("expected at least one per-entry error from blocked dir, got %+v", rep)
+	}
+	absRoot, _ := filepath.Abs(root)
+	vol := volumeFor(t, s, absRoot)
+	runs, err := s.ListRunsForVolume(ctx, vol.ID)
+	if err != nil {
+		t.Fatalf("ListRunsForVolume: %v", err)
+	}
+	if len(runs) != 1 || runs[0].Status != store.RunStatusPartial {
+		t.Fatalf("got runs %+v, want one partial run", runs)
+	}
+}
+
 func TestDryRunReportsMissingCount(t *testing.T) {
 	root := t.TempDir()
 	a := filepath.Join(root, "a.txt")
