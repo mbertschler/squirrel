@@ -96,13 +96,12 @@ func TestCLIRunsVolumeFilter(t *testing.T) {
 	if len(lines) != 3 {
 		t.Fatalf("expected 2 runs for volume a, got lines:\n%s", out)
 	}
+	// Volume is the 3rd whitespace-separated column (ID, KIND, VOLUME, …).
+	const volumeColumn = 2
 	for _, line := range lines[1:] {
-		if !strings.Contains(line, "  a  ") && !strings.HasSuffix(line, "  a") {
-			// Tabwriter pads with spaces; volume name "a" should appear as
-			// its own column. Use a forgiving substring check.
-			if !strings.Contains(line, " a ") {
-				t.Fatalf("row missing volume=a: %q", line)
-			}
+		fields := strings.Fields(line)
+		if len(fields) <= volumeColumn || fields[volumeColumn] != "a" {
+			t.Fatalf("row volume column = %q, want \"a\": full line %q", fields, line)
 		}
 	}
 }
@@ -120,10 +119,10 @@ func TestCLIRunsLimit(t *testing.T) {
 	}
 
 	out := runCLI(t, "runs", "--db", db, "--limit", "2")
-	rows := strings.Count(strings.TrimRight(out, "\n"), "\n") // header + 2 rows = 2 newlines? No, 3 lines = 2 newlines between, so rows ~= total lines.
 	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
-	if len(lines) != 3 {
-		t.Fatalf("--limit 2 produced %d lines (header + rows), want 3:\n%s", rows+1, out)
+	const wantLines = 3 // header + 2 capped rows
+	if len(lines) != wantLines {
+		t.Fatalf("--limit 2 produced %d lines, want %d:\n%s", len(lines), wantLines, out)
 	}
 }
 
