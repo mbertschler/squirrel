@@ -29,5 +29,6 @@ When asked to implement an issue (e.g. "implement #19"), unless instructed other
 1. Implement on a feature branch, following the principles above.
 2. Open a PR with `Closes #N` in the body.
 3. After pushing, self-review for code quality: dead code, oversize functions, accidental scope creep, anything that violates CLAUDE.md. Push fixes for what you find.
-4. Watch CI. On failure, diagnose and push a fix; on success, surface that to the user.
-5. Stop and wait for explicit approval before merging — never self-merge.
+4. Watch the PR for CI results and automated reviews (e.g. Copilot). On CI failure, diagnose and push a fix. On review comments, address legitimate findings by pushing fixes; reply briefly to dismiss anything that's incorrect or out of scope.
+5. Once CI is green and any automated review threads are resolved, surface readiness to the user.
+6. Stop and wait for explicit approval before merging — never self-merge.
