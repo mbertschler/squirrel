@@ -10,6 +10,17 @@ linters:
     - misspell
     - unconvert
     - unparam
+  settings:
+    errcheck:
+      exclude-functions:
+        - (*database/sql.DB).Close
+        - (*database/sql.Tx).Rollback
+        - (*database/sql.Rows).Close
+        - (*os.File).Close
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - os.Unsetenv
 
 formatters:
   enable:
