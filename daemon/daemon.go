@@ -14,11 +14,21 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/store"
+)
+
+// Scan strategy values for Config.ScanStrategy. Shallow uses the
+// (size, mtime) shortcut on the existing index row; Deep always
+// rehashes every file (the bit-rot-detection use case).
+const (
+	ScanStrategyShallow = "shallow"
+	ScanStrategyDeep    = "deep"
 )
 
 // Config configures one daemon listener. Fields are validated by New; all
@@ -44,15 +54,34 @@ type Config struct {
 	// disables the sync endpoints (they return 404 on every volume),
 	// which is what tests of the auth/health surface want.
 	Volumes map[string]*config.Volume
+	// ScanInterval is the period between drift-detection passes over
+	// every hosted volume (#17). Zero (default) disables the
+	// scheduler; the daemon then only re-hashes during peer syncs.
+	ScanInterval time.Duration
+	// ScanStrategy selects the per-tick rehash policy:
+	// ScanStrategyShallow (the default; equivalent to today's
+	// `--shallow` index) skips files whose (size, mtime) match the
+	// stored row, and ScanStrategyDeep re-hashes every file
+	// unconditionally (the bit-rot-detection use case). Empty is
+	// treated as Shallow.
+	ScanStrategy string
+	// ScanLogger receives one-line advisories from the
+	// drift-detection scheduler (one per volume per tick, plus skip
+	// notes on lock contention). Nil discards. The CLI wires this
+	// to os.Stderr; tests inject a buffer.
+	ScanLogger io.Writer
 }
 
 // Server is one daemon instance. It holds the HTTP handler stack and a
 // reference to the underlying store for the health endpoint's
 // schema_version field; future endpoints (plan, reconcile, ...) will use
-// the same handle.
+// the same handle. The router is kept as a field so the scan scheduler
+// (#17) can acquire the same per-volume lock the /v1/sync/* handlers
+// use, serialising audit and sync against the same volume.
 type Server struct {
 	cfg     Config
 	store   *store.Store
+	router  *peerSyncRouter
 	handler http.Handler
 }
 
@@ -98,6 +127,14 @@ func validateConfig(cfg Config) error {
 	if cfg.Version == "" {
 		return errors.New("daemon: Config.Version is required")
 	}
+	if cfg.ScanInterval < 0 {
+		return errors.New("daemon: Config.ScanInterval must not be negative")
+	}
+	switch cfg.ScanStrategy {
+	case "", ScanStrategyShallow, ScanStrategyDeep:
+	default:
+		return errors.New("daemon: Config.ScanStrategy must be \"shallow\" or \"deep\"")
+	}
 	return nil
 }
 
@@ -108,8 +145,8 @@ func validateConfig(cfg Config) error {
 func (s *Server) buildHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", s.handleHealth)
-	router := newPeerSyncRouter(s, s.cfg.Volumes)
-	router.register(mux)
+	s.router = newPeerSyncRouter(s, s.cfg.Volumes)
+	s.router.register(mux)
 	return mux
 }
 

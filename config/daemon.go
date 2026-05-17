@@ -3,6 +3,13 @@ package config
 import (
 	"errors"
 	"fmt"
+	"time"
+)
+
+// Scan strategy constants for Daemon.ScanStrategy.
+const (
+	ScanStrategyShallow = "shallow"
+	ScanStrategyDeep    = "deep"
 )
 
 // Daemon is the resolved `[daemon]` block. It is nil on Config when the
@@ -25,16 +32,28 @@ type Daemon struct {
 	// without a token is an unauthenticated open port and we refuse to
 	// start one.
 	Token string
+	// ScanInterval is the period between drift-detection passes the
+	// daemon runs over its hosted volumes (#17). Zero (the default,
+	// when the TOML key is absent) disables the scheduler — the
+	// daemon then only re-hashes during peer syncs.
+	ScanInterval time.Duration
+	// ScanStrategy picks the per-tick rehash policy:
+	// ScanStrategyShallow (default) skips files whose (size, mtime)
+	// match the stored row; ScanStrategyDeep re-hashes everything
+	// unconditionally — the bit-rot-detection schedule.
+	ScanStrategy string
 }
 
 // rawDaemon mirrors the `[daemon]` TOML block. We use typed sub-structs
 // (rather than map[string]any) so DisallowUnknownFields catches typos like
 // `cret` or `lisetn` at load time instead of silently dropping them.
 type rawDaemon struct {
-	Listen string   `toml:"listen"`
-	DB     string   `toml:"db"`
-	TLS    *rawTLS  `toml:"tls"`
-	Auth   *rawAuth `toml:"auth"`
+	Listen       string   `toml:"listen"`
+	DB           string   `toml:"db"`
+	TLS          *rawTLS  `toml:"tls"`
+	Auth         *rawAuth `toml:"auth"`
+	ScanInterval string   `toml:"scan_interval"`
+	ScanStrategy string   `toml:"scan_strategy"`
 }
 
 type rawTLS struct {
@@ -67,7 +86,39 @@ func resolveDaemon(r *rawDaemon) (*Daemon, error) {
 	if err := resolveDaemonAuth(r.Auth, d); err != nil {
 		return nil, err
 	}
+	if err := resolveDaemonScan(r, d); err != nil {
+		return nil, err
+	}
 	return d, nil
+}
+
+// resolveDaemonScan parses the drift-detection scheduler knobs. Both
+// are optional; absent means "no scheduled audits". A scan_strategy
+// without a scan_interval is accepted as effectively dead config (the
+// strategy is ignored when interval is zero) — emitting an error
+// would force users who toggle scheduling off to also delete the
+// strategy line.
+func resolveDaemonScan(r *rawDaemon, d *Daemon) error {
+	if r.ScanInterval != "" {
+		dur, err := time.ParseDuration(r.ScanInterval)
+		if err != nil {
+			return fmt.Errorf("scan_interval %q: %w", r.ScanInterval, err)
+		}
+		if dur < 0 {
+			return fmt.Errorf("scan_interval must not be negative, got %s", dur)
+		}
+		d.ScanInterval = dur
+	}
+	switch r.ScanStrategy {
+	case "":
+		d.ScanStrategy = ScanStrategyShallow
+	case ScanStrategyShallow, ScanStrategyDeep:
+		d.ScanStrategy = r.ScanStrategy
+	default:
+		return fmt.Errorf("scan_strategy %q is invalid (want %q or %q)",
+			r.ScanStrategy, ScanStrategyShallow, ScanStrategyDeep)
+	}
+	return nil
 }
 
 func resolveDaemonTLS(r *rawTLS, d *Daemon) error {

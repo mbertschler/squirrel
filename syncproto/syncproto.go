@@ -85,6 +85,15 @@ type BeginResponse struct {
 	// runs.peer_node_id) so the local audit log is symmetric with
 	// the receiver's.
 	ReceiverNodeName string `json:"receiver_node_name"`
+	// PendingWarnings is a list of one-line advisories the receiver
+	// wants the initiator to surface to its operator. Currently used
+	// for the drift-detection feature (#17): when the receiver has
+	// run one or more `audit` walks since the last successful sync
+	// with this peer and any of them flipped content at a path
+	// out-of-band, the corresponding lines land here so the
+	// initiator's CLI renders them alongside its own warnings.
+	// Empty in the common "no drift" case and omitted on the wire.
+	PendingWarnings []string `json:"pending_warnings,omitempty"`
 }
 
 // PlanRequest carries the initiator's index slice.

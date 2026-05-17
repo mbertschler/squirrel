@@ -8,7 +8,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 6
+const SchemaVersion = 7
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -40,6 +40,7 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 6, up: func(ctx context.Context, db *sql.DB) error {
 			return migrateV5ToV6(ctx, db, mctx.nodeName)
 		}},
+		{version: 7, up: migrateV6ToV7},
 	}
 }
 
@@ -515,4 +516,79 @@ func migrateV5ToV6(ctx context.Context, db *sql.DB, nodeName string) error {
 		return fmt.Errorf("record schema v6: %w", err)
 	}
 	return tx.Commit()
+}
+
+// --- v6 → v7 ---
+
+// migrateV6ToV7 rebuilds the runs table to widen the kind CHECK to
+// include 'audit', the run-kind for periodic drift detection on
+// daemon-hosted volumes (#17). 'audit' joins 'index' in the
+// destination-NULL branch of the kind↔destination coupling CHECK —
+// audits, like indexes, are scoped to one volume with no rclone
+// target.
+//
+// Reuses the v4→v5 recipe (FK off, rebuild, foreign_key_check verify,
+// FK on) because runs is referenced by files.first_seen_run_id and
+// files.last_seen_run_id; an in-place ALTER would dangle those FKs
+// during the rebuild.
+func migrateV6ToV7(ctx context.Context, db *sql.DB) error {
+	conn, restore, err := disableForeignKeys(ctx, db)
+	if err != nil {
+		return err
+	}
+	defer restore()
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := rebuildRunsTableV7(ctx, tx); err != nil {
+		return err
+	}
+	if err := verifyForeignKeysClean(ctx, tx, "v6→v7"); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func rebuildRunsTableV7(ctx context.Context, tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE runs_v7 (
+			id            INTEGER PRIMARY KEY,
+			kind          TEXT NOT NULL CHECK (kind IN ('index','sync','restore','audit')),
+			volume_id     INTEGER REFERENCES volumes(id),
+			destination   TEXT,
+			started_at_ns INTEGER NOT NULL,
+			ended_at_ns   INTEGER,
+			status        TEXT NOT NULL CHECK (status IN ('running','success','failed','partial')),
+			error         TEXT,
+			file_count    INTEGER NOT NULL DEFAULT 0,
+			peer_node_id      INTEGER REFERENCES nodes(id),
+			correlated_run_id INTEGER,
+			CHECK (
+				(kind IN ('index','audit') AND destination IS NULL) OR
+				(kind IN ('sync','restore') AND destination IS NOT NULL AND destination != '')
+			)
+		)`,
+		`INSERT INTO runs_v7 (
+			id, kind, volume_id, destination, started_at_ns, ended_at_ns,
+			status, error, file_count, peer_node_id, correlated_run_id
+		)
+		SELECT id, kind, volume_id, destination, started_at_ns, ended_at_ns,
+		       status, error, file_count, peer_node_id, correlated_run_id
+		FROM runs`,
+		`DROP TABLE runs`,
+		`ALTER TABLE runs_v7 RENAME TO runs`,
+		`CREATE INDEX idx_runs_volume_started ON runs(volume_id, started_at_ns)`,
+		`CREATE INDEX idx_runs_destination ON runs(destination) WHERE destination IS NOT NULL`,
+		`INSERT INTO schema_version (version) VALUES (7)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("rebuild runs: %w", err)
+		}
+	}
+	return nil
 }

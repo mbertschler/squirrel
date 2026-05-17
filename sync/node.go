@@ -155,6 +155,7 @@ func (d *nodeSyncDriver) phaseBegin() error {
 		return fmt.Errorf("stamp correlated run id: %w", err)
 	}
 	d.report.NodeReceiverRunID = resp.ReceiverRunID
+	d.report.NodePendingWarnings = resp.PendingWarnings
 	return nil
 }
 

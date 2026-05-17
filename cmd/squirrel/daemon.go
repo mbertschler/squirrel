@@ -47,12 +47,15 @@ func runDaemon(cmd *cobra.Command) error {
 	defer s.Close()
 
 	srv, err := daemon.New(daemon.Config{
-		Listen:  cfg.Daemon.Listen,
-		Token:   cfg.Daemon.Token,
-		TLSCert: cfg.Daemon.TLSCert,
-		TLSKey:  cfg.Daemon.TLSKey,
-		Version: daemonVersion,
-		Volumes: cfg.Volumes,
+		Listen:       cfg.Daemon.Listen,
+		Token:        cfg.Daemon.Token,
+		TLSCert:      cfg.Daemon.TLSCert,
+		TLSKey:       cfg.Daemon.TLSKey,
+		Version:      daemonVersion,
+		Volumes:      cfg.Volumes,
+		ScanInterval: cfg.Daemon.ScanInterval,
+		ScanStrategy: cfg.Daemon.ScanStrategy,
+		ScanLogger:   cmd.ErrOrStderr(),
 	}, s)
 	if err != nil {
 		return err

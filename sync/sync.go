@@ -78,6 +78,13 @@ type Report struct {
 	// and the new BLAKE3 plus the receiver-relative preserved path so
 	// the CLI can render a meaningful "review at <path>" pointer.
 	NodeConflicts []syncproto.ConflictDetail
+	// NodePendingWarnings is the receiver's drift-detection advisory
+	// from the handshake (#17): one line per audit run on the volume
+	// since the last successful sync that flipped content
+	// out-of-band. The CLI surfaces them prefixed with "peer reports"
+	// so the operator can distinguish source-side warnings from
+	// receiver-side ones.
+	NodePendingWarnings []string
 }
 
 // RunPair is the single entry point for one sync invocation. It

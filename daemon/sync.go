@@ -231,6 +231,10 @@ func (r *peerSyncRouter) finishBegin(ctx context.Context, body syncproto.BeginRe
 	if err != nil {
 		return syncproto.BeginResponse{}, http.StatusInternalServerError, fmt.Errorf("begin run: %w", err)
 	}
+	warnings, err := r.collectDriftWarnings(ctx, body.Volume, v.ID, peer.ID)
+	if err != nil {
+		return syncproto.BeginResponse{}, http.StatusInternalServerError, fmt.Errorf("collect drift warnings: %w", err)
+	}
 	r.storeSession(&peerSession{
 		receiverRunID:   runID,
 		volume:          vol,
@@ -242,7 +246,51 @@ func (r *peerSyncRouter) finishBegin(ctx context.Context, body syncproto.BeginRe
 	return syncproto.BeginResponse{
 		ReceiverRunID:    runID,
 		ReceiverNodeName: self.Name,
+		PendingWarnings:  warnings,
 	}, http.StatusOK, nil
+}
+
+// collectDriftWarnings produces one PendingWarnings line per audit run
+// against (volumeID) since the last successful sync with peerNodeID
+// that detected non-zero drift. Drift is the sum of `modified`
+// (content changed in place — supersede chain) and `missing` (file
+// vanished from disk — MarkMissing flip). The watermark is read from
+// peer_sync_state.last_synced_at; no row yet means "first contact"
+// and surfaces every audit run on the volume.
+//
+// Both counts are derived from the existing files table; no
+// audit-specific schema column carries them. Clean audits (zero
+// modified + zero missing) are omitted so the initiator's CLI doesn't
+// spam empty lines on every sync.
+func (r *peerSyncRouter) collectDriftWarnings(ctx context.Context, volumeName string, volumeID, peerNodeID int64) ([]string, error) {
+	state, err := r.srv.store.GetPeerSyncState(ctx, volumeID, peerNodeID)
+	var sinceNs int64
+	if err == nil {
+		sinceNs = state.LastSyncedAtNs
+	} else if !store.IsNotFound(err) {
+		return nil, fmt.Errorf("peer_sync_state: %w", err)
+	}
+	audits, err := r.srv.store.ListAuditRunsSince(ctx, volumeID, sinceNs)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, run := range audits {
+		modified, err := r.srv.store.CountModifiedFilesByRun(ctx, run.ID)
+		if err != nil {
+			return nil, err
+		}
+		missing, err := r.srv.store.CountMissingFilesByRun(ctx, run.ID)
+		if err != nil {
+			return nil, err
+		}
+		if modified == 0 && missing == 0 {
+			continue
+		}
+		out = append(out, fmt.Sprintf("audit run %d on volume %s: %d modified, %d missing",
+			run.ID, volumeName, modified, missing))
+	}
+	return out, nil
 }
 
 // peerEndpoint resolves the endpoint string to store on the peer

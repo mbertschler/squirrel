@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // writeConfig is a t.TempDir-rooted helper that writes the given TOML body
@@ -521,6 +522,74 @@ path = "/x"
 	}
 	if cfg.Daemon != nil {
 		t.Fatalf("Daemon should be nil when block is absent")
+	}
+}
+
+// TestLoadDaemonScanInterval parses the optional drift-detection
+// knobs and verifies (a) duration string parses round-trip,
+// (b) absent ScanInterval leaves the field zero (scheduler disabled),
+// and (c) ScanStrategy defaults to "shallow" when unspecified.
+func TestLoadDaemonScanInterval(t *testing.T) {
+	p := writeConfig(t, `
+[daemon]
+listen        = "127.0.0.1:9000"
+auth          = { token = "t" }
+scan_interval = "30m"
+scan_strategy = "deep"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Daemon.ScanInterval != 30*time.Minute {
+		t.Fatalf("ScanInterval = %s, want 30m", cfg.Daemon.ScanInterval)
+	}
+	if cfg.Daemon.ScanStrategy != ScanStrategyDeep {
+		t.Fatalf("ScanStrategy = %q, want %q", cfg.Daemon.ScanStrategy, ScanStrategyDeep)
+	}
+}
+
+func TestLoadDaemonScanDefaults(t *testing.T) {
+	p := writeConfig(t, `
+[daemon]
+listen = "127.0.0.1:9000"
+auth   = { token = "t" }
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Daemon.ScanInterval != 0 {
+		t.Fatalf("default ScanInterval = %s, want 0", cfg.Daemon.ScanInterval)
+	}
+	if cfg.Daemon.ScanStrategy != ScanStrategyShallow {
+		t.Fatalf("default ScanStrategy = %q, want %q", cfg.Daemon.ScanStrategy, ScanStrategyShallow)
+	}
+}
+
+func TestLoadDaemonRejectsBadScanStrategy(t *testing.T) {
+	p := writeConfig(t, `
+[daemon]
+listen        = "127.0.0.1:9000"
+auth          = { token = "t" }
+scan_strategy = "fancy"
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "scan_strategy") {
+		t.Fatalf("expected scan_strategy error, got %v", err)
+	}
+}
+
+func TestLoadDaemonRejectsBadScanInterval(t *testing.T) {
+	p := writeConfig(t, `
+[daemon]
+listen        = "127.0.0.1:9000"
+auth          = { token = "t" }
+scan_interval = "not-a-duration"
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "scan_interval") {
+		t.Fatalf("expected scan_interval error, got %v", err)
 	}
 }
 
