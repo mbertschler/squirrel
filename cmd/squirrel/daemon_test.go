@@ -27,19 +27,23 @@ func reservePort(t *testing.T) string {
 		t.Fatalf("reserve port: %v", err)
 	}
 	addr := ln.Addr().String()
-	ln.Close()
+	if err := ln.Close(); err != nil {
+		t.Fatalf("close reserve listener: %v", err)
+	}
 	return addr
 }
 
 // startDaemonCLI runs the cobra root with `daemon` in a goroutine. It
 // returns a cancel function (which terminates the daemon and waits for
-// graceful shutdown), the captured stdout/stderr buffer, and the listen
-// address derived from the supplied config.
-func startDaemonCLI(t *testing.T, configPath string) (cancel func(), buf *bytes.Buffer, addr string) {
+// graceful shutdown) and the listen address derived from the supplied
+// config. The captured stdout/stderr buffer is kept inside the closure
+// so failure messages still surface the daemon's own output, but
+// callers don't need it directly.
+func startDaemonCLI(t *testing.T, configPath string) (cancel func(), addr string) {
 	t.Helper()
 	isolateConfig(t)
 	ctx, c := context.WithCancel(context.Background())
-	buf = &bytes.Buffer{}
+	buf := &bytes.Buffer{}
 	root := newRootCmd()
 	root.SetOut(buf)
 	root.SetErr(buf)
@@ -59,7 +63,7 @@ func startDaemonCLI(t *testing.T, configPath string) (cancel func(), buf *bytes.
 		case <-time.After(5 * time.Second):
 			t.Fatalf("daemon did not shut down within timeout\noutput:\n%s", buf.String())
 		}
-	}, buf, addr
+	}, addr
 }
 
 func waitForBanner(t *testing.T, buf *bytes.Buffer) string {
@@ -81,29 +85,29 @@ func waitForBanner(t *testing.T, buf *bytes.Buffer) string {
 	return ""
 }
 
-func writeDaemonConfig(t *testing.T, listen, token string) (configPath, dbPath string) {
+func writeDaemonConfig(t *testing.T, listen, token string) string {
 	t.Helper()
 	dir := t.TempDir()
-	dbPath = filepath.Join(dir, "index.db")
-	configPath = filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "index.db")
+	configPath := filepath.Join(dir, "config.toml")
 	body := fmt.Sprintf("db = %q\n\n[daemon]\nlisten = %q\nauth = { token = %q }\n", dbPath, listen, token)
 	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
-	return configPath, dbPath
+	return configPath
 }
 
 func TestCLIDaemonHealthEndpoint(t *testing.T) {
 	listen := reservePort(t)
-	cfgPath, _ := writeDaemonConfig(t, listen, "the-token")
-	stop, _, addr := startDaemonCLI(t, cfgPath)
+	cfgPath := writeDaemonConfig(t, listen, "the-token")
+	stop, addr := startDaemonCLI(t, cfgPath)
 	defer stop()
 
 	resp, err := http.Get("http://" + addr + "/v1/health")
 	if err != nil {
 		t.Fatalf("GET /v1/health: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
@@ -124,8 +128,8 @@ func TestCLIDaemonHealthEndpoint(t *testing.T) {
 
 func TestCLIDaemonPlanRequiresBearer(t *testing.T) {
 	listen := reservePort(t)
-	cfgPath, _ := writeDaemonConfig(t, listen, "secret-token")
-	stop, _, addr := startDaemonCLI(t, cfgPath)
+	cfgPath := writeDaemonConfig(t, listen, "secret-token")
+	stop, addr := startDaemonCLI(t, cfgPath)
 	defer stop()
 
 	// No auth → 401.
@@ -133,7 +137,7 @@ func TestCLIDaemonPlanRequiresBearer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST /v1/plan: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("no-auth status = %d, want 401", resp.StatusCode)
 	}
@@ -145,7 +149,7 @@ func TestCLIDaemonPlanRequiresBearer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST /v1/plan: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusNotImplemented {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status = %d, want 501; body=%s", resp.StatusCode, body)

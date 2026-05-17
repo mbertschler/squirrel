@@ -16,6 +16,24 @@ import (
 // need to revisit.
 const shutdownGrace = 5 * time.Second
 
+// readHeaderTimeout caps how long a client can take to send request
+// headers, the principal slowloris mitigation for net/http. Reasonable
+// floor for the LAN/VPN exposure model this daemon is built for.
+//
+// We deliberately don't set ReadTimeout or WriteTimeout: plan
+// negotiation (PR 3) streams the initiator's index slice and the
+// receiver's reconciliation report over the same connection, and either
+// can outlast a hard wall-clock cap on realistic volumes. Header timing
+// alone is enough to keep half-open connections from accumulating.
+//
+// idleTimeout closes connections kept alive between requests after a
+// reasonable quiet period so we don't leak fds to clients that go away
+// without an explicit close.
+const (
+	readHeaderTimeout = 10 * time.Second
+	idleTimeout       = 60 * time.Second
+)
+
 // ListenAndServe opens a TCP listener on Config.Listen and serves it.
 // Returns when ctx is cancelled (after a graceful shutdown) or when the
 // underlying http.Server fails to start.
@@ -35,7 +53,11 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 // :0, observe the resolved port via ln.Addr(), and drive the daemon
 // end-to-end without binding a fixed port.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
-	httpSrv := &http.Server{Handler: s.handler}
+	httpSrv := &http.Server{
+		Handler:           s.handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+	}
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- runServer(httpSrv, ln, s.cfg.TLSCert, s.cfg.TLSKey)

@@ -86,7 +86,7 @@ func TestHealthIsUnauthenticated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET /v1/health: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
@@ -112,7 +112,13 @@ func TestPlanRequiresBearerToken(t *testing.T) {
 		{"no header", "", http.StatusUnauthorized},
 		{"wrong scheme", "Basic Zm9vOmJhcg==", http.StatusUnauthorized},
 		{"wrong token", "Bearer wrong-token", http.StatusUnauthorized},
+		{"empty token after scheme", "Bearer ", http.StatusUnauthorized},
 		{"correct token", "Bearer right-token", http.StatusNotImplemented},
+		// RFC 7235 §2.1: the scheme name is case-insensitive.
+		{"lowercase scheme", "bearer right-token", http.StatusNotImplemented},
+		{"mixed-case scheme", "BeArEr right-token", http.StatusNotImplemented},
+		// Tolerant of an extra space between scheme and token.
+		{"extra whitespace", "Bearer  right-token", http.StatusNotImplemented},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -124,7 +130,7 @@ func TestPlanRequiresBearerToken(t *testing.T) {
 			if err != nil {
 				t.Fatalf("POST: %v", err)
 			}
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 			if resp.StatusCode != c.wantStatus {
 				t.Fatalf("status = %d, want %d", resp.StatusCode, c.wantStatus)
 			}
@@ -132,11 +138,11 @@ func TestPlanRequiresBearerToken(t *testing.T) {
 	}
 }
 
-// TestPlanRejectsBearerWithLengthDifference catches the obvious
-// regression where someone replaces subtle.ConstantTimeCompare with `==`
-// and the check passes when the supplied token is a prefix of (or
-// otherwise differently-shaped to) the configured one. ConstantTimeCompare
-// returns 0 for unequal lengths, which is exactly the behaviour we want.
+// TestPlanRejectsBearerWithLengthDifference pins the behaviour that
+// shorter/longer-than-configured tokens are rejected. The implementation
+// hashes both sides before comparing (so the compare itself sees equal-
+// length digests) and this test guards against a regression where a
+// future refactor reintroduces a prefix-match or substring-match path.
 func TestPlanRejectsBearerWithLengthDifference(t *testing.T) {
 	srv := newTestServer(t, Config{Token: "right-token"})
 	ts := httptest.NewServer(srv.Handler())
@@ -149,7 +155,7 @@ func TestPlanRejectsBearerWithLengthDifference(t *testing.T) {
 		if err != nil {
 			t.Fatalf("POST: %v", err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("token %q: status = %d, want 401", tok, resp.StatusCode)
 		}
@@ -172,7 +178,7 @@ func TestServePlainHTTP(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	cancel()
 	if err := <-done; err != nil {
@@ -196,10 +202,10 @@ func TestServeTLS(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- srv.Serve(ctx, ln) }()
 
-	// The cert is self-signed and the SAN won't match the loopback
-	// address shape — InsecureSkipVerify is appropriate for the
-	// transport-layer smoke test; production trust is established by
-	// fingerprint pinning on the initiator side (PR 3).
+	// The cert is self-signed (no trust chain a default client would
+	// accept) so we set InsecureSkipVerify on the test client. The cert
+	// itself does carry loopback SANs — that's how production trust will
+	// work via fingerprint pinning on the initiator side in PR 3.
 	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	client := &http.Client{Transport: tr, Timeout: 5 * time.Second}
 
@@ -208,7 +214,7 @@ func TestServeTLS(t *testing.T) {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
 	body := decodeHealth(t, resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if body.SchemaVersion != store.SchemaVersion {
 		t.Fatalf("schema_version = %d", body.SchemaVersion)
 	}

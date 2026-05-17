@@ -10,6 +10,7 @@
 package daemon
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -72,9 +73,9 @@ func (s *Server) Handler() http.Handler { return s.handler }
 // dial.
 func (s *Server) HasTLS() bool { return s.cfg.TLSCert != "" }
 
-// Addr returns the configured listen address. The actual address the
-// kernel chose (after `:0`-style allocation) is only known after Serve
-// owns a listener; see netListenerAddr in serve.go for that case.
+// Addr returns the configured listen address verbatim. For `:0`-style
+// binds the kernel-assigned port is only knowable from the net.Listener
+// the caller hands to Serve; this accessor is for the startup banner.
 func (s *Server) Addr() string { return s.cfg.Listen }
 
 func validateConfig(cfg Config) error {
@@ -104,27 +105,47 @@ func (s *Server) buildHandler() http.Handler {
 	return mux
 }
 
-// requireBearer is the auth middleware. It checks the Authorization
-// header is `Bearer <token>` with the configured token, using
-// subtle.ConstantTimeCompare to avoid leaking length-prefix information
-// via response timing. The configured token must be non-empty (enforced
-// by validateConfig).
+// requireBearer is the auth middleware. The Authorization header must
+// parse as `<scheme> <token>` with scheme matching "Bearer" case-
+// insensitively (per RFC 7235 §2.1) and token matching the configured
+// value. We hash both sides to a fixed-length SHA-256 digest before
+// subtle.ConstantTimeCompare so the comparison time is independent of
+// the attacker-controlled token length (subtle.ConstantTimeCompare
+// short-circuits on len mismatch, which would otherwise leak length).
+// The configured token is non-empty (enforced by validateConfig).
 func (s *Server) requireBearer(next http.Handler) http.Handler {
-	expected := []byte(s.cfg.Token)
+	expectedHash := sha256.Sum256([]byte(s.cfg.Token))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		const prefix = "Bearer "
-		h := r.Header.Get("Authorization")
-		if !strings.HasPrefix(h, prefix) {
+		token, ok := extractBearerToken(r.Header.Get("Authorization"))
+		if !ok {
 			writeError(w, http.StatusUnauthorized, "missing bearer token")
 			return
 		}
-		got := []byte(h[len(prefix):])
-		if subtle.ConstantTimeCompare(got, expected) != 1 {
+		gotHash := sha256.Sum256([]byte(token))
+		if subtle.ConstantTimeCompare(gotHash[:], expectedHash[:]) != 1 {
 			writeError(w, http.StatusUnauthorized, "invalid bearer token")
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// extractBearerToken parses `<scheme> <token>` from an Authorization
+// header value. The scheme match is case-insensitive; trailing
+// whitespace after the scheme is consumed so `Bearer  tok` (double
+// space) works. Returns ok=false when the header is empty, malformed,
+// or uses a non-Bearer scheme — all of which the middleware rejects
+// uniformly as "missing bearer token" so callers can't infer which.
+func extractBearerToken(header string) (string, bool) {
+	scheme, rest, found := strings.Cut(header, " ")
+	if !found || !strings.EqualFold(scheme, "Bearer") {
+		return "", false
+	}
+	token := strings.TrimLeft(rest, " ")
+	if token == "" {
+		return "", false
+	}
+	return token, true
 }
 
 // healthResponse is the documented shape of GET /v1/health. The field
@@ -137,7 +158,11 @@ type healthResponse struct {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	sv, err := s.store.CurrentSchemaVersion(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "read schema_version: "+err.Error())
+		// /v1/health is unauthenticated. The underlying store error can
+		// contain filesystem paths or SQL fragments, so we return a
+		// generic message and leave details to a server-side log story
+		// (which lands with the rest of the observability work).
+		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	writeJSON(w, http.StatusOK, healthResponse{
