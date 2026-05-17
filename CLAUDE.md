@@ -22,6 +22,8 @@ Don't:
 
 When opening a PR that completes one or more issues, include a closing keyword per issue in the PR body (`Closes #19`, or `Closes #19, Closes #20` for several). GitHub auto-closes the linked issues on merge. Use `Closes` only when the PR completes the issue in full — for partial work, reference the issue without the closing keyword.
 
+Always preserve individual PR commits on merge — never squash. The per-commit history is the audit trail (review fixes, CI fix-ups, refactor steps) and collapsing it loses information that may matter later.
+
 # Default workflow for issue implementations
 
 When asked to implement an issue (e.g. "implement #19"), unless instructed otherwise, do all of the following:
