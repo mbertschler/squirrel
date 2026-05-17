@@ -36,6 +36,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newVolumesCmd())
 	root.AddCommand(newSyncCmd())
 	root.AddCommand(newRestoreCmd())
+	root.AddCommand(newDaemonCmd())
 	return root
 }
 

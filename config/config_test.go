@@ -403,6 +403,127 @@ path = "/tmp/pictures"
 	}
 }
 
+func TestLoadDaemonBlock(t *testing.T) {
+	t.Setenv("SQUIRREL_DAEMON_TOKEN", "s3cret")
+	p := writeConfig(t, `
+[daemon]
+listen = "0.0.0.0:8443"
+db     = "/var/db/squirrel.db"
+tls    = { cert = "/etc/squirrel/cert.pem", key = "/etc/squirrel/key.pem" }
+auth   = { token = { env = "SQUIRREL_DAEMON_TOKEN" } }
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Daemon == nil {
+		t.Fatalf("Daemon block not parsed")
+	}
+	if cfg.Daemon.Listen != "0.0.0.0:8443" {
+		t.Fatalf("Listen = %q", cfg.Daemon.Listen)
+	}
+	if cfg.Daemon.DB != "/var/db/squirrel.db" {
+		t.Fatalf("DB = %q", cfg.Daemon.DB)
+	}
+	if cfg.Daemon.TLSCert != "/etc/squirrel/cert.pem" || cfg.Daemon.TLSKey != "/etc/squirrel/key.pem" {
+		t.Fatalf("TLS pair = %q / %q", cfg.Daemon.TLSCert, cfg.Daemon.TLSKey)
+	}
+	if cfg.Daemon.Token != "s3cret" {
+		t.Fatalf("Token = %q, want resolved literal", cfg.Daemon.Token)
+	}
+}
+
+func TestLoadDaemonMinimalNoTLS(t *testing.T) {
+	// No `[daemon.tls]` is the plain-HTTP path: TLSCert/TLSKey both empty.
+	p := writeConfig(t, `
+[daemon]
+listen = "127.0.0.1:9000"
+auth   = { token = "literal-token" }
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Daemon == nil {
+		t.Fatalf("Daemon block not parsed")
+	}
+	if cfg.Daemon.TLSCert != "" || cfg.Daemon.TLSKey != "" {
+		t.Fatalf("expected no TLS, got %q / %q", cfg.Daemon.TLSCert, cfg.Daemon.TLSKey)
+	}
+	if cfg.Daemon.Token != "literal-token" {
+		t.Fatalf("Token = %q", cfg.Daemon.Token)
+	}
+}
+
+func TestLoadDaemonMissingToken(t *testing.T) {
+	// auth = { } without a token must fail — an open daemon port is a
+	// footgun even in lab setups, so we refuse to start one.
+	p := writeConfig(t, `
+[daemon]
+listen = "127.0.0.1:9000"
+auth   = { }
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "auth.token is required") {
+		t.Fatalf("expected auth.token-required error, got %v", err)
+	}
+}
+
+func TestLoadDaemonMissingListen(t *testing.T) {
+	p := writeConfig(t, `
+[daemon]
+auth = { token = "x" }
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "listen is required") {
+		t.Fatalf("expected listen-required error, got %v", err)
+	}
+}
+
+func TestLoadDaemonPartialTLS(t *testing.T) {
+	// One half of the cert/key pair must imply the other — partial TLS is
+	// almost certainly a typo.
+	p := writeConfig(t, `
+[daemon]
+listen = "127.0.0.1:9000"
+tls    = { cert = "/x.pem" }
+auth   = { token = "t" }
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "tls.cert and tls.key must be set together") {
+		t.Fatalf("expected partial-TLS error, got %v", err)
+	}
+}
+
+func TestLoadDaemonRejectsUnknownField(t *testing.T) {
+	// Strict per-field validation against typos in the [daemon] block.
+	p := writeConfig(t, `
+[daemon]
+listen      = "127.0.0.1:9000"
+auth        = { token = "t" }
+lisetnaddr  = "oops"
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "lisetnaddr") {
+		t.Fatalf("expected unknown-field error, got %v", err)
+	}
+}
+
+func TestLoadDaemonAbsent(t *testing.T) {
+	// Config without [daemon] is fine — only the daemon subcommand needs it.
+	p := writeConfig(t, `
+[volumes.x]
+path = "/x"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Daemon != nil {
+		t.Fatalf("Daemon should be nil when block is absent")
+	}
+}
+
 func TestMissingErrorWrappingChain(t *testing.T) {
 	// MissingError must be detectable both via IsMissing and errors.As so
 	// callers can choose either ergonomic form.
