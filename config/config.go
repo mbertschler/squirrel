@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/pelletier/go-toml/v2"
 )
@@ -64,6 +65,18 @@ type Volume struct {
 	Name   string
 	Path   string   // absolute, ~ expanded
 	SyncTo []string // destination names declared on this volume
+	// SyncEvery is the agent-scheduler cadence for full syncs of this
+	// volume. Zero means "no scheduled sync" — the agent never auto-
+	// triggers a sync for this volume; manual `squirrel sync` still
+	// works. A scheduled sync always indexes immediately before
+	// pushing.
+	SyncEvery time.Duration
+	// IndexEvery is the cadence for *standalone* index passes between
+	// scheduled syncs, for finer-grained forensic history. Zero means
+	// "no extra indexing". When SyncEvery is also set, IndexEvery
+	// must be strictly shorter — equal or longer adds nothing on top
+	// of the pre-sync indexing the scheduler already runs.
+	IndexEvery time.Duration
 }
 
 // Destination is one rclone-backed remote. Type drives which Params are
@@ -140,8 +153,10 @@ type rawConfig struct {
 }
 
 type rawVolume struct {
-	Path   string   `toml:"path"`
-	SyncTo []string `toml:"sync_to"`
+	Path       string   `toml:"path"`
+	SyncTo     []string `toml:"sync_to"`
+	SyncEvery  string   `toml:"sync_every"`
+	IndexEvery string   `toml:"index_every"`
 }
 
 func (r *rawConfig) resolve(path string) (*Config, error) {
@@ -218,7 +233,56 @@ func resolveVolume(name string, raw rawVolume, dests map[string]*Destination, no
 		}
 		return nil, fmt.Errorf("sync_to references unknown destination or node %q", dst)
 	}
-	return &Volume{Name: name, Path: abs, SyncTo: raw.SyncTo}, nil
+	syncEvery, err := parseVolumeCadence("sync_every", raw.SyncEvery)
+	if err != nil {
+		return nil, err
+	}
+	indexEvery, err := parseVolumeCadence("index_every", raw.IndexEvery)
+	if err != nil {
+		return nil, err
+	}
+	// The scheduler always indexes immediately before each scheduled
+	// sync, so an index_every that is equal to or longer than
+	// sync_every contributes no extra observations between syncs —
+	// it's almost certainly a misconfiguration. Reject it loudly.
+	if syncEvery > 0 && indexEvery > 0 && indexEvery >= syncEvery {
+		return nil, errors.New("index_every must be strictly shorter than sync_every (pre-sync indexing already runs at sync_every cadence)")
+	}
+	return &Volume{
+		Name:       name,
+		Path:       abs,
+		SyncTo:     raw.SyncTo,
+		SyncEvery:  syncEvery,
+		IndexEvery: indexEvery,
+	}, nil
+}
+
+// volumeCadenceFloor is the minimum scheduler interval for either
+// per-volume cadence knob. The floor exists to catch obvious
+// misconfigurations (e.g. forgetting the unit suffix and writing `5`
+// where `5m` was intended) before the scheduler spins up a tight loop.
+const volumeCadenceFloor = time.Second
+
+// parseVolumeCadence parses an optional cadence string. Empty stays
+// zero (caller treats that as "agent does not auto-trigger this
+// cadence for the volume"). Non-empty must (a) parse as a
+// time.Duration, (b) be strictly positive, and (c) be at least
+// volumeCadenceFloor.
+func parseVolumeCadence(field, raw string) (time.Duration, error) {
+	if raw == "" {
+		return 0, nil
+	}
+	dur, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s %q: %w", field, raw, err)
+	}
+	if dur <= 0 {
+		return 0, fmt.Errorf("%s must be a positive duration, got %s", field, dur)
+	}
+	if dur < volumeCadenceFloor {
+		return 0, fmt.Errorf("%s must be at least %s, got %s", field, volumeCadenceFloor, dur)
+	}
+	return dur, nil
 }
 
 // formatTomlError unwraps pelletier's StrictMissingError so the bare
