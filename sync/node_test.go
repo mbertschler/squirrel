@@ -1046,6 +1046,90 @@ func TestBeginPendingWarningsSurfaceAuditDrift(t *testing.T) {
 	if !strings.Contains(resp.PendingWarnings[0], "1 modified") {
 		t.Fatalf("PendingWarnings[0] = %q, want '1 modified'", resp.PendingWarnings[0])
 	}
+	if !strings.Contains(resp.PendingWarnings[0], "0 missing") {
+		t.Fatalf("PendingWarnings[0] = %q, want '0 missing' (only a modification, no deletion)", resp.PendingWarnings[0])
+	}
+}
+
+// TestBeginPendingWarningsSurfaceMissing covers the other half of
+// drift: a file vanishes from disk between syncs, the audit marks it
+// missing via the schema's MarkMissing flip, and the next handshake
+// surfaces the missing count in PendingWarnings. Originally the
+// receiver only counted modifications and silently dropped pure
+// deletions (Copilot review on PR 31).
+func TestBeginPendingWarningsSurfaceMissing(t *testing.T) {
+	f := setupNodeFixtureNoRclone(t)
+	ctx := context.Background()
+
+	v, err := f.recvStore.CreateVolume(ctx, f.recvVol.Name, f.recvVol.Path)
+	if err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	initSelf, _ := f.initStore.GetSelfNode(ctx)
+	peer, err := f.recvStore.CreateNode(ctx, initSelf.Name, "peer://"+initSelf.Name)
+	if err != nil {
+		t.Fatalf("seed peer node: %v", err)
+	}
+	priorRun, err := f.recvStore.BeginPeerSyncRun(ctx, v.ID, peer.ID, 5, initSelf.Name)
+	if err != nil {
+		t.Fatalf("BeginPeerSyncRun: %v", err)
+	}
+	_ = f.recvStore.FinishRun(ctx, priorRun, store.RunStatusSuccess, "", 1)
+
+	// Place the file on disk so the row's last_seen_run_id is the
+	// prior sync run, then "delete" it before the audit.
+	doc := filepath.Join(f.recvVol.Path, "gone.md")
+	if err := os.WriteFile(doc, []byte("baseline"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.recvStore.Upsert(ctx, store.FileRow{
+		VolumeID: v.ID, Path: "gone.md", Blake3: bytesDigest(0x77),
+		SizeBytes: 8, MtimeNs: 1, Status: store.StatusPresent,
+		FirstSeenRunID: priorRun, LastSeenRunID: priorRun, IndexedAtNs: 1,
+	}, &store.Provenance{NodeID: peer.ID, RunID: priorRun}); err != nil {
+		t.Fatalf("seed receiver row: %v", err)
+	}
+	if err := f.recvStore.UpsertPeerSyncState(ctx, v.ID, peer.ID, 5); err != nil {
+		t.Fatalf("UpsertPeerSyncState: %v", err)
+	}
+	if err := os.Remove(doc); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := index.Index(ctx, f.recvStore, f.recvVol.Path, index.Options{
+		Name: f.recvVol.Name,
+		Kind: store.RunKindAudit,
+	})
+	if err != nil {
+		t.Fatalf("receiver audit: %v", err)
+	}
+	if rep.Missing != 1 {
+		t.Fatalf("audit missing count = %d, want 1", rep.Missing)
+	}
+	auditRunID := rep.RunID
+
+	client := newNodeClient(f.node)
+	resp, err := client.begin(ctx, syncproto.BeginRequest{
+		Volume:            f.recvVol.Name,
+		InitiatorNodeName: initSelf.Name,
+		InitiatorRunID:    101,
+	})
+	if err != nil {
+		t.Fatalf("/begin: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = client.close(ctx, syncproto.CloseRequest{
+			ReceiverRunID: resp.ReceiverRunID,
+			Status:        store.RunStatusFailed,
+		})
+	})
+	wantSubstr := fmt.Sprintf("audit run %d on volume %s", auditRunID, f.recvVol.Name)
+	if len(resp.PendingWarnings) == 0 || !strings.Contains(resp.PendingWarnings[0], wantSubstr) {
+		t.Fatalf("PendingWarnings = %v, want a line for %q", resp.PendingWarnings, wantSubstr)
+	}
+	if !strings.Contains(resp.PendingWarnings[0], "1 missing") {
+		t.Fatalf("PendingWarnings[0] = %q, want '1 missing'", resp.PendingWarnings[0])
+	}
 }
 
 // TestBeginPendingWarningsEmptyAfterWatermark checks that audit runs

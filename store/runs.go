@@ -330,6 +330,23 @@ func (s *Store) CountModifiedFilesByRun(ctx context.Context, runID int64) (int, 
 	return n, nil
 }
 
+// CountMissingFilesByRun returns the number of files rows whose status
+// is 'missing' and whose last_seen_run_id equals runID — i.e. the rows
+// MarkMissing flipped to missing during runID. Relies on the contract
+// that MarkMissing stamps last_seen_run_id on the flip; together with
+// CountModifiedFilesByRun it gives the "modified + missing" pair the
+// drift-detection handshake (#17) surfaces.
+func (s *Store) CountMissingFilesByRun(ctx context.Context, runID int64) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM files
+		 WHERE status = 'missing' AND last_seen_run_id = ?`, runID).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count missing by run %d: %w", runID, err)
+	}
+	return n, nil
+}
+
 // LatestSuccessfulIndexRun returns the most recent index run for the given
 // volume that finished in status 'success' or 'partial'. Used by the sync
 // command as a prerequisite check: refusing to sync a volume that has never

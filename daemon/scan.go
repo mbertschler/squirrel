@@ -15,10 +15,14 @@ import (
 // runScanLoop drives the periodic drift-detection scan described in
 // issue #17. One tick walks every configured volume; for each it
 // acquires the same per-volume lock the /v1/sync/* handlers use, then
-// runs an `audit`-kind index pass against the volume root. An
-// in-flight sync on the same volume yields a try-lock failure that
-// gets a logged skip and a retry on the next tick — audit and sync
-// against the same volume never run concurrently.
+// runs an `audit`-kind index pass against the volume root.
+//
+// Locking is try-lock on both sides: an audit tick arriving while a
+// sync is in flight logs a skip and retries on the next tick; a sync
+// /begin arriving mid-audit returns 409 (matching the pre-existing
+// sync-vs-sync behaviour) and the initiator retries from its end.
+// Audit and sync against the same volume therefore never run
+// concurrently.
 //
 // The loop returns when ctx is cancelled. Tickers tick on the wall
 // clock, not on completion, so a long-running audit doesn't drag the

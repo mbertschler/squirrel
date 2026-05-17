@@ -252,14 +252,16 @@ func (r *peerSyncRouter) finishBegin(ctx context.Context, body syncproto.BeginRe
 
 // collectDriftWarnings produces one PendingWarnings line per audit run
 // against (volumeID) since the last successful sync with peerNodeID
-// that detected at least one modified file. The watermark is read from
-// peer_sync_state.last_synced_at; no row yet means "first contact" and
-// surfaces every audit run on the volume.
+// that detected non-zero drift. Drift is the sum of `modified`
+// (content changed in place — supersede chain) and `missing` (file
+// vanished from disk — MarkMissing flip). The watermark is read from
+// peer_sync_state.last_synced_at; no row yet means "first contact"
+// and surfaces every audit run on the volume.
 //
-// Modified count is derived on-the-fly from the supersede chain in
-// `files`; no audit-specific schema column carries it. Clean audits
-// (zero modified) are omitted so the initiator's CLI doesn't spam
-// "audit run N: 0 modified" lines on every sync.
+// Both counts are derived from the existing files table; no
+// audit-specific schema column carries them. Clean audits (zero
+// modified + zero missing) are omitted so the initiator's CLI doesn't
+// spam empty lines on every sync.
 func (r *peerSyncRouter) collectDriftWarnings(ctx context.Context, volumeName string, volumeID, peerNodeID int64) ([]string, error) {
 	state, err := r.srv.store.GetPeerSyncState(ctx, volumeID, peerNodeID)
 	var sinceNs int64
@@ -278,11 +280,15 @@ func (r *peerSyncRouter) collectDriftWarnings(ctx context.Context, volumeName st
 		if err != nil {
 			return nil, err
 		}
-		if modified == 0 {
+		missing, err := r.srv.store.CountMissingFilesByRun(ctx, run.ID)
+		if err != nil {
+			return nil, err
+		}
+		if modified == 0 && missing == 0 {
 			continue
 		}
-		out = append(out, fmt.Sprintf("audit run %d on volume %s: %d modified",
-			run.ID, volumeName, modified))
+		out = append(out, fmt.Sprintf("audit run %d on volume %s: %d modified, %d missing",
+			run.ID, volumeName, modified, missing))
 	}
 	return out, nil
 }

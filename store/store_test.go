@@ -2562,3 +2562,89 @@ func TestCountModifiedFilesByRun(t *testing.T) {
 		t.Fatalf("clean modified = %d, want 0", got)
 	}
 }
+
+// TestMarkMissingStampsRunIDAndCount verifies the MarkMissing
+// contract relied on by CountMissingFilesByRun: rows flipped to
+// 'missing' carry last_seen_run_id = currentRunID, so the count
+// helper can attribute the deletion to a specific audit run without
+// an extra schema column.
+func TestMarkMissingStampsRunIDAndCount(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	vID := makeVolume(t, s, "/v")
+	indexRun := makeRun(t, s, vID)
+	for i, path := range []string{"a.txt", "b.txt", "c.txt"} {
+		if err := s.Upsert(ctx, FileRow{
+			VolumeID: vID, Path: path, Blake3: digest(byte(0xA0 + i)),
+			SizeBytes: 1, MtimeNs: 1, Status: StatusPresent,
+			FirstSeenRunID: indexRun, LastSeenRunID: indexRun, IndexedAtNs: 1,
+		}, nil); err != nil {
+			t.Fatalf("upsert %s: %v", path, err)
+		}
+	}
+
+	auditRun, err := s.BeginRun(ctx, RunKindAudit, vID, "")
+	if err != nil {
+		t.Fatalf("BeginRun audit: %v", err)
+	}
+	// Touch only a.txt during the audit; b.txt and c.txt should flip
+	// to missing.
+	if err := s.TouchSeen(ctx, vID, "a.txt", auditRun); err != nil {
+		t.Fatalf("TouchSeen: %v", err)
+	}
+	n, err := s.MarkMissing(ctx, vID, auditRun)
+	if err != nil {
+		t.Fatalf("MarkMissing: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("MarkMissing affected %d, want 2", n)
+	}
+
+	// Both b.txt and c.txt carry last_seen_run_id = auditRun now.
+	for _, path := range []string{"b.txt", "c.txt"} {
+		row, err := s.GetByPath(ctx, vID, path)
+		if err != nil {
+			t.Fatalf("GetByPath %s: %v", path, err)
+		}
+		if row.Status != StatusMissing {
+			t.Fatalf("%s status = %q, want missing", path, row.Status)
+		}
+		if row.LastSeenRunID != auditRun {
+			t.Fatalf("%s LastSeenRunID = %d, want %d (audit run stamps flip)",
+				path, row.LastSeenRunID, auditRun)
+		}
+	}
+
+	got, err := s.CountMissingFilesByRun(ctx, auditRun)
+	if err != nil {
+		t.Fatalf("CountMissingFilesByRun: %v", err)
+	}
+	if got != 2 {
+		t.Fatalf("missing-by-audit = %d, want 2", got)
+	}
+
+	// A subsequent audit that touches a.txt as still-present
+	// (TouchSeen advances last_seen to laterRun) and re-MarkMissings
+	// the volume yields zero newly-missing rows: b.txt and c.txt are
+	// already missing, and a.txt is present.
+	laterRun, _ := s.BeginRun(ctx, RunKindAudit, vID, "")
+	if err := s.TouchSeen(ctx, vID, "a.txt", laterRun); err != nil {
+		t.Fatalf("TouchSeen later: %v", err)
+	}
+	if _, err := s.MarkMissing(ctx, vID, laterRun); err != nil {
+		t.Fatalf("MarkMissing (later): %v", err)
+	}
+	got, err = s.CountMissingFilesByRun(ctx, laterRun)
+	if err != nil {
+		t.Fatalf("CountMissingFilesByRun later: %v", err)
+	}
+	if got != 0 {
+		t.Fatalf("later missing-by-audit = %d, want 0 (no newly-missing rows)", got)
+	}
+}

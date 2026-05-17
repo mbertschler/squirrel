@@ -381,17 +381,22 @@ func (s *Store) TouchSeen(ctx context.Context, volumeID int64, relPath string, r
 
 // MarkMissing flips every row in the given volume that was not touched by the
 // given run (last_seen_run_id != currentRunID) and is currently 'present' to
-// 'missing'. The caller is responsible for only invoking this after the run
-// has fully scanned the volume: any path the run failed to visit (per-file
-// error, context cancellation, fatal walk failure) will look "missing" to
-// this query even when it still exists on disk. The indexer enforces this by
+// 'missing', stamping last_seen_run_id with the current run as part of the
+// flip. The stamp captures the audit run that *observed* the absence so
+// drift surfacing (#17) can count "files newly missing during run N" via
+// CountMissingFilesByRun without any audit-specific schema column.
+//
+// The caller is responsible for only invoking this after the run has fully
+// scanned the volume: any path the run failed to visit (per-file error,
+// context cancellation, fatal walk failure) will look "missing" to this
+// query even when it still exists on disk. The indexer enforces this by
 // skipping MarkMissing whenever report.Errors > 0 or the walk returned an
 // error.
 func (s *Store) MarkMissing(ctx context.Context, volumeID int64, currentRunID int64) (int64, error) {
 	res, err := s.db.ExecContext(ctx, `
-		UPDATE files SET status = 'missing'
+		UPDATE files SET status = 'missing', last_seen_run_id = ?
 		WHERE status = 'present' AND volume_id = ? AND last_seen_run_id != ?
-	`, volumeID, currentRunID)
+	`, currentRunID, volumeID, currentRunID)
 	if err != nil {
 		return 0, err
 	}
