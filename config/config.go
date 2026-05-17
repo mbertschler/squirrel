@@ -50,6 +50,9 @@ type Config struct {
 	Volumes map[string]*Volume
 	// Destinations is keyed by destination name. Names match nameRE.
 	Destinations map[string]*Destination
+	// Daemon is non-nil when the config declares a `[daemon]` block. The
+	// daemon subcommand requires it; other subcommands ignore it.
+	Daemon *Daemon
 }
 
 // Volume is one indexable root.
@@ -128,6 +131,7 @@ type rawConfig struct {
 	NodeName     string                    `toml:"node_name"`
 	Volumes      map[string]rawVolume      `toml:"volumes"`
 	Destinations map[string]map[string]any `toml:"destinations"`
+	Daemon       *rawDaemon                `toml:"daemon"`
 }
 
 type rawVolume struct {
@@ -167,6 +171,13 @@ func (r *rawConfig) resolve(path string) (*Config, error) {
 			return nil, fmt.Errorf("volumes.%s: %w", name, err)
 		}
 		cfg.Volumes[name] = vol
+	}
+	if r.Daemon != nil {
+		d, err := resolveDaemon(r.Daemon)
+		if err != nil {
+			return nil, fmt.Errorf("daemon: %w", err)
+		}
+		cfg.Daemon = d
 	}
 	return cfg, nil
 }
