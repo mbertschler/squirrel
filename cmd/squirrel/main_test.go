@@ -37,8 +37,8 @@ func runCLI(t *testing.T, args ...string) string {
 }
 
 // runCLIExpectErr executes the cobra root expecting a non-nil error, and
-// returns (err, captured output).
-func runCLIExpectErr(t *testing.T, args ...string) (error, string) {
+// returns (captured output, err).
+func runCLIExpectErr(t *testing.T, args ...string) (string, error) {
 	t.Helper()
 	isolateConfig(t)
 	var buf bytes.Buffer
@@ -50,7 +50,7 @@ func runCLIExpectErr(t *testing.T, args ...string) (error, string) {
 	if err == nil {
 		t.Fatalf("CLI %v unexpectedly succeeded; output:\n%s", args, buf.String())
 	}
-	return err, buf.String()
+	return buf.String(), err
 }
 
 func writeTestFile(t *testing.T, path, content string) {
@@ -146,7 +146,7 @@ func TestCLIIndexAndQueryRoundTrip(t *testing.T) {
 
 func TestCLIIndexUnknownVolume(t *testing.T) {
 	f := writeConfigFor(t, map[string]string{"declared": t.TempDir()})
-	err, _ := runCLIExpectErr(t, "--config", f.configPath, "index", "missing")
+	_, err := runCLIExpectErr(t, "--config", f.configPath, "index", "missing")
 	if !strings.Contains(err.Error(), `unknown volume "missing"`) {
 		t.Fatalf("expected unknown-volume error, got %v", err)
 	}
@@ -154,7 +154,7 @@ func TestCLIIndexUnknownVolume(t *testing.T) {
 
 func TestCLIIndexRequiresConfig(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "no-config.toml")
-	err, _ := runCLIExpectErr(t, "--config", missing, "index", "src")
+	_, err := runCLIExpectErr(t, "--config", missing, "index", "src")
 	if !strings.Contains(err.Error(), "no config at") {
 		t.Fatalf("expected missing-config error, got %v", err)
 	}

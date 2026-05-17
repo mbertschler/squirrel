@@ -130,7 +130,7 @@ func TestCLIRestoreNeedsExplicitFromWhenAmbiguous(t *testing.T) {
 	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	err, _ := runCLIExpectErr(t, "--config", cfgPath, "restore", "pics")
+	_, err := runCLIExpectErr(t, "--config", cfgPath, "restore", "pics")
 	if !strings.Contains(err.Error(), "multiple destinations") {
 		t.Fatalf("expected multiple-destinations error, got %v", err)
 	}

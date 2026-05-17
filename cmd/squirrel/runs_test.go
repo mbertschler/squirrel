@@ -125,7 +125,7 @@ func TestCLIRunsUnknownVolume(t *testing.T) {
 	f := writeConfigFor(t, map[string]string{"src": src})
 	runCLI(t, "--config", f.configPath, "index", "src")
 
-	err, _ := runCLIExpectErr(t, "--config", f.configPath, "runs", "--volume", "no-such-volume")
+	_, err := runCLIExpectErr(t, "--config", f.configPath, "runs", "--volume", "no-such-volume")
 	if !strings.Contains(err.Error(), "no volume named") {
 		t.Fatalf("unexpected error: %v", err)
 	}

@@ -64,7 +64,7 @@ func TestCLIQueryPrefersExistingPathOverHashLike(t *testing.T) {
 
 	// A 64-hex string with no file on disk falls through to the hash branch.
 	bogusHex := strings.Repeat("b", 64)
-	_, output := runCLIExpectErr(t, "--config", f.configPath, "query", bogusHex)
+	output, _ := runCLIExpectErr(t, "--config", f.configPath, "query", bogusHex)
 	if !strings.Contains(output, "no rows for blake3") {
 		t.Fatalf("expected hash-branch error message, got:\n%s", output)
 	}
@@ -107,7 +107,7 @@ func TestCLIQueryHistoryRejectsHashLookup(t *testing.T) {
 	out := runCLI(t, "--config", f.configPath, "query", filepath.Join(src, "a.txt"))
 	hex := extractField(t, out, "blake3:")
 
-	err, msg := runCLIExpectErr(t, "--config", f.configPath, "query", "--history", hex)
+	msg, err := runCLIExpectErr(t, "--config", f.configPath, "query", "--history", hex)
 	if !strings.Contains(err.Error(), "applies to path queries") {
 		t.Fatalf("unexpected error %v; output:\n%s", err, msg)
 	}
@@ -116,7 +116,7 @@ func TestCLIQueryHistoryRejectsHashLookup(t *testing.T) {
 func TestCLIQueryUnknownPath(t *testing.T) {
 	tmp := t.TempDir()
 	db := filepath.Join(tmp, "test.db")
-	err, _ := runCLIExpectErr(t, "query", "--db", db, filepath.Join(tmp, "nope.txt"))
+	_, err := runCLIExpectErr(t, "query", "--db", db, filepath.Join(tmp, "nope.txt"))
 	if !strings.Contains(err.Error(), "no row for path") {
 		t.Fatalf("unexpected error message: %v", err)
 	}

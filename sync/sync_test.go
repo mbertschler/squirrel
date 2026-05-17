@@ -351,11 +351,11 @@ func TestCheckMinVersionBranches(t *testing.T) {
 			Raw: fmt.Sprintf("rclone v%d.%d.%d", maj, min, pat)}
 	}
 	cases := []struct {
-		name      string
-		version   Version
-		shallow   bool
-		wantErr   bool
-		wantWarn  bool
+		name     string
+		version  Version
+		shallow  bool
+		wantErr  bool
+		wantWarn bool
 	}{
 		{"at floor, !shallow", v(1, 66, 0), false, false, false},
 		{"above floor, !shallow", v(1, 80, 0), false, false, false},
@@ -427,11 +427,11 @@ sync_to = ["a"]
 		vol, dest string
 		want      int
 	}{
-		{"", "", 3},       // all pairs: one→a, one→b, two→a
-		{"one", "", 2},    // both pairs for 'one'
-		{"two", "", 1},    // only 'two'→a
-		{"", "a", 2},      // every pair targeting destination 'a'
-		{"one", "b", 1},   // single specific pair
+		{"", "", 3},     // all pairs: one→a, one→b, two→a
+		{"one", "", 2},  // both pairs for 'one'
+		{"two", "", 1},  // only 'two'→a
+		{"", "a", 2},    // every pair targeting destination 'a'
+		{"one", "b", 1}, // single specific pair
 	}
 	for _, c := range cases {
 		got, err := PairsFor(cfg, c.vol, c.dest)

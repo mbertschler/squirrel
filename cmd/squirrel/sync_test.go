@@ -24,11 +24,11 @@ func requireRcloneCLI(t *testing.T) {
 // and a fresh DB path. Returns the config and db paths so callers can
 // pass them via --config / --db on the CLI.
 type syncFixturePaths struct {
-	volumeDir   string
-	destDir     string
-	configPath  string
-	dbPath      string
-	volumeName  string
+	volumeDir  string
+	destDir    string
+	configPath string
+	dbPath     string
+	volumeName string
 }
 
 func writeSyncFixture(t *testing.T) syncFixturePaths {
@@ -69,7 +69,7 @@ func TestCLISyncErrorsWhenVolumeNotIndexed(t *testing.T) {
 	f := writeSyncFixture(t)
 	writeTestFile(t, filepath.Join(f.volumeDir, "a.txt"), "alpha")
 
-	err, out := runCLIExpectErr(t, "--config", f.configPath, "sync", "pics")
+	out, err := runCLIExpectErr(t, "--config", f.configPath, "sync", "pics")
 	if !strings.Contains(err.Error(), "never been indexed") &&
 		!strings.Contains(out, "never been indexed") {
 		t.Fatalf("expected unindexed-volume error, got err=%v out=%q", err, out)
@@ -100,7 +100,7 @@ func TestCLISyncHappyPath(t *testing.T) {
 
 func TestCLISyncUnknownDestinationFlag(t *testing.T) {
 	f := writeSyncFixture(t)
-	err, _ := runCLIExpectErr(t, "--config", f.configPath, "sync", "pics", "--to", "ghost")
+	_, err := runCLIExpectErr(t, "--config", f.configPath, "sync", "pics", "--to", "ghost")
 	if !strings.Contains(err.Error(), "unknown destination") {
 		t.Fatalf("expected unknown-destination error, got %v", err)
 	}
@@ -111,7 +111,7 @@ func TestCLISyncRequiresConfig(t *testing.T) {
 	// pointer to the missing file instead of a generic IO error.
 	tmp := t.TempDir()
 	missing := filepath.Join(tmp, "no-config.toml")
-	err, _ := runCLIExpectErr(t, "--config", missing, "sync", "pics")
+	_, err := runCLIExpectErr(t, "--config", missing, "sync", "pics")
 	if !strings.Contains(err.Error(), "no config at") {
 		t.Fatalf("expected missing-config error, got %v", err)
 	}
@@ -146,7 +146,7 @@ func TestCLISyncDryRun(t *testing.T) {
 // This also indirectly covers the path-validation message format.
 func TestCLISyncMissingExplicitConfigErrors(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "nope.toml")
-	err, _ := runCLIExpectErr(t, "--config", missing, "query", "--db", filepath.Join(t.TempDir(), "x.db"), "abc")
+	_, err := runCLIExpectErr(t, "--config", missing, "query", "--db", filepath.Join(t.TempDir(), "x.db"), "abc")
 	if !strings.Contains(err.Error(), "no config at") {
 		t.Fatalf("expected missing-config error when --config is explicit, got %v", err)
 	}

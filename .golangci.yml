@@ -14,8 +14,10 @@ linters:
     errcheck:
       exclude-functions:
         - (*database/sql.DB).Close
+        - (*database/sql.Conn).Close
         - (*database/sql.Tx).Rollback
         - (*database/sql.Rows).Close
+        - (*github.com/mbertschler/squirrel/store.Store).Close
         - (*os.File).Close
         - fmt.Fprint
         - fmt.Fprintf
