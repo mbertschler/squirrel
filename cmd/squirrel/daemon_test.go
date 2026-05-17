@@ -126,33 +126,34 @@ func TestCLIDaemonHealthEndpoint(t *testing.T) {
 	}
 }
 
-func TestCLIDaemonPlanRequiresBearer(t *testing.T) {
+func TestCLIDaemonSyncRequiresBearer(t *testing.T) {
 	listen := reservePort(t)
 	cfgPath := writeDaemonConfig(t, listen, "secret-token")
 	stop, addr := startDaemonCLI(t, cfgPath)
 	defer stop()
 
 	// No auth → 401.
-	resp, err := http.Post("http://"+addr+"/v1/plan", "application/json", nil)
+	resp, err := http.Post("http://"+addr+"/v1/sync/begin", "application/json", nil)
 	if err != nil {
-		t.Fatalf("POST /v1/plan: %v", err)
+		t.Fatalf("POST /v1/sync/begin: %v", err)
 	}
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("no-auth status = %d, want 401", resp.StatusCode)
 	}
 
-	// With the correct bearer → 501 (the placeholder).
-	req, _ := http.NewRequest(http.MethodPost, "http://"+addr+"/v1/plan", nil)
+	// With the correct bearer + an empty body → 400 (request validation
+	// past the auth wall).
+	req, _ := http.NewRequest(http.MethodPost, "http://"+addr+"/v1/sync/begin", nil)
 	req.Header.Set("Authorization", "Bearer secret-token")
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("POST /v1/plan: %v", err)
+		t.Fatalf("POST /v1/sync/begin: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusNotImplemented {
+	if resp.StatusCode != http.StatusBadRequest {
 		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("status = %d, want 501; body=%s", resp.StatusCode, body)
+		t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, body)
 	}
 }
 

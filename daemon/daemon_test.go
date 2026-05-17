@@ -99,11 +99,15 @@ func TestHealthIsUnauthenticated(t *testing.T) {
 	}
 }
 
-func TestPlanRequiresBearerToken(t *testing.T) {
+func TestSyncBeginRequiresBearerToken(t *testing.T) {
 	srv := newTestServer(t, Config{Token: "right-token"})
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
+	// /v1/sync/begin with an empty body and a valid bearer token gets
+	// past auth and hits the JSON decoder, which rejects with 400.
+	// Anything that fails auth must return 401 before reaching the
+	// decoder.
 	cases := []struct {
 		name       string
 		authHeader string
@@ -113,16 +117,16 @@ func TestPlanRequiresBearerToken(t *testing.T) {
 		{"wrong scheme", "Basic Zm9vOmJhcg==", http.StatusUnauthorized},
 		{"wrong token", "Bearer wrong-token", http.StatusUnauthorized},
 		{"empty token after scheme", "Bearer ", http.StatusUnauthorized},
-		{"correct token", "Bearer right-token", http.StatusNotImplemented},
+		{"correct token", "Bearer right-token", http.StatusBadRequest},
 		// RFC 7235 §2.1: the scheme name is case-insensitive.
-		{"lowercase scheme", "bearer right-token", http.StatusNotImplemented},
-		{"mixed-case scheme", "BeArEr right-token", http.StatusNotImplemented},
+		{"lowercase scheme", "bearer right-token", http.StatusBadRequest},
+		{"mixed-case scheme", "BeArEr right-token", http.StatusBadRequest},
 		// Tolerant of an extra space between scheme and token.
-		{"extra whitespace", "Bearer  right-token", http.StatusNotImplemented},
+		{"extra whitespace", "Bearer  right-token", http.StatusBadRequest},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/plan", nil)
+			req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/sync/begin", nil)
 			if c.authHeader != "" {
 				req.Header.Set("Authorization", c.authHeader)
 			}
@@ -138,18 +142,18 @@ func TestPlanRequiresBearerToken(t *testing.T) {
 	}
 }
 
-// TestPlanRejectsBearerWithLengthDifference pins the behaviour that
+// TestSyncBeginRejectsBearerWithLengthDifference pins the behaviour that
 // shorter/longer-than-configured tokens are rejected. The implementation
 // hashes both sides before comparing (so the compare itself sees equal-
 // length digests) and this test guards against a regression where a
 // future refactor reintroduces a prefix-match or substring-match path.
-func TestPlanRejectsBearerWithLengthDifference(t *testing.T) {
+func TestSyncBeginRejectsBearerWithLengthDifference(t *testing.T) {
 	srv := newTestServer(t, Config{Token: "right-token"})
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
 	for _, tok := range []string{"right", "right-token-with-trailing"} {
-		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/plan", nil)
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/sync/begin", nil)
 		req.Header.Set("Authorization", "Bearer "+tok)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {

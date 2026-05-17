@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -71,7 +72,7 @@ func runSync(cmd *cobra.Command, volumeName, destinationName string, opts sync.O
 
 	var anyFailed bool
 	for _, p := range pairs {
-		rep, err := sync.Sync(cmd.Context(), s, rcl, p.Volume, p.Destination, opts)
+		rep, err := sync.RunPair(cmd.Context(), s, rcl, p, opts)
 		printSyncReport(out, rep, err)
 		if err != nil || rep.Status != "success" {
 			anyFailed = true
@@ -100,6 +101,21 @@ func printSyncReport(w io.Writer, rep sync.Report, runErr error) {
 		rep.Volume, rep.Destination, rep.Status,
 		r.Transferred, r.Checked, r.Errors, r.Bytes, rep.RunID,
 	)
+	if rep.NodeReceiverRunID != 0 {
+		fmt.Fprintf(w, "  receiver_run=%d matched=%d mismatched=%d missing=%d\n",
+			rep.NodeReceiverRunID,
+			len(rep.NodeVerify.Matched),
+			len(rep.NodeVerify.Mismatched),
+			len(rep.NodeVerify.Missing),
+		)
+		for _, m := range rep.NodeVerify.Mismatched {
+			fmt.Fprintf(w, "    mismatched %s: expected %s, actual %s\n", m.Path, m.ExpectedHex, m.ActualHex)
+		}
+	}
+	for _, c := range rep.NodeConflicts {
+		fmt.Fprintf(w, "  conflict %s: %s (initiator %s, receiver %s)\n",
+			c.Path, c.Reason, c.InitiatorBlake3Hex, c.ReceiverBlake3Hex)
+	}
 	for _, ff := range r.FailedFiles {
 		// Some rclone errors (auth, listing, fatal copy) have no Object.
 		// Render those as a bare "error: ..." rather than "error : ...".
@@ -115,6 +131,11 @@ func printSyncReport(w io.Writer, rep sync.Report, runErr error) {
 		fmt.Fprintf(w, "  warning: failed to record terminal run state: %v\n", rep.FinishErr)
 	}
 	if runErr != nil {
-		fmt.Fprintf(w, "  %v\n", runErr)
+		var conflict *sync.ConflictError
+		if errors.As(runErr, &conflict) {
+			fmt.Fprintf(w, "  %s\n", conflict.Error())
+		} else {
+			fmt.Fprintf(w, "  %v\n", runErr)
+		}
 	}
 }
