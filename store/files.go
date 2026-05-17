@@ -306,6 +306,29 @@ func supersedeLiveRow(ctx context.Context, tx *sql.Tx, volumeID int64, relPath s
 	return nil
 }
 
+// MarkSuperseded flips the currently-live row at (volumeID, relPath) to
+// 'superseded' without inserting a replacement. The path-level invariant
+// (at most one non-superseded row per (volume, path)) holds either way:
+// before the call there is at most one live row; after the call there is
+// none. A no-op when the path has no live row.
+//
+// Used by the peer-sync conflict pre-stage: when the receiver moves a
+// conflicting file out to .squirrel-conflicts/, the original-path row
+// must go superseded before the new conflict-path row is inserted,
+// otherwise both would briefly carry the prior blake3 as live content
+// (distinct paths, so no PK conflict, but redundant and surprising to
+// any concurrent reader).
+func (s *Store) MarkSuperseded(ctx context.Context, volumeID int64, relPath string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE files SET status = 'superseded'
+		 WHERE volume_id = ? AND path = ? AND status != 'superseded'`,
+		volumeID, relPath)
+	if err != nil {
+		return fmt.Errorf("mark superseded: %w", err)
+	}
+	return nil
+}
+
 // updateLiveRow refreshes the mutable fields on an existing row matching
 // (volume_id, path, blake3). blake3 and first_seen_run_id are never touched.
 // The (source_node_id, source_run_id) provenance pair is rewritten to the

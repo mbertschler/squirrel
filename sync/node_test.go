@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
-	"errors"
 	"net/http/httptest"
 	"net/url"
 	"os"
@@ -255,14 +254,20 @@ func TestNodeSyncSupersedeMovesPriorBytes(t *testing.T) {
 	}
 }
 
-// TestNodeSyncReturnsConflictOnLocalWriteOnReceiver synthesises the
-// PR-3 conflict scenario by planting a present file row on the
-// receiver with source_node_id = NULL (i.e. a "local write"), then
-// initiating a sync from the initiator with a different blake3 at
-// the same path. The plan must surface a conflict; the run must
-// fail; no rclone should run; receiver-side state must remain
-// untouched.
-func TestNodeSyncReturnsConflictOnLocalWriteOnReceiver(t *testing.T) {
+// TestNodeSyncResolvesConflictOnLocalWriteOnReceiver covers the v1
+// multi-writer scenario: the receiver has a `present` row at a path
+// authored locally (source_node_id NULL — a NAS web-app upload or a
+// daemon-side `squirrel index` after a manual edit), and an initiator
+// sync arrives carrying a different blake3 at the same path.
+//
+// The expected resolution is "initiator wins live, loser preserved":
+// rclone delivers the initiator's bytes to the original path, while
+// the receiver moves the prior bytes to
+// .squirrel-conflicts/run-<id>/<path> and seeds an index row there
+// carrying the prior blake3 + prior provenance. The run is NOT a
+// failure — `peer_sync_state` advances so the next sync doesn't
+// re-flag the same conflict.
+func TestNodeSyncResolvesConflictOnLocalWriteOnReceiver(t *testing.T) {
 	f := setupNodeFixture(t)
 	ctx := context.Background()
 
@@ -284,9 +289,6 @@ func TestNodeSyncReturnsConflictOnLocalWriteOnReceiver(t *testing.T) {
 	}, nil); err != nil {
 		t.Fatalf("seed receiver file row: %v", err)
 	}
-	// Materialise the file on disk so the supersede-pre-move would
-	// have something to rename (if we incorrectly fell through to
-	// supersede).
 	if err := os.WriteFile(filepath.Join(f.recvVol.Path, "doc.md"), []byte("recvr"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -298,31 +300,109 @@ func TestNodeSyncReturnsConflictOnLocalWriteOnReceiver(t *testing.T) {
 	f.indexInitiator(t)
 
 	rep, err := SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
-	if err == nil {
-		t.Fatalf("expected conflict error, got nil (rep=%+v)", rep)
+	if err != nil {
+		t.Fatalf("SyncNode: %v (rep=%+v)", err, rep)
 	}
-	var conflict *ConflictError
-	if !errors.As(err, &conflict) {
-		t.Fatalf("error = %v (%T), want *ConflictError", err, err)
+	if rep.Status != store.RunStatusSuccess {
+		t.Fatalf("Status = %q, want success: %+v", rep.Status, rep)
 	}
-	if len(conflict.Paths) != 1 || conflict.Paths[0] != "doc.md" {
-		t.Fatalf("conflict paths = %v, want [doc.md]", conflict.Paths)
+	if len(rep.NodeConflicts) != 1 || rep.NodeConflicts[0].Path != "doc.md" {
+		t.Fatalf("NodeConflicts = %+v, want one for doc.md", rep.NodeConflicts)
 	}
-	if conflict.Conflicts[0].Reason != "local write on receiver" {
-		t.Fatalf("conflict reason = %q, want 'local write on receiver'", conflict.Conflicts[0].Reason)
+	if rep.NodeConflicts[0].Reason != "local write on receiver" {
+		t.Fatalf("conflict reason = %q, want 'local write on receiver'", rep.NodeConflicts[0].Reason)
+	}
+	preservedRel := rep.NodeConflicts[0].PreservedAtPath
+	if preservedRel == "" {
+		t.Fatalf("PreservedAtPath empty; want a .squirrel-conflicts/... path")
 	}
 
-	// Receiver-side file row unchanged.
-	live, err := f.recvStore.GetByPath(ctx, v.ID, "doc.md")
+	// Initiator's bytes are live at the original path.
+	live, err := os.ReadFile(filepath.Join(f.recvVol.Path, "doc.md"))
 	if err != nil {
-		t.Fatalf("GetByPath: %v", err)
+		t.Fatalf("read live: %v", err)
 	}
-	if hex.EncodeToString(live.Blake3) != hex.EncodeToString(receiverDigest) {
-		t.Fatalf("receiver row was overwritten: %x", live.Blake3)
+	if string(live) != "initr" {
+		t.Fatalf("live content = %q, want 'initr'", live)
 	}
-	on, _ := os.ReadFile(filepath.Join(f.recvVol.Path, "doc.md"))
-	if string(on) != "recvr" {
-		t.Fatalf("receiver on-disk content changed to %q", on)
+
+	// Loser's bytes are at the preserved path.
+	loser, err := os.ReadFile(filepath.Join(f.recvVol.Path, preservedRel))
+	if err != nil {
+		t.Fatalf("read preserved %s: %v", preservedRel, err)
+	}
+	if string(loser) != "recvr" {
+		t.Fatalf("preserved content = %q, want 'recvr'", loser)
+	}
+
+	// Index reachability: live row at doc.md carries initiator
+	// provenance; conflict-path row carries the prior blake3 with
+	// NULL source (local write).
+	liveRow, err := f.recvStore.GetByPath(ctx, v.ID, "doc.md")
+	if err != nil {
+		t.Fatalf("GetByPath doc.md: %v", err)
+	}
+	if hex.EncodeToString(liveRow.Blake3) == hex.EncodeToString(receiverDigest) {
+		t.Fatalf("live row still carries the prior blake3; want initiator's")
+	}
+	if !liveRow.SourceNodeID.Valid {
+		t.Fatalf("live doc.md row has NULL source_node_id; want initiator attribution")
+	}
+	preservedRow, err := f.recvStore.GetByPath(ctx, v.ID, preservedRel)
+	if err != nil {
+		t.Fatalf("GetByPath %s: %v", preservedRel, err)
+	}
+	if hex.EncodeToString(preservedRow.Blake3) != hex.EncodeToString(receiverDigest) {
+		t.Fatalf("preserved row blake3 = %x, want %x (the prior content)",
+			preservedRow.Blake3, receiverDigest)
+	}
+	if preservedRow.SourceNodeID.Valid {
+		t.Fatalf("preserved row source_node_id = %d, want NULL (prior was a local write)",
+			preservedRow.SourceNodeID.Int64)
+	}
+
+	// Loser is reachable by hash too — `squirrel query <prior>`
+	// should land on the conflict path.
+	matches, err := f.recvStore.GetByBlake3(ctx, receiverDigest)
+	if err != nil {
+		t.Fatalf("GetByBlake3: %v", err)
+	}
+	foundAtConflictPath := false
+	for _, m := range matches {
+		if m.File.Path == preservedRel {
+			foundAtConflictPath = true
+			break
+		}
+	}
+	if !foundAtConflictPath {
+		t.Fatalf("prior blake3 not reachable at preserved path %s (matches=%+v)",
+			preservedRel, matches)
+	}
+
+	// peer_sync_state advanced (watermark moves on success even with
+	// conflicts — the conflicts are resolved, not unhandled).
+	initSelf, _ := f.initStore.GetSelfNode(ctx)
+	peerOnRecv, _ := f.recvStore.GetNodeByName(ctx, initSelf.Name)
+	state, err := f.recvStore.GetPeerSyncState(ctx, v.ID, peerOnRecv.ID)
+	if err != nil {
+		t.Fatalf("GetPeerSyncState: %v", err)
+	}
+	if !state.LastSharedRunID.Valid || state.LastSharedRunID.Int64 != rep.RunID {
+		t.Fatalf("watermark = %+v, want %d", state.LastSharedRunID, rep.RunID)
+	}
+
+	// Re-running sync immediately must produce zero conflicts: the
+	// receiver's new doc.md row is sourced from the initiator at the
+	// just-closed run, which is ≤ the watermark.
+	rep2, err := SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	if err != nil {
+		t.Fatalf("second SyncNode: %v", err)
+	}
+	if rep2.Status != store.RunStatusSuccess {
+		t.Fatalf("second run status = %q", rep2.Status)
+	}
+	if len(rep2.NodeConflicts) != 0 {
+		t.Fatalf("second run still flags conflicts: %+v", rep2.NodeConflicts)
 	}
 }
 
@@ -607,17 +687,205 @@ func TestPlanResponseContainsAllDispositions(t *testing.T) {
 	if len(plan.Conflicts) != 1 || plan.Conflicts[0].Path != "local.txt" {
 		t.Fatalf("conflicts = %+v, want one for local.txt", plan.Conflicts)
 	}
+	if plan.Conflicts[0].PreservedAtPath == "" {
+		t.Fatalf("conflict missing PreservedAtPath: %+v", plan.Conflicts[0])
+	}
 
 	// Supersede side-effect: prior bytes moved into history dir.
 	matches, _ := filepath.Glob(filepath.Join(f.recvVol.Path, daemon.HistoryDirName, "run-*", "evolved.txt"))
 	if len(matches) == 0 {
 		t.Fatalf("evolved.txt prior bytes were not pre-moved")
 	}
-	// local.txt (conflict) must NOT be moved — PR 3 doesn't resolve
-	// conflicts; rclone is never invoked for them, and the prior
-	// bytes stay at the original path.
-	if _, err := os.Stat(filepath.Join(f.recvVol.Path, "local.txt")); err != nil {
-		t.Fatalf("local.txt was moved despite conflict disposition: %v", err)
+	// Conflict side-effect: local.txt prior bytes moved into the
+	// conflicts dir; the original path is empty so rclone could
+	// deliver the initiator's bytes there. Index reflects both rows.
+	confMatches, _ := filepath.Glob(filepath.Join(f.recvVol.Path, daemon.ConflictsDirName, "run-*", "local.txt"))
+	if len(confMatches) == 0 {
+		t.Fatalf("local.txt prior bytes were not moved to %s/run-N/", daemon.ConflictsDirName)
+	}
+	if _, err := os.Stat(filepath.Join(f.recvVol.Path, "local.txt")); !os.IsNotExist(err) {
+		t.Fatalf("local.txt still present at original path after conflict pre-stage: %v", err)
+	}
+	conflictRow, err := f.recvStore.GetByPath(ctx, v.ID, plan.Conflicts[0].PreservedAtPath)
+	if err != nil {
+		t.Fatalf("GetByPath %s: %v", plan.Conflicts[0].PreservedAtPath, err)
+	}
+	if hex.EncodeToString(conflictRow.Blake3) != hexDigest(0xCC) {
+		t.Fatalf("conflict-path row blake3 = %x, want prior digest (0xCC...)", conflictRow.Blake3)
+	}
+}
+
+// TestNodeSyncEndToEndConflictAfterDaemonSideIndex walks the full
+// acceptance scenario from #22: initiator → sync round 1 (blake3 X) →
+// daemon-side `squirrel index` after the file is edited locally on
+// the receiver (blake3 Y, local-write provenance) → initiator
+// re-syncs with a third version (blake3 Z), expecting Z to land
+// live, Y preserved under .squirrel-conflicts/run-<id>/, and X
+// reachable in the receiver's `.squirrel-history/` from round 1.
+func TestNodeSyncEndToEndConflictAfterDaemonSideIndex(t *testing.T) {
+	f := setupNodeFixture(t)
+	ctx := context.Background()
+	target := filepath.Join(f.initVol.Path, "doc.md")
+
+	// Round 1: initiator writes X, receiver gets X via sync.
+	if err := os.WriteFile(target, []byte("version-X"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.indexInitiator(t)
+	rep1, err := SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	if err != nil {
+		t.Fatalf("round 1 SyncNode: %v", err)
+	}
+	if rep1.Status != store.RunStatusSuccess || len(rep1.NodeConflicts) != 0 {
+		t.Fatalf("round 1 unexpected: status=%q conflicts=%+v", rep1.Status, rep1.NodeConflicts)
+	}
+
+	// Receiver's web-app / operator edits the file in-place to Y and
+	// runs `squirrel index` on the receiver host. The daemon and CLI
+	// share the same DB file in this scenario, so the local index
+	// run writes through the receiver's store and the resulting row
+	// has source_node_id NULL (local write).
+	if err := os.WriteFile(filepath.Join(f.recvVol.Path, "doc.md"), []byte("version-Y-local"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := index.Index(ctx, f.recvStore, f.recvVol.Path,
+		index.Options{Name: f.recvVol.Name}); err != nil {
+		t.Fatalf("daemon-side index: %v", err)
+	}
+	v, err := f.recvStore.GetVolumeByName(ctx, f.recvVol.Name)
+	if err != nil {
+		t.Fatalf("GetVolumeByName: %v", err)
+	}
+	beforeRound2, err := f.recvStore.GetByPath(ctx, v.ID, "doc.md")
+	if err != nil {
+		t.Fatalf("GetByPath before round 2: %v", err)
+	}
+	if beforeRound2.SourceNodeID.Valid {
+		t.Fatalf("post-index row has source_node_id %d; want NULL (local write)",
+			beforeRound2.SourceNodeID.Int64)
+	}
+
+	// Round 2: initiator writes Z and re-syncs. The receiver's row
+	// for doc.md is a local-write so the planner classifies the
+	// path as conflict. Resolution preserves Y at the conflict path
+	// and lands Z live.
+	if err := os.WriteFile(target, []byte("version-Z-from-init"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.indexInitiator(t)
+	rep2, err := SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	if err != nil {
+		t.Fatalf("round 2 SyncNode: %v", err)
+	}
+	if rep2.Status != store.RunStatusSuccess {
+		t.Fatalf("round 2 status = %q, want success", rep2.Status)
+	}
+	if len(rep2.NodeConflicts) != 1 {
+		t.Fatalf("round 2 NodeConflicts = %+v, want one entry", rep2.NodeConflicts)
+	}
+	conflict := rep2.NodeConflicts[0]
+	if conflict.Reason != "local write on receiver" {
+		t.Fatalf("conflict reason = %q, want 'local write on receiver'", conflict.Reason)
+	}
+	if conflict.PreservedAtPath == "" {
+		t.Fatalf("PreservedAtPath is empty")
+	}
+
+	// Live disk content is Z; preserved content is Y.
+	live, err := os.ReadFile(filepath.Join(f.recvVol.Path, "doc.md"))
+	if err != nil {
+		t.Fatalf("read live: %v", err)
+	}
+	if string(live) != "version-Z-from-init" {
+		t.Fatalf("live content = %q, want version-Z-from-init", live)
+	}
+	preserved, err := os.ReadFile(filepath.Join(f.recvVol.Path, conflict.PreservedAtPath))
+	if err != nil {
+		t.Fatalf("read preserved: %v", err)
+	}
+	if string(preserved) != "version-Y-local" {
+		t.Fatalf("preserved content = %q, want version-Y-local", preserved)
+	}
+
+	// Conflict count surfaces in the receiver's runs row via the
+	// path-prefix query that backs `squirrel runs`.
+	count, err := f.recvStore.CountFilesFirstSeenWithPathPrefix(ctx, rep2.NodeReceiverRunID, ConflictsDirName)
+	if err != nil {
+		t.Fatalf("CountFilesFirstSeenWithPathPrefix: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("conflict count for receiver run = %d, want 1", count)
+	}
+}
+
+// TestNodeSyncConflictWhenPriorRowFromDifferentPeer covers the
+// "sourced from a different peer" branch of dispositionForExisting:
+// the receiver has a `present` row whose provenance points to a peer
+// other than the current initiator, so the planner refuses to treat
+// the diff as supersede and resolves it as a conflict instead.
+func TestNodeSyncConflictWhenPriorRowFromDifferentPeer(t *testing.T) {
+	f := setupNodeFixture(t)
+	ctx := context.Background()
+
+	// Seed receiver state: volume + a third-party peer row + an
+	// already-completed peer-sync run attributing the prior content
+	// to that other peer.
+	v, err := f.recvStore.CreateVolume(ctx, f.recvVol.Name, f.recvVol.Path)
+	if err != nil {
+		t.Fatalf("seed volume: %v", err)
+	}
+	otherPeer, err := f.recvStore.CreateNode(ctx, "third-party", "peer://third-party")
+	if err != nil {
+		t.Fatalf("seed third-party peer: %v", err)
+	}
+	priorRun, err := f.recvStore.BeginPeerSyncRun(ctx, v.ID, otherPeer.ID, 7, "third-party")
+	if err != nil {
+		t.Fatalf("BeginPeerSyncRun: %v", err)
+	}
+	_ = f.recvStore.FinishRun(ctx, priorRun, store.RunStatusSuccess, "", 1)
+	priorDigest := bytesDigest(0x77)
+	if err := f.recvStore.Upsert(ctx, store.FileRow{
+		VolumeID: v.ID, Path: "shared.md", Blake3: priorDigest,
+		SizeBytes: 1, MtimeNs: 1, Status: store.StatusPresent,
+		FirstSeenRunID: priorRun, LastSeenRunID: priorRun, IndexedAtNs: 1,
+	}, &store.Provenance{NodeID: otherPeer.ID, RunID: priorRun}); err != nil {
+		t.Fatalf("seed third-party row: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.recvVol.Path, "shared.md"), []byte("from-third-party"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Initiator writes a *different* blake3.
+	if err := os.WriteFile(filepath.Join(f.initVol.Path, "shared.md"), []byte("from-our-initiator"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.indexInitiator(t)
+
+	rep, err := SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	if err != nil {
+		t.Fatalf("SyncNode: %v", err)
+	}
+	if rep.Status != store.RunStatusSuccess {
+		t.Fatalf("status = %q, want success", rep.Status)
+	}
+	if len(rep.NodeConflicts) != 1 {
+		t.Fatalf("NodeConflicts = %+v, want one entry", rep.NodeConflicts)
+	}
+	if rep.NodeConflicts[0].Reason != "sourced from a different peer" {
+		t.Fatalf("reason = %q, want 'sourced from a different peer'", rep.NodeConflicts[0].Reason)
+	}
+
+	// The third-party-sourced row's provenance survives onto the
+	// conflict-path row (preserves attribution; the v1 design is
+	// emphatic that conflict resolution must not silently rewrite
+	// "who wrote this" history).
+	preservedRow, err := f.recvStore.GetByPath(ctx, v.ID, rep.NodeConflicts[0].PreservedAtPath)
+	if err != nil {
+		t.Fatalf("GetByPath %s: %v", rep.NodeConflicts[0].PreservedAtPath, err)
+	}
+	if !preservedRow.SourceNodeID.Valid || preservedRow.SourceNodeID.Int64 != otherPeer.ID {
+		t.Fatalf("preserved row source_node_id = %+v, want %d (third-party)",
+			preservedRow.SourceNodeID, otherPeer.ID)
 	}
 }
 

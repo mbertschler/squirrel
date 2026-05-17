@@ -104,10 +104,12 @@ func (d *nodeSyncDriver) run() error {
 	if err != nil {
 		return d.abortWithError("plan", err)
 	}
-	if len(plan.Conflicts) > 0 {
-		d.report.NodeConflicts = plan.Conflicts
-		return d.abortConflicts(plan.Conflicts)
-	}
+	// PR 4: conflicts are no longer fatal. The receiver has already
+	// pre-staged the losers under .squirrel-conflicts/ and rclone
+	// will deliver the initiator's bytes to the original path just
+	// like a transfer. We surface the records on the report so the
+	// CLI can print "preserved at ..." lines.
+	d.report.NodeConflicts = plan.Conflicts
 	if err := d.phaseTransfer(plan); err != nil {
 		return d.abortWithError("transfer", err)
 	}
@@ -195,12 +197,15 @@ func (d *nodeSyncDriver) collectIndexEntries() ([]syncproto.IndexEntry, error) {
 }
 
 // phaseTransfer invokes rclone exactly once over the transfer +
-// supersede paths the plan returned. Re-uses the existing Rclone
-// wrapper but with a different argv: no --backup-dir, an --files-from
-// containing the in-scope paths, and no .squirrel-history filter
-// (the receiver doesn't share that namespace through HTTP).
+// supersede + conflict paths the plan returned. Re-uses the existing
+// Rclone wrapper but with a different argv: no --backup-dir, an
+// --files-from containing the in-scope paths, and no .squirrel-history
+// filter (the receiver doesn't share that namespace through HTTP).
+// Conflict paths are in scope because the receiver moved the prior
+// bytes aside in pre-stage; rclone just delivers the initiator's
+// version to the now-empty original path.
 func (d *nodeSyncDriver) phaseTransfer(plan syncproto.PlanResponse) error {
-	transferPaths := pathsInScope(plan, false)
+	transferPaths := pathsInScope(plan)
 	if len(transferPaths) == 0 {
 		return nil
 	}
@@ -294,23 +299,6 @@ func (d *nodeSyncDriver) phaseClose() error {
 	})
 }
 
-// abortConflicts produces the run-level error for the conflict
-// disposition. Per the PR 3 scope this is fatal; PR 4 will resolve
-// them instead. We still call /close with status=failed so the
-// receiver releases the volume lock and finalises its run row.
-func (d *nodeSyncDriver) abortConflicts(conflicts []syncproto.ConflictDetail) error {
-	d.report.Status = store.RunStatusFailed
-	_ = d.client.close(d.ctx, syncproto.CloseRequest{
-		ReceiverRunID: d.receiverRunID,
-		Status:        store.RunStatusFailed,
-	})
-	names := make([]string, 0, len(conflicts))
-	for _, c := range conflicts {
-		names = append(names, c.Path)
-	}
-	return &ConflictError{Paths: names, Conflicts: conflicts}
-}
-
 func (d *nodeSyncDriver) abortWithError(phase string, err error) error {
 	d.report.Status = store.RunStatusFailed
 	if d.receiverRunID != 0 {
@@ -320,19 +308,6 @@ func (d *nodeSyncDriver) abortWithError(phase string, err error) error {
 		})
 	}
 	return fmt.Errorf("%s: %w", phase, err)
-}
-
-// ConflictError is returned by SyncNode when /plan reported one or
-// more conflict-disposition paths. The CLI renders Paths verbatim;
-// the structured Conflicts list is available for programmatic
-// inspection.
-type ConflictError struct {
-	Paths     []string
-	Conflicts []syncproto.ConflictDetail
-}
-
-func (e *ConflictError) Error() string {
-	return fmt.Sprintf("sync aborted: %d conflict(s) — %v", len(e.Paths), e.Paths)
 }
 
 // nodeClient wraps the HTTP transport against one peer node. The
@@ -448,18 +423,16 @@ func (c *nodeClient) do(ctx context.Context, urlPath string, body, out any) erro
 }
 
 // pathsInScope returns the relative paths from the plan whose
-// disposition needs rclone to run. The conflict bucket is never in
-// scope; already-correct never needs bytes.
-func pathsInScope(plan syncproto.PlanResponse, includeConflict bool) []string {
+// disposition needs rclone to deliver bytes — transfer, supersede,
+// conflict. Already-correct paths are skipped (no bytes need move).
+func pathsInScope(plan syncproto.PlanResponse) []string {
 	out := make([]string, 0, len(plan.Dispositions))
 	for _, d := range plan.Dispositions {
 		switch d.Disposition {
-		case syncproto.DispositionTransfer, syncproto.DispositionSupersede:
+		case syncproto.DispositionTransfer,
+			syncproto.DispositionSupersede,
+			syncproto.DispositionConflict:
 			out = append(out, d.Path)
-		case syncproto.DispositionConflict:
-			if includeConflict {
-				out = append(out, d.Path)
-			}
 		}
 	}
 	return out

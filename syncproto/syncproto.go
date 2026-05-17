@@ -42,9 +42,13 @@ const DispositionSupersede = "supersede"
 
 // DispositionConflict — receiver has a live row at this path with a
 // different blake3 that is not traceable to this initiator's prior
-// writes. In PR 3 (single-writer mode) this disposition aborts the
-// run with a clear error; PR 4 will resolve conflicts by moving the
-// loser into `.squirrel-conflicts/run-<id>/`.
+// writes (local write on the receiver, or sourced from a different
+// peer post-watermark). The receiver pre-moves the prior bytes to
+// `.squirrel-conflicts/run-<id>/<path>` and seeds a new `present` row
+// at that path carrying the prior blake3 + prior provenance, so both
+// versions remain reachable by hash and by path. The initiator wins
+// live: rclone delivers its bytes to the original path and /close
+// inserts a new `present` row there with `source_node_id = initiator`.
 const DispositionConflict = "conflict"
 
 // BeginRequest opens a peer-sync session.
@@ -106,9 +110,12 @@ type PlanResponse struct {
 	// client can drive rclone in one pass without re-cross-referencing
 	// against PlanRequest).
 	Dispositions []PlanDisposition `json:"dispositions"`
-	// Conflicts captures the offending paths whose disposition was
-	// "conflict". In PR 3 the presence of any conflict aborts the
-	// run; the field exists so the error message can list specifics.
+	// Conflicts captures the paths whose disposition was "conflict",
+	// with the prior bytes' preserved path on the receiver attached so
+	// the initiator's CLI can render a meaningful "preserved at ..."
+	// line. A conflict is no longer a fatal disposition: the receiver
+	// has already pre-staged the loser under .squirrel-conflicts/ and
+	// the initiator's bytes are still in scope for the rclone transfer.
 	Conflicts []ConflictDetail `json:"conflicts,omitempty"`
 }
 
@@ -123,15 +130,19 @@ type PlanDisposition struct {
 }
 
 // ConflictDetail names a conflicting path and surfaces enough metadata
-// for the CLI to render a meaningful error. ReceiverBlake3Hex is the
-// digest the receiver currently has at this path; Reason classifies
-// why the supersede disposition was refused (e.g. "local write",
-// "different peer").
+// for the CLI to render a meaningful summary. ReceiverBlake3Hex is the
+// digest the receiver had at this path before the pre-stage move;
+// Reason classifies why the supersede disposition was refused (e.g.
+// "local write on receiver", "sourced from a different peer").
+// PreservedAtPath is the volume-relative path the receiver moved the
+// prior bytes to (`.squirrel-conflicts/run-<id>/<path>`) so the CLI
+// can point the operator at the preserved version.
 type ConflictDetail struct {
 	Path               string `json:"path"`
 	InitiatorBlake3Hex string `json:"initiator_blake3"`
 	ReceiverBlake3Hex  string `json:"receiver_blake3"`
 	Reason             string `json:"reason"`
+	PreservedAtPath    string `json:"preserved_at_path,omitempty"`
 }
 
 // VerifyRequest tells the receiver "rclone said it finished, please

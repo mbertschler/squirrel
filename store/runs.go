@@ -216,6 +216,41 @@ func (s *Store) GetRun(ctx context.Context, id int64) (Run, error) {
 	return scanRun(row.Scan)
 }
 
+// CountFilesFirstSeenWithPathPrefix returns the number of files rows
+// inserted (first_seen_run_id matches) by the given run whose path starts
+// with pathPrefix. Used by `squirrel runs` to derive the conflict count
+// for a peer-sync run without adding a dedicated column: every conflict
+// inserts one row under .squirrel-conflicts/run-<id>/, so the
+// path-prefix count is the conflict count. The pathPrefix is passed in
+// rather than hard-coded so the store stays decoupled from the
+// sync-package directory naming convention.
+func (s *Store) CountFilesFirstSeenWithPathPrefix(ctx context.Context, runID int64, pathPrefix string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM files
+		 WHERE first_seen_run_id = ? AND path LIKE ? ESCAPE '\'`,
+		runID, escapeLikePrefix(pathPrefix)+"/%").Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count files for run %d: %w", runID, err)
+	}
+	return n, nil
+}
+
+// escapeLikePrefix escapes %, _ and \ in s so it can be embedded into a
+// SQL LIKE pattern without matching wildcards in the supplied prefix.
+// The companion ESCAPE '\' clause on the query consumes the escapes.
+func escapeLikePrefix(s string) string {
+	var b []byte
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '%' || c == '_' || c == '\\' {
+			b = append(b, '\\')
+		}
+		b = append(b, c)
+	}
+	return string(b)
+}
+
 // LatestSuccessfulIndexRun returns the most recent index run for the given
 // volume that finished in status 'success' or 'partial'. Used by the sync
 // command as a prerequisite check: refusing to sync a volume that has never

@@ -2122,6 +2122,117 @@ func TestFileRowScanInsertRoundTrip(t *testing.T) {
 // list against drift from fileColumns. A column added to fileColumns but
 // forgotten elsewhere (or vice versa) trips here before any INSERT hits
 // SQLite and produces an opaque parameter-count error.
+// TestMarkSupersededFlipsLiveRowOnly checks the public helper used by
+// peer-sync conflict pre-staging: the live row at a path goes
+// 'superseded', any already-superseded rows are left alone, and a
+// path with no live row is a clean no-op.
+func TestMarkSupersededFlipsLiveRowOnly(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	volID := makeVolume(t, s, "/v")
+	runID := makeRun(t, s, volID)
+
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: volID, Path: "a", Blake3: digest(0x01),
+		SizeBytes: 1, MtimeNs: 1, Status: StatusPresent,
+		FirstSeenRunID: runID, LastSeenRunID: runID, IndexedAtNs: 1,
+	}, nil); err != nil {
+		t.Fatalf("seed a@v1: %v", err)
+	}
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: volID, Path: "a", Blake3: digest(0x02),
+		SizeBytes: 1, MtimeNs: 2, Status: StatusPresent,
+		FirstSeenRunID: runID, LastSeenRunID: runID, IndexedAtNs: 2,
+	}, nil); err != nil {
+		t.Fatalf("seed a@v2: %v", err)
+	}
+
+	// Flip the live row to superseded; the prior superseded row stays
+	// superseded (no double-flip), and GetByPath now returns sql.ErrNoRows.
+	if err := s.MarkSuperseded(ctx, volID, "a"); err != nil {
+		t.Fatalf("MarkSuperseded: %v", err)
+	}
+	if _, err := s.GetByPath(ctx, volID, "a"); !IsNotFound(err) {
+		t.Fatalf("GetByPath after supersede = %v, want NotFound", err)
+	}
+	history, err := s.ListHistoryByPath(ctx, volID, "a")
+	if err != nil {
+		t.Fatalf("ListHistoryByPath: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("history has %d rows, want 2", len(history))
+	}
+	for _, r := range history {
+		if r.Status != StatusSuperseded {
+			t.Fatalf("row %x status = %q, want superseded", r.Blake3, r.Status)
+		}
+	}
+
+	// No live row left → MarkSuperseded is a no-op, not an error.
+	if err := s.MarkSuperseded(ctx, volID, "a"); err != nil {
+		t.Fatalf("idempotent MarkSuperseded: %v", err)
+	}
+	// Unknown path is also a no-op.
+	if err := s.MarkSuperseded(ctx, volID, "never-seen"); err != nil {
+		t.Fatalf("MarkSuperseded on unknown path: %v", err)
+	}
+}
+
+// TestCountFilesFirstSeenWithPathPrefix exercises the path-prefix
+// counter `squirrel runs` uses to derive each peer-sync run's
+// conflict count without a dedicated column. Two rows under the
+// prefix should match; rows outside the prefix (different first-seen
+// run, or unrelated path) must not.
+func TestCountFilesFirstSeenWithPathPrefix(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	volID := makeVolume(t, s, "/v")
+	thisRun := makeRun(t, s, volID)
+	otherRun := makeRun(t, s, volID)
+
+	for i, p := range []string{".squirrel-conflicts/run-1/a", ".squirrel-conflicts/run-1/sub/b"} {
+		if err := s.Upsert(ctx, FileRow{
+			VolumeID: volID, Path: p, Blake3: digest(byte(0x10 + i)),
+			SizeBytes: 1, MtimeNs: 1, Status: StatusPresent,
+			FirstSeenRunID: thisRun, LastSeenRunID: thisRun, IndexedAtNs: 1,
+		}, nil); err != nil {
+			t.Fatalf("upsert %s: %v", p, err)
+		}
+	}
+	// A row from another run, same prefix — should not be counted.
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: volID, Path: ".squirrel-conflicts/run-2/x", Blake3: digest(0x99),
+		SizeBytes: 1, MtimeNs: 1, Status: StatusPresent,
+		FirstSeenRunID: otherRun, LastSeenRunID: otherRun, IndexedAtNs: 1,
+	}, nil); err != nil {
+		t.Fatalf("upsert other-run row: %v", err)
+	}
+	// A same-run row outside the prefix — should not be counted.
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: volID, Path: "unrelated.txt", Blake3: digest(0xEE),
+		SizeBytes: 1, MtimeNs: 1, Status: StatusPresent,
+		FirstSeenRunID: thisRun, LastSeenRunID: thisRun, IndexedAtNs: 1,
+	}, nil); err != nil {
+		t.Fatalf("upsert outside-prefix row: %v", err)
+	}
+
+	n, err := s.CountFilesFirstSeenWithPathPrefix(ctx, thisRun, ".squirrel-conflicts")
+	if err != nil {
+		t.Fatalf("CountFilesFirstSeenWithPathPrefix: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("count = %d, want 2", n)
+	}
+}
+
 func TestFilePlaceholdersMatchesFileColumns(t *testing.T) {
 	gotCols := strings.Count(fileColumns, ",") + 1
 	gotPlaceholders := strings.Count(filePlaceholders, "?")
