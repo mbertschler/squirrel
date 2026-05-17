@@ -419,4 +419,3 @@ func buildRestoreArgs(vol *config.Volume, dest *config.Destination, opts Restore
 	args = append(args, srcArg, dstArg)
 	return args
 }
-
