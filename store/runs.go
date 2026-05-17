@@ -10,11 +10,15 @@ import (
 // Run kinds. The runs.volume_id column is nullable so a future sync run can
 // span volumes; index runs are always scoped to a single volume. Sync and
 // restore runs additionally carry a non-empty runs.destination naming the
-// rclone destination; index runs leave destination NULL.
+// rclone destination; index and audit runs leave destination NULL. Audit
+// runs share the index run-kind's shape — they walk a volume root and
+// reconcile the index with on-disk reality — but are tagged separately so
+// out-of-band drift detections don't dilute the index-run history.
 const (
 	RunKindIndex   = "index"
 	RunKindSync    = "sync"
 	RunKindRestore = "restore"
+	RunKindAudit   = "audit"
 )
 
 // Run statuses. A run begins in 'running' and is moved to a terminal state by
@@ -273,6 +277,57 @@ func escapeLikePrefix(s string) string {
 		b = append(b, c)
 	}
 	return string(b)
+}
+
+// ListAuditRunsSince returns every kind='audit' run on the given volume
+// whose started_at_ns is strictly greater than sinceNs, oldest first.
+// Used by the peer-sync handshake to surface "drift since last sync" to
+// initiators: an empty watermark (sinceNs == 0) returns every audit run
+// on the volume; a populated one narrows to the period since the
+// receiver and peer last agreed.
+func (s *Store) ListAuditRunsSince(ctx context.Context, volumeID int64, sinceNs int64) ([]Run, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+runColumns+` FROM runs
+		 WHERE kind = 'audit' AND volume_id = ? AND started_at_ns > ?
+		 ORDER BY id`,
+		volumeID, sinceNs)
+	if err != nil {
+		return nil, fmt.Errorf("list audit runs: %w", err)
+	}
+	defer rows.Close()
+	var out []Run
+	for rows.Next() {
+		r, err := scanRun(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// CountModifiedFilesByRun returns the number of files rows whose
+// first_seen_run_id is the given runID and that have a prior superseded
+// row at the same (volume_id, path). This is the "the bytes changed
+// during this run" count, derivable without an audit-specific schema
+// column because the supersede chain already records the prior content.
+// Returns 0 when no such rows exist (a clean audit). New content at a
+// path never seen before (no prior superseded row) is *not* counted —
+// that is an addition, not a modification.
+func (s *Store) CountModifiedFilesByRun(ctx context.Context, runID int64) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM files f
+		 WHERE f.first_seen_run_id = ? AND f.status = 'present'
+		   AND EXISTS (
+		       SELECT 1 FROM files p
+		       WHERE p.volume_id = f.volume_id AND p.path = f.path
+		         AND p.status = 'superseded'
+		   )`, runID).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count modified by run %d: %w", runID, err)
+	}
+	return n, nil
 }
 
 // LatestSuccessfulIndexRun returns the most recent index run for the given

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"fmt"
 	"net/http/httptest"
 	"net/url"
 	"os"
@@ -35,8 +36,24 @@ type nodeFixture struct {
 
 func setupNodeFixture(t *testing.T) *nodeFixture {
 	t.Helper()
+	f, root := buildNodeFixture(t)
 	rcl := requireRclone(t)
+	rcl.Config = filepath.Join(root, "rclone.conf")
+	if err := os.WriteFile(rcl.Config, []byte{}, 0o600); err != nil {
+		t.Fatalf("write rclone.conf: %v", err)
+	}
+	f.rcl = rcl
+	return f
+}
 
+// buildNodeFixture is the rclone-agnostic core of setupNodeFixture:
+// it lays down the on-disk volume dirs, opens initiator and receiver
+// stores, and spins an in-process daemon to back the receiver. Tests
+// that need rclone wrap with the requireRclone skip + config write
+// via setupNodeFixture; tests that drive the HTTP surface directly
+// call this helper and leave fixture.rcl nil.
+func buildNodeFixture(t *testing.T) (*nodeFixture, string) {
+	t.Helper()
 	root := t.TempDir()
 	initVolPath := filepath.Join(root, "init", "pics")
 	recvVolRoot := filepath.Join(root, "recv")
@@ -45,10 +62,6 @@ func setupNodeFixture(t *testing.T) *nodeFixture {
 		if err := os.MkdirAll(p, 0o755); err != nil {
 			t.Fatalf("mkdir %s: %v", p, err)
 		}
-	}
-	rcl.Config = filepath.Join(root, "rclone.conf")
-	if err := os.WriteFile(rcl.Config, []byte{}, 0o600); err != nil {
-		t.Fatalf("write rclone.conf: %v", err)
 	}
 
 	initStore := openStoreWithName(t, filepath.Join(root, "init.db"), "init")
@@ -89,9 +102,8 @@ func setupNodeFixture(t *testing.T) *nodeFixture {
 		initVol:   initVol,
 		recvVol:   recvVol,
 		node:      node,
-		rcl:       rcl,
 		server:    ts,
-	}
+	}, root
 }
 
 func openStoreWithName(t *testing.T, path, name string) *store.Store {
@@ -950,6 +962,168 @@ func TestCollectIndexEntriesSkipsReservedDirs(t *testing.T) {
 			t.Fatalf("reserved-dir path %q leaked onto the wire", p)
 		}
 	}
+}
+
+// TestBeginPendingWarningsSurfaceAuditDrift drives the issue #17
+// acceptance path: the receiver runs an audit against an out-of-band
+// file modification, then a subsequent /v1/sync/begin returns a
+// PendingWarnings line. Exercised via the nodeClient directly (no
+// rclone) so the daemon→syncproto→client→Report propagation is
+// pinned without depending on the rclone binary at test time.
+func TestBeginPendingWarningsSurfaceAuditDrift(t *testing.T) {
+	f := setupNodeFixtureNoRclone(t)
+	ctx := context.Background()
+
+	// Seed a present row on the receiver attributed to the initiator.
+	v, err := f.recvStore.CreateVolume(ctx, f.recvVol.Name, f.recvVol.Path)
+	if err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	initSelf, _ := f.initStore.GetSelfNode(ctx)
+	peer, err := f.recvStore.CreateNode(ctx, initSelf.Name, "peer://"+initSelf.Name)
+	if err != nil {
+		t.Fatalf("seed peer node: %v", err)
+	}
+	priorRun, err := f.recvStore.BeginPeerSyncRun(ctx, v.ID, peer.ID, 5, initSelf.Name)
+	if err != nil {
+		t.Fatalf("BeginPeerSyncRun: %v", err)
+	}
+	_ = f.recvStore.FinishRun(ctx, priorRun, store.RunStatusSuccess, "", 1)
+	if err := f.recvStore.Upsert(ctx, store.FileRow{
+		VolumeID: v.ID, Path: "doc.md", Blake3: bytesDigest(0x11),
+		SizeBytes: 8, MtimeNs: 1, Status: store.StatusPresent,
+		FirstSeenRunID: priorRun, LastSeenRunID: priorRun, IndexedAtNs: 1,
+	}, &store.Provenance{NodeID: peer.ID, RunID: priorRun}); err != nil {
+		t.Fatalf("seed receiver row: %v", err)
+	}
+	// peer_sync_state must exist so the audit-since watermark is set;
+	// it doesn't matter what the last_shared_run_id is here.
+	if err := f.recvStore.UpsertPeerSyncState(ctx, v.ID, peer.ID, 5); err != nil {
+		t.Fatalf("UpsertPeerSyncState: %v", err)
+	}
+
+	// Drift: the file is modified out-of-band on disk, then an audit
+	// catches it. The audit's index.Index call supersedes the prior
+	// row and inserts a new present row, counted as 1 modified.
+	if err := os.WriteFile(filepath.Join(f.recvVol.Path, "doc.md"), []byte("drifted"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := index.Index(ctx, f.recvStore, f.recvVol.Path, index.Options{
+		Name: f.recvVol.Name,
+		Kind: store.RunKindAudit,
+	})
+	if err != nil {
+		t.Fatalf("receiver audit: %v", err)
+	}
+	if rep.Modified != 1 {
+		t.Fatalf("audit modified count = %d, want 1", rep.Modified)
+	}
+	auditRunID := rep.RunID
+
+	// New /begin call surfaces the drift via PendingWarnings.
+	client := newNodeClient(f.node)
+	resp, err := client.begin(ctx, syncproto.BeginRequest{
+		Volume:            f.recvVol.Name,
+		InitiatorNodeName: initSelf.Name,
+		InitiatorRunID:    99,
+	})
+	if err != nil {
+		t.Fatalf("/begin: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = client.close(ctx, syncproto.CloseRequest{
+			ReceiverRunID: resp.ReceiverRunID,
+			Status:        store.RunStatusFailed,
+		})
+	})
+	if len(resp.PendingWarnings) == 0 {
+		t.Fatalf("PendingWarnings empty; want one line for the drifted doc.md")
+	}
+	wantSubstr := fmt.Sprintf("audit run %d on volume %s", auditRunID, f.recvVol.Name)
+	if !strings.Contains(resp.PendingWarnings[0], wantSubstr) {
+		t.Fatalf("PendingWarnings[0] = %q, want substring %q", resp.PendingWarnings[0], wantSubstr)
+	}
+	if !strings.Contains(resp.PendingWarnings[0], "1 modified") {
+		t.Fatalf("PendingWarnings[0] = %q, want '1 modified'", resp.PendingWarnings[0])
+	}
+}
+
+// TestBeginPendingWarningsEmptyAfterWatermark checks that audit runs
+// preceding peer_sync_state.last_synced_at are NOT replayed —
+// drift surfaced on one round shouldn't re-fire on the next. The
+// watermark advances on the receiver via UpsertPeerSyncState, which
+// /close calls automatically on success.
+func TestBeginPendingWarningsEmptyAfterWatermark(t *testing.T) {
+	f := setupNodeFixtureNoRclone(t)
+	ctx := context.Background()
+
+	v, err := f.recvStore.CreateVolume(ctx, f.recvVol.Name, f.recvVol.Path)
+	if err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	initSelf, _ := f.initStore.GetSelfNode(ctx)
+	peer, err := f.recvStore.CreateNode(ctx, initSelf.Name, "peer://"+initSelf.Name)
+	if err != nil {
+		t.Fatalf("seed peer node: %v", err)
+	}
+	priorRun, err := f.recvStore.BeginPeerSyncRun(ctx, v.ID, peer.ID, 5, initSelf.Name)
+	if err != nil {
+		t.Fatalf("BeginPeerSyncRun: %v", err)
+	}
+	_ = f.recvStore.FinishRun(ctx, priorRun, store.RunStatusSuccess, "", 1)
+	if err := f.recvStore.Upsert(ctx, store.FileRow{
+		VolumeID: v.ID, Path: "doc.md", Blake3: bytesDigest(0x22),
+		SizeBytes: 8, MtimeNs: 1, Status: store.StatusPresent,
+		FirstSeenRunID: priorRun, LastSeenRunID: priorRun, IndexedAtNs: 1,
+	}, &store.Provenance{NodeID: peer.ID, RunID: priorRun}); err != nil {
+		t.Fatalf("seed receiver row: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.recvVol.Path, "doc.md"), []byte("drifted"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := index.Index(ctx, f.recvStore, f.recvVol.Path, index.Options{
+		Name: f.recvVol.Name,
+		Kind: store.RunKindAudit,
+	}); err != nil {
+		t.Fatalf("receiver audit: %v", err)
+	}
+
+	// Advance the watermark past the audit timestamp so the
+	// post-watermark /begin sees no drift to surface. The audit row's
+	// started_at_ns is the truth; we use NowNs() which is >= it.
+	if err := f.recvStore.UpsertPeerSyncState(ctx, v.ID, peer.ID, 99); err != nil {
+		t.Fatalf("UpsertPeerSyncState: %v", err)
+	}
+
+	client := newNodeClient(f.node)
+	resp, err := client.begin(ctx, syncproto.BeginRequest{
+		Volume:            f.recvVol.Name,
+		InitiatorNodeName: initSelf.Name,
+		InitiatorRunID:    200,
+	})
+	if err != nil {
+		t.Fatalf("/begin: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = client.close(ctx, syncproto.CloseRequest{
+			ReceiverRunID: resp.ReceiverRunID,
+			Status:        store.RunStatusFailed,
+		})
+	})
+	if len(resp.PendingWarnings) != 0 {
+		t.Fatalf("PendingWarnings = %v, want empty (audit predates watermark)", resp.PendingWarnings)
+	}
+}
+
+// setupNodeFixtureNoRclone is the lighter-weight variant of
+// setupNodeFixture for tests that drive the daemon HTTP surface
+// directly. Skipping the rclone-prerequisite means these tests run
+// under CI conditions where rclone is missing or below the supported
+// version.
+func setupNodeFixtureNoRclone(t *testing.T) *nodeFixture {
+	t.Helper()
+	f, _ := buildNodeFixture(t)
+	return f
 }
 
 // bytesDigest returns a 32-byte buffer filled with b for compact

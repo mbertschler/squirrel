@@ -96,6 +96,9 @@ func printSyncReport(w io.Writer, rep sync.Report, runErr error) {
 	for _, msg := range rep.Warnings {
 		fmt.Fprintf(w, "warning: %s\n", msg)
 	}
+	for _, msg := range rep.NodePendingWarnings {
+		fmt.Fprintf(w, "warning: peer reports %s\n", msg)
+	}
 	fmt.Fprintf(w, "%s → %s  status=%s transferred=%d checked=%d errors=%d bytes=%d run=%d\n",
 		rep.Volume, rep.Destination, rep.Status,
 		r.Transferred, r.Checked, r.Errors, r.Bytes, rep.RunID,

@@ -29,6 +29,11 @@ type Options struct {
 	Workers int
 	// QueueDepth: maximum pending entries between walker and workers. 0 means 4 * Workers.
 	QueueDepth int
+	// Kind selects the runs.kind label written for this invocation.
+	// Empty defaults to store.RunKindIndex. The daemon's drift-detection
+	// scheduler (#17) sets store.RunKindAudit so out-of-band re-walks
+	// are distinguishable from regular indexing in `squirrel runs`.
+	Kind string
 }
 
 type Report struct {
@@ -41,6 +46,10 @@ type Report struct {
 	// ErrorList contains the actual errors. Callers (CLI, tests) decide how
 	// to surface them; this package never writes to os.Stderr directly.
 	ErrorList []error
+	// RunID is the runs.id this invocation wrote to. Zero in DryRun mode
+	// (which never inserts a row). Exposed so audit callers can correlate
+	// the report with a runs row without a follow-up lookup.
+	RunID int64
 }
 
 type changeKind int
@@ -173,7 +182,11 @@ func (i *indexer) beginRun() error {
 	if i.opts.DryRun {
 		return nil
 	}
-	id, err := i.store.BeginRun(i.ctx, store.RunKindIndex, i.volumeID, "")
+	kind := i.opts.Kind
+	if kind == "" {
+		kind = store.RunKindIndex
+	}
+	id, err := i.store.BeginRun(i.ctx, kind, i.volumeID, "")
 	if err != nil {
 		return fmt.Errorf("begin run: %w", err)
 	}
@@ -187,6 +200,7 @@ func (i *indexer) beginRun() error {
 // errors with a clean walk yield 'partial', and an entirely clean run yields
 // 'success'.
 func (i *indexer) finishRun(report *Report, fatalErr error) {
+	report.RunID = i.runID
 	if i.opts.DryRun || i.runID == 0 {
 		return
 	}

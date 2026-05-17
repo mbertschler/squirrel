@@ -2276,3 +2276,289 @@ func TestFilePlaceholdersMatchesFileColumns(t *testing.T) {
 		t.Fatalf("insertArgs returns %d args, fileColumns has %d entries", n, gotCols)
 	}
 }
+
+// TestMigrateV6ToV7AddsAuditKind builds a v6-shape database by hand,
+// populates it with file and run rows, then opens it via Open() to
+// drive the v6→v7 step. The migration must (a) carry every existing
+// runs row through verbatim, (b) widen the kind CHECK so an 'audit'
+// row inserts cleanly, (c) keep the kind↔destination coupling intact
+// (audit shares the index branch — destination must be NULL), and
+// (d) leave the files FK to runs(id) resolvable.
+func TestMigrateV6ToV7AddsAuditKind(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	rawDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("raw sql.Open: %v", err)
+	}
+	v6DDL := []string{
+		`CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)`,
+		`CREATE TABLE volumes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL)`,
+		`CREATE TABLE nodes (
+			id                     INTEGER PRIMARY KEY,
+			name                   TEXT NOT NULL UNIQUE,
+			endpoint               TEXT,
+			public_key_fingerprint TEXT
+		)`,
+		`CREATE TABLE runs (
+			id            INTEGER PRIMARY KEY,
+			kind          TEXT NOT NULL CHECK (kind IN ('index','sync','restore')),
+			volume_id     INTEGER REFERENCES volumes(id),
+			destination   TEXT,
+			started_at_ns INTEGER NOT NULL,
+			ended_at_ns   INTEGER,
+			status        TEXT NOT NULL CHECK (status IN ('running','success','failed','partial')),
+			error         TEXT,
+			file_count    INTEGER NOT NULL DEFAULT 0,
+			peer_node_id      INTEGER REFERENCES nodes(id),
+			correlated_run_id INTEGER,
+			CHECK (
+				(kind = 'index' AND destination IS NULL) OR
+				(kind IN ('sync','restore') AND destination IS NOT NULL AND destination != '')
+			)
+		)`,
+		`CREATE TABLE peer_sync_state (
+			volume_id          INTEGER NOT NULL REFERENCES volumes(id),
+			peer_node_id       INTEGER NOT NULL REFERENCES nodes(id),
+			last_shared_run_id INTEGER,
+			last_synced_at     INTEGER NOT NULL,
+			PRIMARY KEY (volume_id, peer_node_id)
+		)`,
+		`CREATE TABLE files (
+			volume_id         INTEGER NOT NULL REFERENCES volumes(id),
+			path              TEXT NOT NULL,
+			blake3            BLOB NOT NULL CHECK (length(blake3) = 32),
+			size_bytes        INTEGER NOT NULL,
+			mtime_ns          INTEGER NOT NULL,
+			status            TEXT NOT NULL CHECK (status IN ('present','missing','superseded')),
+			first_seen_run_id INTEGER NOT NULL REFERENCES runs(id),
+			last_seen_run_id  INTEGER NOT NULL REFERENCES runs(id),
+			indexed_at_ns     INTEGER NOT NULL,
+			source_node_id    INTEGER REFERENCES nodes(id),
+			source_run_id     INTEGER REFERENCES runs(id),
+			PRIMARY KEY (volume_id, path, blake3)
+		)`,
+		`INSERT INTO schema_version (version) VALUES (6)`,
+		`INSERT INTO nodes (name, endpoint, public_key_fingerprint) VALUES ('self', NULL, NULL)`,
+		`INSERT INTO volumes (id, name, path) VALUES (1, 'photos', '/photos')`,
+		`INSERT INTO runs (id, kind, volume_id, started_at_ns, status, file_count)
+		 VALUES (1, 'index', 1, 100, 'success', 1)`,
+		`INSERT INTO runs (id, kind, volume_id, destination, started_at_ns, status, file_count)
+		 VALUES (2, 'sync', 1, 'nas', 200, 'success', 1)`,
+	}
+	for _, q := range v6DDL {
+		if _, err := rawDB.Exec(q); err != nil {
+			t.Fatalf("v6 DDL %q: %v", q, err)
+		}
+	}
+	if _, err := rawDB.Exec(
+		`INSERT INTO files (volume_id, path, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
+		 VALUES (1, 'a.jpg', ?, 10, 50, 'present', 1, 1, 50)`, digest(0xab),
+	); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	rawDB.Close()
+
+	s, err := OpenWithOptions(dsn, OpenOptions{NodeName: "nas"})
+	if err != nil {
+		t.Fatalf("OpenWithOptions (should migrate v6→v7): %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	if v, _ := s.CurrentSchemaVersion(ctx); v != SchemaVersion {
+		t.Fatalf("schema_version = %d, want %d", v, SchemaVersion)
+	}
+
+	// Existing rows carried over verbatim.
+	var sawIndex, sawSync bool
+	runs, err := s.ListRuns(ctx, ListRunsOpts{})
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	for _, r := range runs {
+		if r.ID == 1 && r.Kind == "index" {
+			sawIndex = true
+		}
+		if r.ID == 2 && r.Kind == "sync" && r.Destination.Valid && r.Destination.String == "nas" {
+			sawSync = true
+		}
+	}
+	if !sawIndex || !sawSync {
+		t.Fatalf("post-migration runs missing rows: %+v", runs)
+	}
+
+	// FK from files.last_seen_run_id → runs(id) still resolves.
+	row, err := s.GetByPath(ctx, 1, "a.jpg")
+	if err != nil {
+		t.Fatalf("GetByPath after migration: %v", err)
+	}
+	if row.LastSeenRunID != 1 {
+		t.Fatalf("LastSeenRunID = %d, want 1 (FK preserved)", row.LastSeenRunID)
+	}
+
+	// New 'audit' kind inserts cleanly via BeginRun, with destination NULL.
+	auditID, err := s.BeginRun(ctx, RunKindAudit, 1, "")
+	if err != nil {
+		t.Fatalf("BeginRun audit: %v", err)
+	}
+	r, err := s.GetRun(ctx, auditID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if r.Kind != RunKindAudit {
+		t.Fatalf("audit run kind = %q, want %q", r.Kind, RunKindAudit)
+	}
+	if r.Destination.Valid {
+		t.Fatalf("audit run destination = %+v, want NULL", r.Destination)
+	}
+
+	// audit-with-destination is rejected by the kind↔destination CHECK,
+	// proving the destination-NULL branch was widened to include audit
+	// (not weakened to allow audit-with-destination).
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO runs (kind, volume_id, destination, started_at_ns, status)
+		VALUES ('audit', 1, 'nas', ?, 'running')`, NowNs()); err == nil {
+		t.Fatalf("INSERT audit-with-destination succeeded; want CHECK violation")
+	}
+}
+
+// TestAuditRunWidensKindCheckOnFreshDB confirms the fresh-DB code path
+// (no v6 baseline to migrate) lands at v7 with the audit kind already
+// permitted. Catches a regression where the fresh-DB schema and the
+// migrated schema drift apart.
+func TestAuditRunWidensKindCheckOnFreshDB(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+	if _, err := s.BeginRun(ctx, RunKindAudit, vID, ""); err != nil {
+		t.Fatalf("BeginRun audit on fresh DB: %v", err)
+	}
+}
+
+// TestListAuditRunsSince filters by (volume, sinceNs). Audit runs on
+// the same volume but at or before the watermark are excluded;
+// non-audit runs are excluded; runs on other volumes are excluded.
+func TestListAuditRunsSince(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	vID := makeVolume(t, s, "/v")
+	otherID := makeVolume(t, s, "/other")
+	// A regular index run (excluded by kind).
+	_, _ = s.BeginRun(ctx, RunKindIndex, vID, "")
+	// Three audit runs on vID. Their started_at_ns is set by BeginRun
+	// to time.Now().UnixNano(); we read it back rather than synthesise.
+	r1, _ := s.BeginRun(ctx, RunKindAudit, vID, "")
+	row1, _ := s.GetRun(ctx, r1)
+	r2, _ := s.BeginRun(ctx, RunKindAudit, vID, "")
+	r3, _ := s.BeginRun(ctx, RunKindAudit, vID, "")
+	// An audit run on a different volume — must not appear.
+	_, _ = s.BeginRun(ctx, RunKindAudit, otherID, "")
+
+	got, err := s.ListAuditRunsSince(ctx, vID, 0)
+	if err != nil {
+		t.Fatalf("ListAuditRunsSince all: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d audit runs, want 3 (full list): %+v", len(got), got)
+	}
+	for i, r := range got {
+		if r.Kind != RunKindAudit {
+			t.Fatalf("entry %d kind = %q, want audit", i, r.Kind)
+		}
+	}
+
+	// Use r1's start as a watermark — r1 itself is excluded (strict >).
+	got, err = s.ListAuditRunsSince(ctx, vID, row1.StartedAtNs)
+	if err != nil {
+		t.Fatalf("ListAuditRunsSince since-r1: %v", err)
+	}
+	wantIDs := []int64{r2, r3}
+	if len(got) != len(wantIDs) {
+		t.Fatalf("got %d runs, want %d (since=%d)", len(got), len(wantIDs), row1.StartedAtNs)
+	}
+	for i, id := range wantIDs {
+		if got[i].ID != id {
+			t.Fatalf("got[%d].ID = %d, want %d", i, got[i].ID, id)
+		}
+	}
+}
+
+// TestCountModifiedFilesByRun verifies the modified-count helper used
+// by the drift-warning handshake path. A 'modified' file is one whose
+// first_seen_run_id is the audit run AND a prior superseded row
+// exists at the same (volume, path) — i.e. content changed at a
+// previously-seen path. Additions (no prior superseded row) don't
+// count.
+func TestCountModifiedFilesByRun(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	vID := makeVolume(t, s, "/v")
+	indexRun := makeRun(t, s, vID)
+	// Two files added in the index run.
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: vID, Path: "a.txt", Blake3: digest(0x11), SizeBytes: 1, MtimeNs: 1,
+		Status: StatusPresent, FirstSeenRunID: indexRun, LastSeenRunID: indexRun, IndexedAtNs: 1,
+	}, nil); err != nil {
+		t.Fatalf("upsert a.txt: %v", err)
+	}
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: vID, Path: "b.txt", Blake3: digest(0x22), SizeBytes: 1, MtimeNs: 1,
+		Status: StatusPresent, FirstSeenRunID: indexRun, LastSeenRunID: indexRun, IndexedAtNs: 1,
+	}, nil); err != nil {
+		t.Fatalf("upsert b.txt: %v", err)
+	}
+
+	auditRun, err := s.BeginRun(ctx, RunKindAudit, vID, "")
+	if err != nil {
+		t.Fatalf("BeginRun audit: %v", err)
+	}
+	// During the audit: a.txt content changes (modification), c.txt is
+	// new (addition). The addition must not be counted.
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: vID, Path: "a.txt", Blake3: digest(0xAA), SizeBytes: 2, MtimeNs: 2,
+		Status: StatusPresent, FirstSeenRunID: auditRun, LastSeenRunID: auditRun, IndexedAtNs: 2,
+	}, nil); err != nil {
+		t.Fatalf("upsert a.txt (audit): %v", err)
+	}
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: vID, Path: "c.txt", Blake3: digest(0xCC), SizeBytes: 1, MtimeNs: 1,
+		Status: StatusPresent, FirstSeenRunID: auditRun, LastSeenRunID: auditRun, IndexedAtNs: 1,
+	}, nil); err != nil {
+		t.Fatalf("upsert c.txt: %v", err)
+	}
+
+	got, err := s.CountModifiedFilesByRun(ctx, auditRun)
+	if err != nil {
+		t.Fatalf("CountModifiedFilesByRun: %v", err)
+	}
+	if got != 1 {
+		t.Fatalf("modified = %d, want 1 (only a.txt; c.txt is an addition)", got)
+	}
+
+	// A clean run (no modifications) returns zero.
+	cleanRun, _ := s.BeginRun(ctx, RunKindAudit, vID, "")
+	got, err = s.CountModifiedFilesByRun(ctx, cleanRun)
+	if err != nil {
+		t.Fatalf("CountModifiedFilesByRun clean: %v", err)
+	}
+	if got != 0 {
+		t.Fatalf("clean modified = %d, want 0", got)
+	}
+}

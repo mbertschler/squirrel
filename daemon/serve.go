@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -52,6 +54,10 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 // Config has a cert/key pair. Tests can construct a listener bound to
 // :0, observe the resolved port via ln.Addr(), and drive the daemon
 // end-to-end without binding a fixed port.
+//
+// When Config.ScanInterval is non-zero the drift-detection scheduler
+// (#17) runs in a sibling goroutine off the same context; cancelling
+// ctx stops both.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	httpSrv := &http.Server{
 		Handler:           s.handler,
@@ -63,15 +69,50 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		errCh <- runServer(httpSrv, ln, s.cfg.TLSCert, s.cfg.TLSKey)
 	}()
 
+	scanCtx, cancelScan := context.WithCancel(ctx)
+	defer cancelScan()
+	var scanWG sync.WaitGroup
+	s.startScanLoop(scanCtx, &scanWG, s.scanLogger())
+
 	select {
 	case <-ctx.Done():
-		return gracefulShutdown(httpSrv, errCh)
+		err := gracefulShutdown(httpSrv, errCh)
+		cancelScan()
+		scanWG.Wait()
+		return err
 	case err := <-errCh:
+		cancelScan()
+		scanWG.Wait()
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
 		return err
 	}
+}
+
+// startScanLoop spins up the drift-detection scheduler in a sibling
+// goroutine, but only when ScanInterval is set. The WaitGroup lets
+// Serve block on the loop's clean exit during shutdown so a tick
+// already-in-flight finishes its volume before the function returns.
+func (s *Server) startScanLoop(ctx context.Context, wg *sync.WaitGroup, logger io.Writer) {
+	if s.cfg.ScanInterval <= 0 {
+		return
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.runScanLoop(ctx, logger)
+	}()
+}
+
+// scanLogger picks the destination for the scan loop's one-line
+// updates. The Config field wins; nil falls back to io.Discard so
+// the loop never panics for callers that left it unset.
+func (s *Server) scanLogger() io.Writer {
+	if s.cfg.ScanLogger != nil {
+		return s.cfg.ScanLogger
+	}
+	return io.Discard
 }
 
 // runServer dispatches to ServeTLS when a cert/key pair is set, plain
