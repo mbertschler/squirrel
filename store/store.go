@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -14,7 +16,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 5
+const SchemaVersion = 6
 
 type Store struct {
 	db *sql.DB
@@ -32,7 +34,10 @@ type Volume struct {
 // FileRow is a single indexed file. Path is stored relative to the volume's
 // path. VolumeID references volumes(id). FirstSeenRunID is the run that first
 // inserted this row and is never overwritten on subsequent updates;
-// LastSeenRunID advances on every observation.
+// LastSeenRunID advances on every observation. SourceNodeID and SourceRunID
+// record provenance for peer-syncs (NULL means "local write" — today's only
+// path). They are populated on read for inspection; writes go through Upsert
+// with an explicit *Provenance.
 type FileRow struct {
 	VolumeID       int64
 	Path           string
@@ -43,6 +48,17 @@ type FileRow struct {
 	FirstSeenRunID int64
 	LastSeenRunID  int64
 	IndexedAtNs    int64
+	SourceNodeID   sql.NullInt64
+	SourceRunID    sql.NullInt64
+}
+
+// Provenance carries the "who wrote this row" attribution that Upsert
+// records on a peer-sourced write. NodeID references nodes(id) and RunID
+// references runs(id) on the receiver's side. A nil *Provenance to Upsert
+// records NULLs, the convention for local writes (today's only path).
+type Provenance struct {
+	NodeID int64
+	RunID  int64
 }
 
 // FileWithVolume bundles a file row with its volume, returned by read APIs
@@ -77,19 +93,40 @@ const (
 	RunStatusPartial = "partial"
 )
 
+// OpenOptions tunes Store.Open. NodeName is the identity recorded as the
+// self row in the nodes table on first migration to v6 (or beyond). An
+// empty NodeName falls back to os.Hostname() — callers that don't yet wire
+// a config-derived name still produce a self row.
+type OpenOptions struct {
+	NodeName string
+}
+
 // Open opens (or creates) the SQLite database at the given filesystem path
-// and ensures the schema is at the version this binary expects. The path must
-// be a plain filesystem path (no '?' query string and no URI scheme prefix);
-// DSN parameters are managed internally so callers cannot override pragmas
-// like journal_mode or busy_timeout. Returns an error if the database's
-// schema version is newer than SchemaVersion, or if it is at an older
-// unsupported version (this binary does not migrate v1 databases).
+// and ensures the schema is at the version this binary expects. Equivalent
+// to OpenWithOptions(path, OpenOptions{}) — the self node row gets a name
+// derived from os.Hostname().
 func Open(path string) (*Store, error) {
+	return OpenWithOptions(path, OpenOptions{})
+}
+
+// OpenWithOptions opens or creates the SQLite database, applies any schema
+// migrations, and seeds the self node row using opts.NodeName (falling back
+// to os.Hostname() when empty). The path must be a plain filesystem path
+// (no '?' query string and no URI scheme prefix); DSN parameters are
+// managed internally so callers cannot override pragmas like journal_mode
+// or busy_timeout. Returns an error if the database's schema version is
+// newer than SchemaVersion, or if it is at an older unsupported version
+// (this binary does not migrate v1 databases).
+func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 	if strings.ContainsAny(path, "?#") {
 		return nil, fmt.Errorf("db path %q must not contain '?' or '#'", path)
 	}
 	if strings.Contains(path, "://") || strings.HasPrefix(path, "file:") {
 		return nil, fmt.Errorf("db path %q must be a plain filesystem path, not a URI", path)
+	}
+	nodeName, err := resolveNodeName(opts.NodeName)
+	if err != nil {
+		return nil, err
 	}
 	// _txlock=immediate makes BeginTx start with `BEGIN IMMEDIATE`, acquiring
 	// the write lock at transaction start. Without it, a transaction that
@@ -106,16 +143,70 @@ func Open(path string) (*Store, error) {
 	db.SetMaxOpenConns(1)
 
 	s := &Store{db: db}
-	if err := s.migrate(context.Background()); err != nil {
+	if err := s.migrate(context.Background(), nodeName); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return s, nil
 }
 
+// resolveNodeName returns the explicit name when non-empty, else the host
+// name. Explicit names are validated against the identifier rule the
+// config layer enforces — the same string lands as a TOML key, a
+// destination subfolder, and an rclone.conf section, so syntactic gaps
+// between the store and the config would let a database be seeded with
+// an identity that later config parsing rejects. The hostname fallback
+// is sanitised rather than rejected because real-world hostnames often
+// carry dots ("laptop.local") that the strict rule disallows; the
+// sanitised form is deterministic and stays human-readable.
+func resolveNodeName(name string) (string, error) {
+	if name != "" {
+		if !nodeNameRE.MatchString(name) {
+			return "", fmt.Errorf("OpenOptions.NodeName %q is invalid (must match %s)", name, nodeNameRE)
+		}
+		return name, nil
+	}
+	host, err := os.Hostname()
+	if err != nil {
+		return "", fmt.Errorf("resolve hostname for self node name: %w", err)
+	}
+	sanitised := sanitiseNodeName(host)
+	if sanitised == "" {
+		return "", fmt.Errorf("os.Hostname %q has no characters usable as a node name; pass OpenOptions.NodeName", host)
+	}
+	return sanitised, nil
+}
+
+// nodeNameRE mirrors config.nameRE. Duplicated here to keep store
+// free of a config import; if the rule ever changes, both sites change.
+var nodeNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`)
+
+// sanitiseNodeName produces a nodeNameRE-compliant identifier from a
+// hostname by mapping every disallowed rune to '-', then trimming
+// leading separators so the result begins with an alphanumeric (the
+// regex anchor requires it). Returns "" when no usable characters
+// survive.
+func sanitiseNodeName(host string) string {
+	var b strings.Builder
+	for _, r := range host {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'),
+			r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	out := strings.TrimLeft(b.String(), "-_")
+	if out == "" || !nodeNameRE.MatchString(out) {
+		return ""
+	}
+	return out
+}
+
 func (s *Store) Close() error { return s.db.Close() }
 
-func (s *Store) migrate(ctx context.Context) error {
+func (s *Store) migrate(ctx context.Context, nodeName string) error {
 	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL PRIMARY KEY)`); err != nil {
 		return fmt.Errorf("create schema_version: %w", err)
 	}
@@ -136,7 +227,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		if err := applyV5(ctx, s.db); err != nil {
 			return fmt.Errorf("apply schema v5: %w", err)
 		}
-		return nil
+		current = 5
 	}
 	// Chained upgrades — each step is a self-contained transaction.
 	if current == 2 {
@@ -154,6 +245,12 @@ func (s *Store) migrate(ctx context.Context) error {
 	if current == 4 {
 		if err := migrateV4ToV5(ctx, s.db); err != nil {
 			return fmt.Errorf("migrate schema v4→v5: %w", err)
+		}
+		current = 5
+	}
+	if current == 5 {
+		if err := migrateV5ToV6(ctx, s.db, nodeName); err != nil {
+			return fmt.Errorf("migrate schema v5→v6: %w", err)
 		}
 	}
 	return nil
@@ -418,6 +515,66 @@ func migrateV4ToV5(ctx context.Context, db *sql.DB) error {
 	return tx.Commit()
 }
 
+// migrateV5ToV6 adds the node-sync foundations: the `nodes` table (with a
+// self-row), the `peer_sync_state` watermark table, and the provenance
+// columns on `files` and `runs`. ALTER TABLE ADD COLUMN is used for the
+// column additions — the new columns are nullable with no default, so
+// SQLite skips a full table rewrite and existing rows surface them as
+// NULL ("local write" convention). The partial index on
+// `files (source_node_id) WHERE status='present' AND source_node_id IS
+// NOT NULL` lets the peer-sync planner answer "find rows sourced from
+// peer X" cheaply: the NOT NULL clause excludes the local-write majority
+// (which would otherwise dominate the index entries) so the index size
+// tracks the peer-sourced subset, not every present row.
+func migrateV5ToV6(ctx context.Context, db *sql.DB, nodeName string) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`CREATE TABLE nodes (
+			id                     INTEGER PRIMARY KEY,
+			name                   TEXT NOT NULL UNIQUE,
+			endpoint               TEXT,
+			public_key_fingerprint TEXT
+		)`,
+		// last_shared_run_id is NOT a FK to local runs(id): it carries the
+		// initiator's local run-id, which is the shared identifier between
+		// the two nodes. The receiver records its own correlated id on
+		// runs.correlated_run_id; FK-constraining the watermark to the
+		// receiver's runs table would reject most updates.
+		`CREATE TABLE peer_sync_state (
+			volume_id          INTEGER NOT NULL REFERENCES volumes(id),
+			peer_node_id       INTEGER NOT NULL REFERENCES nodes(id),
+			last_shared_run_id INTEGER,
+			last_synced_at     INTEGER NOT NULL,
+			PRIMARY KEY (volume_id, peer_node_id)
+		)`,
+		`ALTER TABLE files ADD COLUMN source_node_id INTEGER REFERENCES nodes(id)`,
+		`ALTER TABLE files ADD COLUMN source_run_id  INTEGER REFERENCES runs(id)`,
+		`ALTER TABLE runs ADD COLUMN peer_node_id     INTEGER REFERENCES nodes(id)`,
+		`ALTER TABLE runs ADD COLUMN correlated_run_id INTEGER`,
+		`CREATE INDEX idx_files_source_node ON files(source_node_id)
+		 WHERE status = 'present' AND source_node_id IS NOT NULL`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("exec %q: %w", q, err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO nodes (name, endpoint, public_key_fingerprint) VALUES (?, NULL, NULL)`,
+		nodeName); err != nil {
+		return fmt.Errorf("insert self node row: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (6)`); err != nil {
+		return fmt.Errorf("record schema v6: %w", err)
+	}
+	return tx.Commit()
+}
+
 // migrateV3ToV4 widens the files PK from (volume_id, path) to
 // (volume_id, path, blake3) and adds 'superseded' to the status check. Every
 // existing v3 row has a unique blake3 at its (volume, path), so the widening
@@ -584,7 +741,7 @@ func (s *Store) ListVolumes(ctx context.Context) ([]Volume, error) {
 
 // --- File APIs ---
 
-const fileColumns = `volume_id, path, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns`
+const fileColumns = `volume_id, path, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns, source_node_id, source_run_id`
 
 // GetByPath returns the currently-live row for (volumeID, relPath) — i.e.
 // the row with status='present' or status='missing'. Superseded rows
@@ -707,7 +864,14 @@ func (s *Store) GetByBlake3(ctx context.Context, digest []byte) ([]FileWithVolum
 //
 // In all cases, blake3 is never rewritten in place; content history at a
 // path grows append-only.
-func (s *Store) Upsert(ctx context.Context, r FileRow) error {
+//
+// prov carries the per-write provenance recorded as (source_node_id,
+// source_run_id) on the affected row. A nil *Provenance records NULLs —
+// "local write", today's only path. The provenance reflects the current
+// observation: cases 1 and 2 rewrite the live row's source columns to the
+// new prov (the previous attribution is preserved on the superseded
+// row in case 2).
+func (s *Store) Upsert(ctx context.Context, r FileRow, prov *Provenance) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin upsert: %w", err)
@@ -722,7 +886,7 @@ func (s *Store) Upsert(ctx context.Context, r FileRow) error {
 	switch {
 	case err == nil && existingStatus != StatusSuperseded:
 		// Case 1: exact row exists and is live — touch it.
-		if err := updateLiveRow(ctx, tx, r); err != nil {
+		if err := updateLiveRow(ctx, tx, r, prov); err != nil {
 			return err
 		}
 	case err == nil && existingStatus == StatusSuperseded:
@@ -731,7 +895,7 @@ func (s *Store) Upsert(ctx context.Context, r FileRow) error {
 		if err := supersedeLiveRow(ctx, tx, r.VolumeID, r.Path); err != nil {
 			return err
 		}
-		if err := updateLiveRow(ctx, tx, r); err != nil {
+		if err := updateLiveRow(ctx, tx, r, prov); err != nil {
 			return err
 		}
 	case errors.Is(err, sql.ErrNoRows):
@@ -739,7 +903,7 @@ func (s *Store) Upsert(ctx context.Context, r FileRow) error {
 		if err := supersedeLiveRow(ctx, tx, r.VolumeID, r.Path); err != nil {
 			return err
 		}
-		if err := insertNewRow(ctx, tx, r); err != nil {
+		if err := insertNewRow(ctx, tx, r, prov); err != nil {
 			return err
 		}
 	default:
@@ -747,6 +911,18 @@ func (s *Store) Upsert(ctx context.Context, r FileRow) error {
 	}
 
 	return tx.Commit()
+}
+
+// provColumns returns the (source_node_id, source_run_id) pair as
+// sql.NullInt64 so callers can splat them into UPDATE/INSERT bind lists.
+// A nil *Provenance yields two invalid NullInt64 — the binding renders as
+// NULL columns, the "local write" convention.
+func provColumns(p *Provenance) (sql.NullInt64, sql.NullInt64) {
+	if p == nil {
+		return sql.NullInt64{}, sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: p.NodeID, Valid: true},
+		sql.NullInt64{Int64: p.RunID, Valid: true}
 }
 
 // supersedeLiveRow flips the single non-superseded row at (volumeID, relPath)
@@ -766,13 +942,18 @@ func supersedeLiveRow(ctx context.Context, tx *sql.Tx, volumeID int64, relPath s
 
 // updateLiveRow refreshes the mutable fields on an existing row matching
 // (volume_id, path, blake3). blake3 and first_seen_run_id are never touched.
-func updateLiveRow(ctx context.Context, tx *sql.Tx, r FileRow) error {
+// The (source_node_id, source_run_id) provenance pair is rewritten to the
+// caller-supplied prov so the row tracks the most recent attribution.
+func updateLiveRow(ctx context.Context, tx *sql.Tx, r FileRow, prov *Provenance) error {
+	srcNode, srcRun := provColumns(prov)
 	_, err := tx.ExecContext(ctx, `
 		UPDATE files SET
 			size_bytes = ?, mtime_ns = ?, status = ?,
-			last_seen_run_id = ?, indexed_at_ns = ?
+			last_seen_run_id = ?, indexed_at_ns = ?,
+			source_node_id = ?, source_run_id = ?
 		WHERE volume_id = ? AND path = ? AND blake3 = ?
 	`, r.SizeBytes, r.MtimeNs, r.Status, r.LastSeenRunID, r.IndexedAtNs,
+		srcNode, srcRun,
 		r.VolumeID, r.Path, r.Blake3)
 	if err != nil {
 		return fmt.Errorf("update live row: %w", err)
@@ -780,14 +961,17 @@ func updateLiveRow(ctx context.Context, tx *sql.Tx, r FileRow) error {
 	return nil
 }
 
-func insertNewRow(ctx context.Context, tx *sql.Tx, r FileRow) error {
+func insertNewRow(ctx context.Context, tx *sql.Tx, r FileRow, prov *Provenance) error {
+	srcNode, srcRun := provColumns(prov)
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO files (
 			volume_id, path, blake3, size_bytes, mtime_ns, status,
-			first_seen_run_id, last_seen_run_id, indexed_at_ns
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			first_seen_run_id, last_seen_run_id, indexed_at_ns,
+			source_node_id, source_run_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, r.VolumeID, r.Path, r.Blake3, r.SizeBytes, r.MtimeNs, r.Status,
-		r.FirstSeenRunID, r.LastSeenRunID, r.IndexedAtNs)
+		r.FirstSeenRunID, r.LastSeenRunID, r.IndexedAtNs,
+		srcNode, srcRun)
 	if err != nil {
 		return fmt.Errorf("insert new row: %w", err)
 	}
@@ -887,11 +1071,11 @@ func (s *Store) CurrentSchemaVersion(ctx context.Context) (int, error) {
 	return v, err
 }
 
-const joinedColumns = `f.volume_id, f.path, f.blake3, f.size_bytes, f.mtime_ns, f.status, f.first_seen_run_id, f.last_seen_run_id, f.indexed_at_ns, v.id, v.name, v.path`
+const joinedColumns = `f.volume_id, f.path, f.blake3, f.size_bytes, f.mtime_ns, f.status, f.first_seen_run_id, f.last_seen_run_id, f.indexed_at_ns, f.source_node_id, f.source_run_id, v.id, v.name, v.path`
 
 func scanFileRow(scan func(...any) error) (FileRow, error) {
 	var r FileRow
-	err := scan(&r.VolumeID, &r.Path, &r.Blake3, &r.SizeBytes, &r.MtimeNs, &r.Status, &r.FirstSeenRunID, &r.LastSeenRunID, &r.IndexedAtNs)
+	err := scan(&r.VolumeID, &r.Path, &r.Blake3, &r.SizeBytes, &r.MtimeNs, &r.Status, &r.FirstSeenRunID, &r.LastSeenRunID, &r.IndexedAtNs, &r.SourceNodeID, &r.SourceRunID)
 	return r, err
 }
 
@@ -902,6 +1086,7 @@ func collectJoined(rows *sql.Rows) ([]FileWithVolume, error) {
 		if err := rows.Scan(
 			&fv.File.VolumeID, &fv.File.Path, &fv.File.Blake3, &fv.File.SizeBytes,
 			&fv.File.MtimeNs, &fv.File.Status, &fv.File.FirstSeenRunID, &fv.File.LastSeenRunID, &fv.File.IndexedAtNs,
+			&fv.File.SourceNodeID, &fv.File.SourceRunID,
 			&fv.Volume.ID, &fv.Volume.Name, &fv.Volume.Path,
 		); err != nil {
 			return nil, err

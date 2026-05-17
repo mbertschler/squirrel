@@ -103,7 +103,11 @@ func openStore(cmd *cobra.Command, cfg *config.Config) (*store.Store, error) {
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create db directory: %w", err)
 	}
-	s, err := store.Open(dbPath)
+	var opts store.OpenOptions
+	if cfg != nil {
+		opts.NodeName = cfg.NodeName
+	}
+	s, err := store.OpenWithOptions(dbPath, opts)
 	if err != nil {
 		return nil, err
 	}

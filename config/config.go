@@ -42,6 +42,10 @@ type Config struct {
 	// DB is the absolute path to the index database. Empty when not set in
 	// the config; the CLI's --db flag and built-in default fill that in.
 	DB string
+	// NodeName is this host's identity for node-to-node sync. Empty when
+	// not set in the config; the store falls back to os.Hostname() when
+	// inserting the self row at first migration. Must match nameRE.
+	NodeName string
 	// Volumes is keyed by volume name. Names match nameRE.
 	Volumes map[string]*Volume
 	// Destinations is keyed by destination name. Names match nameRE.
@@ -121,6 +125,7 @@ func IsMissing(err error) bool {
 // per-field schema; resolve dispatches to per-type validators.
 type rawConfig struct {
 	DB           string                    `toml:"db"`
+	NodeName     string                    `toml:"node_name"`
 	Volumes      map[string]rawVolume      `toml:"volumes"`
 	Destinations map[string]map[string]any `toml:"destinations"`
 }
@@ -142,6 +147,12 @@ func (r *rawConfig) resolve(path string) (*Config, error) {
 			return nil, fmt.Errorf("db: %w", err)
 		}
 		cfg.DB = expanded
+	}
+	if r.NodeName != "" {
+		if !nameRE.MatchString(r.NodeName) {
+			return nil, fmt.Errorf("node_name %q is invalid (must match %s)", r.NodeName, nameRE)
+		}
+		cfg.NodeName = r.NodeName
 	}
 	for name, raw := range r.Destinations {
 		dest, err := resolveDestination(name, raw)

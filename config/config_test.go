@@ -355,6 +355,54 @@ root   = "/p"
 	}
 }
 
+// TestLoadNodeName checks that the top-level node_name key is parsed and
+// surfaced on Config.NodeName for the store to consume on first migration.
+func TestLoadNodeName(t *testing.T) {
+	p := writeConfig(t, `
+node_name = "laptop"
+
+[volumes.pictures]
+path = "/tmp/pictures"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.NodeName != "laptop" {
+		t.Fatalf("NodeName = %q, want laptop", cfg.NodeName)
+	}
+}
+
+// TestLoadNodeNameInvalid rejects identifiers that don't match nameRE —
+// the same conservative subset volumes and destinations are held to,
+// because the same string lands as an identifier in the index DB and
+// on the sync wire.
+func TestLoadNodeNameInvalid(t *testing.T) {
+	p := writeConfig(t, `
+node_name = "has spaces"
+`)
+	if _, err := Load(p); err == nil {
+		t.Fatalf("Load accepted invalid node_name; want rejection")
+	}
+}
+
+// TestLoadNodeNameOptional is the bridge case for users who haven't
+// added a node_name yet: the field stays empty and the store falls
+// back to os.Hostname() at Open.
+func TestLoadNodeNameOptional(t *testing.T) {
+	p := writeConfig(t, `
+[volumes.pictures]
+path = "/tmp/pictures"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.NodeName != "" {
+		t.Fatalf("NodeName = %q, want empty (hostname-fallback path)", cfg.NodeName)
+	}
+}
+
 func TestMissingErrorWrappingChain(t *testing.T) {
 	// MissingError must be detectable both via IsMissing and errors.As so
 	// callers can choose either ergonomic form.
