@@ -409,10 +409,19 @@ func (p Pair) IsNode() bool { return p.Node != nil }
 // target directory; when empty, the volume's declared path is used. The
 // override is for "pull a recovery copy somewhere else" — squirrel won't
 // silently clobber the live volume unless explicitly pointed at it.
+// IncludeFromFile, when non-empty, is a path to a newline-delimited
+// listing of volume-relative paths and gets forwarded to rclone as
+// --files-from-raw. Used by `restore --from <node>` to ship only that
+// node's source-attributed paths back to the local tree. We use the
+// raw variant (matching sync/node.go's writeFilesFrom flow) so paths
+// beginning with `#`/`;` or with surrounding whitespace are passed
+// through verbatim — the processed --files-from mode would treat
+// those as comments or trim them.
 type RestoreOptions struct {
-	ToPath  string
-	Shallow bool
-	DryRun  bool
+	ToPath          string
+	Shallow         bool
+	DryRun          bool
+	IncludeFromFile string
 }
 
 // Restore reverses Sync: it copies from the destination's per-volume tree
@@ -463,8 +472,13 @@ func getOrCreateVolumeForRestore(ctx context.Context, s *store.Store, vol *confi
 
 // buildRestoreArgs flips the source/destination of sync: source is
 // <dest>:<root>/<volume>/, destination is the local volume path (or
-// override). The same .squirrel-history filter applies — we don't want
-// the destination's historical snapshots to land in the user's tree.
+// override). The .squirrel-history filter applies in the listing-based
+// flow so the destination's historical snapshots don't land in the
+// user's tree; the include-list flow doesn't need it because the
+// list is the authoritative subset. rclone in fact rejects --filter
+// alongside --files-from-raw ("the usage of --files-from-raw overrides
+// all other filters") so we must pick one or the other.
+//
 // Restore does not pass --backup-dir: the local target is the recovery
 // surface, and the user opted in to overwrites by invoking restore.
 // Squirrel-side append-only semantics live in the destination tree, not
@@ -477,9 +491,11 @@ func buildRestoreArgs(vol *config.Volume, dest *config.Destination, opts Restore
 	}
 	dstArg := withTrailingSlash(target)
 
-	args := []string{
-		"copy",
-		"--filter", "- /" + HistoryDirName + "/**",
+	args := []string{"copy"}
+	if opts.IncludeFromFile != "" {
+		args = append(args, "--files-from-raw", opts.IncludeFromFile)
+	} else {
+		args = append(args, "--filter", "- /"+HistoryDirName+"/**")
 	}
 	if !opts.Shallow {
 		args = append(args, "--checksum", "--hash", "blake3")

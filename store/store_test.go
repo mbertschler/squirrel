@@ -2263,6 +2263,178 @@ func TestCountFilesFirstSeenByRunWithPathPrefix(t *testing.T) {
 	}
 }
 
+// TestListPresentBySource pins the two filter modes: valid nodeID
+// returns rows attributed to that peer, NULL nodeID returns rows
+// without provenance (local writes). Superseded and missing rows
+// must be excluded under either mode.
+func TestListPresentBySource(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := OpenWithOptions(dsn, OpenOptions{NodeName: "self"})
+	if err != nil {
+		t.Fatalf("OpenWithOptions: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	peerA, err := s.CreateNode(ctx, "peer-a", "https://a.example")
+	if err != nil {
+		t.Fatalf("CreateNode peer-a: %v", err)
+	}
+	peerB, err := s.CreateNode(ctx, "peer-b", "https://b.example")
+	if err != nil {
+		t.Fatalf("CreateNode peer-b: %v", err)
+	}
+
+	vID := makeVolume(t, s, "/v")
+	run := makeRun(t, s, vID)
+
+	upsert := func(p string, b byte, status string, prov *Provenance) {
+		t.Helper()
+		if err := s.Upsert(ctx, FileRow{
+			VolumeID: vID, Path: p, Blake3: digest(b), SizeBytes: 1, MtimeNs: 1,
+			Status: status, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1,
+		}, prov); err != nil {
+			t.Fatalf("Upsert %s: %v", p, err)
+		}
+	}
+	upsert("a-from-peer-a.txt", 0x11, StatusPresent, &Provenance{NodeID: peerA.ID, RunID: run})
+	upsert("b-from-peer-a.txt", 0x12, StatusPresent, &Provenance{NodeID: peerA.ID, RunID: run})
+	upsert("c-from-peer-b.txt", 0x21, StatusPresent, &Provenance{NodeID: peerB.ID, RunID: run})
+	upsert("local-write.txt", 0x31, StatusPresent, nil)
+	upsert("missing-from-peer-a.txt", 0x41, StatusMissing, &Provenance{NodeID: peerA.ID, RunID: run})
+
+	collect := func(nodeID sql.NullInt64) []string {
+		var got []string
+		for row, err := range s.ListPresentBySource(ctx, vID, nodeID) {
+			if err != nil {
+				t.Fatalf("iter: %v", err)
+			}
+			got = append(got, row.Path)
+		}
+		return got
+	}
+
+	peerAOnly := collect(sql.NullInt64{Int64: peerA.ID, Valid: true})
+	wantA := []string{"a-from-peer-a.txt", "b-from-peer-a.txt"}
+	if fmt.Sprint(peerAOnly) != fmt.Sprint(wantA) {
+		t.Fatalf("peer-a paths = %v, want %v", peerAOnly, wantA)
+	}
+
+	peerBOnly := collect(sql.NullInt64{Int64: peerB.ID, Valid: true})
+	if fmt.Sprint(peerBOnly) != fmt.Sprint([]string{"c-from-peer-b.txt"}) {
+		t.Fatalf("peer-b paths = %v", peerBOnly)
+	}
+
+	localOnly := collect(sql.NullInt64{})
+	if fmt.Sprint(localOnly) != fmt.Sprint([]string{"local-write.txt"}) {
+		t.Fatalf("local (NULL) paths = %v", localOnly)
+	}
+}
+
+// TestListPresentBySourceEarlyBreakClosesRows confirms the iter.Seq2
+// implementation closes its underlying rows when the consumer breaks
+// early. Without this guarantee a long-running CLI could leak a
+// statement handle whenever the user pages results.
+func TestListPresentBySourceEarlyBreakClosesRows(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := OpenWithOptions(dsn, OpenOptions{NodeName: "self"})
+	if err != nil {
+		t.Fatalf("OpenWithOptions: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	peer, _ := s.CreateNode(ctx, "peer", "https://p.example")
+	vID := makeVolume(t, s, "/v")
+	run := makeRun(t, s, vID)
+	for i := byte(1); i <= 5; i++ {
+		if err := s.Upsert(ctx, FileRow{
+			VolumeID: vID, Path: fmt.Sprintf("p%d", i), Blake3: digest(i), SizeBytes: 1, MtimeNs: 1,
+			Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1,
+		}, &Provenance{NodeID: peer.ID, RunID: run}); err != nil {
+			t.Fatalf("Upsert: %v", err)
+		}
+	}
+
+	var seen int
+	for _, err := range s.ListPresentBySource(ctx, vID, sql.NullInt64{Int64: peer.ID, Valid: true}) {
+		if err != nil {
+			t.Fatalf("iter: %v", err)
+		}
+		seen++
+		if seen == 2 {
+			break
+		}
+	}
+	if seen != 2 {
+		t.Fatalf("seen = %d, want 2", seen)
+	}
+	// A second pass must succeed, proving the prior pass released its
+	// rows handle (the store pins MaxOpenConns=1, so a leak would block
+	// the next QueryContext indefinitely — guard with a separate scan).
+	again := 0
+	for _, err := range s.ListPresentBySource(ctx, vID, sql.NullInt64{Int64: peer.ID, Valid: true}) {
+		if err != nil {
+			t.Fatalf("second iter: %v", err)
+		}
+		again++
+	}
+	if again != 5 {
+		t.Fatalf("second pass = %d rows, want 5", again)
+	}
+}
+
+// TestListRunsByPeer pins peer-id filtering, ordering, and the limit
+// argument's behaviour. Index runs and bucket-sync runs must be
+// excluded entirely.
+func TestListRunsByPeer(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := OpenWithOptions(dsn, OpenOptions{NodeName: "self"})
+	if err != nil {
+		t.Fatalf("OpenWithOptions: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	peerA, _ := s.CreateNode(ctx, "peer-a", "https://a.example")
+	peerB, _ := s.CreateNode(ctx, "peer-b", "https://b.example")
+	vID := makeVolume(t, s, "/v")
+
+	// Two peer-sync runs for peer-a, one for peer-b, one bucket sync.
+	r1, _ := s.BeginPeerSyncRun(ctx, vID, peerA.ID, 101, "peer-a")
+	r2, _ := s.BeginPeerSyncRun(ctx, vID, peerA.ID, 102, "peer-a")
+	r3, _ := s.BeginPeerSyncRun(ctx, vID, peerB.ID, 201, "peer-b")
+	bucketRun, _ := s.BeginRun(ctx, RunKindSync, vID, "scratch")
+	_ = bucketRun
+	_ = makeRun(t, s, vID) // an index run, to confirm it's excluded too
+	_ = r3
+
+	runs, err := s.ListRunsByPeer(ctx, peerA.ID, 0)
+	if err != nil {
+		t.Fatalf("ListRunsByPeer: %v", err)
+	}
+	if len(runs) != 2 {
+		t.Fatalf("len(runs) = %d, want 2", len(runs))
+	}
+	// Descending id order: r2 first.
+	if runs[0].ID != r2 || runs[1].ID != r1 {
+		t.Fatalf("ordering: got [%d, %d], want [%d, %d]", runs[0].ID, runs[1].ID, r2, r1)
+	}
+	for _, r := range runs {
+		if !r.PeerNodeID.Valid || r.PeerNodeID.Int64 != peerA.ID {
+			t.Fatalf("row has wrong peer: %+v", r)
+		}
+	}
+
+	capped, err := s.ListRunsByPeer(ctx, peerA.ID, 1)
+	if err != nil {
+		t.Fatalf("ListRunsByPeer cap: %v", err)
+	}
+	if len(capped) != 1 || capped[0].ID != r2 {
+		t.Fatalf("limit=1 returned %+v, want only r2 (%d)", capped, r2)
+	}
+}
+
 func TestFilePlaceholdersMatchesFileColumns(t *testing.T) {
 	gotCols := strings.Count(fileColumns, ",") + 1
 	gotPlaceholders := strings.Count(filePlaceholders, "?")

@@ -34,6 +34,18 @@ func (s *Store) GetSelfNode(ctx context.Context) (Node, error) {
 	return n, err
 }
 
+// GetNodeByID returns the node row with the given id, or
+// sql.ErrNoRows. The id is the surrogate key used by `files.source_node_id`
+// and `runs.peer_node_id`.
+func (s *Store) GetNodeByID(ctx context.Context, id int64) (Node, error) {
+	var n Node
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, name, endpoint, public_key_fingerprint
+		 FROM nodes WHERE id = ?`, id).
+		Scan(&n.ID, &n.Name, &n.Endpoint, &n.PublicKeyFingerprint)
+	return n, err
+}
+
 // GetNodeByName returns the node row with the given name, or
 // sql.ErrNoRows. Names are UNIQUE per the schema.
 func (s *Store) GetNodeByName(ctx context.Context, name string) (Node, error) {

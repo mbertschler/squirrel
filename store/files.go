@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"iter"
 	"sort"
 	"strings"
 )
@@ -441,6 +442,58 @@ func (s *Store) ListPresentPathsUnder(ctx context.Context, volumeID int64) (map[
 		out[p] = struct{}{}
 	}
 	return out, rows.Err()
+}
+
+// ListPresentBySource yields every present row in volumeID whose
+// source_node_id matches nodeID. A valid nodeID matches that node id
+// and exploits idx_files_source_node (the partial index on
+// (source_node_id) WHERE status='present' AND source_node_id IS NOT
+// NULL); a zero NullInt64 filters to rows with source_node_id IS NULL —
+// the "local write" convention — and falls back to a status-scoped scan
+// because the partial index excludes those rows by construction.
+//
+// Yielded in path order so a caller streaming to `rclone --files-from`
+// produces a stable, diffable listing. iter.Seq2 is used so large
+// volumes don't materialise the whole row set in memory before the
+// caller starts consuming it.
+func (s *Store) ListPresentBySource(ctx context.Context, volumeID int64, nodeID sql.NullInt64) iter.Seq2[FileRow, error] {
+	return func(yield func(FileRow, error) bool) {
+		var (
+			rows *sql.Rows
+			err  error
+		)
+		if nodeID.Valid {
+			rows, err = s.db.QueryContext(ctx,
+				`SELECT `+fileColumns+` FROM files
+				 WHERE volume_id = ? AND status = 'present' AND source_node_id = ?
+				 ORDER BY path`,
+				volumeID, nodeID.Int64)
+		} else {
+			rows, err = s.db.QueryContext(ctx,
+				`SELECT `+fileColumns+` FROM files
+				 WHERE volume_id = ? AND status = 'present' AND source_node_id IS NULL
+				 ORDER BY path`,
+				volumeID)
+		}
+		if err != nil {
+			yield(FileRow{}, fmt.Errorf("query present by source: %w", err))
+			return
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var r FileRow
+			if err := r.scanFrom(rows); err != nil {
+				yield(FileRow{}, fmt.Errorf("scan present by source: %w", err))
+				return
+			}
+			if !yield(r, nil) {
+				return
+			}
+		}
+		if err := rows.Err(); err != nil {
+			yield(FileRow{}, err)
+		}
+	}
 }
 
 // ListMissing returns all rows with status='missing', joined with their volume.

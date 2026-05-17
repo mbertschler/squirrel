@@ -215,6 +215,35 @@ func (s *Store) ListRuns(ctx context.Context, opts ListRunsOpts) ([]Run, error) 
 	return out, rows.Err()
 }
 
+// ListRunsByPeer returns kind='sync' runs whose peer_node_id matches
+// peerNodeID, most recent first. limit caps the result count; zero (or
+// negative) returns every match. Provided so CLIs that surface per-peer
+// run history don't reach into the runs table directly.
+func (s *Store) ListRunsByPeer(ctx context.Context, peerNodeID int64, limit int) ([]Run, error) {
+	query := `SELECT ` + runColumns + ` FROM runs
+	          WHERE kind = 'sync' AND peer_node_id = ?
+	          ORDER BY id DESC`
+	args := []any{peerNodeID}
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list runs by peer: %w", err)
+	}
+	defer rows.Close()
+	var out []Run
+	for rows.Next() {
+		r, err := scanRun(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // GetRun returns the run with the given id, or sql.ErrNoRows.
 func (s *Store) GetRun(ctx context.Context, id int64) (Run, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT `+runColumns+` FROM runs WHERE id = ?`, id)
