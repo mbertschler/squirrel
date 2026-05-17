@@ -1887,3 +1887,251 @@ func TestPartialIndexAbsentOnV5(t *testing.T) {
 		t.Fatalf("idx_files_source_node found on v5; expected migration to add it on v6")
 	}
 }
+
+// TestRunMigrationsAppliesInOrder exercises the registry mechanism with a
+// custom slice of fake migrations on a fresh DB at the v5 baseline. Each
+// fake migration appends its version to a side table and bumps
+// schema_version; the test asserts both ran in order and the version row
+// advanced after each step (matching the per-migration atomicity contract).
+func TestRunMigrationsAppliesInOrder(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	stmts := []string{
+		`CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)`,
+		`CREATE TABLE migration_trace (step INTEGER NOT NULL, version_at_entry INTEGER NOT NULL)`,
+		`INSERT INTO schema_version (version) VALUES (5)`,
+	}
+	for _, q := range stmts {
+		if _, err := db.ExecContext(ctx, q); err != nil {
+			t.Fatalf("setup %q: %v", q, err)
+		}
+	}
+
+	fake := []migration{
+		{version: 100, up: func(ctx context.Context, db *sql.DB) error {
+			tx, err := db.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+			var maxV int
+			if err := tx.QueryRowContext(ctx,
+				`SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&maxV); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO migration_trace (step, version_at_entry) VALUES (100, ?)`, maxV); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (100)`); err != nil {
+				return err
+			}
+			return tx.Commit()
+		}},
+		{version: 101, up: func(ctx context.Context, db *sql.DB) error {
+			tx, err := db.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+			var maxV int
+			if err := tx.QueryRowContext(ctx,
+				`SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&maxV); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO migration_trace (step, version_at_entry) VALUES (101, ?)`, maxV); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (101)`); err != nil {
+				return err
+			}
+			return tx.Commit()
+		}},
+	}
+
+	end, err := runMigrations(ctx, db, 5, fake)
+	if err != nil {
+		t.Fatalf("runMigrations: %v", err)
+	}
+	if end != 101 {
+		t.Fatalf("end version = %d, want 101", end)
+	}
+
+	rows, err := db.QueryContext(ctx,
+		`SELECT step, version_at_entry FROM migration_trace ORDER BY rowid`)
+	if err != nil {
+		t.Fatalf("query trace: %v", err)
+	}
+	defer rows.Close()
+	type traceRow struct{ step, entry int }
+	var got []traceRow
+	for rows.Next() {
+		var r traceRow
+		if err := rows.Scan(&r.step, &r.entry); err != nil {
+			t.Fatalf("scan trace: %v", err)
+		}
+		got = append(got, r)
+	}
+	want := []traceRow{{100, 5}, {101, 100}}
+	if len(got) != len(want) {
+		t.Fatalf("trace = %+v, want %+v", got, want)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Fatalf("trace[%d] = %+v, want %+v", i, got[i], w)
+		}
+	}
+
+	var finalV int
+	if err := db.QueryRowContext(ctx,
+		`SELECT MAX(version) FROM schema_version`).Scan(&finalV); err != nil {
+		t.Fatalf("read final version: %v", err)
+	}
+	if finalV != 101 {
+		t.Fatalf("schema_version max = %d, want 101", finalV)
+	}
+}
+
+// TestRunMigrationsSkipsAlreadyApplied verifies that migrations whose
+// version is <= current are skipped — the loop's idempotency guarantee.
+func TestRunMigrationsSkipsAlreadyApplied(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+
+	var ran []int
+	ms := []migration{
+		{version: 5, up: func(_ context.Context, _ *sql.DB) error { ran = append(ran, 5); return nil }},
+		{version: 6, up: func(_ context.Context, _ *sql.DB) error { ran = append(ran, 6); return nil }},
+		{version: 7, up: func(_ context.Context, _ *sql.DB) error { ran = append(ran, 7); return nil }},
+	}
+	end, err := runMigrations(context.Background(), db, 6, ms)
+	if err != nil {
+		t.Fatalf("runMigrations: %v", err)
+	}
+	if end != 7 {
+		t.Fatalf("end version = %d, want 7", end)
+	}
+	if len(ran) != 1 || ran[0] != 7 {
+		t.Fatalf("ran = %v, want [7]", ran)
+	}
+}
+
+// TestRunMigrationsRejectsOutOfOrder confirms the safety net in
+// runMigrations that catches a registry slice with non-ascending versions
+// before any harm is done.
+func TestRunMigrationsRejectsOutOfOrder(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+
+	ms := []migration{
+		{version: 6, up: func(_ context.Context, _ *sql.DB) error { return nil }},
+		{version: 5, up: func(_ context.Context, _ *sql.DB) error { return nil }},
+	}
+	if _, err := runMigrations(context.Background(), db, 0, ms); err == nil {
+		t.Fatalf("runMigrations accepted out-of-order registry; want error")
+	}
+}
+
+// TestBuildMigrationsAscending pins the production registry's contract:
+// versions strictly ascend. A future migration that accidentally lands
+// before its predecessor in the slice trips this test instead of
+// surfacing as a confusing migration error at runtime.
+func TestBuildMigrationsAscending(t *testing.T) {
+	ms := buildMigrations(migrationCtx{nodeName: "test"})
+	prev := -1
+	for _, m := range ms {
+		if m.version <= prev {
+			t.Fatalf("buildMigrations not ascending: v%d follows v%d", m.version, prev)
+		}
+		prev = m.version
+	}
+}
+
+// TestFileRowScanInsertRoundTrip locks in the column-order invariant
+// between fileColumns, scanFrom, and insertArgs. A row inserted via
+// insertArgs and read back via scanFrom must equal the original. Adding
+// a column without updating every helper would surface here as a Scan
+// arity mismatch or a field whose value lands in the wrong slot.
+func TestFileRowScanInsertRoundTrip(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	volID := makeVolume(t, s, "/photos")
+	runID := makeRun(t, s, volID)
+
+	want := FileRow{
+		VolumeID:       volID,
+		Path:           "a/b/c.jpg",
+		Blake3:         digest(0x42),
+		SizeBytes:      4242,
+		MtimeNs:        1_700_000_000_000_000_000,
+		Status:         StatusPresent,
+		FirstSeenRunID: runID,
+		LastSeenRunID:  runID,
+		IndexedAtNs:    1_700_000_500_000_000_000,
+		SourceNodeID:   sql.NullInt64{Int64: 1, Valid: true},
+		SourceRunID:    sql.NullInt64{Int64: runID, Valid: true},
+	}
+
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO files (`+fileColumns+`) VALUES (`+filePlaceholders+`)`,
+		want.insertArgs()...); err != nil {
+		t.Fatalf("insert via insertArgs: %v", err)
+	}
+
+	var got FileRow
+	row := s.db.QueryRowContext(ctx,
+		`SELECT `+fileColumns+` FROM files WHERE volume_id = ? AND path = ? AND blake3 = ?`,
+		want.VolumeID, want.Path, want.Blake3)
+	if err := got.scanFrom(row); err != nil {
+		t.Fatalf("scanFrom: %v", err)
+	}
+
+	if got.VolumeID != want.VolumeID || got.Path != want.Path ||
+		!bytes.Equal(got.Blake3, want.Blake3) ||
+		got.SizeBytes != want.SizeBytes || got.MtimeNs != want.MtimeNs ||
+		got.Status != want.Status ||
+		got.FirstSeenRunID != want.FirstSeenRunID || got.LastSeenRunID != want.LastSeenRunID ||
+		got.IndexedAtNs != want.IndexedAtNs ||
+		got.SourceNodeID != want.SourceNodeID || got.SourceRunID != want.SourceRunID {
+		t.Fatalf("round-trip mismatch:\n got=%+v\nwant=%+v", got, want)
+	}
+}
+
+// TestFilePlaceholdersMatchesFileColumns guards the derived placeholder
+// list against drift from fileColumns. A column added to fileColumns but
+// forgotten elsewhere (or vice versa) trips here before any INSERT hits
+// SQLite and produces an opaque parameter-count error.
+func TestFilePlaceholdersMatchesFileColumns(t *testing.T) {
+	gotCols := strings.Count(fileColumns, ",") + 1
+	gotPlaceholders := strings.Count(filePlaceholders, "?")
+	if gotCols != gotPlaceholders {
+		t.Fatalf("fileColumns has %d entries, filePlaceholders has %d ?s", gotCols, gotPlaceholders)
+	}
+	// insertArgs is the third leg of the invariant — its return length
+	// must match too. Use a zero-value row; the only thing we sample is
+	// the slice length.
+	if n := len(FileRow{}.insertArgs()); n != gotCols {
+		t.Fatalf("insertArgs returns %d args, fileColumns has %d entries", n, gotCols)
+	}
+}

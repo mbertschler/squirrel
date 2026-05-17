@@ -6,6 +6,25 @@ import (
 	"fmt"
 )
 
+// Run kinds. The runs.volume_id column is nullable so a future sync run can
+// span volumes; index runs are always scoped to a single volume. Sync and
+// restore runs additionally carry a non-empty runs.destination naming the
+// rclone destination; index runs leave destination NULL.
+const (
+	RunKindIndex   = "index"
+	RunKindSync    = "sync"
+	RunKindRestore = "restore"
+)
+
+// Run statuses. A run begins in 'running' and is moved to a terminal state by
+// FinishRun. 'partial' means the walk completed but some files errored.
+const (
+	RunStatusRunning = "running"
+	RunStatusSuccess = "success"
+	RunStatusFailed  = "failed"
+	RunStatusPartial = "partial"
+)
+
 // Run is one entry in the runs table. VolumeID uses sql.NullInt64 because the
 // column is nullable (cross-volume sync runs in the future); EndedAtNs and
 // Error are likewise nullable while a run is still in-flight or finished
