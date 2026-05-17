@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mbertschler/squirrel/store"
 )
 
 // reservePort claims a free localhost port via the kernel then releases
@@ -178,5 +180,41 @@ func TestCLIAgentRequiresConfig(t *testing.T) {
 	_, err := runCLIExpectErr(t, "--config", missing, "agent")
 	if !strings.Contains(err.Error(), "no config at") {
 		t.Fatalf("expected missing-config error, got %v", err)
+	}
+}
+
+// TestCLIAgentSeedsConfiguredNodeName guards openAgentStore plumbing
+// `node_name` through to the store on first-DB seed. A fresh agent
+// run against a configured DB used to drop the name (calling
+// store.Open instead of OpenWithOptions) and seed the self row from
+// os.Hostname(), so the receiver advertised the wrong identity on
+// /v1/sync/begin.
+func TestCLIAgentSeedsConfiguredNodeName(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "index.db")
+	cfgPath := filepath.Join(dir, "config.toml")
+	listen := reservePort(t)
+	body := fmt.Sprintf(
+		"db = %q\nnode_name = %q\n\n[agent]\nlisten = %q\nauth = { token = %q }\n",
+		dbPath, "configured-name", listen, "tok")
+	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	stop, _ := startAgentCLI(t, cfgPath)
+	// Cancel the CLI so its defer s.Close() runs before we reopen.
+	stop()
+
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer s.Close()
+	self, err := s.GetSelfNode(context.Background())
+	if err != nil {
+		t.Fatalf("GetSelfNode: %v", err)
+	}
+	if self.Name != "configured-name" {
+		t.Fatalf("self node name = %q, want %q (os.Hostname leak from store.Open path)",
+			self.Name, "configured-name")
 	}
 }

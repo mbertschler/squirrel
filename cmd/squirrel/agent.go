@@ -78,7 +78,7 @@ func openAgentStore(cmd *cobra.Command, cfg *config.Config) (*store.Store, error
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create db directory: %w", err)
 	}
-	return store.Open(dbPath)
+	return store.OpenWithOptions(dbPath, store.OpenOptions{NodeName: cfg.NodeName})
 }
 
 func resolveAgentDBPath(cmd *cobra.Command, cfg *config.Config) (string, error) {
