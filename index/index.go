@@ -341,7 +341,7 @@ func (i *indexer) persist(r resultItem) error {
 		}
 		return nil
 	}
-	if err := i.store.Upsert(i.ctx, r.row); err != nil {
+	if err := i.store.Upsert(i.ctx, r.row, nil); err != nil {
 		return fmt.Errorf("upsert %s/%s: %w", i.absRoot, r.row.Path, err)
 	}
 	return nil

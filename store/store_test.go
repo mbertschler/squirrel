@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -250,7 +251,7 @@ func TestUpsertAndGet(t *testing.T) {
 		VolumeID: xID, Path: "a", Blake3: digest(0xab), SizeBytes: 10, MtimeNs: 1, Status: StatusPresent,
 		FirstSeenRunID: xRun, LastSeenRunID: xRun, IndexedAtNs: 100,
 	}
-	if err := s.Upsert(ctx, r); err != nil {
+	if err := s.Upsert(ctx, r, nil); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
 
@@ -268,7 +269,7 @@ func TestUpsertAndGet(t *testing.T) {
 	r2.Blake3 = digest(0xcd)
 	r2.FirstSeenRunID = yRun
 	r2.LastSeenRunID = yRun
-	if err := s.Upsert(ctx, r2); err != nil {
+	if err := s.Upsert(ctx, r2, nil); err != nil {
 		t.Fatalf("Upsert /y/a: %v", err)
 	}
 	gotX, _ := s.GetByPath(ctx, xID, "a")
@@ -280,7 +281,7 @@ func TestUpsertAndGet(t *testing.T) {
 	// Update same (volume, path).
 	r.Blake3 = digest(0xef)
 	r.SizeBytes = 20
-	if err := s.Upsert(ctx, r); err != nil {
+	if err := s.Upsert(ctx, r, nil); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
 	got, err = s.GetByPath(ctx, xID, "a")
@@ -326,7 +327,7 @@ func TestMarkMissingScopedToVolume(t *testing.T) {
 		{VolumeID: otherID, Path: "c", Blake3: digest(0x03), SizeBytes: 1, MtimeNs: 1, Status: StatusPresent, FirstSeenRunID: otherRun, LastSeenRunID: otherRun, IndexedAtNs: 50},
 	}
 	for _, r := range rows {
-		if err := s.Upsert(ctx, r); err != nil {
+		if err := s.Upsert(ctx, r, nil); err != nil {
 			t.Fatalf("Upsert: %v", err)
 		}
 	}
@@ -370,7 +371,7 @@ func TestListDuplicates(t *testing.T) {
 		{VolumeID: rID, Path: "c", Blake3: digest(0x22), Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1},
 	}
 	for _, r := range rows {
-		if err := s.Upsert(ctx, r); err != nil {
+		if err := s.Upsert(ctx, r, nil); err != nil {
 			t.Fatalf("Upsert: %v", err)
 		}
 	}
@@ -409,7 +410,7 @@ func TestCheckConstraintsRejectBadRows(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := s.Upsert(ctx, tc.row); err == nil {
+			if err := s.Upsert(ctx, tc.row, nil); err == nil {
 				t.Fatalf("Upsert(%+v) succeeded, want CHECK constraint failure", tc.row)
 			}
 		})
@@ -436,7 +437,7 @@ func TestCrossVolumeDuplicates(t *testing.T) {
 		{VolumeID: aID, Path: "z", Blake3: digest(0x99), Status: StatusPresent, FirstSeenRunID: aRun, LastSeenRunID: aRun, IndexedAtNs: 1},
 	}
 	for _, r := range rows {
-		if err := s.Upsert(ctx, r); err != nil {
+		if err := s.Upsert(ctx, r, nil); err != nil {
 			t.Fatalf("Upsert: %v", err)
 		}
 	}
@@ -467,7 +468,7 @@ func TestTouchSeenUpdatesStatusAndLastSeenRun(t *testing.T) {
 	oldRun := makeRun(t, s, rID)
 	newRun := makeRun(t, s, rID)
 	r := FileRow{VolumeID: rID, Path: "a", Blake3: digest(0x01), Status: StatusMissing, FirstSeenRunID: oldRun, LastSeenRunID: oldRun, IndexedAtNs: 100}
-	if err := s.Upsert(ctx, r); err != nil {
+	if err := s.Upsert(ctx, r, nil); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
 	if err := s.TouchSeen(ctx, rID, "a", newRun); err != nil {
@@ -499,7 +500,7 @@ func TestGetByAbsolutePathNotUnderAnyVolume(t *testing.T) {
 
 	rID := makeVolume(t, s, "/r")
 	run := makeRun(t, s, rID)
-	if err := s.Upsert(ctx, FileRow{VolumeID: rID, Path: "a", Blake3: digest(0x01), Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1}); err != nil {
+	if err := s.Upsert(ctx, FileRow{VolumeID: rID, Path: "a", Blake3: digest(0x01), Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1}, nil); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
 	if _, err := s.GetByAbsolutePath(ctx, "/somewhere/else"); !IsNotFound(err) {
@@ -525,10 +526,10 @@ func TestGetByAbsolutePathLongestPrefixWins(t *testing.T) {
 	innerRun := makeRun(t, s, inner)
 
 	// Same file path "x" upserted under each volume with a distinguishing digest.
-	if err := s.Upsert(ctx, FileRow{VolumeID: outer, Path: "sub/x", Blake3: digest(0x01), Status: StatusPresent, FirstSeenRunID: outerRun, LastSeenRunID: outerRun, IndexedAtNs: 1}); err != nil {
+	if err := s.Upsert(ctx, FileRow{VolumeID: outer, Path: "sub/x", Blake3: digest(0x01), Status: StatusPresent, FirstSeenRunID: outerRun, LastSeenRunID: outerRun, IndexedAtNs: 1}, nil); err != nil {
 		t.Fatalf("upsert outer: %v", err)
 	}
-	if err := s.Upsert(ctx, FileRow{VolumeID: inner, Path: "x", Blake3: digest(0x02), Status: StatusPresent, FirstSeenRunID: innerRun, LastSeenRunID: innerRun, IndexedAtNs: 1}); err != nil {
+	if err := s.Upsert(ctx, FileRow{VolumeID: inner, Path: "x", Blake3: digest(0x02), Status: StatusPresent, FirstSeenRunID: innerRun, LastSeenRunID: innerRun, IndexedAtNs: 1}, nil); err != nil {
 		t.Fatalf("upsert inner: %v", err)
 	}
 
@@ -569,7 +570,7 @@ func TestRunLifecycleTracks(t *testing.T) {
 		VolumeID: vID, Path: "a", Blake3: digest(0x42), SizeBytes: 1, MtimeNs: 1,
 		Status: StatusPresent, FirstSeenRunID: runID, LastSeenRunID: runID, IndexedAtNs: 1,
 	}
-	if err := s.Upsert(ctx, row); err != nil {
+	if err := s.Upsert(ctx, row, nil); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
 
@@ -938,13 +939,13 @@ func TestUpsertContentChangePreservesOldHash(t *testing.T) {
 	if err := s.Upsert(ctx, FileRow{
 		VolumeID: vID, Path: "doc.txt", Blake3: hashA, SizeBytes: 10, MtimeNs: 1,
 		Status: StatusPresent, FirstSeenRunID: run1, LastSeenRunID: run1, IndexedAtNs: 1,
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatalf("first Upsert: %v", err)
 	}
 	if err := s.Upsert(ctx, FileRow{
 		VolumeID: vID, Path: "doc.txt", Blake3: hashB, SizeBytes: 20, MtimeNs: 2,
 		Status: StatusPresent, FirstSeenRunID: run2, LastSeenRunID: run2, IndexedAtNs: 2,
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatalf("second Upsert: %v", err)
 	}
 
@@ -1002,7 +1003,7 @@ func TestUpsertRevertContent(t *testing.T) {
 		}
 	}
 	for _, r := range []FileRow{mkRow(hashA, r1, 1), mkRow(hashB, r2, 2), mkRow(hashA, r3, 3)} {
-		if err := s.Upsert(ctx, r); err != nil {
+		if err := s.Upsert(ctx, r, nil); err != nil {
 			t.Fatalf("Upsert: %v", err)
 		}
 	}
@@ -1048,7 +1049,7 @@ func TestTriggerRejectsBlake3Update(t *testing.T) {
 	if err := s.Upsert(ctx, FileRow{
 		VolumeID: vID, Path: "x", Blake3: digest(0xaa), SizeBytes: 1, MtimeNs: 1,
 		Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1,
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
 
@@ -1093,7 +1094,7 @@ func TestUniqueIndexRejectsSecondLiveRow(t *testing.T) {
 	if err := s.Upsert(ctx, FileRow{
 		VolumeID: vID, Path: "x", Blake3: digest(0xaa), SizeBytes: 1, MtimeNs: 1,
 		Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1,
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
 
@@ -1191,13 +1192,13 @@ func TestMarkMissingIgnoresSupersededRows(t *testing.T) {
 	if err := s.Upsert(ctx, FileRow{
 		VolumeID: vID, Path: "p", Blake3: digest(0x01), SizeBytes: 1, MtimeNs: 1,
 		Status: StatusPresent, FirstSeenRunID: oldRun, LastSeenRunID: oldRun, IndexedAtNs: 1,
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatalf("first Upsert: %v", err)
 	}
 	if err := s.Upsert(ctx, FileRow{
 		VolumeID: vID, Path: "p", Blake3: digest(0x02), SizeBytes: 1, MtimeNs: 2,
 		Status: StatusPresent, FirstSeenRunID: curRun, LastSeenRunID: curRun, IndexedAtNs: 2,
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatalf("second Upsert: %v", err)
 	}
 
@@ -1429,5 +1430,360 @@ func TestLatestSuccessfulIndexRun(t *testing.T) {
 	}
 	if got.ID != okID {
 		t.Fatalf("got run id %d, want %d (most recent successful index)", got.ID, okID)
+	}
+}
+
+// TestFreshV6SelfNodeRow verifies the v6 acceptance contract: a fresh
+// database has exactly one row in the nodes table, and that row carries
+// the OpenOptions.NodeName the caller supplied (no synthetic peers).
+func TestFreshV6SelfNodeRow(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := OpenWithOptions(dsn, OpenOptions{NodeName: "laptop"})
+	if err != nil {
+		t.Fatalf("OpenWithOptions: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM nodes`).Scan(&count); err != nil {
+		t.Fatalf("count nodes: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("nodes count = %d, want 1 (only the self row)", count)
+	}
+	var name string
+	var endpoint, fp sql.NullString
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT name, endpoint, public_key_fingerprint FROM nodes`).Scan(&name, &endpoint, &fp); err != nil {
+		t.Fatalf("read self row: %v", err)
+	}
+	if name != "laptop" {
+		t.Fatalf("self node name = %q, want laptop", name)
+	}
+	if endpoint.Valid {
+		t.Fatalf("endpoint = %+v, want NULL on self row", endpoint)
+	}
+	if fp.Valid {
+		t.Fatalf("public_key_fingerprint = %+v, want NULL on v1 self row", fp)
+	}
+}
+
+// TestOpenHostnameFallback exercises the empty-NodeName path: when no
+// explicit name is supplied the migration seeds the self row from
+// os.Hostname() so the table is never left empty.
+func TestOpenHostnameFallback(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	host, err := os.Hostname()
+	if err != nil {
+		t.Skipf("hostname unavailable: %v", err)
+	}
+	var name string
+	if err := s.db.QueryRowContext(ctx, `SELECT name FROM nodes`).Scan(&name); err != nil {
+		t.Fatalf("read self row: %v", err)
+	}
+	if name != host {
+		t.Fatalf("self node name = %q, want hostname %q", name, host)
+	}
+}
+
+// TestMigrateV5ToV6 builds a v5-shape database by hand, populates it with
+// a file row plus an index run, then opens it via Open() to drive the
+// v5→v6 step. The migration must (a) leave files rows untouched except
+// for the two NULL provenance columns, (b) leave runs rows untouched
+// except for the two NULL peer columns, (c) create the nodes table with
+// a single self row, (d) create the peer_sync_state table, and (e) end
+// with schema_version = 6.
+func TestMigrateV5ToV6(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	rawDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("raw sql.Open: %v", err)
+	}
+	v5DDL := []string{
+		`CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)`,
+		`CREATE TABLE volumes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL)`,
+		`CREATE TABLE runs (
+			id            INTEGER PRIMARY KEY,
+			kind          TEXT NOT NULL CHECK (kind IN ('index','sync','restore')),
+			volume_id     INTEGER REFERENCES volumes(id),
+			destination   TEXT,
+			started_at_ns INTEGER NOT NULL,
+			ended_at_ns   INTEGER,
+			status        TEXT NOT NULL CHECK (status IN ('running','success','failed','partial')),
+			error         TEXT,
+			file_count    INTEGER NOT NULL DEFAULT 0,
+			CHECK (
+				(kind = 'index' AND destination IS NULL) OR
+				(kind IN ('sync','restore') AND destination IS NOT NULL AND destination != '')
+			)
+		)`,
+		`CREATE TABLE files (
+			volume_id         INTEGER NOT NULL REFERENCES volumes(id),
+			path              TEXT NOT NULL,
+			blake3            BLOB NOT NULL CHECK (length(blake3) = 32),
+			size_bytes        INTEGER NOT NULL,
+			mtime_ns          INTEGER NOT NULL,
+			status            TEXT NOT NULL CHECK (status IN ('present','missing','superseded')),
+			first_seen_run_id INTEGER NOT NULL REFERENCES runs(id),
+			last_seen_run_id  INTEGER NOT NULL REFERENCES runs(id),
+			indexed_at_ns     INTEGER NOT NULL,
+			PRIMARY KEY (volume_id, path, blake3)
+		)`,
+		`INSERT INTO schema_version (version) VALUES (5)`,
+		`INSERT INTO volumes (id, name, path) VALUES (1, 'photos', '/photos')`,
+		`INSERT INTO runs (id, kind, volume_id, started_at_ns, status, file_count)
+		 VALUES (1, 'index', 1, 100, 'success', 1)`,
+	}
+	for _, q := range v5DDL {
+		if _, err := rawDB.Exec(q); err != nil {
+			t.Fatalf("v5 DDL %q: %v", q, err)
+		}
+	}
+	d := digest(0xab)
+	if _, err := rawDB.Exec(
+		`INSERT INTO files (volume_id, path, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
+		 VALUES (1, 'a.jpg', ?, 10, 50, 'present', 1, 1, 50)`, d,
+	); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	rawDB.Close()
+
+	s, err := OpenWithOptions(dsn, OpenOptions{NodeName: "nas"})
+	if err != nil {
+		t.Fatalf("OpenWithOptions (should migrate v5→v6): %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	if v, _ := s.CurrentSchemaVersion(ctx); v != SchemaVersion {
+		t.Fatalf("schema_version = %d, want %d", v, SchemaVersion)
+	}
+
+	row, err := s.GetByPath(ctx, 1, "a.jpg")
+	if err != nil {
+		t.Fatalf("GetByPath after migration: %v", err)
+	}
+	if !bytes.Equal(row.Blake3, d) || row.SizeBytes != 10 || row.Status != StatusPresent {
+		t.Fatalf("file row mangled by migration: %+v", row)
+	}
+	if row.SourceNodeID.Valid || row.SourceRunID.Valid {
+		t.Fatalf("migrated row has non-NULL provenance %+v / %+v, want NULL",
+			row.SourceNodeID, row.SourceRunID)
+	}
+
+	var peerNode, correlated sql.NullInt64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT peer_node_id, correlated_run_id FROM runs WHERE id = 1`).Scan(&peerNode, &correlated); err != nil {
+		t.Fatalf("read migrated run: %v", err)
+	}
+	if peerNode.Valid || correlated.Valid {
+		t.Fatalf("migrated run has non-NULL peer columns %+v / %+v, want NULL",
+			peerNode, correlated)
+	}
+
+	var nodeCount, peerStateCount int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM nodes`).Scan(&nodeCount); err != nil {
+		t.Fatalf("count nodes: %v", err)
+	}
+	if nodeCount != 1 {
+		t.Fatalf("nodes count = %d, want 1", nodeCount)
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM peer_sync_state`).Scan(&peerStateCount); err != nil {
+		t.Fatalf("count peer_sync_state: %v", err)
+	}
+	if peerStateCount != 0 {
+		t.Fatalf("peer_sync_state count = %d, want 0 (PR 3 populates it)", peerStateCount)
+	}
+	var selfName string
+	if err := s.db.QueryRowContext(ctx, `SELECT name FROM nodes`).Scan(&selfName); err != nil {
+		t.Fatalf("read self row: %v", err)
+	}
+	if selfName != "nas" {
+		t.Fatalf("self name = %q, want 'nas'", selfName)
+	}
+}
+
+// TestUpsertWithProvenance verifies that a non-nil *Provenance lands the
+// source_node_id and source_run_id columns on the inserted row, that a
+// subsequent provenance-aware overwrite supersedes the prior row, and
+// that the supersede flow itself is unchanged (the prior row's
+// provenance survives on the historical record).
+func TestUpsertWithProvenance(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := OpenWithOptions(dsn, OpenOptions{NodeName: "local"})
+	if err != nil {
+		t.Fatalf("OpenWithOptions: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	// Insert a peer node so its id is FK-valid.
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO nodes (name, endpoint) VALUES ('peer', 'https://peer.example')`)
+	if err != nil {
+		t.Fatalf("insert peer node: %v", err)
+	}
+	peerID, _ := res.LastInsertId()
+
+	vID := makeVolume(t, s, "/v")
+	run1 := makeRun(t, s, vID)
+	run2 := makeRun(t, s, vID)
+
+	prov1 := &Provenance{NodeID: peerID, RunID: run1}
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: vID, Path: "doc.txt", Blake3: digest(0xaa), SizeBytes: 1, MtimeNs: 1,
+		Status: StatusPresent, FirstSeenRunID: run1, LastSeenRunID: run1, IndexedAtNs: 1,
+	}, prov1); err != nil {
+		t.Fatalf("Upsert with prov1: %v", err)
+	}
+	live, err := s.GetByPath(ctx, vID, "doc.txt")
+	if err != nil {
+		t.Fatalf("GetByPath: %v", err)
+	}
+	if !live.SourceNodeID.Valid || live.SourceNodeID.Int64 != peerID {
+		t.Fatalf("SourceNodeID = %+v, want %d", live.SourceNodeID, peerID)
+	}
+	if !live.SourceRunID.Valid || live.SourceRunID.Int64 != run1 {
+		t.Fatalf("SourceRunID = %+v, want %d", live.SourceRunID, run1)
+	}
+
+	// New content + nil provenance — supersede the peer-sourced row with a
+	// local write. The supersede flow must still preserve the prior row's
+	// provenance on the historical record (we read the superseded row to
+	// confirm).
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: vID, Path: "doc.txt", Blake3: digest(0xbb), SizeBytes: 2, MtimeNs: 2,
+		Status: StatusPresent, FirstSeenRunID: run2, LastSeenRunID: run2, IndexedAtNs: 2,
+	}, nil); err != nil {
+		t.Fatalf("Upsert with nil prov: %v", err)
+	}
+	history, err := s.ListHistoryByPath(ctx, vID, "doc.txt")
+	if err != nil {
+		t.Fatalf("ListHistoryByPath: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("history len = %d, want 2", len(history))
+	}
+	old, newRow := history[0], history[1]
+	if old.Status != StatusSuperseded || !bytes.Equal(old.Blake3, digest(0xaa)) {
+		t.Fatalf("old row = %+v, want hashA superseded", old)
+	}
+	if !old.SourceNodeID.Valid || old.SourceNodeID.Int64 != peerID {
+		t.Fatalf("superseded row lost provenance: %+v", old.SourceNodeID)
+	}
+	if newRow.Status != StatusPresent || !bytes.Equal(newRow.Blake3, digest(0xbb)) {
+		t.Fatalf("new row = %+v, want hashB present", newRow)
+	}
+	if newRow.SourceNodeID.Valid || newRow.SourceRunID.Valid {
+		t.Fatalf("local-write row has non-NULL provenance: %+v / %+v",
+			newRow.SourceNodeID, newRow.SourceRunID)
+	}
+}
+
+// TestUpsertProvenanceFKRejected guards the FK enforcement on the new
+// source_node_id column: pointing at a node id that does not exist must
+// fail rather than silently land a dangling reference.
+func TestUpsertProvenanceFKRejected(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	vID := makeVolume(t, s, "/v")
+	run := makeRun(t, s, vID)
+
+	// 99999 is not in the nodes table — the FK must abort the insert.
+	err = s.Upsert(ctx, FileRow{
+		VolumeID: vID, Path: "x", Blake3: digest(0x11), SizeBytes: 1, MtimeNs: 1,
+		Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1,
+	}, &Provenance{NodeID: 99999, RunID: run})
+	if err == nil {
+		t.Fatalf("Upsert with bogus NodeID succeeded; FK not enforced")
+	}
+}
+
+// TestPartialIndexOnSourceNodeExistsV6 verifies the schema-introspection
+// expectation called out in the PR description: the partial index on
+// files(source_node_id) WHERE status='present' exists on v6 (and is
+// absent on a v5 fixture that hasn't been migrated yet).
+func TestPartialIndexOnSourceNodeExistsV6(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	var ddl string
+	err = s.db.QueryRowContext(ctx,
+		`SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_files_source_node'`).Scan(&ddl)
+	if err != nil {
+		t.Fatalf("look up partial index: %v", err)
+	}
+	if !strings.Contains(ddl, "source_node_id") || !strings.Contains(ddl, "status = 'present'") {
+		t.Fatalf("idx_files_source_node SQL = %q, want partial index on source_node_id where status='present'", ddl)
+	}
+}
+
+// TestPartialIndexAbsentOnV5 builds a v5-shape DB by hand without opening
+// it through the migration, and confirms idx_files_source_node is not
+// present — the index is a v6 artifact, not a v5 one.
+func TestPartialIndexAbsentOnV5(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	rawDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("raw sql.Open: %v", err)
+	}
+	defer rawDB.Close()
+	v5DDL := []string{
+		`CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)`,
+		`CREATE TABLE volumes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL)`,
+		`CREATE TABLE runs (
+			id            INTEGER PRIMARY KEY,
+			kind          TEXT NOT NULL CHECK (kind IN ('index','sync','restore')),
+			volume_id     INTEGER REFERENCES volumes(id),
+			destination   TEXT,
+			started_at_ns INTEGER NOT NULL,
+			ended_at_ns   INTEGER,
+			status        TEXT NOT NULL CHECK (status IN ('running','success','failed','partial')),
+			error         TEXT,
+			file_count    INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE files (
+			volume_id         INTEGER NOT NULL REFERENCES volumes(id),
+			path              TEXT NOT NULL,
+			blake3            BLOB NOT NULL CHECK (length(blake3) = 32),
+			size_bytes        INTEGER NOT NULL,
+			mtime_ns          INTEGER NOT NULL,
+			status            TEXT NOT NULL CHECK (status IN ('present','missing','superseded')),
+			first_seen_run_id INTEGER NOT NULL REFERENCES runs(id),
+			last_seen_run_id  INTEGER NOT NULL REFERENCES runs(id),
+			indexed_at_ns     INTEGER NOT NULL,
+			PRIMARY KEY (volume_id, path, blake3)
+		)`,
+		`INSERT INTO schema_version (version) VALUES (5)`,
+	}
+	for _, q := range v5DDL {
+		if _, err := rawDB.Exec(q); err != nil {
+			t.Fatalf("v5 DDL %q: %v", q, err)
+		}
+	}
+	var name sql.NullString
+	row := rawDB.QueryRow(
+		`SELECT name FROM sqlite_master WHERE type='index' AND name='idx_files_source_node'`)
+	if err := row.Scan(&name); err == nil {
+		t.Fatalf("idx_files_source_node found on v5; expected migration to add it on v6")
 	}
 }
