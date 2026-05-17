@@ -14,6 +14,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 
 	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/store"
@@ -173,7 +174,12 @@ func (d *nodeSyncDriver) phasePlan() (syncproto.PlanResponse, error) {
 // collectIndexEntries walks the present rows for this volume and
 // builds the wire-format index slice. Only 'present' rows are
 // considered — missing/superseded rows describe history, not what we
-// want to push.
+// want to push. Rows under reserved sync directories
+// (.squirrel-history/, .squirrel-conflicts/) are filtered out so a
+// node that received conflict preservation in a prior sync doesn't
+// re-publish the loser's content to peers when it later acts as an
+// initiator. The local DB row stays put — `squirrel query` against
+// the prior blake3 still resolves — but the path is not on the wire.
 func (d *nodeSyncDriver) collectIndexEntries() ([]syncproto.IndexEntry, error) {
 	paths, err := d.store.ListPresentPathsUnder(d.ctx, d.volID)
 	if err != nil {
@@ -181,6 +187,9 @@ func (d *nodeSyncDriver) collectIndexEntries() ([]syncproto.IndexEntry, error) {
 	}
 	entries := make([]syncproto.IndexEntry, 0, len(paths))
 	for p := range paths {
+		if isReservedSyncPath(p) {
+			continue
+		}
 		row, err := d.store.GetByPath(d.ctx, d.volID, p)
 		if err != nil {
 			return nil, fmt.Errorf("lookup %s: %w", p, err)
@@ -193,6 +202,15 @@ func (d *nodeSyncDriver) collectIndexEntries() ([]syncproto.IndexEntry, error) {
 		})
 	}
 	return entries, nil
+}
+
+// isReservedSyncPath reports whether p lives under one of the
+// receiver-owned reserved subtrees. Kept here rather than in the
+// store because the reserved-ness is a sync-layer concern: the DB
+// happily stores rows under any path.
+func isReservedSyncPath(p string) bool {
+	return strings.HasPrefix(p, HistoryDirName+"/") ||
+		strings.HasPrefix(p, ConflictsDirName+"/")
 }
 
 // phaseTransfer invokes rclone exactly once over the transfer +

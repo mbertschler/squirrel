@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/zeebo/blake3"
@@ -60,6 +61,11 @@ type peerSession struct {
 	// dispositions stores the receiver's verdict per path so /verify
 	// and /close can rehash and commit without re-running the diff.
 	dispositions map[string]*sessionEntry
+	// conflictOrder records the conflict-disposition paths in the
+	// order the initiator sent them in /plan, so the /plan response
+	// (and the CLI rendering downstream) is deterministic instead of
+	// reflecting the map iteration order.
+	conflictOrder []string
 }
 
 // sessionEntry is one path's state across the session: the
@@ -283,6 +289,9 @@ func (r *peerSyncRouter) planSession(ctx context.Context, sess *peerSession, ent
 		Dispositions: make([]syncproto.PlanDisposition, 0, len(entries)),
 	}
 	for _, e := range entries {
+		if err := validateRelPath(e.Path); err != nil {
+			return syncproto.PlanResponse{}, fmt.Errorf("path %q: %w", e.Path, err)
+		}
 		digest, err := hex.DecodeString(e.Blake3Hex)
 		if err != nil || len(digest) != 32 {
 			return syncproto.PlanResponse{}, fmt.Errorf("invalid blake3 hex %q for path %q", e.Blake3Hex, e.Path)
@@ -294,6 +303,9 @@ func (r *peerSyncRouter) planSession(ctx context.Context, sess *peerSession, ent
 		}
 		entry.disposition = disp
 		sess.dispositions[e.Path] = entry
+		if disp == syncproto.DispositionConflict {
+			sess.conflictOrder = append(sess.conflictOrder, e.Path)
+		}
 		resp.Dispositions = append(resp.Dispositions, syncproto.PlanDisposition{
 			Path: e.Path, Disposition: disp, Blake3Hex: e.Blake3Hex,
 		})
@@ -308,16 +320,44 @@ func (r *peerSyncRouter) planSession(ctx context.Context, sess *peerSession, ent
 	return resp, nil
 }
 
+// validateRelPath rejects wire paths that would escape the volume
+// root once joined with filepath.Join (a malicious peer could
+// otherwise have the receiver mv files into /etc or overwrite host
+// files), or that would land under a reserved sync directory the
+// receiver owns. The cleaner-and-prefix-check pattern catches
+// "../escape", "a/../b/../etc/passwd", "//etc/passwd",
+// and similar variants that filepath.Join itself would resolve to
+// outside the root.
+func validateRelPath(p string) error {
+	if p == "" {
+		return errors.New("path must not be empty")
+	}
+	if strings.ContainsRune(p, 0) {
+		return errors.New("path must not contain a NUL byte")
+	}
+	if filepath.IsAbs(p) || strings.HasPrefix(p, "/") || strings.HasPrefix(p, `\`) {
+		return errors.New("path must be relative")
+	}
+	cleaned := filepath.ToSlash(filepath.Clean(p))
+	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return errors.New("path escapes the volume root")
+	}
+	if cleaned == HistoryDirName || strings.HasPrefix(cleaned, HistoryDirName+"/") ||
+		cleaned == ConflictsDirName || strings.HasPrefix(cleaned, ConflictsDirName+"/") {
+		return errors.New("path is under a reserved sync directory")
+	}
+	return nil
+}
+
 // collectConflicts builds the wire-format conflict list from the
-// post-pre-stage session entries. Doing it after pre-stage means each
-// entry carries its preservedAtPath, which the initiator-side report
-// needs to render the "review at <path>" line.
+// post-pre-stage session entries in the order the initiator sent
+// them. Iterating sess.conflictOrder (a slice) instead of
+// sess.dispositions (a map) keeps PlanResponse deterministic across
+// runs and Go versions.
 func collectConflicts(sess *peerSession) []syncproto.ConflictDetail {
-	var out []syncproto.ConflictDetail
-	for path, entry := range sess.dispositions {
-		if entry.disposition != syncproto.DispositionConflict {
-			continue
-		}
+	out := make([]syncproto.ConflictDetail, 0, len(sess.conflictOrder))
+	for _, path := range sess.conflictOrder {
+		entry := sess.dispositions[path]
 		out = append(out, syncproto.ConflictDetail{
 			Path:               path,
 			InitiatorBlake3Hex: hex.EncodeToString(entry.blake3),
@@ -446,41 +486,33 @@ func (r *peerSyncRouter) preMoveSupersedes(sess *peerSession) error {
 //     .squirrel-conflicts/run-<receiverRunID>/<path>. This frees the
 //     original path so rclone can deliver the initiator's bytes
 //     without `--inplace` games.
-//  2. Mark the prior row at the original path as superseded.
-//  3. Insert a new `present` row at the conflict path carrying the
-//     prior blake3 + prior provenance, so the losing version stays
-//     reachable both by hash (`squirrel query <prior-blake3>`) and by
-//     path (`ls .squirrel-conflicts/run-N/...`).
+//  2. Atomically supersede the original-path row and insert the
+//     conflict-path row carrying the prior blake3 + prior provenance,
+//     so the losing version stays reachable by hash and by path.
 //
-// The session entry's preservedAtPath is set so /plan's response can
-// surface it; verifySession and closeSession then treat conflict
-// paths the same as transfer paths for the post-rclone reconciliation.
+// Disk-mv runs first; the DB mutations run together in one transaction
+// via the store helper. The window between the mv and the DB commit
+// is the only crash-unsafe step — a daemon restart there leaves the
+// file at the conflict path with both index rows in pre-call state,
+// and the next /plan replans the same conflict, which is the correct
+// recovery path: content stays preserved through retries.
 func (r *peerSyncRouter) preStageConflicts(ctx context.Context, sess *peerSession) error {
 	confSubdir := filepath.Join(ConflictsDirName, "run-"+strconv.FormatInt(sess.receiverRunID, 10))
-	for path, entry := range sess.dispositions {
-		if entry.disposition != syncproto.DispositionConflict {
-			continue
-		}
+	for _, path := range sess.conflictOrder {
+		entry := sess.dispositions[path]
 		preservedRel := filepath.ToSlash(filepath.Join(confSubdir, path))
 		srcAbs := filepath.Join(sess.volume.Path, path)
 		dstAbs := filepath.Join(sess.volume.Path, preservedRel)
 		if err := os.MkdirAll(filepath.Dir(dstAbs), 0o755); err != nil {
 			return fmt.Errorf("mkdir conflicts for %s: %w", path, err)
 		}
-		if err := os.Rename(srcAbs, dstAbs); err != nil {
-			if !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("rename %s → %s: %w", srcAbs, dstAbs, err)
-			}
-			// Prior row claims a file that isn't on disk anymore.
-			// Carry on — we still update the index to reflect the
-			// loser's identity, so a future query for the prior
-			// blake3 still surfaces the conflict path even if the
-			// bytes are unrecoverable. The next index run on the
-			// receiver will mark the row missing if it doesn't
-			// materialise.
-		}
-		if err := r.srv.store.MarkSuperseded(ctx, sess.volumeID, path); err != nil {
-			return fmt.Errorf("supersede original-path row for %s: %w", path, err)
+		if err := os.Rename(srcAbs, dstAbs); err != nil && !errors.Is(err, os.ErrNotExist) {
+			// On ErrNotExist the prior bytes are unrecoverable, but
+			// the index update below still records the loser's
+			// identity so a future query for the prior blake3
+			// surfaces the conflict path. The next index run on the
+			// receiver will mark it missing if no bytes materialise.
+			return fmt.Errorf("rename %s → %s: %w", srcAbs, dstAbs, err)
 		}
 		conflictRow := store.FileRow{
 			VolumeID:       sess.volumeID,
@@ -493,8 +525,8 @@ func (r *peerSyncRouter) preStageConflicts(ctx context.Context, sess *peerSessio
 			LastSeenRunID:  sess.receiverRunID,
 			IndexedAtNs:    store.NowNs(),
 		}
-		if err := r.srv.store.Upsert(ctx, conflictRow, priorProvenance(entry.priorRow)); err != nil {
-			return fmt.Errorf("seed conflict-path row for %s: %w", path, err)
+		if err := r.srv.store.RecordConflictPreStage(ctx, sess.volumeID, path, conflictRow, priorProvenance(entry.priorRow)); err != nil {
+			return fmt.Errorf("record conflict pre-stage for %s: %w", path, err)
 		}
 		entry.preservedAtPath = preservedRel
 	}

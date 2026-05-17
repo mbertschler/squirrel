@@ -2122,11 +2122,15 @@ func TestFileRowScanInsertRoundTrip(t *testing.T) {
 // list against drift from fileColumns. A column added to fileColumns but
 // forgotten elsewhere (or vice versa) trips here before any INSERT hits
 // SQLite and produces an opaque parameter-count error.
-// TestMarkSupersededFlipsLiveRowOnly checks the public helper used by
-// peer-sync conflict pre-staging: the live row at a path goes
-// 'superseded', any already-superseded rows are left alone, and a
-// path with no live row is a clean no-op.
-func TestMarkSupersededFlipsLiveRowOnly(t *testing.T) {
+
+// TestRecordConflictPreStageAtomic exercises the supersede + insert
+// transaction used by the receiver's conflict pre-stage: the live row
+// at the original path goes 'superseded' and a new 'present' row
+// appears at the conflict path carrying the prior blake3 + the
+// supplied provenance. Both halves must be visible together — the
+// transaction guarantee is what protects against a daemon crash
+// between the two updates.
+func TestRecordConflictPreStageAtomic(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -2135,50 +2139,59 @@ func TestMarkSupersededFlipsLiveRowOnly(t *testing.T) {
 	ctx := context.Background()
 	volID := makeVolume(t, s, "/v")
 	runID := makeRun(t, s, volID)
+	priorBlake3 := digest(0x01)
 
 	if err := s.Upsert(ctx, FileRow{
-		VolumeID: volID, Path: "a", Blake3: digest(0x01),
-		SizeBytes: 1, MtimeNs: 1, Status: StatusPresent,
-		FirstSeenRunID: runID, LastSeenRunID: runID, IndexedAtNs: 1,
+		VolumeID: volID, Path: "doc.md", Blake3: priorBlake3,
+		SizeBytes: 5, MtimeNs: 100, Status: StatusPresent,
+		FirstSeenRunID: runID, LastSeenRunID: runID, IndexedAtNs: 100,
 	}, nil); err != nil {
-		t.Fatalf("seed a@v1: %v", err)
-	}
-	if err := s.Upsert(ctx, FileRow{
-		VolumeID: volID, Path: "a", Blake3: digest(0x02),
-		SizeBytes: 1, MtimeNs: 2, Status: StatusPresent,
-		FirstSeenRunID: runID, LastSeenRunID: runID, IndexedAtNs: 2,
-	}, nil); err != nil {
-		t.Fatalf("seed a@v2: %v", err)
+		t.Fatalf("seed live row: %v", err)
 	}
 
-	// Flip the live row to superseded; the prior superseded row stays
-	// superseded (no double-flip), and GetByPath now returns sql.ErrNoRows.
-	if err := s.MarkSuperseded(ctx, volID, "a"); err != nil {
-		t.Fatalf("MarkSuperseded: %v", err)
+	conflictRow := FileRow{
+		VolumeID: volID, Path: ".squirrel-conflicts/run-9/doc.md", Blake3: priorBlake3,
+		SizeBytes: 5, MtimeNs: 100, Status: StatusPresent,
+		FirstSeenRunID: runID, LastSeenRunID: runID, IndexedAtNs: 200,
 	}
-	if _, err := s.GetByPath(ctx, volID, "a"); !IsNotFound(err) {
-		t.Fatalf("GetByPath after supersede = %v, want NotFound", err)
+	if err := s.RecordConflictPreStage(ctx, volID, "doc.md", conflictRow, nil); err != nil {
+		t.Fatalf("RecordConflictPreStage: %v", err)
 	}
-	history, err := s.ListHistoryByPath(ctx, volID, "a")
+
+	// Original path no longer has a live row.
+	if _, err := s.GetByPath(ctx, volID, "doc.md"); !IsNotFound(err) {
+		t.Fatalf("GetByPath(doc.md) after pre-stage = %v, want NotFound", err)
+	}
+	// Conflict path has a present row carrying the prior blake3.
+	got, err := s.GetByPath(ctx, volID, ".squirrel-conflicts/run-9/doc.md")
 	if err != nil {
-		t.Fatalf("ListHistoryByPath: %v", err)
+		t.Fatalf("GetByPath(conflict): %v", err)
 	}
-	if len(history) != 2 {
-		t.Fatalf("history has %d rows, want 2", len(history))
+	if !bytes.Equal(got.Blake3, priorBlake3) {
+		t.Fatalf("conflict-path blake3 = %x, want %x", got.Blake3, priorBlake3)
 	}
-	for _, r := range history {
-		if r.Status != StatusSuperseded {
-			t.Fatalf("row %x status = %q, want superseded", r.Blake3, r.Status)
-		}
+	if got.Status != StatusPresent {
+		t.Fatalf("conflict-path status = %q, want present", got.Status)
 	}
 
-	// No live row left → MarkSuperseded is a no-op, not an error.
-	if err := s.MarkSuperseded(ctx, volID, "a"); err != nil {
-		t.Fatalf("idempotent MarkSuperseded: %v", err)
+	// Prior blake3 is reachable by hash: GetByBlake3 returns both
+	// rows (one present at conflict path, one superseded at original
+	// path), which is the append-only history contract.
+	matches, err := s.GetByBlake3(ctx, priorBlake3)
+	if err != nil {
+		t.Fatalf("GetByBlake3: %v", err)
 	}
-	// Unknown path is also a no-op.
-	if err := s.MarkSuperseded(ctx, volID, "never-seen"); err != nil {
-		t.Fatalf("MarkSuperseded on unknown path: %v", err)
+	byPath := make(map[string]string, len(matches))
+	for _, m := range matches {
+		byPath[m.File.Path] = m.File.Status
+	}
+	if byPath[".squirrel-conflicts/run-9/doc.md"] != StatusPresent {
+		t.Fatalf("conflict-path row status = %q, want present (matches=%+v)",
+			byPath[".squirrel-conflicts/run-9/doc.md"], byPath)
+	}
+	if byPath["doc.md"] != StatusSuperseded {
+		t.Fatalf("original-path row status = %q, want superseded (matches=%+v)",
+			byPath["doc.md"], byPath)
 	}
 }
 

@@ -308,3 +308,46 @@ func writePEM(t *testing.T, path, blockType string, bytes []byte) {
 		t.Fatalf("pem encode: %v", err)
 	}
 }
+
+// TestValidateRelPathRejectsTraversal pins the receiver-side wire
+// path sanitisation. A buggy or hostile initiator must not be able
+// to talk the receiver into mv/Upserting outside the volume root, or
+// into the receiver's own reserved subtrees.
+func TestValidateRelPathRejectsTraversal(t *testing.T) {
+	bad := []string{
+		"",
+		"/etc/passwd",
+		`\windows\system32`,
+		"..",
+		"../etc/passwd",
+		"a/../../etc/passwd",
+		"a/../..",
+		"with\x00null",
+		HistoryDirName,
+		HistoryDirName + "/run-1/doc.md",
+		ConflictsDirName,
+		ConflictsDirName + "/run-1/doc.md",
+	}
+	for _, p := range bad {
+		t.Run(p, func(t *testing.T) {
+			if err := validateRelPath(p); err == nil {
+				t.Fatalf("validateRelPath(%q) accepted; want rejection", p)
+			}
+		})
+	}
+
+	good := []string{
+		"a.txt",
+		"sub/dir/file",
+		"a/b/c.bin",
+		"a..b",
+		"....",
+	}
+	for _, p := range good {
+		t.Run(p, func(t *testing.T) {
+			if err := validateRelPath(p); err != nil {
+				t.Fatalf("validateRelPath(%q) rejected: %v", p, err)
+			}
+		})
+	}
+}

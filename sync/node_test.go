@@ -890,6 +890,68 @@ func TestNodeSyncConflictWhenPriorRowFromDifferentPeer(t *testing.T) {
 	}
 }
 
+// TestCollectIndexEntriesSkipsReservedDirs pins the initiator-side
+// filter: rows under .squirrel-history/ and .squirrel-conflicts/ are
+// reachable via the local index for `squirrel query`, but they must
+// not be advertised on the wire to peers. A node that has acted as a
+// receiver and accumulated conflict-path rows would otherwise
+// re-publish those losers when it later initiates a sync.
+func TestCollectIndexEntriesSkipsReservedDirs(t *testing.T) {
+	f := setupNodeFixture(t)
+	ctx := context.Background()
+
+	// Build the initiator-side volume row + a few file rows.
+	v, err := f.initStore.CreateVolume(ctx, f.initVol.Name, f.initVol.Path)
+	if err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	runID, err := f.initStore.BeginRun(ctx, store.RunKindIndex, v.ID, "")
+	if err != nil {
+		t.Fatalf("BeginRun: %v", err)
+	}
+	_ = f.initStore.FinishRun(ctx, runID, store.RunStatusSuccess, "", 0)
+	mustUpsert := func(path string, b byte) {
+		t.Helper()
+		if err := f.initStore.Upsert(ctx, store.FileRow{
+			VolumeID: v.ID, Path: path, Blake3: bytesDigest(b),
+			SizeBytes: 1, MtimeNs: 1, Status: store.StatusPresent,
+			FirstSeenRunID: runID, LastSeenRunID: runID, IndexedAtNs: 1,
+		}, nil); err != nil {
+			t.Fatalf("upsert %s: %v", path, err)
+		}
+	}
+	mustUpsert("a.txt", 0xAA)
+	mustUpsert("sub/b.txt", 0xBB)
+	mustUpsert(HistoryDirName+"/run-1/leftover.bin", 0xCC)
+	mustUpsert(ConflictsDirName+"/run-1/loser.md", 0xDD)
+
+	driver := &nodeSyncDriver{
+		ctx: ctx, store: f.initStore, vol: f.initVol, volID: v.ID,
+	}
+	entries, err := driver.collectIndexEntries()
+	if err != nil {
+		t.Fatalf("collectIndexEntries: %v", err)
+	}
+	seen := make(map[string]struct{}, len(entries))
+	for _, e := range entries {
+		seen[e.Path] = struct{}{}
+	}
+	want := []string{"a.txt", "sub/b.txt"}
+	for _, p := range want {
+		if _, ok := seen[p]; !ok {
+			t.Fatalf("missing %q in index slice: %+v", p, seen)
+		}
+	}
+	for _, p := range []string{
+		HistoryDirName + "/run-1/leftover.bin",
+		ConflictsDirName + "/run-1/loser.md",
+	} {
+		if _, ok := seen[p]; ok {
+			t.Fatalf("reserved-dir path %q leaked onto the wire", p)
+		}
+	}
+}
+
 // bytesDigest returns a 32-byte buffer filled with b for compact
 // fixture digests.
 func bytesDigest(b byte) []byte {
