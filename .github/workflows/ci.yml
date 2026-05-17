@@ -25,14 +25,8 @@ jobs:
           go-version-file: go.mod
           check-latest: true
 
-      - name: Install rclone
-        # Ubuntu 24.04's apt ships rclone 1.60, which is below the
-        # MinRcloneVersion (1.66) enforced in sync/rclone.go, so the
-        # sync tests would fail. Use the upstream install script to get
-        # a current version.
-        run: |
-          curl -fsSL https://rclone.org/install.sh | sudo bash
-          rclone version
+      - name: Set up mise tools
+        uses: jdx/mise-action@v2
 
       - name: go build
         run: go build ./...
@@ -55,7 +49,8 @@ jobs:
           go-version-file: go.mod
           check-latest: true
 
+      - name: Set up mise tools
+        uses: jdx/mise-action@v2
+
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v8
-        with:
-          version: v2.12.2
+        run: golangci-lint run
