@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -150,21 +151,57 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 }
 
 // resolveNodeName returns the explicit name when non-empty, else the host
-// name. Host name lookup errors surface to the caller — opening the DB
-// without a way to identify this node would silently leave the self row
-// nameless on first migration, which we'd rather refuse loudly.
+// name. Explicit names are validated against the identifier rule the
+// config layer enforces — the same string lands as a TOML key, a
+// destination subfolder, and an rclone.conf section, so syntactic gaps
+// between the store and the config would let a database be seeded with
+// an identity that later config parsing rejects. The hostname fallback
+// is sanitised rather than rejected because real-world hostnames often
+// carry dots ("laptop.local") that the strict rule disallows; the
+// sanitised form is deterministic and stays human-readable.
 func resolveNodeName(name string) (string, error) {
 	if name != "" {
+		if !nodeNameRE.MatchString(name) {
+			return "", fmt.Errorf("OpenOptions.NodeName %q is invalid (must match %s)", name, nodeNameRE)
+		}
 		return name, nil
 	}
 	host, err := os.Hostname()
 	if err != nil {
 		return "", fmt.Errorf("resolve hostname for self node name: %w", err)
 	}
-	if host == "" {
-		return "", errors.New("os.Hostname returned empty string; pass OpenOptions.NodeName")
+	sanitised := sanitiseNodeName(host)
+	if sanitised == "" {
+		return "", fmt.Errorf("os.Hostname %q has no characters usable as a node name; pass OpenOptions.NodeName", host)
 	}
-	return host, nil
+	return sanitised, nil
+}
+
+// nodeNameRE mirrors config.nameRE. Duplicated here to keep store
+// free of a config import; if the rule ever changes, both sites change.
+var nodeNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`)
+
+// sanitiseNodeName produces a nodeNameRE-compliant identifier from a
+// hostname by mapping every disallowed rune to '-', then trimming
+// leading separators so the result begins with an alphanumeric (the
+// regex anchor requires it). Returns "" when no usable characters
+// survive.
+func sanitiseNodeName(host string) string {
+	var b strings.Builder
+	for _, r := range host {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'),
+			r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	out := strings.TrimLeft(b.String(), "-_")
+	if out == "" || !nodeNameRE.MatchString(out) {
+		return ""
+	}
+	return out
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -484,9 +521,11 @@ func migrateV4ToV5(ctx context.Context, db *sql.DB) error {
 // column additions — the new columns are nullable with no default, so
 // SQLite skips a full table rewrite and existing rows surface them as
 // NULL ("local write" convention). The partial index on
-// `files (source_node_id) WHERE status='present'` lets the peer-sync
-// planner answer "find rows sourced from peer X" cheaply without bloating
-// every present row with an unconditional secondary index.
+// `files (source_node_id) WHERE status='present' AND source_node_id IS
+// NOT NULL` lets the peer-sync planner answer "find rows sourced from
+// peer X" cheaply: the NOT NULL clause excludes the local-write majority
+// (which would otherwise dominate the index entries) so the index size
+// tracks the peer-sourced subset, not every present row.
 func migrateV5ToV6(ctx context.Context, db *sql.DB, nodeName string) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -501,10 +540,15 @@ func migrateV5ToV6(ctx context.Context, db *sql.DB, nodeName string) error {
 			endpoint               TEXT,
 			public_key_fingerprint TEXT
 		)`,
+		// last_shared_run_id is NOT a FK to local runs(id): it carries the
+		// initiator's local run-id, which is the shared identifier between
+		// the two nodes. The receiver records its own correlated id on
+		// runs.correlated_run_id; FK-constraining the watermark to the
+		// receiver's runs table would reject most updates.
 		`CREATE TABLE peer_sync_state (
 			volume_id          INTEGER NOT NULL REFERENCES volumes(id),
 			peer_node_id       INTEGER NOT NULL REFERENCES nodes(id),
-			last_shared_run_id INTEGER REFERENCES runs(id),
+			last_shared_run_id INTEGER,
 			last_synced_at     INTEGER NOT NULL,
 			PRIMARY KEY (volume_id, peer_node_id)
 		)`,
@@ -512,7 +556,8 @@ func migrateV5ToV6(ctx context.Context, db *sql.DB, nodeName string) error {
 		`ALTER TABLE files ADD COLUMN source_run_id  INTEGER REFERENCES runs(id)`,
 		`ALTER TABLE runs ADD COLUMN peer_node_id     INTEGER REFERENCES nodes(id)`,
 		`ALTER TABLE runs ADD COLUMN correlated_run_id INTEGER`,
-		`CREATE INDEX idx_files_source_node ON files(source_node_id) WHERE status = 'present'`,
+		`CREATE INDEX idx_files_source_node ON files(source_node_id)
+		 WHERE status = 'present' AND source_node_id IS NOT NULL`,
 	}
 	for _, q := range stmts {
 		if _, err := tx.ExecContext(ctx, q); err != nil {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1469,6 +1470,48 @@ func TestFreshV6SelfNodeRow(t *testing.T) {
 	}
 }
 
+// TestOpenRejectsInvalidNodeName guards the identifier rule that the
+// config layer also enforces — programmatic callers that bypass config
+// should still be unable to seed a self row with a name later layers
+// (sync wire, rclone.conf section, destination subfolder) would reject.
+func TestOpenRejectsInvalidNodeName(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	_, err := OpenWithOptions(dsn, OpenOptions{NodeName: "has spaces"})
+	if err == nil {
+		t.Fatalf("OpenWithOptions accepted invalid node name; want rejection")
+	}
+	if !strings.Contains(err.Error(), "invalid") {
+		t.Fatalf("error %q does not mention invalid identifier", err)
+	}
+}
+
+// TestSanitiseNodeName covers the deterministic mapping from a raw
+// hostname to a nodeNameRE-compliant identifier. The hostname fallback
+// uses this so a real-world "laptop.local"-style host doesn't fail to
+// open at the validator.
+func TestSanitiseNodeName(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"laptop", "laptop"},
+		{"laptop.local", "laptop-local"},
+		{"my host", "my-host"},
+		{"---foo", "foo"},
+		{"1abc", "1abc"},
+		{"", ""},
+		{"...", ""},
+	}
+	for _, c := range cases {
+		got := sanitiseNodeName(c.in)
+		if got != c.want {
+			t.Fatalf("sanitiseNodeName(%q) = %q, want %q", c.in, got, c.want)
+		}
+		if got != "" && !nodeNameRE.MatchString(got) {
+			t.Fatalf("sanitised %q = %q does not match nodeNameRE", c.in, got)
+		}
+	}
+}
+
 // TestOpenHostnameFallback exercises the empty-NodeName path: when no
 // explicit name is supplied the migration seeds the self row from
 // os.Hostname() so the table is never left empty.
@@ -1485,12 +1528,16 @@ func TestOpenHostnameFallback(t *testing.T) {
 	if err != nil {
 		t.Skipf("hostname unavailable: %v", err)
 	}
+	want := sanitiseNodeName(host)
+	if want == "" {
+		t.Skipf("hostname %q sanitises to empty; nothing to compare", host)
+	}
 	var name string
 	if err := s.db.QueryRowContext(ctx, `SELECT name FROM nodes`).Scan(&name); err != nil {
 		t.Fatalf("read self row: %v", err)
 	}
-	if name != host {
-		t.Fatalf("self node name = %q, want hostname %q", name, host)
+	if name != want {
+		t.Fatalf("self node name = %q, want sanitised hostname %q (raw %q)", name, want, host)
 	}
 }
 
@@ -1688,9 +1735,9 @@ func TestUpsertWithProvenance(t *testing.T) {
 	}
 }
 
-// TestUpsertProvenanceFKRejected guards the FK enforcement on the new
-// source_node_id column: pointing at a node id that does not exist must
-// fail rather than silently land a dangling reference.
+// TestUpsertProvenanceFKRejected guards the FK enforcement on both new
+// provenance columns: pointing at a node or run id that does not exist
+// must fail rather than silently land a dangling reference.
 func TestUpsertProvenanceFKRejected(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "test.db")
 	s, err := Open(dsn)
@@ -1702,14 +1749,65 @@ func TestUpsertProvenanceFKRejected(t *testing.T) {
 
 	vID := makeVolume(t, s, "/v")
 	run := makeRun(t, s, vID)
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO nodes (name, endpoint) VALUES ('peer', 'https://peer.example')`)
+	if err != nil {
+		t.Fatalf("insert peer node: %v", err)
+	}
+	peerID, _ := res.LastInsertId()
 
-	// 99999 is not in the nodes table — the FK must abort the insert.
-	err = s.Upsert(ctx, FileRow{
-		VolumeID: vID, Path: "x", Blake3: digest(0x11), SizeBytes: 1, MtimeNs: 1,
-		Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1,
-	}, &Provenance{NodeID: 99999, RunID: run})
-	if err == nil {
-		t.Fatalf("Upsert with bogus NodeID succeeded; FK not enforced")
+	cases := []struct {
+		name string
+		prov *Provenance
+	}{
+		{"bogus node id", &Provenance{NodeID: 99999, RunID: run}},
+		{"bogus run id", &Provenance{NodeID: peerID, RunID: 99999}},
+	}
+	for i, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := s.Upsert(ctx, FileRow{
+				// Distinct paths per case so a prior failure can't shadow a
+				// later one through the live-row state machine.
+				VolumeID: vID, Path: fmt.Sprintf("x-%d", i), Blake3: digest(byte(0x10 + i)),
+				SizeBytes: 1, MtimeNs: 1,
+				Status:    StatusPresent, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1,
+			}, c.prov)
+			if err == nil {
+				t.Fatalf("Upsert with %s succeeded; FK not enforced", c.name)
+			}
+		})
+	}
+}
+
+// TestPeerSyncStateAcceptsForeignRunID guards the design contract that
+// peer_sync_state.last_shared_run_id is not FK-bound to the local
+// runs(id) — the value carries the initiator's local id, which on the
+// receiver is recorded as runs.correlated_run_id, not as a local run.
+// FK-constraining it would reject the watermark update on most peer
+// syncs.
+func TestPeerSyncStateAcceptsForeignRunID(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	vID := makeVolume(t, s, "/v")
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO nodes (name, endpoint) VALUES ('peer', 'https://peer.example')`)
+	if err != nil {
+		t.Fatalf("insert peer node: %v", err)
+	}
+	peerID, _ := res.LastInsertId()
+
+	// 99999 is not a local runs.id — must still insert.
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO peer_sync_state (volume_id, peer_node_id, last_shared_run_id, last_synced_at)
+		VALUES (?, ?, ?, ?)
+	`, vID, peerID, 99999, NowNs()); err != nil {
+		t.Fatalf("peer_sync_state insert with foreign run id rejected: %v", err)
 	}
 }
 
@@ -1732,8 +1830,10 @@ func TestPartialIndexOnSourceNodeExistsV6(t *testing.T) {
 	if err != nil {
 		t.Fatalf("look up partial index: %v", err)
 	}
-	if !strings.Contains(ddl, "source_node_id") || !strings.Contains(ddl, "status = 'present'") {
-		t.Fatalf("idx_files_source_node SQL = %q, want partial index on source_node_id where status='present'", ddl)
+	for _, want := range []string{"source_node_id", "status = 'present'", "source_node_id IS NOT NULL"} {
+		if !strings.Contains(ddl, want) {
+			t.Fatalf("idx_files_source_node SQL = %q, missing %q (partial index must exclude local-write NULLs)", ddl, want)
+		}
 	}
 }
 
