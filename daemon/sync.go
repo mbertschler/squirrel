@@ -127,71 +127,84 @@ func (r *peerSyncRouter) lookupSession(receiverRunID int64) *peerSession {
 	return r.sessions[receiverRunID]
 }
 
-// handleBegin implements POST /v1/sync/begin.
+// handleBegin implements POST /v1/sync/begin. The handler is the
+// thin HTTP shell over beginSession, which carries the actual flow.
 func (r *peerSyncRouter) handleBegin(w http.ResponseWriter, req *http.Request) {
 	var body syncproto.BeginRequest
 	if err := decodeJSON(req, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if body.Volume == "" || body.InitiatorNodeName == "" || body.InitiatorRunID == 0 {
-		writeError(w, http.StatusBadRequest, "volume, initiator_node_name, and initiator_run_id are required")
+	resp, status, err := r.beginSession(req.Context(), body)
+	if err != nil {
+		writeError(w, status, err.Error())
 		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// beginSession is the handler body in plain-function form so each
+// failure mode pairs its error with the right HTTP status without
+// burying the control flow in repeated writeError/return tuples.
+// The lock is acquired before any DB row insertion that would need
+// rollback on a later failure; releasing it lives in the per-phase
+// guard.
+func (r *peerSyncRouter) beginSession(ctx context.Context, body syncproto.BeginRequest) (syncproto.BeginResponse, int, error) {
+	if body.Volume == "" || body.InitiatorNodeName == "" || body.InitiatorRunID == 0 {
+		return syncproto.BeginResponse{}, http.StatusBadRequest, errors.New("volume, initiator_node_name, and initiator_run_id are required")
 	}
 	vol, ok := r.volumes[body.Volume]
 	if !ok {
-		writeError(w, http.StatusNotFound, fmt.Sprintf("volume %q is not declared on this node", body.Volume))
-		return
+		return syncproto.BeginResponse{}, http.StatusNotFound, fmt.Errorf("volume %q is not declared on this node", body.Volume)
 	}
-	ctx := req.Context()
-	v, err := r.srv.store.GetVolumeByName(ctx, body.Volume)
+	v, err := r.ensureVolumeRow(ctx, body.Volume, vol.Path)
 	if err != nil {
-		if store.IsNotFound(err) {
-			// Volume declared in config but not yet present in the index —
-			// create it so the run row's FK resolves. Indexing on the
-			// receiver side (PR 4) will fill the rows later.
-			created, err := r.srv.store.CreateVolume(ctx, body.Volume, vol.Path)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, fmt.Sprintf("create volume row: %v", err))
-				return
-			}
-			v = created
-		} else {
-			writeError(w, http.StatusInternalServerError, fmt.Sprintf("lookup volume: %v", err))
-			return
-		}
+		return syncproto.BeginResponse{}, http.StatusInternalServerError, err
 	}
 	if !r.acquireVolumeLock(v.ID) {
-		writeError(w, http.StatusConflict, fmt.Sprintf("volume %q already has an in-flight sync", body.Volume))
-		return
+		return syncproto.BeginResponse{}, http.StatusConflict, fmt.Errorf("volume %q already has an in-flight sync", body.Volume)
 	}
-	rollback := func() { r.releaseVolumeLock(v.ID) }
-
-	endpoint := body.InitiatorEndpoint
-	if endpoint == "" {
-		// Single-writer initiators don't expose a daemon of their own;
-		// synthesise a stable placeholder per node name so peer rows
-		// satisfy the "non-empty endpoint" invariant without leaking
-		// a real URL onto the wire.
-		endpoint = "peer://" + body.InitiatorNodeName
-	}
-	peer, err := r.srv.store.GetOrCreatePeerNode(ctx, body.InitiatorNodeName, endpoint)
+	resp, status, err := r.finishBegin(ctx, body, vol, v)
 	if err != nil {
-		rollback()
-		writeError(w, http.StatusConflict, err.Error())
-		return
+		r.releaseVolumeLock(v.ID)
+	}
+	return resp, status, err
+}
+
+// ensureVolumeRow looks up the volume by name on the receiver side
+// and creates the row on first contact. The config-declared path is
+// what we materialise; indexing on the receiver (PR 4) refills file
+// rows from disk later.
+func (r *peerSyncRouter) ensureVolumeRow(ctx context.Context, name, absPath string) (store.Volume, error) {
+	v, err := r.srv.store.GetVolumeByName(ctx, name)
+	if err == nil {
+		return v, nil
+	}
+	if !store.IsNotFound(err) {
+		return store.Volume{}, fmt.Errorf("lookup volume: %w", err)
+	}
+	created, err := r.srv.store.CreateVolume(ctx, name, absPath)
+	if err != nil {
+		return store.Volume{}, fmt.Errorf("create volume row: %w", err)
+	}
+	return created, nil
+}
+
+// finishBegin runs the post-lock steps: peer/self lookup, runs-row
+// insertion, in-memory session registration. The caller releases the
+// volume lock on any non-nil error.
+func (r *peerSyncRouter) finishBegin(ctx context.Context, body syncproto.BeginRequest, vol *config.Volume, v store.Volume) (syncproto.BeginResponse, int, error) {
+	peer, err := r.srv.store.GetOrCreatePeerNode(ctx, body.InitiatorNodeName, peerEndpoint(body))
+	if err != nil {
+		return syncproto.BeginResponse{}, http.StatusConflict, err
 	}
 	self, err := r.srv.store.GetSelfNode(ctx)
 	if err != nil {
-		rollback()
-		writeError(w, http.StatusInternalServerError, fmt.Sprintf("look up self node: %v", err))
-		return
+		return syncproto.BeginResponse{}, http.StatusInternalServerError, fmt.Errorf("look up self node: %w", err)
 	}
 	runID, err := r.srv.store.BeginPeerSyncRun(ctx, v.ID, peer.ID, body.InitiatorRunID, body.InitiatorNodeName)
 	if err != nil {
-		rollback()
-		writeError(w, http.StatusInternalServerError, fmt.Sprintf("begin run: %v", err))
-		return
+		return syncproto.BeginResponse{}, http.StatusInternalServerError, fmt.Errorf("begin run: %w", err)
 	}
 	r.storeSession(&peerSession{
 		receiverRunID:   runID,
@@ -201,10 +214,22 @@ func (r *peerSyncRouter) handleBegin(w http.ResponseWriter, req *http.Request) {
 		correlatedRunID: body.InitiatorRunID,
 		dispositions:    make(map[string]*sessionEntry),
 	})
-	writeJSON(w, http.StatusOK, syncproto.BeginResponse{
+	return syncproto.BeginResponse{
 		ReceiverRunID:    runID,
 		ReceiverNodeName: self.Name,
-	})
+	}, http.StatusOK, nil
+}
+
+// peerEndpoint resolves the endpoint string to store on the peer
+// nodes row. Single-writer initiators don't expose a daemon of their
+// own, so the empty case yields a stable name-derived placeholder
+// that satisfies the "non-empty endpoint" invariant without leaking a
+// real URL onto the wire.
+func peerEndpoint(body syncproto.BeginRequest) string {
+	if body.InitiatorEndpoint != "" {
+		return body.InitiatorEndpoint
+	}
+	return "peer://" + body.InitiatorNodeName
 }
 
 // handlePlan implements POST /v1/sync/plan: diff the initiator's index
