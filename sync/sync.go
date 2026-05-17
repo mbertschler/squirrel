@@ -111,27 +111,48 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 		return rep, err
 	}
 
-	runID, err := beginSyncRun(ctx, s, opts.DryRun, volID, dest.Name)
+	err = runRcloneOperation(ctx, s, rcl, store.RunKindSync, opts.DryRun, volID, dest.Name, &rep,
+		func(runID int64) []string {
+			return buildRcloneArgs(vol, dest, runID, opts)
+		})
+	return rep, err
+}
+
+// runRcloneOperation is the shared scaffold for Sync and Restore: begin a
+// runs row, invoke rclone via buildArgs, coerce a bare invocation failure
+// into FatalError, and arrange the deferred FinishRun that mutates *rep
+// before the helper returns. Each caller keeps its own preflight
+// (requireIndexedVolume / getOrCreateVolumeForRestore) and just hands the
+// arg-builder closure in.
+func runRcloneOperation(
+	ctx context.Context,
+	s *store.Store,
+	rcl *Rclone,
+	kind string,
+	dryRun bool,
+	volID int64,
+	destName string,
+	rep *Report,
+	buildArgs func(runID int64) []string,
+) (err error) {
+	runID, err := beginRun(ctx, s, dryRun, kind, volID, destName)
 	if err != nil {
-		return rep, err
+		return err
 	}
 	rep.RunID = runID
-	// Named returns let this deferred call mutate rep.Status (and persist
-	// the FinishRun row) after the function body sets rep.RcloneResult.
 	defer func() {
-		finishSyncRun(ctx, s, opts.DryRun, runID, &rep)
+		finishSyncRun(ctx, s, dryRun, runID, rep)
 	}()
 
-	args := buildRcloneArgs(vol, dest, runID, opts)
-	rep.RcloneResult, err = rcl.Run(ctx, args...)
+	rep.RcloneResult, err = rcl.Run(ctx, buildArgs(runID)...)
 	if err != nil && rep.RcloneResult.Errors == 0 && !rep.RcloneResult.FatalError {
 		// Invocation failed without a parseable error count: treat as fatal.
 		rep.RcloneResult.FatalError = true
 	}
 	if err != nil {
-		return rep, fmt.Errorf("rclone: %w", err)
+		return fmt.Errorf("rclone: %w", err)
 	}
-	return rep, nil
+	return nil
 }
 
 // requireIndexedVolume looks up the volume row by name and ensures at
@@ -155,13 +176,16 @@ func requireIndexedVolume(ctx context.Context, s *store.Store, vol *config.Volum
 	return v.ID, nil
 }
 
-func beginSyncRun(ctx context.Context, s *store.Store, dryRun bool, volID int64, destName string) (int64, error) {
+// beginRun inserts a runs row of the given kind, unless dryRun is set in
+// which case it returns (0, nil) and no row is written. Kind is folded
+// into the error wrap so a failure here points at the right phase.
+func beginRun(ctx context.Context, s *store.Store, dryRun bool, kind string, volID int64, destName string) (int64, error) {
 	if dryRun {
 		return 0, nil
 	}
-	id, err := s.BeginRun(ctx, store.RunKindSync, volID, destName)
+	id, err := s.BeginRun(ctx, kind, volID, destName)
 	if err != nil {
-		return 0, fmt.Errorf("begin sync run: %w", err)
+		return 0, fmt.Errorf("begin %s run: %w", kind, err)
 	}
 	return id, nil
 }
@@ -401,24 +425,11 @@ func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volum
 		return rep, err
 	}
 
-	runID, err := beginRestoreRun(ctx, s, opts.DryRun, v.ID, dest.Name)
-	if err != nil {
-		return rep, err
-	}
-	rep.RunID = runID
-	defer func() {
-		finishSyncRun(ctx, s, opts.DryRun, runID, &rep)
-	}()
-
-	args := buildRestoreArgs(vol, dest, opts)
-	rep.RcloneResult, err = rcl.Run(ctx, args...)
-	if err != nil && rep.RcloneResult.Errors == 0 && !rep.RcloneResult.FatalError {
-		rep.RcloneResult.FatalError = true
-	}
-	if err != nil {
-		return rep, fmt.Errorf("rclone: %w", err)
-	}
-	return rep, nil
+	err = runRcloneOperation(ctx, s, rcl, store.RunKindRestore, opts.DryRun, v.ID, dest.Name, &rep,
+		func(_ int64) []string {
+			return buildRestoreArgs(vol, dest, opts)
+		})
+	return rep, err
 }
 
 func getOrCreateVolumeForRestore(ctx context.Context, s *store.Store, vol *config.Volume) (store.Volume, error) {
@@ -440,17 +451,6 @@ func getOrCreateVolumeForRestore(ctx context.Context, s *store.Store, vol *confi
 		return store.Volume{}, fmt.Errorf("create volume %q: %w", vol.Name, err)
 	}
 	return v, nil
-}
-
-func beginRestoreRun(ctx context.Context, s *store.Store, dryRun bool, volID int64, destName string) (int64, error) {
-	if dryRun {
-		return 0, nil
-	}
-	id, err := s.BeginRun(ctx, store.RunKindRestore, volID, destName)
-	if err != nil {
-		return 0, fmt.Errorf("begin restore run: %w", err)
-	}
-	return id, nil
 }
 
 // buildRestoreArgs flips the source/destination of sync: source is

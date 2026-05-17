@@ -2,67 +2,10 @@ package main
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
-
-// requireRcloneCLI mirrors sync.requireRclone but for the CLI tests in
-// this package. Sync tests against the real rclone binary; without it
-// installed, the test is skipped (and that's surfaced in test output).
-func requireRcloneCLI(t *testing.T) {
-	t.Helper()
-	if _, err := exec.LookPath("rclone"); err != nil {
-		t.Skip("rclone not on PATH; install rclone ≥ 1.66 to run these tests")
-	}
-}
-
-// writeSyncFixture lays out a workspace with: a squirrel config file
-// pointing at a `pics` volume and a `scratch` local destination, the
-// volume directory itself with one file, an empty destination directory,
-// and a fresh DB path. Returns the config and db paths so callers can
-// pass them via --config / --db on the CLI.
-type syncFixturePaths struct {
-	volumeDir  string
-	destDir    string
-	configPath string
-	dbPath     string
-	volumeName string
-}
-
-func writeSyncFixture(t *testing.T) syncFixturePaths {
-	t.Helper()
-	root := t.TempDir()
-	// Use "pics" as the path basename so the volume row's auto-derived
-	// name lines up with the config-declared name. After commit (e) the
-	// indexer takes the name from config and this aliasing won't matter.
-	volumeDir := filepath.Join(root, "pics")
-	if err := os.MkdirAll(volumeDir, 0o755); err != nil {
-		t.Fatalf("mkdir volume: %v", err)
-	}
-	destDir := filepath.Join(root, "dst")
-	if err := os.MkdirAll(destDir, 0o755); err != nil {
-		t.Fatalf("mkdir dest: %v", err)
-	}
-	dbPath := filepath.Join(root, "index.db")
-	configPath := filepath.Join(root, "config.toml")
-	body := "" +
-		"db = \"" + dbPath + "\"\n\n" +
-		"[destinations.scratch]\n" +
-		"type = \"local\"\n" +
-		"root = \"" + destDir + "\"\n\n" +
-		"[volumes.pics]\n" +
-		"path = \"" + volumeDir + "\"\n" +
-		"sync_to = [\"scratch\"]\n"
-	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	return syncFixturePaths{
-		volumeDir: volumeDir, destDir: destDir,
-		configPath: configPath, dbPath: dbPath, volumeName: "pics",
-	}
-}
 
 func TestCLISyncErrorsWhenVolumeNotIndexed(t *testing.T) {
 	requireRcloneCLI(t)

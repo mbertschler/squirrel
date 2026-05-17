@@ -4,11 +4,69 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
 )
+
+// requireRcloneCLI mirrors sync.requireRclone but for the CLI tests in
+// this package. Sync tests against the real rclone binary; without it
+// installed, the test is skipped (and that's surfaced in test output).
+func requireRcloneCLI(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("rclone"); err != nil {
+		t.Skip("rclone not on PATH; install rclone ≥ 1.66 to run these tests")
+	}
+}
+
+// syncFixturePaths bundles the paths writeSyncFixture lays down so callers
+// can pass them straight to the CLI via --config / --db.
+type syncFixturePaths struct {
+	volumeDir  string
+	destDir    string
+	configPath string
+	dbPath     string
+	volumeName string
+}
+
+// writeSyncFixture lays out a workspace with: a squirrel config file
+// pointing at a `pics` volume and a `scratch` local destination, the
+// volume directory itself, an empty destination directory, and a fresh DB
+// path. Shared by sync_test.go and restore_test.go.
+func writeSyncFixture(t *testing.T) syncFixturePaths {
+	t.Helper()
+	root := t.TempDir()
+	// Use "pics" as the path basename so the volume row's auto-derived
+	// name lines up with the config-declared name. After commit (e) the
+	// indexer takes the name from config and this aliasing won't matter.
+	volumeDir := filepath.Join(root, "pics")
+	if err := os.MkdirAll(volumeDir, 0o755); err != nil {
+		t.Fatalf("mkdir volume: %v", err)
+	}
+	destDir := filepath.Join(root, "dst")
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		t.Fatalf("mkdir dest: %v", err)
+	}
+	dbPath := filepath.Join(root, "index.db")
+	configPath := filepath.Join(root, "config.toml")
+	body := "" +
+		"db = \"" + dbPath + "\"\n\n" +
+		"[destinations.scratch]\n" +
+		"type = \"local\"\n" +
+		"root = \"" + destDir + "\"\n\n" +
+		"[volumes.pics]\n" +
+		"path = \"" + volumeDir + "\"\n" +
+		"sync_to = [\"scratch\"]\n"
+	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return syncFixturePaths{
+		volumeDir: volumeDir, destDir: destDir,
+		configPath: configPath, dbPath: dbPath, volumeName: "pics",
+	}
+}
 
 // isolateConfig points SQUIRREL_CONFIG at a path inside t.TempDir that
 // will never exist. Without this, runCLI would inherit the developer's

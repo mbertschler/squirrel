@@ -34,6 +34,18 @@ func writeFile(t *testing.T, path, content string) {
 	}
 }
 
+// skipIfRoot bails out of tests that simulate read errors with chmod 0o000.
+// The kernel bypasses DAC permission checks for uid=0, so the chmod becomes
+// a no-op and the assertion that errors surfaced would fail spuriously when
+// the suite is run as root (containers, some sandboxes). CI runs as a
+// non-root user so coverage is preserved there.
+func skipIfRoot(t *testing.T) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("test relies on chmod 0o000 denying access; root bypasses DAC checks")
+	}
+}
+
 // volumeFor resolves the volume for an absolute path, failing the test if
 // the volume hasn't been created by the indexer yet.
 func volumeFor(t *testing.T, s *store.Store, absPath string) store.Volume {
@@ -341,6 +353,7 @@ func isZeroReport(r Report) bool {
 }
 
 func TestReportSurfacesPerFileErrors(t *testing.T) {
+	skipIfRoot(t)
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "ok.txt"), "hello")
 	unreadable := filepath.Join(root, "denied.txt")
@@ -476,6 +489,7 @@ func TestIndexRecordsRuns(t *testing.T) {
 }
 
 func TestIndexPartialRunOnPerFileError(t *testing.T) {
+	skipIfRoot(t)
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "ok.txt"), "hello")
 	unreadable := filepath.Join(root, "denied.txt")
@@ -510,6 +524,7 @@ func TestIndexPartialRunOnPerFileError(t *testing.T) {
 // even though the file still exists on disk. finalizeMissing must skip the
 // flip when report.Errors > 0.
 func TestPartialRunDoesNotMarkErroredFilesMissing(t *testing.T) {
+	skipIfRoot(t)
 	root := t.TempDir()
 	a := filepath.Join(root, "a.txt")
 	b := filepath.Join(root, "b.txt")
@@ -663,6 +678,7 @@ func TestRunStatus(t *testing.T) {
 // and that the resulting run still finishes as 'partial' (the walk completed
 // for the parts we could see).
 func TestIndexWalkErrorReachesRun(t *testing.T) {
+	skipIfRoot(t)
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "visible.txt"), "hello")
 	hidden := filepath.Join(root, "no-entry")
