@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 )
 
 // Run kinds. The runs.volume_id column is nullable so a future sync run can
@@ -216,24 +217,47 @@ func (s *Store) GetRun(ctx context.Context, id int64) (Run, error) {
 	return scanRun(row.Scan)
 }
 
-// CountFilesFirstSeenWithPathPrefix returns the number of files rows
-// inserted (first_seen_run_id matches) by the given run whose path starts
-// with pathPrefix. Used by `squirrel runs` to derive the conflict count
-// for a peer-sync run without adding a dedicated column: every conflict
-// inserts one row under .squirrel-conflicts/run-<id>/, so the
-// path-prefix count is the conflict count. The pathPrefix is passed in
-// rather than hard-coded so the store stays decoupled from the
-// sync-package directory naming convention.
-func (s *Store) CountFilesFirstSeenWithPathPrefix(ctx context.Context, runID int64, pathPrefix string) (int, error) {
-	var n int
-	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM files
-		 WHERE first_seen_run_id = ? AND path LIKE ? ESCAPE '\'`,
-		runID, escapeLikePrefix(pathPrefix)+"/%").Scan(&n)
-	if err != nil {
-		return 0, fmt.Errorf("count files for run %d: %w", runID, err)
+// CountFilesFirstSeenByRunWithPathPrefix returns a map from run id to
+// the number of files rows that run first-saw under pathPrefix. The
+// path prefix is escaped against LIKE metacharacters by the helper —
+// callers pass the directory name as plain text (no trailing slash,
+// no wildcards). The map only carries entries for runs with non-zero
+// matches; absent keys mean zero.
+//
+// `squirrel runs` uses this to render the CONFLICTS column without a
+// per-run query (every conflict inserts one row under
+// .squirrel-conflicts/run-<id>/, so the prefix count is the conflict
+// count). The pathPrefix is passed in so the store stays decoupled
+// from the sync-package directory naming convention.
+func (s *Store) CountFilesFirstSeenByRunWithPathPrefix(ctx context.Context, runIDs []int64, pathPrefix string) (map[int64]int, error) {
+	out := make(map[int64]int, len(runIDs))
+	if len(runIDs) == 0 {
+		return out, nil
 	}
-	return n, nil
+	placeholders := strings.Repeat("?,", len(runIDs)-1) + "?"
+	args := make([]any, 0, len(runIDs)+1)
+	for _, id := range runIDs {
+		args = append(args, id)
+	}
+	args = append(args, escapeLikePrefix(pathPrefix)+"/%")
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT first_seen_run_id, COUNT(*) FROM files
+		 WHERE first_seen_run_id IN (`+placeholders+`)
+		   AND path LIKE ? ESCAPE '\'
+		 GROUP BY first_seen_run_id`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("count files by run: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var n int
+		if err := rows.Scan(&id, &n); err != nil {
+			return nil, fmt.Errorf("scan count row: %w", err)
+		}
+		out[id] = n
+	}
+	return out, rows.Err()
 }
 
 // escapeLikePrefix escapes %, _ and \ in s so it can be embedded into a

@@ -104,11 +104,10 @@ func (d *nodeSyncDriver) run() error {
 	if err != nil {
 		return d.abortWithError("plan", err)
 	}
-	// PR 4: conflicts are no longer fatal. The receiver has already
-	// pre-staged the losers under .squirrel-conflicts/ and rclone
-	// will deliver the initiator's bytes to the original path just
-	// like a transfer. We surface the records on the report so the
-	// CLI can print "preserved at ..." lines.
+	// Conflicts flow through the transfer path: the receiver has
+	// already pre-staged each loser under .squirrel-conflicts/ and
+	// the original path is empty, so rclone treats the entry like a
+	// fresh transfer.
 	d.report.NodeConflicts = plan.Conflicts
 	if err := d.phaseTransfer(plan); err != nil {
 		return d.abortWithError("transfer", err)

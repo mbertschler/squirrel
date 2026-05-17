@@ -2182,12 +2182,13 @@ func TestMarkSupersededFlipsLiveRowOnly(t *testing.T) {
 	}
 }
 
-// TestCountFilesFirstSeenWithPathPrefix exercises the path-prefix
-// counter `squirrel runs` uses to derive each peer-sync run's
-// conflict count without a dedicated column. Two rows under the
-// prefix should match; rows outside the prefix (different first-seen
-// run, or unrelated path) must not.
-func TestCountFilesFirstSeenWithPathPrefix(t *testing.T) {
+// TestCountFilesFirstSeenByRunWithPathPrefix exercises the grouped
+// path-prefix counter `squirrel runs` uses to derive each peer-sync
+// run's conflict count in a single query. Rows under the prefix
+// should be summed per-run; rows outside the prefix (different
+// first-seen run, or unrelated path) must not contribute. An empty
+// runIDs slice short-circuits to an empty result without a query.
+func TestCountFilesFirstSeenByRunWithPathPrefix(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -2197,6 +2198,7 @@ func TestCountFilesFirstSeenWithPathPrefix(t *testing.T) {
 	volID := makeVolume(t, s, "/v")
 	thisRun := makeRun(t, s, volID)
 	otherRun := makeRun(t, s, volID)
+	emptyRun := makeRun(t, s, volID)
 
 	for i, p := range []string{".squirrel-conflicts/run-1/a", ".squirrel-conflicts/run-1/sub/b"} {
 		if err := s.Upsert(ctx, FileRow{
@@ -2207,7 +2209,7 @@ func TestCountFilesFirstSeenWithPathPrefix(t *testing.T) {
 			t.Fatalf("upsert %s: %v", p, err)
 		}
 	}
-	// A row from another run, same prefix — should not be counted.
+	// Another run, same prefix → counted under that run's id.
 	if err := s.Upsert(ctx, FileRow{
 		VolumeID: volID, Path: ".squirrel-conflicts/run-2/x", Blake3: digest(0x99),
 		SizeBytes: 1, MtimeNs: 1, Status: StatusPresent,
@@ -2215,7 +2217,7 @@ func TestCountFilesFirstSeenWithPathPrefix(t *testing.T) {
 	}, nil); err != nil {
 		t.Fatalf("upsert other-run row: %v", err)
 	}
-	// A same-run row outside the prefix — should not be counted.
+	// Same-run row outside the prefix → must not contribute.
 	if err := s.Upsert(ctx, FileRow{
 		VolumeID: volID, Path: "unrelated.txt", Blake3: digest(0xEE),
 		SizeBytes: 1, MtimeNs: 1, Status: StatusPresent,
@@ -2224,12 +2226,27 @@ func TestCountFilesFirstSeenWithPathPrefix(t *testing.T) {
 		t.Fatalf("upsert outside-prefix row: %v", err)
 	}
 
-	n, err := s.CountFilesFirstSeenWithPathPrefix(ctx, thisRun, ".squirrel-conflicts")
+	counts, err := s.CountFilesFirstSeenByRunWithPathPrefix(ctx,
+		[]int64{thisRun, otherRun, emptyRun}, ".squirrel-conflicts")
 	if err != nil {
-		t.Fatalf("CountFilesFirstSeenWithPathPrefix: %v", err)
+		t.Fatalf("CountFilesFirstSeenByRunWithPathPrefix: %v", err)
 	}
-	if n != 2 {
-		t.Fatalf("count = %d, want 2", n)
+	if counts[thisRun] != 2 {
+		t.Fatalf("counts[thisRun] = %d, want 2", counts[thisRun])
+	}
+	if counts[otherRun] != 1 {
+		t.Fatalf("counts[otherRun] = %d, want 1", counts[otherRun])
+	}
+	if _, ok := counts[emptyRun]; ok {
+		t.Fatalf("counts[emptyRun] present (%d), want absent", counts[emptyRun])
+	}
+
+	empty, err := s.CountFilesFirstSeenByRunWithPathPrefix(ctx, nil, ".squirrel-conflicts")
+	if err != nil {
+		t.Fatalf("empty input: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("empty input returned %v, want empty map", empty)
 	}
 }
 

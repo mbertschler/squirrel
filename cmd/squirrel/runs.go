@@ -73,25 +73,26 @@ func runRuns(cmd *cobra.Command, volumeName string, limit int) error {
 	return printRuns(cmd.OutOrStdout(), runs, volumes, conflicts)
 }
 
-// loadConflictCounts looks up the conflict count for every sync run in
-// the listing. Conflicts are derived from a path-prefix query against
-// `files` rather than stored on the run row directly — the v6 schema
-// already carries enough information, so we avoided a v7 migration for
-// what is essentially a derived audit number. Index/restore runs and
-// peer-less sync runs return 0 with no query issued.
+// loadConflictCounts derives the conflict count for every peer-sync
+// run in the listing via one grouped query against `files`. The v6
+// schema doesn't carry the count on the run row itself; every
+// conflict inserts one row under `.squirrel-conflicts/run-<id>/`, so
+// the prefix-count is the audit number we want.
 func loadConflictCounts(cmd *cobra.Command, s *store.Store, runs []store.Run) (map[int64]int, error) {
-	out := make(map[int64]int, len(runs))
+	var peerSyncIDs []int64
 	for _, r := range runs {
-		if r.Kind != store.RunKindSync || !r.PeerNodeID.Valid {
-			continue
+		if r.Kind == store.RunKindSync && r.PeerNodeID.Valid {
+			peerSyncIDs = append(peerSyncIDs, r.ID)
 		}
-		n, err := s.CountFilesFirstSeenWithPathPrefix(cmd.Context(), r.ID, sync.ConflictsDirName)
-		if err != nil {
-			return nil, fmt.Errorf("conflict count for run %d: %w", r.ID, err)
-		}
-		out[r.ID] = n
 	}
-	return out, nil
+	if len(peerSyncIDs) == 0 {
+		return map[int64]int{}, nil
+	}
+	counts, err := s.CountFilesFirstSeenByRunWithPathPrefix(cmd.Context(), peerSyncIDs, sync.ConflictsDirName)
+	if err != nil {
+		return nil, fmt.Errorf("conflict counts: %w", err)
+	}
+	return counts, nil
 }
 
 // loadVolumeNames builds an id→name map for rendering runs. Loading once up

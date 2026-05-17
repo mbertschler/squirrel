@@ -809,12 +809,13 @@ func TestNodeSyncEndToEndConflictAfterDaemonSideIndex(t *testing.T) {
 
 	// Conflict count surfaces in the receiver's runs row via the
 	// path-prefix query that backs `squirrel runs`.
-	count, err := f.recvStore.CountFilesFirstSeenWithPathPrefix(ctx, rep2.NodeReceiverRunID, ConflictsDirName)
+	counts, err := f.recvStore.CountFilesFirstSeenByRunWithPathPrefix(ctx,
+		[]int64{rep2.NodeReceiverRunID}, ConflictsDirName)
 	if err != nil {
-		t.Fatalf("CountFilesFirstSeenWithPathPrefix: %v", err)
+		t.Fatalf("CountFilesFirstSeenByRunWithPathPrefix: %v", err)
 	}
-	if count != 1 {
-		t.Fatalf("conflict count for receiver run = %d, want 1", count)
+	if counts[rep2.NodeReceiverRunID] != 1 {
+		t.Fatalf("conflict count for receiver run = %d, want 1", counts[rep2.NodeReceiverRunID])
 	}
 }
 

@@ -192,8 +192,8 @@ func (r *peerSyncRouter) beginSession(ctx context.Context, body syncproto.BeginR
 
 // ensureVolumeRow looks up the volume by name on the receiver side
 // and creates the row on first contact. The config-declared path is
-// what we materialise; indexing on the receiver (PR 4) refills file
-// rows from disk later.
+// what we materialise; a subsequent `squirrel index` run on the
+// receiver host refills the file rows from disk.
 func (r *peerSyncRouter) ensureVolumeRow(ctx context.Context, name, absPath string) (store.Volume, error) {
 	v, err := r.srv.store.GetVolumeByName(ctx, name)
 	if err == nil {
@@ -371,10 +371,11 @@ func (r *peerSyncRouter) classify(ctx context.Context, sess *peerSession, relPat
 //     runs row and reading its correlated_run_id (the two columns are
 //     in different id spaces — receiver-local vs. initiator-local).
 //
-// In single-writer v1 the second branch is forward-compatible cover:
-// only one initiator ever writes a given volume, so the watermark
-// check should always pass; the structured path is what PR 4 expands
-// to handle multi-writer drift.
+// All three branches can fire in the multi-writer flow: the
+// receiver may have local writes (a NAS web app dropped a file in,
+// or `squirrel index` ran on the receiver host between syncs), or
+// it may carry rows from a different peer that haven't synced
+// through us yet.
 func (r *peerSyncRouter) dispositionForExisting(ctx context.Context, sess *peerSession, existing store.FileRow) (string, string) {
 	if !existing.SourceNodeID.Valid {
 		return syncproto.DispositionConflict, "local write on receiver"
