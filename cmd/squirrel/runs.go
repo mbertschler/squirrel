@@ -33,6 +33,7 @@ func newRunsCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&volumeName, "volume", "", "filter to runs against this volume name")
 	cmd.Flags().IntVar(&limit, "limit", 20, "maximum number of runs to show (0 for no limit)")
+	cmd.AddCommand(newRunsFailCmd())
 	return cmd
 }
 
