@@ -52,6 +52,7 @@ func runDaemon(cmd *cobra.Command) error {
 		TLSCert: cfg.Daemon.TLSCert,
 		TLSKey:  cfg.Daemon.TLSKey,
 		Version: daemonVersion,
+		Volumes: cfg.Volumes,
 	}, s)
 	if err != nil {
 		return err

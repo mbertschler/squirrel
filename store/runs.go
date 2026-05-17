@@ -30,17 +30,23 @@ const (
 // Error are likewise nullable while a run is still in-flight or finished
 // without an error. Destination is NULL for index runs and required for
 // sync/restore runs (enforced by a CHECK in the schema). FileCount is int64
-// to match the SQLite INTEGER column.
+// to match the SQLite INTEGER column. PeerNodeID and CorrelatedRunID are
+// non-NULL on peer-sync runs only: the former references the peer's nodes
+// row (initiator or receiver, depending on which side wrote the row), the
+// latter carries the *other side's* local run id so the two halves of one
+// logical sync can be joined offline.
 type Run struct {
-	ID          int64
-	Kind        string
-	VolumeID    sql.NullInt64
-	Destination sql.NullString
-	StartedAtNs int64
-	EndedAtNs   sql.NullInt64
-	Status      string
-	Error       sql.NullString
-	FileCount   int64
+	ID              int64
+	Kind            string
+	VolumeID        sql.NullInt64
+	Destination     sql.NullString
+	StartedAtNs     int64
+	EndedAtNs       sql.NullInt64
+	Status          string
+	Error           sql.NullString
+	FileCount       int64
+	PeerNodeID      sql.NullInt64
+	CorrelatedRunID sql.NullInt64
 }
 
 // BeginRun records the start of a run and returns its id. Callers must pair
@@ -66,6 +72,54 @@ func (s *Store) BeginRun(ctx context.Context, kind string, volumeID int64, desti
 		return 0, fmt.Errorf("run last insert id: %w", err)
 	}
 	return id, nil
+}
+
+// BeginPeerSyncRun is BeginRun's sibling for kind='sync' rows tied to a
+// peer node. It records the (peer_node_id, correlated_run_id) pair
+// alongside the regular destination name (the peer's name from the
+// initiator's config, or its self-name on the receiver). The
+// destination column stays populated so the schema CHECK
+// (kind='sync' ⇒ destination non-empty) is satisfied and the existing
+// `squirrel runs` listing renders sensibly without special-casing.
+func (s *Store) BeginPeerSyncRun(ctx context.Context, volumeID, peerNodeID, correlatedRunID int64, destination string) (int64, error) {
+	if destination == "" {
+		return 0, fmt.Errorf("BeginPeerSyncRun: destination must be non-empty")
+	}
+	res, err := s.db.ExecContext(ctx, `
+		INSERT INTO runs (
+			kind, volume_id, destination, started_at_ns, status, file_count,
+			peer_node_id, correlated_run_id
+		) VALUES ('sync', ?, ?, ?, 'running', 0, ?, ?)
+	`, volumeID, destination, NowNs(), peerNodeID, correlatedRunID)
+	if err != nil {
+		return 0, fmt.Errorf("insert peer-sync run: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("peer-sync run last insert id: %w", err)
+	}
+	return id, nil
+}
+
+// SetCorrelatedRunID stamps the supplied correlated id onto an
+// already-open run row. Used by the initiator to record the receiver's
+// run id once /v1/sync/begin returns: at BeginRun time the receiver
+// hadn't yet allocated one. Returns sql.ErrNoRows if runID is invalid.
+func (s *Store) SetCorrelatedRunID(ctx context.Context, runID, correlatedRunID int64) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE runs SET correlated_run_id = ? WHERE id = ?`,
+		correlatedRunID, runID)
+	if err != nil {
+		return fmt.Errorf("set correlated run id: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("set correlated run id rows affected: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("set correlated run id: no run with id %d", runID)
+	}
+	return nil
 }
 
 // FinishRun records the terminal state of a run. errMsg is stored as NULL
@@ -110,10 +164,22 @@ type ListRunsOpts struct {
 	Descending bool
 }
 
+// runColumns is the fixed projection for every read of a runs row. Keeps
+// the scan order in lockstep with the query order; adding a column means
+// editing one place.
+const runColumns = `id, kind, volume_id, destination, started_at_ns, ended_at_ns, status, error, file_count, peer_node_id, correlated_run_id`
+
+func scanRun(scan func(...any) error) (Run, error) {
+	var r Run
+	err := scan(&r.ID, &r.Kind, &r.VolumeID, &r.Destination, &r.StartedAtNs, &r.EndedAtNs,
+		&r.Status, &r.Error, &r.FileCount, &r.PeerNodeID, &r.CorrelatedRunID)
+	return r, err
+}
+
 // ListRuns returns runs matching opts. See ListRunsOpts for filter and
 // ordering semantics.
 func (s *Store) ListRuns(ctx context.Context, opts ListRunsOpts) ([]Run, error) {
-	query := `SELECT id, kind, volume_id, destination, started_at_ns, ended_at_ns, status, error, file_count FROM runs`
+	query := `SELECT ` + runColumns + ` FROM runs`
 	var args []any
 	if opts.VolumeID != nil {
 		query += ` WHERE volume_id = ?`
@@ -135,13 +201,19 @@ func (s *Store) ListRuns(ctx context.Context, opts ListRunsOpts) ([]Run, error) 
 	defer rows.Close()
 	var out []Run
 	for rows.Next() {
-		var r Run
-		if err := rows.Scan(&r.ID, &r.Kind, &r.VolumeID, &r.Destination, &r.StartedAtNs, &r.EndedAtNs, &r.Status, &r.Error, &r.FileCount); err != nil {
+		r, err := scanRun(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// GetRun returns the run with the given id, or sql.ErrNoRows.
+func (s *Store) GetRun(ctx context.Context, id int64) (Run, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+runColumns+` FROM runs WHERE id = ?`, id)
+	return scanRun(row.Scan)
 }
 
 // LatestSuccessfulIndexRun returns the most recent index run for the given
@@ -151,13 +223,11 @@ func (s *Store) ListRuns(ctx context.Context, opts ListRunsOpts) ([]Run, error) 
 // Returns sql.ErrNoRows when no such run exists.
 func (s *Store) LatestSuccessfulIndexRun(ctx context.Context, volumeID int64) (Run, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, kind, volume_id, destination, started_at_ns, ended_at_ns, status, error, file_count
+		SELECT `+runColumns+`
 		FROM runs
 		WHERE kind = 'index' AND volume_id = ?
 		  AND status IN ('success','partial')
 		ORDER BY id DESC LIMIT 1
 	`, volumeID)
-	var r Run
-	err := row.Scan(&r.ID, &r.Kind, &r.VolumeID, &r.Destination, &r.StartedAtNs, &r.EndedAtNs, &r.Status, &r.Error, &r.FileCount)
-	return r, err
+	return scanRun(row.Scan)
 }

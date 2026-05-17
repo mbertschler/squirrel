@@ -50,6 +50,10 @@ type Config struct {
 	Volumes map[string]*Volume
 	// Destinations is keyed by destination name. Names match nameRE.
 	Destinations map[string]*Destination
+	// Nodes is keyed by node name. Names match nameRE. A name MUST NOT
+	// collide with an entry in Destinations — the syntactic split is the
+	// dispatch signal for sync.
+	Nodes map[string]*Node
 	// Daemon is non-nil when the config declares a `[daemon]` block. The
 	// daemon subcommand requires it; other subcommands ignore it.
 	Daemon *Daemon
@@ -131,6 +135,7 @@ type rawConfig struct {
 	NodeName     string                    `toml:"node_name"`
 	Volumes      map[string]rawVolume      `toml:"volumes"`
 	Destinations map[string]map[string]any `toml:"destinations"`
+	Nodes        map[string]rawNode        `toml:"nodes"`
 	Daemon       *rawDaemon                `toml:"daemon"`
 }
 
@@ -144,6 +149,7 @@ func (r *rawConfig) resolve(path string) (*Config, error) {
 		Path:         path,
 		Volumes:      make(map[string]*Volume, len(r.Volumes)),
 		Destinations: make(map[string]*Destination, len(r.Destinations)),
+		Nodes:        make(map[string]*Node, len(r.Nodes)),
 	}
 	if r.DB != "" {
 		expanded, err := expandPath(r.DB)
@@ -165,8 +171,18 @@ func (r *rawConfig) resolve(path string) (*Config, error) {
 		}
 		cfg.Destinations[name] = dest
 	}
+	for name, raw := range r.Nodes {
+		if _, clash := cfg.Destinations[name]; clash {
+			return nil, fmt.Errorf("nodes.%s: name also declared as a destination — names must be unique across both kinds", name)
+		}
+		node, err := resolveNode(name, &raw)
+		if err != nil {
+			return nil, fmt.Errorf("nodes.%s: %w", name, err)
+		}
+		cfg.Nodes[name] = node
+	}
 	for name, raw := range r.Volumes {
-		vol, err := resolveVolume(name, raw, cfg.Destinations)
+		vol, err := resolveVolume(name, raw, cfg.Destinations, cfg.Nodes)
 		if err != nil {
 			return nil, fmt.Errorf("volumes.%s: %w", name, err)
 		}
@@ -182,7 +198,7 @@ func (r *rawConfig) resolve(path string) (*Config, error) {
 	return cfg, nil
 }
 
-func resolveVolume(name string, raw rawVolume, dests map[string]*Destination) (*Volume, error) {
+func resolveVolume(name string, raw rawVolume, dests map[string]*Destination, nodes map[string]*Node) (*Volume, error) {
 	if !nameRE.MatchString(name) {
 		return nil, fmt.Errorf("invalid volume name (must match %s)", nameRE)
 	}
@@ -194,9 +210,13 @@ func resolveVolume(name string, raw rawVolume, dests map[string]*Destination) (*
 		return nil, fmt.Errorf("path: %w", err)
 	}
 	for _, dst := range raw.SyncTo {
-		if _, ok := dests[dst]; !ok {
-			return nil, fmt.Errorf("sync_to references unknown destination %q", dst)
+		if _, ok := dests[dst]; ok {
+			continue
 		}
+		if _, ok := nodes[dst]; ok {
+			continue
+		}
+		return nil, fmt.Errorf("sync_to references unknown destination or node %q", dst)
 	}
 	return &Volume{Name: name, Path: abs, SyncTo: raw.SyncTo}, nil
 }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/store"
+	"github.com/mbertschler/squirrel/syncproto"
 )
 
 // HistoryDirName is the directory at the destination, per volume, where
@@ -52,6 +53,32 @@ type Report struct {
 	// .squirrel-history directory" so the user knows that content was
 	// silently filtered from the upload.
 	Warnings []string
+	// NodeReceiverRunID is set on a successful node-sync handshake and
+	// echoed in the CLI output so the operator can join the two halves
+	// of one logical sync against the receiver's `squirrel runs`
+	// listing. Zero for bucket syncs and for runs that failed before
+	// /begin returned.
+	NodeReceiverRunID int64
+	// NodeVerify carries the receiver's verification report after a
+	// node sync. Empty for bucket syncs.
+	NodeVerify syncproto.VerifyResponse
+	// NodeConflicts is non-empty when a node sync aborted because the
+	// receiver returned one or more 'conflict' dispositions. In PR 3
+	// these are fatal; PR 4 resolves them.
+	NodeConflicts []syncproto.ConflictDetail
+}
+
+// RunPair is the single entry point for one sync invocation. It
+// dispatches between bucket-destination and node-destination flows
+// based on which slot of the Pair is populated. CLI callers use it
+// directly so the per-Pair printing loop is a one-liner; the
+// per-flavour functions (Sync, SyncNode) remain exported for tests
+// and for callers that already have the typed destination in hand.
+func RunPair(ctx context.Context, s *store.Store, rcl *Rclone, p Pair, opts Options) (Report, error) {
+	if p.IsNode() {
+		return SyncNode(ctx, s, rcl, p.Volume, p.Node, opts)
+	}
+	return Sync(ctx, s, rcl, p.Volume, p.Destination, opts)
 }
 
 // Sync runs one (volume, destination) pair via rclone. It:
@@ -265,12 +292,12 @@ func checkMinVersion(v Version, out io.Writer, shallow bool) error {
 	return fmt.Errorf("rclone %s is below the supported floor %s — --hash blake3 is unavailable; upgrade rclone or pass --shallow", v, MinRcloneVersion)
 }
 
-// PairsFor builds the list of (volume, destination) pairs to sync given
-// optional volume-name and destination-name filters. An empty volumeName
-// means "every volume with sync_to declared"; an empty destinationName
-// means "every destination on the matched volume(s)". Validation: every
-// non-empty filter must reference a name that exists in cfg, and the
-// pair must be declared in the volume's sync_to list.
+// PairsFor builds the list of (volume, target) pairs to sync given
+// optional volume-name and destination/node-name filters. An empty
+// volumeName means "every volume with sync_to declared"; an empty
+// destinationName means "every target on the matched volume(s)". The
+// destinationName matches against both buckets and nodes — they share
+// a flat namespace from the user's perspective.
 func PairsFor(cfg *config.Config, volumeName, destinationName string) ([]Pair, error) {
 	if volumeName != "" {
 		if _, ok := cfg.Volumes[volumeName]; !ok {
@@ -278,8 +305,10 @@ func PairsFor(cfg *config.Config, volumeName, destinationName string) ([]Pair, e
 		}
 	}
 	if destinationName != "" {
-		if _, ok := cfg.Destinations[destinationName]; !ok {
-			return nil, fmt.Errorf("unknown destination %q", destinationName)
+		_, bucketOK := cfg.Destinations[destinationName]
+		_, nodeOK := cfg.Nodes[destinationName]
+		if !bucketOK && !nodeOK {
+			return nil, fmt.Errorf("unknown destination or node %q", destinationName)
 		}
 	}
 	var out []Pair
@@ -291,11 +320,15 @@ func PairsFor(cfg *config.Config, volumeName, destinationName string) ([]Pair, e
 			if destinationName != "" && dname != destinationName {
 				continue
 			}
-			dest, ok := cfg.Destinations[dname]
-			if !ok {
-				return nil, fmt.Errorf("volume %s references destination %q not in config (config validation should have caught this)", vname, dname)
+			if dest, ok := cfg.Destinations[dname]; ok {
+				out = append(out, Pair{Volume: vol, Destination: dest})
+				continue
 			}
-			out = append(out, Pair{Volume: vol, Destination: dest})
+			if node, ok := cfg.Nodes[dname]; ok {
+				out = append(out, Pair{Volume: vol, Node: node})
+				continue
+			}
+			return nil, fmt.Errorf("volume %s references destination or node %q not in config (config validation should have caught this)", vname, dname)
 		}
 	}
 	if len(out) == 0 {
@@ -304,11 +337,29 @@ func PairsFor(cfg *config.Config, volumeName, destinationName string) ([]Pair, e
 	return out, nil
 }
 
-// Pair is one matched (volume, destination) pair returned by PairsFor.
+// Pair is one matched (volume, target) pair returned by PairsFor.
+// Exactly one of Destination / Node is non-nil; callers dispatch
+// accordingly.
 type Pair struct {
 	Volume      *config.Volume
 	Destination *config.Destination
+	Node        *config.Node
 }
+
+// TargetName returns the name of whichever target slot is filled.
+// Used by the CLI for per-pair output framing.
+func (p Pair) TargetName() string {
+	if p.Destination != nil {
+		return p.Destination.Name
+	}
+	if p.Node != nil {
+		return p.Node.Name
+	}
+	return ""
+}
+
+// IsNode reports whether this pair targets a peer node (vs. a bucket).
+func (p Pair) IsNode() bool { return p.Node != nil }
 
 // RestoreOptions shape one Restore invocation. ToPath overrides the local
 // target directory; when empty, the volume's declared path is used. The

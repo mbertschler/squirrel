@@ -524,6 +524,157 @@ path = "/x"
 	}
 }
 
+// TestLoadNodeBlock parses a complete [nodes.X] block including TLS
+// pin and env-resolved bearer. The resolved Endpoint must be a
+// fully-parsed *url.URL (not a string) so subsequent layers compose
+// per-endpoint URIs via ResolveReference rather than concatenation.
+func TestLoadNodeBlock(t *testing.T) {
+	t.Setenv("NAS_TOKEN", "supersecret")
+	p := writeConfig(t, `
+[nodes.nas]
+endpoint = "https://nas.local:8443"
+path     = "/srv/squirrel"
+auth     = { bearer = { env = "NAS_TOKEN" } }
+tls      = { cert_fingerprint = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" }
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	n, ok := cfg.Nodes["nas"]
+	if !ok {
+		t.Fatalf("nodes.nas missing: %+v", cfg.Nodes)
+	}
+	if n.Endpoint.Scheme != "https" || n.Endpoint.Host != "nas.local:8443" {
+		t.Fatalf("Endpoint = %+v", n.Endpoint)
+	}
+	if n.Token != "supersecret" {
+		t.Fatalf("Token = %q, want resolved literal", n.Token)
+	}
+	if n.Path != "/srv/squirrel" {
+		t.Fatalf("Path = %q", n.Path)
+	}
+	if !strings.HasPrefix(n.CertFingerprint, "sha256:") || len(n.CertFingerprint) != len("sha256:")+64 {
+		t.Fatalf("CertFingerprint = %q", n.CertFingerprint)
+	}
+}
+
+// TestLoadNodeBlockMinimal: bearer literal, no TLS pin, http endpoint.
+func TestLoadNodeBlockMinimal(t *testing.T) {
+	p := writeConfig(t, `
+[nodes.lan]
+endpoint = "http://10.0.0.1:8000"
+path     = "/data"
+auth     = { bearer = "literal-bearer" }
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	n := cfg.Nodes["lan"]
+	if n.Token != "literal-bearer" {
+		t.Fatalf("Token = %q", n.Token)
+	}
+	if n.CertFingerprint != "" {
+		t.Fatalf("CertFingerprint = %q, want empty (no tls block)", n.CertFingerprint)
+	}
+}
+
+// TestLoadNodeRejectsBadEndpoint covers the parse + scheme + host
+// guards on the endpoint field — a misconfigured URL must surface
+// at load time, not first sync.
+func TestLoadNodeRejectsBadEndpoint(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"missing", `[nodes.x]
+path = "/r"
+auth = { bearer = "t" }`, "endpoint is required"},
+		{"bad scheme", `[nodes.x]
+endpoint = "ftp://x"
+path     = "/r"
+auth     = { bearer = "t" }`, "scheme must be http or https"},
+		{"no host", `[nodes.x]
+endpoint = "http://"
+path     = "/r"
+auth     = { bearer = "t" }`, "host is required"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, c.body))
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("error = %v, want substring %q", err, c.want)
+			}
+		})
+	}
+}
+
+// TestLoadNodeRejectsBadFingerprint checks that the fingerprint must
+// match the exact `sha256:<64-hex>` form. A typo'd pin would
+// otherwise silently accept any cert.
+func TestLoadNodeRejectsBadFingerprint(t *testing.T) {
+	p := writeConfig(t, `
+[nodes.nas]
+endpoint = "https://nas.local"
+path     = "/r"
+auth     = { bearer = "t" }
+tls      = { cert_fingerprint = "sha256:tooshort" }
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "sha256:<64-hex>") {
+		t.Fatalf("error = %v, want fingerprint-shape error", err)
+	}
+}
+
+// TestLoadVolumeSyncToAcceptsNodeName lets sync_to reference a name
+// from either Nodes or Destinations — the user-facing namespace is
+// flat.
+func TestLoadVolumeSyncToAcceptsNodeName(t *testing.T) {
+	p := writeConfig(t, `
+[nodes.nas]
+endpoint = "http://nas.local"
+path     = "/r"
+auth     = { bearer = "t" }
+
+[destinations.offsite]
+type = "local"
+root = "/o"
+
+[volumes.pictures]
+path    = "/p"
+sync_to = ["nas", "offsite"]
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Volumes["pictures"].SyncTo; len(got) != 2 || got[0] != "nas" || got[1] != "offsite" {
+		t.Fatalf("SyncTo = %v", got)
+	}
+}
+
+// TestLoadRejectsCollidingNodeAndDestinationName guards the "flat
+// namespace" rule: nodes and destinations share the sync_to space,
+// so a name can be in at most one of them.
+func TestLoadRejectsCollidingNodeAndDestinationName(t *testing.T) {
+	p := writeConfig(t, `
+[nodes.shared]
+endpoint = "http://x"
+path     = "/r"
+auth     = { bearer = "t" }
+
+[destinations.shared]
+type = "local"
+root = "/o"
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "also declared as a destination") {
+		t.Fatalf("error = %v, want collision error", err)
+	}
+}
+
 func TestMissingErrorWrappingChain(t *testing.T) {
 	// MissingError must be detectable both via IsMissing and errors.As so
 	// callers can choose either ergonomic form.

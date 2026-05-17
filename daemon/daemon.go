@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/store"
 )
 
@@ -37,6 +38,12 @@ type Config struct {
 	// Version is the daemon binary version reported via /v1/health.
 	// Required so the field is never an unset zero-value in responses.
 	Version string
+	// Volumes maps volume name → resolved config-side volume. The
+	// peer-sync endpoints consult this to look up the on-disk path
+	// for a volume the initiator named in /v1/sync/begin. A nil map
+	// disables the sync endpoints (they return 404 on every volume),
+	// which is what tests of the auth/health surface want.
+	Volumes map[string]*config.Volume
 }
 
 // Server is one daemon instance. It holds the HTTP handler stack and a
@@ -101,7 +108,8 @@ func validateConfig(cfg Config) error {
 func (s *Server) buildHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", s.handleHealth)
-	mux.Handle("POST /v1/plan", s.requireBearer(http.HandlerFunc(s.handlePlanPlaceholder)))
+	router := newPeerSyncRouter(s, s.cfg.Volumes)
+	router.register(mux)
 	return mux
 }
 
@@ -169,12 +177,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		Version:       s.cfg.Version,
 		SchemaVersion: sv,
 	})
-}
-
-// handlePlanPlaceholder is the auth-guarded 501 stub. PR 3 replaces it
-// with the real four-bucket plan negotiation.
-func (s *Server) handlePlanPlaceholder(w http.ResponseWriter, _ *http.Request) {
-	writeError(w, http.StatusNotImplemented, "plan endpoint not yet implemented")
 }
 
 // errorResponse is the uniform JSON error body. Plain text would be
