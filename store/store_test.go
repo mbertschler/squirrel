@@ -2841,11 +2841,11 @@ func TestBeginSyncRunIfClearAtomic(t *testing.T) {
 
 	const parallel = 8
 	var (
-		wg        sync.WaitGroup
-		mu        sync.Mutex
-		newIDs    []int64
-		blockers  []*Run
-		execErrs  []error
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		newIDs   []int64
+		blockers []*Run
+		execErrs []error
 	)
 	start := make(chan struct{})
 	for i := 0; i < parallel; i++ {
