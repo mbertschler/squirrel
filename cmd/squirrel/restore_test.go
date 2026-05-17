@@ -131,39 +131,13 @@ func TestCLIRestoreFromNodeFiltersByAttribution(t *testing.T) {
 	runCLI(t, "--config", f.configPath, "index", f.volumeName)
 	runCLI(t, "--config", f.configPath, "sync", "pics")
 
-	// Inject peer attribution onto the from-* paths directly. The
-	// destination tree was just written by sync, so the rclone-side
-	// content is unchanged — restore will pull only the path subset
-	// we ask for via --files-from.
-	s, err := store.OpenWithOptions(f.dbPath, store.OpenOptions{})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer s.Close()
-	ctx := context.Background()
-
-	peerA, _ := s.CreateNode(ctx, "peer-a", "https://a.example")
-	peerB, _ := s.CreateNode(ctx, "peer-b", "https://b.example")
-	vol, _ := s.GetVolumeByName(ctx, "pics")
-	runA, _ := s.BeginPeerSyncRun(ctx, vol.ID, peerA.ID, 1, peerA.Name)
-	if err := s.FinishRun(ctx, runA, store.RunStatusSuccess, "", 1); err != nil {
-		t.Fatal(err)
-	}
-	runB, _ := s.BeginPeerSyncRun(ctx, vol.ID, peerB.ID, 1, peerB.Name)
-	if err := s.FinishRun(ctx, runB, store.RunStatusSuccess, "", 1); err != nil {
-		t.Fatal(err)
-	}
-	stamp := func(relPath string, prov *store.Provenance) {
-		row, err := s.GetByPath(ctx, vol.ID, relPath)
-		if err != nil {
-			t.Fatalf("GetByPath %s: %v", relPath, err)
-		}
-		if err := s.Upsert(ctx, row, prov); err != nil {
-			t.Fatalf("Upsert %s: %v", relPath, err)
-		}
-	}
-	stamp("from-a.txt", &store.Provenance{NodeID: peerA.ID, RunID: runA})
-	stamp("from-b.txt", &store.Provenance{NodeID: peerB.ID, RunID: runB})
+	// Inject peer attribution onto the from-* paths. The destination
+	// tree was just written by sync, so the rclone-side content is
+	// unchanged — restore will pull only the path subset we ask for
+	// via --files-from-raw. The store handle is closed before the
+	// subsequent runCLI so there's exactly one process holding the
+	// SQLite file when the CLI runs.
+	stampPeerProvenance(t, f.dbPath)
 
 	target := filepath.Join(t.TempDir(), "recovered")
 	out := runCLI(t, "--config", f.configPath, "restore", "pics", "--from", "peer-a", "--to", target)
@@ -177,6 +151,64 @@ func TestCLIRestoreFromNodeFiltersByAttribution(t *testing.T) {
 	for _, leaked := range []string{"from-b.txt", "local.txt"} {
 		if _, err := os.Stat(filepath.Join(target, leaked)); err == nil {
 			t.Fatalf("restore --from peer-a leaked %s into the target tree", leaked)
+		}
+	}
+}
+
+// stampPeerProvenance opens the index DB at dbPath, creates peer-a /
+// peer-b nodes plus a sync-kind run for each, then promotes the
+// from-{a,b}.txt rows (already indexed under the "pics" volume) to
+// the respective peer's source attribution via Upsert. The store
+// handle is closed before returning so the next CLI invocation has
+// no concurrent SQLite connection from this process.
+func stampPeerProvenance(t *testing.T, dbPath string) {
+	t.Helper()
+	s, err := store.OpenWithOptions(dbPath, store.OpenOptions{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	peerA, err := s.CreateNode(ctx, "peer-a", "https://a.example")
+	if err != nil {
+		t.Fatalf("CreateNode peer-a: %v", err)
+	}
+	peerB, err := s.CreateNode(ctx, "peer-b", "https://b.example")
+	if err != nil {
+		t.Fatalf("CreateNode peer-b: %v", err)
+	}
+	vol, err := s.GetVolumeByName(ctx, "pics")
+	if err != nil {
+		t.Fatalf("GetVolumeByName: %v", err)
+	}
+	runA, err := s.BeginPeerSyncRun(ctx, vol.ID, peerA.ID, 1, peerA.Name)
+	if err != nil {
+		t.Fatalf("BeginPeerSyncRun a: %v", err)
+	}
+	if err := s.FinishRun(ctx, runA, store.RunStatusSuccess, "", 1); err != nil {
+		t.Fatalf("FinishRun a: %v", err)
+	}
+	runB, err := s.BeginPeerSyncRun(ctx, vol.ID, peerB.ID, 1, peerB.Name)
+	if err != nil {
+		t.Fatalf("BeginPeerSyncRun b: %v", err)
+	}
+	if err := s.FinishRun(ctx, runB, store.RunStatusSuccess, "", 1); err != nil {
+		t.Fatalf("FinishRun b: %v", err)
+	}
+	for _, c := range []struct {
+		path string
+		prov *store.Provenance
+	}{
+		{"from-a.txt", &store.Provenance{NodeID: peerA.ID, RunID: runA}},
+		{"from-b.txt", &store.Provenance{NodeID: peerB.ID, RunID: runB}},
+	} {
+		row, err := s.GetByPath(ctx, vol.ID, c.path)
+		if err != nil {
+			t.Fatalf("GetByPath %s: %v", c.path, err)
+		}
+		if err := s.Upsert(ctx, row, c.prov); err != nil {
+			t.Fatalf("Upsert %s: %v", c.path, err)
 		}
 	}
 }
@@ -203,11 +235,16 @@ func TestCLIRestoreFromNodeWithNoAttributedRows(t *testing.T) {
 	writeTestFile(t, filepath.Join(f.volumeDir, "a.txt"), "alpha")
 	runCLI(t, "--config", f.configPath, "index", f.volumeName)
 
-	s, _ := store.OpenWithOptions(f.dbPath, store.OpenOptions{})
-	defer s.Close()
-	if _, err := s.CreateNode(context.Background(), "stranger", "https://stranger.example"); err != nil {
-		t.Fatalf("CreateNode: %v", err)
-	}
+	func() {
+		s, err := store.OpenWithOptions(f.dbPath, store.OpenOptions{})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		defer s.Close()
+		if _, err := s.CreateNode(context.Background(), "stranger", "https://stranger.example"); err != nil {
+			t.Fatalf("CreateNode: %v", err)
+		}
+	}()
 
 	_, err := runCLIExpectErr(t, "--config", f.configPath, "restore", "pics", "--from", "stranger", "--to", filepath.Join(t.TempDir(), "x"))
 	if !strings.Contains(err.Error(), "no rows attributed") {
