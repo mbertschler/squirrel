@@ -141,7 +141,7 @@ func runRcloneOperation(
 	}
 	rep.RunID = runID
 	defer func() {
-		finishSyncRun(ctx, s, dryRun, runID, rep)
+		finishRun(ctx, s, dryRun, runID, rep)
 	}()
 
 	rep.RcloneResult, err = rcl.Run(ctx, buildArgs(runID)...)
@@ -190,11 +190,12 @@ func beginRun(ctx context.Context, s *store.Store, dryRun bool, kind string, vol
 	return id, nil
 }
 
-// finishSyncRun is the deferred terminal-state writer. A FinishRun failure
-// would otherwise leave the run row stuck in 'running' and only surface
-// during the next `squirrel runs` listing; recording it on rep.FinishErr
-// lets the CLI surface it next to the rclone outcome on this very run.
-func finishSyncRun(ctx context.Context, s *store.Store, dryRun bool, runID int64, rep *Report) {
+// finishRun is the deferred terminal-state writer shared by Sync and
+// Restore. A FinishRun failure would otherwise leave the run row stuck
+// in 'running' and only surface during the next `squirrel runs`
+// listing; recording it on rep.FinishErr lets the CLI surface it next
+// to the rclone outcome on this very run.
+func finishRun(ctx context.Context, s *store.Store, dryRun bool, runID int64, rep *Report) {
 	rep.Status = deriveStatus(rep.RcloneResult)
 	if dryRun || runID == 0 {
 		return

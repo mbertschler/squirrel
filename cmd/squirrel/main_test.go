@@ -12,8 +12,9 @@ import (
 )
 
 // requireRcloneCLI mirrors sync.requireRclone but for the CLI tests in
-// this package. Sync tests against the real rclone binary; without it
-// installed, the test is skipped (and that's surfaced in test output).
+// this package. Sync and restore tests both shell out to the real
+// rclone binary; without it installed, the test is skipped (and that's
+// surfaced in test output).
 func requireRcloneCLI(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("rclone"); err != nil {
