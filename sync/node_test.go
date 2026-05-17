@@ -12,8 +12,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/agent"
+	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/index"
 	"github.com/mbertschler/squirrel/store"
 	"github.com/mbertschler/squirrel/syncproto"
