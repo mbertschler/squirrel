@@ -17,3 +17,17 @@ Don't:
 - Index low-cardinality columns; prefer partial indexes
 - Skip `go mod tidy` after adding a dependency
 - Preserve names or visibility blindly when moving code — re-evaluate
+
+# Pull request conventions
+
+When opening a PR that completes one or more issues, include a closing keyword per issue in the PR body (`Closes #19`, or `Closes #19, Closes #20` for several). GitHub auto-closes the linked issues on merge. Use `Closes` only when the PR completes the issue in full — for partial work, reference the issue without the closing keyword.
+
+# Default workflow for issue implementations
+
+When asked to implement an issue (e.g. "implement #19"), unless instructed otherwise, do all of the following:
+
+1. Implement on a feature branch, following the principles above.
+2. Open a PR with `Closes #N` in the body.
+3. After pushing, self-review for code quality: dead code, oversize functions, accidental scope creep, anything that violates CLAUDE.md. Push fixes for what you find.
+4. Watch CI. On failure, diagnose and push a fix; on success, surface that to the user.
+5. Stop and wait for explicit approval before merging — never self-merge.
