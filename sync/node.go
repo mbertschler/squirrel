@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -125,7 +126,10 @@ func (d *nodeSyncDriver) run() error {
 // phaseBegin opens a session with the receiver. The initiator's own
 // runs row is inserted first so the (peer_node_id, correlated_run_id)
 // pair lands the right way around: the receiver's id becomes our
-// correlated id, not the other way around.
+// correlated id, not the other way around. The local insert goes
+// through store.BeginSyncRunIfClear so two concurrent initiator
+// invocations against the same (volume, peer) can't both proceed —
+// the loser surfaces the same diagnostic the bucket path does.
 func (d *nodeSyncDriver) phaseBegin() error {
 	peer, err := d.store.GetOrCreatePeerNode(d.ctx, d.node.Name, d.node.Endpoint.String())
 	if err != nil {
@@ -136,10 +140,18 @@ func (d *nodeSyncDriver) phaseBegin() error {
 		return fmt.Errorf("look up self node: %w", err)
 	}
 	// correlated_run_id is filled in once we know the receiver's id.
-	// Pass 0 here; SetCorrelatedRunID below stamps the real value.
-	runID, err := d.store.BeginPeerSyncRun(d.ctx, d.volID, peer.ID, 0, d.node.Name)
+	// Pass a zero NullInt64 here; SetCorrelatedRunID below stamps the
+	// real value after /v1/sync/begin returns.
+	runID, blocker, err := d.store.BeginSyncRunIfClear(d.ctx, store.SyncRunSpec{
+		VolumeID:    d.volID,
+		Destination: d.node.Name,
+		PeerNodeID:  sql.NullInt64{Int64: peer.ID, Valid: true},
+	})
 	if err != nil {
 		return fmt.Errorf("begin local run: %w", err)
+	}
+	if blocker != nil {
+		return alreadyRunningErr(d.vol.Name, d.node.Name, blocker)
 	}
 	d.report.RunID = runID
 	resp, err := d.client.begin(d.ctx, syncproto.BeginRequest{

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/mbertschler/squirrel/config"
@@ -340,6 +341,128 @@ func TestSyncWarnsAboutHistoryDirInSource(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("warnings = %v; expected one mentioning %s", rep.Warnings, HistoryDirName)
+	}
+}
+
+// TestRunPairRefusesWhenAnotherIsRunning is half of the issue #36
+// acceptance: while a kind='sync' row for the same (volume,
+// destination) is still in 'running', a fresh RunPair refuses with a
+// clean error and writes no new run. Pre-inserting the running row
+// via BeginRun stands in for an in-flight first invocation that
+// hasn't reached FinishRun yet. The race-free side is covered by
+// TestRunPairRefusesConcurrentInvocations below.
+func TestRunPairRefusesWhenAnotherIsRunning(t *testing.T) {
+	f := setupFixture(t)
+	if err := os.WriteFile(filepath.Join(f.vol.Path, "a.txt"), []byte("alpha"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.runIndex(t)
+
+	v, err := f.store.GetVolumeByName(context.Background(), f.vol.Name)
+	if err != nil {
+		t.Fatalf("GetVolumeByName: %v", err)
+	}
+	stuckID, err := f.store.BeginRun(context.Background(), store.RunKindSync, v.ID, f.dest.Name)
+	if err != nil {
+		t.Fatalf("seed running sync row: %v", err)
+	}
+
+	beforeRuns, _ := f.store.ListRuns(context.Background(), store.ListRunsOpts{})
+	p := Pair{Volume: f.vol, Destination: f.dest}
+	rep, err := RunPair(context.Background(), f.store, f.rcl, p, Options{})
+	if err == nil {
+		t.Fatalf("expected refusal while a run is in flight; got rep=%+v", rep)
+	}
+	if !strings.Contains(err.Error(), "already running") {
+		t.Fatalf("error = %v, want one mentioning 'already running'", err)
+	}
+	if want := fmt.Sprintf("run=%d", stuckID); !strings.Contains(err.Error(), want) {
+		t.Fatalf("error = %v, want substring %q", err, want)
+	}
+	afterRuns, _ := f.store.ListRuns(context.Background(), store.ListRunsOpts{})
+	if len(afterRuns) != len(beforeRuns) {
+		t.Fatalf("refused RunPair inserted %d new runs rows, want 0", len(afterRuns)-len(beforeRuns))
+	}
+
+	// Clearing the in-flight row unblocks a fresh invocation.
+	if err := f.store.FinishRun(context.Background(), stuckID, store.RunStatusFailed, "test cleanup", 0); err != nil {
+		t.Fatalf("FinishRun: %v", err)
+	}
+	if _, err := RunPair(context.Background(), f.store, f.rcl, p, Options{}); err != nil {
+		t.Fatalf("RunPair after clearing stuck row: %v", err)
+	}
+}
+
+// TestRunPairRefusesConcurrentInvocations is the other half of #36's
+// acceptance: two RunPair calls launched in parallel against the same
+// (volume, destination) must serialise — exactly one inserts a sync
+// row and succeeds, the other refuses with the "already running"
+// diagnostic. The atomic BEGIN IMMEDIATE in
+// store.BeginSyncRunIfClear closes the check-then-act window that an
+// app-level guard would leave open.
+func TestRunPairRefusesConcurrentInvocations(t *testing.T) {
+	f := setupFixture(t)
+	if err := os.WriteFile(filepath.Join(f.vol.Path, "a.txt"), []byte("alpha"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.runIndex(t)
+
+	const parallel = 6
+	p := Pair{Volume: f.vol, Destination: f.dest}
+
+	var (
+		wg          sync.WaitGroup
+		mu          sync.Mutex
+		successes   int
+		refusals    int
+		otherErrors []error
+	)
+	start := make(chan struct{})
+	for i := 0; i < parallel; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := RunPair(context.Background(), f.store, f.rcl, p, Options{})
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				successes++
+			case strings.Contains(err.Error(), "already running"):
+				refusals++
+			default:
+				otherErrors = append(otherErrors, err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if len(otherErrors) > 0 {
+		t.Fatalf("unexpected errors from concurrent RunPair: %v", otherErrors)
+	}
+	if successes != 1 || refusals != parallel-1 {
+		t.Fatalf("got successes=%d refusals=%d, want 1 success and %d refusals",
+			successes, refusals, parallel-1)
+	}
+
+	// Exactly one sync run row should exist in any terminal state.
+	runs, err := f.store.ListRuns(context.Background(), store.ListRunsOpts{})
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	syncRuns := 0
+	for _, r := range runs {
+		if r.Kind == store.RunKindSync {
+			syncRuns++
+			if r.Status == store.RunStatusRunning {
+				t.Fatalf("sync run %d still in status=running after wg.Wait()", r.ID)
+			}
+		}
+	}
+	if syncRuns != 1 {
+		t.Fatalf("sync runs recorded = %d, want exactly 1", syncRuns)
 	}
 }
 

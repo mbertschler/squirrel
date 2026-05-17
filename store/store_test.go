@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -2818,5 +2819,114 @@ func TestMarkMissingStampsRunIDAndCount(t *testing.T) {
 	}
 	if got != 0 {
 		t.Fatalf("later missing-by-audit = %d, want 0 (no newly-missing rows)", got)
+	}
+}
+
+// TestBeginSyncRunIfClearAtomic exercises the in-progress gate at the
+// store layer. Many goroutines race to start the same (volume,
+// destination) sync; the BEGIN IMMEDIATE wrap inside
+// BeginSyncRunIfClear must serialise them so exactly one inserts and
+// the rest see the inserted row as the blocker. This is the rclone-free
+// companion to TestRunPairRefusesConcurrentInvocations in the sync
+// package.
+func TestBeginSyncRunIfClearAtomic(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+
+	const parallel = 8
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		newIDs   []int64
+		blockers []*Run
+		execErrs []error
+	)
+	start := make(chan struct{})
+	for i := 0; i < parallel; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			id, blocker, err := s.BeginSyncRunIfClear(ctx, SyncRunSpec{
+				VolumeID:    vID,
+				Destination: "nas",
+			})
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err != nil:
+				execErrs = append(execErrs, err)
+			case blocker != nil:
+				blockers = append(blockers, blocker)
+			default:
+				newIDs = append(newIDs, id)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if len(execErrs) > 0 {
+		t.Fatalf("unexpected errors: %v", execErrs)
+	}
+	if len(newIDs) != 1 {
+		t.Fatalf("inserts = %d, want exactly 1 (IDs=%v)", len(newIDs), newIDs)
+	}
+	if len(blockers) != parallel-1 {
+		t.Fatalf("blockers = %d, want %d", len(blockers), parallel-1)
+	}
+	for _, b := range blockers {
+		if b.ID != newIDs[0] {
+			t.Fatalf("blocker id = %d, want %d (the lone inserter)", b.ID, newIDs[0])
+		}
+	}
+
+	// A second pair (different destination) is independent — its slot
+	// is free, so the gate lets it through.
+	id2, blocker2, err := s.BeginSyncRunIfClear(ctx, SyncRunSpec{
+		VolumeID:    vID,
+		Destination: "scratch",
+	})
+	if err != nil || blocker2 != nil || id2 == 0 {
+		t.Fatalf("independent (volume, destination) blocked: id=%d blocker=%+v err=%v", id2, blocker2, err)
+	}
+
+	// Finishing the first run reopens the slot.
+	if err := s.FinishRun(ctx, newIDs[0], RunStatusSuccess, "", 0); err != nil {
+		t.Fatalf("FinishRun: %v", err)
+	}
+	id3, blocker3, err := s.BeginSyncRunIfClear(ctx, SyncRunSpec{
+		VolumeID:    vID,
+		Destination: "nas",
+	})
+	if err != nil || blocker3 != nil || id3 == 0 {
+		t.Fatalf("post-finish reuse blocked: id=%d blocker=%+v err=%v", id3, blocker3, err)
+	}
+}
+
+// TestBeginSyncRunIfClearRejectsEmptyDestination keeps callers from
+// silently inserting NULL/empty destination rows that the schema CHECK
+// would reject only at INSERT time. Pre-checking gives the
+// "BeginSyncRunIfClear: destination must be non-empty" diagnostic
+// instead of the SQLite CHECK constraint failure.
+func TestBeginSyncRunIfClearRejectsEmptyDestination(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+
+	_, _, err = s.BeginSyncRunIfClear(ctx, SyncRunSpec{VolumeID: vID, Destination: ""})
+	if err == nil || !strings.Contains(err.Error(), "destination must be non-empty") {
+		t.Fatalf("want destination-empty error, got %v", err)
 	}
 }
