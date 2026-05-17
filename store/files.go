@@ -306,6 +306,35 @@ func supersedeLiveRow(ctx context.Context, tx *sql.Tx, volumeID int64, relPath s
 	return nil
 }
 
+// RecordConflictPreStage atomically supersedes the live row at
+// originalPath and inserts a new 'present' row at conflictRow.Path
+// carrying the prior blake3 and the supplied provenance. The two
+// updates run inside one transaction so a daemon crash between them
+// rolls both back rather than leaving the receiver in a state where
+// the prior content is reachable only by path or only by hash.
+//
+// The on-disk rename that moves the bytes from originalPath to
+// conflictRow.Path is NOT part of this transaction (the filesystem
+// doesn't share the DB's journal). The contract the caller honours
+// is "mv first, then record": a crash before this returns leaves
+// the bytes at the conflict path with both index rows still in their
+// pre-call state, so the next sync re-plans, sees the same conflict,
+// and pre-stages again — content is preserved through re-runs.
+func (s *Store) RecordConflictPreStage(ctx context.Context, volumeID int64, originalPath string, conflictRow FileRow, prov *Provenance) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin conflict pre-stage: %w", err)
+	}
+	defer tx.Rollback()
+	if err := supersedeLiveRow(ctx, tx, volumeID, originalPath); err != nil {
+		return err
+	}
+	if err := insertNewRow(ctx, tx, conflictRow, prov); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // updateLiveRow refreshes the mutable fields on an existing row matching
 // (volume_id, path, blake3). blake3 and first_seen_run_id are never touched.
 // The (source_node_id, source_run_id) provenance pair is rewritten to the

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 )
 
 // Run kinds. The runs.volume_id column is nullable so a future sync run can
@@ -214,6 +215,64 @@ func (s *Store) ListRuns(ctx context.Context, opts ListRunsOpts) ([]Run, error) 
 func (s *Store) GetRun(ctx context.Context, id int64) (Run, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT `+runColumns+` FROM runs WHERE id = ?`, id)
 	return scanRun(row.Scan)
+}
+
+// CountFilesFirstSeenByRunWithPathPrefix returns a map from run id to
+// the number of files rows that run first-saw under pathPrefix. The
+// path prefix is escaped against LIKE metacharacters by the helper —
+// callers pass the directory name as plain text (no trailing slash,
+// no wildcards). The map only carries entries for runs with non-zero
+// matches; absent keys mean zero.
+//
+// `squirrel runs` uses this to render the CONFLICTS column without a
+// per-run query (every conflict inserts one row under
+// .squirrel-conflicts/run-<id>/, so the prefix count is the conflict
+// count). The pathPrefix is passed in so the store stays decoupled
+// from the sync-package directory naming convention.
+func (s *Store) CountFilesFirstSeenByRunWithPathPrefix(ctx context.Context, runIDs []int64, pathPrefix string) (map[int64]int, error) {
+	out := make(map[int64]int, len(runIDs))
+	if len(runIDs) == 0 {
+		return out, nil
+	}
+	placeholders := strings.Repeat("?,", len(runIDs)-1) + "?"
+	args := make([]any, 0, len(runIDs)+1)
+	for _, id := range runIDs {
+		args = append(args, id)
+	}
+	args = append(args, escapeLikePrefix(pathPrefix)+"/%")
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT first_seen_run_id, COUNT(*) FROM files
+		 WHERE first_seen_run_id IN (`+placeholders+`)
+		   AND path LIKE ? ESCAPE '\'
+		 GROUP BY first_seen_run_id`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("count files by run: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var n int
+		if err := rows.Scan(&id, &n); err != nil {
+			return nil, fmt.Errorf("scan count row: %w", err)
+		}
+		out[id] = n
+	}
+	return out, rows.Err()
+}
+
+// escapeLikePrefix escapes %, _ and \ in s so it can be embedded into a
+// SQL LIKE pattern without matching wildcards in the supplied prefix.
+// The companion ESCAPE '\' clause on the query consumes the escapes.
+func escapeLikePrefix(s string) string {
+	var b []byte
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '%' || c == '_' || c == '\\' {
+			b = append(b, '\\')
+		}
+		b = append(b, c)
+	}
+	return string(b)
 }
 
 // LatestSuccessfulIndexRun returns the most recent index run for the given

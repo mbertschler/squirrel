@@ -22,6 +22,15 @@ import (
 // from `ls -a`.
 const HistoryDirName = ".squirrel-history"
 
+// ConflictsDirName is the daemon-side equivalent of HistoryDirName for
+// node syncs: when a peer-sync diff produces a `conflict` disposition,
+// the receiver moves the losing version under
+// .squirrel-conflicts/run-<id>/<path> and seeds an index row there.
+// Mirrors daemon.ConflictsDirName; duplicated rather than imported so
+// non-sync packages (the CLI's `runs` listing, mainly) don't pull in
+// the daemon transitively.
+const ConflictsDirName = ".squirrel-conflicts"
+
 // Options shapes one Sync invocation.
 type Options struct {
 	// Shallow drops --checksum and --hash blake3 so rclone uses its default
@@ -62,9 +71,12 @@ type Report struct {
 	// NodeVerify carries the receiver's verification report after a
 	// node sync. Empty for bucket syncs.
 	NodeVerify syncproto.VerifyResponse
-	// NodeConflicts is non-empty when a node sync aborted because the
-	// receiver returned one or more 'conflict' dispositions. In PR 3
-	// these are fatal; PR 4 resolves them.
+	// NodeConflicts is non-empty when a node sync resolved one or more
+	// `conflict` dispositions: paths where the receiver's prior bytes
+	// were preserved under .squirrel-conflicts/run-<id>/ while the
+	// initiator's bytes landed live. The records carry both the prior
+	// and the new BLAKE3 plus the receiver-relative preserved path so
+	// the CLI can render a meaningful "review at <path>" pointer.
 	NodeConflicts []syncproto.ConflictDetail
 }
 

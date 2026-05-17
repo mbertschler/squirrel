@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -102,19 +101,23 @@ func printSyncReport(w io.Writer, rep sync.Report, runErr error) {
 		r.Transferred, r.Checked, r.Errors, r.Bytes, rep.RunID,
 	)
 	if rep.NodeReceiverRunID != 0 {
-		fmt.Fprintf(w, "  receiver_run=%d matched=%d mismatched=%d missing=%d\n",
+		fmt.Fprintf(w, "  receiver_run=%d matched=%d mismatched=%d missing=%d conflicts=%d\n",
 			rep.NodeReceiverRunID,
 			len(rep.NodeVerify.Matched),
 			len(rep.NodeVerify.Mismatched),
 			len(rep.NodeVerify.Missing),
+			len(rep.NodeConflicts),
 		)
 		for _, m := range rep.NodeVerify.Mismatched {
 			fmt.Fprintf(w, "    mismatched %s: expected %s, actual %s\n", m.Path, m.ExpectedHex, m.ActualHex)
 		}
 	}
 	for _, c := range rep.NodeConflicts {
-		fmt.Fprintf(w, "  conflict %s: %s (initiator %s, receiver %s)\n",
-			c.Path, c.Reason, c.InitiatorBlake3Hex, c.ReceiverBlake3Hex)
+		fmt.Fprintf(w, "  conflict %s: %s — was %s, now %s\n",
+			c.Path, c.Reason, c.ReceiverBlake3Hex, c.InitiatorBlake3Hex)
+		if c.PreservedAtPath != "" {
+			fmt.Fprintf(w, "    preserved at %s:%s\n", rep.Destination, c.PreservedAtPath)
+		}
 	}
 	for _, ff := range r.FailedFiles {
 		// Some rclone errors (auth, listing, fatal copy) have no Object.
@@ -131,11 +134,6 @@ func printSyncReport(w io.Writer, rep sync.Report, runErr error) {
 		fmt.Fprintf(w, "  warning: failed to record terminal run state: %v\n", rep.FinishErr)
 	}
 	if runErr != nil {
-		var conflict *sync.ConflictError
-		if errors.As(runErr, &conflict) {
-			fmt.Fprintf(w, "  %s\n", conflict.Error())
-		} else {
-			fmt.Fprintf(w, "  %v\n", runErr)
-		}
+		fmt.Fprintf(w, "  %v\n", runErr)
 	}
 }

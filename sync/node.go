@@ -14,6 +14,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 
 	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/store"
@@ -104,10 +105,11 @@ func (d *nodeSyncDriver) run() error {
 	if err != nil {
 		return d.abortWithError("plan", err)
 	}
-	if len(plan.Conflicts) > 0 {
-		d.report.NodeConflicts = plan.Conflicts
-		return d.abortConflicts(plan.Conflicts)
-	}
+	// Conflicts flow through the transfer path: the receiver has
+	// already pre-staged each loser under .squirrel-conflicts/ and
+	// the original path is empty, so rclone treats the entry like a
+	// fresh transfer.
+	d.report.NodeConflicts = plan.Conflicts
 	if err := d.phaseTransfer(plan); err != nil {
 		return d.abortWithError("transfer", err)
 	}
@@ -172,7 +174,12 @@ func (d *nodeSyncDriver) phasePlan() (syncproto.PlanResponse, error) {
 // collectIndexEntries walks the present rows for this volume and
 // builds the wire-format index slice. Only 'present' rows are
 // considered — missing/superseded rows describe history, not what we
-// want to push.
+// want to push. Rows under reserved sync directories
+// (.squirrel-history/, .squirrel-conflicts/) are filtered out so a
+// node that received conflict preservation in a prior sync doesn't
+// re-publish the loser's content to peers when it later acts as an
+// initiator. The local DB row stays put — `squirrel query` against
+// the prior blake3 still resolves — but the path is not on the wire.
 func (d *nodeSyncDriver) collectIndexEntries() ([]syncproto.IndexEntry, error) {
 	paths, err := d.store.ListPresentPathsUnder(d.ctx, d.volID)
 	if err != nil {
@@ -180,6 +187,9 @@ func (d *nodeSyncDriver) collectIndexEntries() ([]syncproto.IndexEntry, error) {
 	}
 	entries := make([]syncproto.IndexEntry, 0, len(paths))
 	for p := range paths {
+		if isReservedSyncPath(p) {
+			continue
+		}
 		row, err := d.store.GetByPath(d.ctx, d.volID, p)
 		if err != nil {
 			return nil, fmt.Errorf("lookup %s: %w", p, err)
@@ -194,13 +204,25 @@ func (d *nodeSyncDriver) collectIndexEntries() ([]syncproto.IndexEntry, error) {
 	return entries, nil
 }
 
+// isReservedSyncPath reports whether p lives under one of the
+// receiver-owned reserved subtrees. Kept here rather than in the
+// store because the reserved-ness is a sync-layer concern: the DB
+// happily stores rows under any path.
+func isReservedSyncPath(p string) bool {
+	return strings.HasPrefix(p, HistoryDirName+"/") ||
+		strings.HasPrefix(p, ConflictsDirName+"/")
+}
+
 // phaseTransfer invokes rclone exactly once over the transfer +
-// supersede paths the plan returned. Re-uses the existing Rclone
-// wrapper but with a different argv: no --backup-dir, an --files-from
-// containing the in-scope paths, and no .squirrel-history filter
-// (the receiver doesn't share that namespace through HTTP).
+// supersede + conflict paths the plan returned. Re-uses the existing
+// Rclone wrapper but with a different argv: no --backup-dir, an
+// --files-from containing the in-scope paths, and no .squirrel-history
+// filter (the receiver doesn't share that namespace through HTTP).
+// Conflict paths are in scope because the receiver moved the prior
+// bytes aside in pre-stage; rclone just delivers the initiator's
+// version to the now-empty original path.
 func (d *nodeSyncDriver) phaseTransfer(plan syncproto.PlanResponse) error {
-	transferPaths := pathsInScope(plan, false)
+	transferPaths := pathsInScope(plan)
 	if len(transferPaths) == 0 {
 		return nil
 	}
@@ -294,23 +316,6 @@ func (d *nodeSyncDriver) phaseClose() error {
 	})
 }
 
-// abortConflicts produces the run-level error for the conflict
-// disposition. Per the PR 3 scope this is fatal; PR 4 will resolve
-// them instead. We still call /close with status=failed so the
-// receiver releases the volume lock and finalises its run row.
-func (d *nodeSyncDriver) abortConflicts(conflicts []syncproto.ConflictDetail) error {
-	d.report.Status = store.RunStatusFailed
-	_ = d.client.close(d.ctx, syncproto.CloseRequest{
-		ReceiverRunID: d.receiverRunID,
-		Status:        store.RunStatusFailed,
-	})
-	names := make([]string, 0, len(conflicts))
-	for _, c := range conflicts {
-		names = append(names, c.Path)
-	}
-	return &ConflictError{Paths: names, Conflicts: conflicts}
-}
-
 func (d *nodeSyncDriver) abortWithError(phase string, err error) error {
 	d.report.Status = store.RunStatusFailed
 	if d.receiverRunID != 0 {
@@ -320,19 +325,6 @@ func (d *nodeSyncDriver) abortWithError(phase string, err error) error {
 		})
 	}
 	return fmt.Errorf("%s: %w", phase, err)
-}
-
-// ConflictError is returned by SyncNode when /plan reported one or
-// more conflict-disposition paths. The CLI renders Paths verbatim;
-// the structured Conflicts list is available for programmatic
-// inspection.
-type ConflictError struct {
-	Paths     []string
-	Conflicts []syncproto.ConflictDetail
-}
-
-func (e *ConflictError) Error() string {
-	return fmt.Sprintf("sync aborted: %d conflict(s) — %v", len(e.Paths), e.Paths)
 }
 
 // nodeClient wraps the HTTP transport against one peer node. The
@@ -448,18 +440,16 @@ func (c *nodeClient) do(ctx context.Context, urlPath string, body, out any) erro
 }
 
 // pathsInScope returns the relative paths from the plan whose
-// disposition needs rclone to run. The conflict bucket is never in
-// scope; already-correct never needs bytes.
-func pathsInScope(plan syncproto.PlanResponse, includeConflict bool) []string {
+// disposition needs rclone to deliver bytes — transfer, supersede,
+// conflict. Already-correct paths are skipped (no bytes need move).
+func pathsInScope(plan syncproto.PlanResponse) []string {
 	out := make([]string, 0, len(plan.Dispositions))
 	for _, d := range plan.Dispositions {
 		switch d.Disposition {
-		case syncproto.DispositionTransfer, syncproto.DispositionSupersede:
+		case syncproto.DispositionTransfer,
+			syncproto.DispositionSupersede,
+			syncproto.DispositionConflict:
 			out = append(out, d.Path)
-		case syncproto.DispositionConflict:
-			if includeConflict {
-				out = append(out, d.Path)
-			}
 		}
 	}
 	return out

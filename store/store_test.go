@@ -2122,6 +2122,147 @@ func TestFileRowScanInsertRoundTrip(t *testing.T) {
 // list against drift from fileColumns. A column added to fileColumns but
 // forgotten elsewhere (or vice versa) trips here before any INSERT hits
 // SQLite and produces an opaque parameter-count error.
+
+// TestRecordConflictPreStageAtomic exercises the supersede + insert
+// transaction used by the receiver's conflict pre-stage: the live row
+// at the original path goes 'superseded' and a new 'present' row
+// appears at the conflict path carrying the prior blake3 + the
+// supplied provenance. Both halves must be visible together — the
+// transaction guarantee is what protects against a daemon crash
+// between the two updates.
+func TestRecordConflictPreStageAtomic(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	volID := makeVolume(t, s, "/v")
+	runID := makeRun(t, s, volID)
+	priorBlake3 := digest(0x01)
+
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: volID, Path: "doc.md", Blake3: priorBlake3,
+		SizeBytes: 5, MtimeNs: 100, Status: StatusPresent,
+		FirstSeenRunID: runID, LastSeenRunID: runID, IndexedAtNs: 100,
+	}, nil); err != nil {
+		t.Fatalf("seed live row: %v", err)
+	}
+
+	conflictRow := FileRow{
+		VolumeID: volID, Path: ".squirrel-conflicts/run-9/doc.md", Blake3: priorBlake3,
+		SizeBytes: 5, MtimeNs: 100, Status: StatusPresent,
+		FirstSeenRunID: runID, LastSeenRunID: runID, IndexedAtNs: 200,
+	}
+	if err := s.RecordConflictPreStage(ctx, volID, "doc.md", conflictRow, nil); err != nil {
+		t.Fatalf("RecordConflictPreStage: %v", err)
+	}
+
+	// Original path no longer has a live row.
+	if _, err := s.GetByPath(ctx, volID, "doc.md"); !IsNotFound(err) {
+		t.Fatalf("GetByPath(doc.md) after pre-stage = %v, want NotFound", err)
+	}
+	// Conflict path has a present row carrying the prior blake3.
+	got, err := s.GetByPath(ctx, volID, ".squirrel-conflicts/run-9/doc.md")
+	if err != nil {
+		t.Fatalf("GetByPath(conflict): %v", err)
+	}
+	if !bytes.Equal(got.Blake3, priorBlake3) {
+		t.Fatalf("conflict-path blake3 = %x, want %x", got.Blake3, priorBlake3)
+	}
+	if got.Status != StatusPresent {
+		t.Fatalf("conflict-path status = %q, want present", got.Status)
+	}
+
+	// Prior blake3 is reachable by hash: GetByBlake3 returns both
+	// rows (one present at conflict path, one superseded at original
+	// path), which is the append-only history contract.
+	matches, err := s.GetByBlake3(ctx, priorBlake3)
+	if err != nil {
+		t.Fatalf("GetByBlake3: %v", err)
+	}
+	byPath := make(map[string]string, len(matches))
+	for _, m := range matches {
+		byPath[m.File.Path] = m.File.Status
+	}
+	if byPath[".squirrel-conflicts/run-9/doc.md"] != StatusPresent {
+		t.Fatalf("conflict-path row status = %q, want present (matches=%+v)",
+			byPath[".squirrel-conflicts/run-9/doc.md"], byPath)
+	}
+	if byPath["doc.md"] != StatusSuperseded {
+		t.Fatalf("original-path row status = %q, want superseded (matches=%+v)",
+			byPath["doc.md"], byPath)
+	}
+}
+
+// TestCountFilesFirstSeenByRunWithPathPrefix exercises the grouped
+// path-prefix counter `squirrel runs` uses to derive each peer-sync
+// run's conflict count in a single query. Rows under the prefix
+// should be summed per-run; rows outside the prefix (different
+// first-seen run, or unrelated path) must not contribute. An empty
+// runIDs slice short-circuits to an empty result without a query.
+func TestCountFilesFirstSeenByRunWithPathPrefix(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	volID := makeVolume(t, s, "/v")
+	thisRun := makeRun(t, s, volID)
+	otherRun := makeRun(t, s, volID)
+	emptyRun := makeRun(t, s, volID)
+
+	for i, p := range []string{".squirrel-conflicts/run-1/a", ".squirrel-conflicts/run-1/sub/b"} {
+		if err := s.Upsert(ctx, FileRow{
+			VolumeID: volID, Path: p, Blake3: digest(byte(0x10 + i)),
+			SizeBytes: 1, MtimeNs: 1, Status: StatusPresent,
+			FirstSeenRunID: thisRun, LastSeenRunID: thisRun, IndexedAtNs: 1,
+		}, nil); err != nil {
+			t.Fatalf("upsert %s: %v", p, err)
+		}
+	}
+	// Another run, same prefix → counted under that run's id.
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: volID, Path: ".squirrel-conflicts/run-2/x", Blake3: digest(0x99),
+		SizeBytes: 1, MtimeNs: 1, Status: StatusPresent,
+		FirstSeenRunID: otherRun, LastSeenRunID: otherRun, IndexedAtNs: 1,
+	}, nil); err != nil {
+		t.Fatalf("upsert other-run row: %v", err)
+	}
+	// Same-run row outside the prefix → must not contribute.
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: volID, Path: "unrelated.txt", Blake3: digest(0xEE),
+		SizeBytes: 1, MtimeNs: 1, Status: StatusPresent,
+		FirstSeenRunID: thisRun, LastSeenRunID: thisRun, IndexedAtNs: 1,
+	}, nil); err != nil {
+		t.Fatalf("upsert outside-prefix row: %v", err)
+	}
+
+	counts, err := s.CountFilesFirstSeenByRunWithPathPrefix(ctx,
+		[]int64{thisRun, otherRun, emptyRun}, ".squirrel-conflicts")
+	if err != nil {
+		t.Fatalf("CountFilesFirstSeenByRunWithPathPrefix: %v", err)
+	}
+	if counts[thisRun] != 2 {
+		t.Fatalf("counts[thisRun] = %d, want 2", counts[thisRun])
+	}
+	if counts[otherRun] != 1 {
+		t.Fatalf("counts[otherRun] = %d, want 1", counts[otherRun])
+	}
+	if _, ok := counts[emptyRun]; ok {
+		t.Fatalf("counts[emptyRun] present (%d), want absent", counts[emptyRun])
+	}
+
+	empty, err := s.CountFilesFirstSeenByRunWithPathPrefix(ctx, nil, ".squirrel-conflicts")
+	if err != nil {
+		t.Fatalf("empty input: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("empty input returned %v, want empty map", empty)
+	}
+}
+
 func TestFilePlaceholdersMatchesFileColumns(t *testing.T) {
 	gotCols := strings.Count(fileColumns, ",") + 1
 	gotPlaceholders := strings.Count(filePlaceholders, "?")

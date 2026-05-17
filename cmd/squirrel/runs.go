@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/mbertschler/squirrel/store"
+	"github.com/mbertschler/squirrel/sync"
 )
 
 // newRunsCmd returns the `squirrel runs` cobra command. It lists rows from
@@ -65,7 +66,33 @@ func runRuns(cmd *cobra.Command, volumeName string, limit int) error {
 	if err != nil {
 		return err
 	}
-	return printRuns(cmd.OutOrStdout(), runs, volumes)
+	conflicts, err := loadConflictCounts(cmd, s, runs)
+	if err != nil {
+		return err
+	}
+	return printRuns(cmd.OutOrStdout(), runs, volumes, conflicts)
+}
+
+// loadConflictCounts derives the conflict count for every peer-sync
+// run in the listing via one grouped query against `files`. The v6
+// schema doesn't carry the count on the run row itself; every
+// conflict inserts one row under `.squirrel-conflicts/run-<id>/`, so
+// the prefix-count is the audit number we want.
+func loadConflictCounts(cmd *cobra.Command, s *store.Store, runs []store.Run) (map[int64]int, error) {
+	var peerSyncIDs []int64
+	for _, r := range runs {
+		if r.Kind == store.RunKindSync && r.PeerNodeID.Valid {
+			peerSyncIDs = append(peerSyncIDs, r.ID)
+		}
+	}
+	if len(peerSyncIDs) == 0 {
+		return map[int64]int{}, nil
+	}
+	counts, err := s.CountFilesFirstSeenByRunWithPathPrefix(cmd.Context(), peerSyncIDs, sync.ConflictsDirName)
+	if err != nil {
+		return nil, fmt.Errorf("conflict counts: %w", err)
+	}
+	return counts, nil
 }
 
 // loadVolumeNames builds an id→name map for rendering runs. Loading once up
@@ -82,19 +109,30 @@ func loadVolumeNames(cmd *cobra.Command, s *store.Store) (map[int64]string, erro
 	return out, nil
 }
 
-func printRuns(out io.Writer, runs []store.Run, volumes map[int64]string) error {
+func printRuns(out io.Writer, runs []store.Run, volumes map[int64]string, conflicts map[int64]int) error {
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tKIND\tVOLUME\tDESTINATION\tSTARTED\tDURATION\tSTATUS\tFILES\tERROR")
+	fmt.Fprintln(tw, "ID\tKIND\tVOLUME\tDESTINATION\tSTARTED\tDURATION\tSTATUS\tFILES\tCONFLICTS\tERROR")
 	for _, r := range runs {
-		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
+		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n",
 			r.ID, r.Kind, volumeLabel(r.VolumeID, volumes),
 			destinationLabel(r.Destination),
 			formatStarted(r.StartedAtNs),
 			formatDuration(r.StartedAtNs, r.EndedAtNs),
-			r.Status, r.FileCount, truncateError(r.Error),
+			r.Status, r.FileCount, conflictLabel(r, conflicts),
+			truncateError(r.Error),
 		)
 	}
 	return tw.Flush()
+}
+
+// conflictLabel formats the per-run conflict count for the listing.
+// Non-peer-sync runs print "—" so the column doesn't pretend the
+// concept is meaningful for index/restore/bucket-sync rows.
+func conflictLabel(r store.Run, conflicts map[int64]int) string {
+	if r.Kind != store.RunKindSync || !r.PeerNodeID.Valid {
+		return "—"
+	}
+	return fmt.Sprintf("%d", conflicts[r.ID])
 }
 
 func destinationLabel(d sql.NullString) string {
