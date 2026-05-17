@@ -1770,7 +1770,7 @@ func TestUpsertProvenanceFKRejected(t *testing.T) {
 				// later one through the live-row state machine.
 				VolumeID: vID, Path: fmt.Sprintf("x-%d", i), Blake3: digest(byte(0x10 + i)),
 				SizeBytes: 1, MtimeNs: 1,
-				Status:    StatusPresent, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1,
+				Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1,
 			}, c.prov)
 			if err == nil {
 				t.Fatalf("Upsert with %s succeeded; FK not enforced", c.name)
