@@ -26,9 +26,12 @@ jobs:
           check-latest: true
 
       - name: Install rclone
+        # Ubuntu 24.04's apt ships rclone 1.60, which is below the
+        # MinRcloneVersion (1.66) enforced in sync/rclone.go, so the
+        # sync tests would fail. Use the upstream install script to get
+        # a current version.
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y rclone
+          curl -fsSL https://rclone.org/install.sh | sudo bash
           rclone version
 
       - name: go build
