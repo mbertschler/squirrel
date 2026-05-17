@@ -407,18 +407,21 @@ func (c *nodeClient) close(ctx context.Context, body syncproto.CloseRequest) err
 }
 
 // do is the shared "POST JSON, decode JSON" implementation. The URL
-// is built via the endpoint's ResolveReference (NOT string
-// concatenation per CLAUDE.md). Non-2xx responses surface as errors
-// carrying the receiver's `error` field when present.
+// is built by joining the configured endpoint's path with urlPath
+// (rather than concatenating raw strings, per CLAUDE.md) — a node
+// reachable at https://nas.local:8443/squirrel/ would dispatch to
+// https://nas.local:8443/squirrel/v1/sync/begin without leaking
+// either the prefix or the action name into request bodies.
+// Non-2xx responses surface as errors carrying the receiver's
+// `error` field when present.
 func (c *nodeClient) do(ctx context.Context, urlPath string, body, out any) error {
-	target := *c.node.Endpoint
-	relPath := *c.node.Endpoint
-	relPath.Path = path.Join(target.Path, urlPath)
+	full := *c.node.Endpoint
+	full.Path = path.Join(c.node.Endpoint.Path, urlPath)
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("encode %s: %w", urlPath, err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, relPath.String(), bytes.NewReader(encoded))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, full.String(), bytes.NewReader(encoded))
 	if err != nil {
 		return fmt.Errorf("new request %s: %w", urlPath, err)
 	}
