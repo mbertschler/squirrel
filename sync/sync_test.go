@@ -343,6 +343,54 @@ func TestSyncWarnsAboutHistoryDirInSource(t *testing.T) {
 	}
 }
 
+// TestRunPairRefusesWhenAnotherIsRunning is the issue #36 acceptance
+// check: while a kind='sync' row for the same (volume, destination)
+// is still in 'running', a second RunPair refuses with a clean
+// error and writes no new run. Pre-inserting the running row via
+// BeginRun is equivalent — from the guard's perspective — to a real
+// concurrent first invocation that hasn't reached FinishRun yet.
+func TestRunPairRefusesWhenAnotherIsRunning(t *testing.T) {
+	f := setupFixture(t)
+	if err := os.WriteFile(filepath.Join(f.vol.Path, "a.txt"), []byte("alpha"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.runIndex(t)
+
+	v, err := f.store.GetVolumeByName(context.Background(), f.vol.Name)
+	if err != nil {
+		t.Fatalf("GetVolumeByName: %v", err)
+	}
+	stuckID, err := f.store.BeginRun(context.Background(), store.RunKindSync, v.ID, f.dest.Name)
+	if err != nil {
+		t.Fatalf("seed running sync row: %v", err)
+	}
+
+	beforeRuns, _ := f.store.ListRuns(context.Background(), store.ListRunsOpts{})
+	p := Pair{Volume: f.vol, Destination: f.dest}
+	rep, err := RunPair(context.Background(), f.store, f.rcl, p, Options{})
+	if err == nil {
+		t.Fatalf("expected refusal while a run is in flight; got rep=%+v", rep)
+	}
+	if !strings.Contains(err.Error(), "already running") {
+		t.Fatalf("error = %v, want one mentioning 'already running'", err)
+	}
+	if want := fmt.Sprintf("run=%d", stuckID); !strings.Contains(err.Error(), want) {
+		t.Fatalf("error = %v, want substring %q", err, want)
+	}
+	afterRuns, _ := f.store.ListRuns(context.Background(), store.ListRunsOpts{})
+	if len(afterRuns) != len(beforeRuns) {
+		t.Fatalf("refused RunPair inserted %d new runs rows, want 0", len(afterRuns)-len(beforeRuns))
+	}
+
+	// Clearing the in-flight row unblocks a fresh invocation.
+	if err := f.store.FinishRun(context.Background(), stuckID, store.RunStatusFailed, "test cleanup", 0); err != nil {
+		t.Fatalf("FinishRun: %v", err)
+	}
+	if _, err := RunPair(context.Background(), f.store, f.rcl, p, Options{}); err != nil {
+		t.Fatalf("RunPair after clearing stuck row: %v", err)
+	}
+}
+
 // TestCheckMinVersionBranches covers the three branches of the
 // version-floor gate without needing a stubbed rclone binary.
 func TestCheckMinVersionBranches(t *testing.T) {

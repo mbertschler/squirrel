@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/store"
@@ -93,11 +94,47 @@ type Report struct {
 // directly so the per-Pair printing loop is a one-liner; the
 // per-flavour functions (Sync, SyncNode) remain exported for tests
 // and for callers that already have the typed destination in hand.
+//
+// Before dispatching, RunPair refuses if another kind='sync' run is
+// already in flight for the same (volume, target) — the runs-row guard
+// described in #36. Stale 'running' rows from crashed processes keep
+// blocking here until cleared by `squirrel runs fail` (#37).
 func RunPair(ctx context.Context, s *store.Store, rcl *Rclone, p Pair, opts Options) (Report, error) {
+	if err := ensureNoRunningSync(ctx, s, p); err != nil {
+		return Report{Volume: p.Volume.Name, Destination: p.TargetName()}, err
+	}
 	if p.IsNode() {
 		return SyncNode(ctx, s, rcl, p.Volume, p.Node, opts)
 	}
 	return Sync(ctx, s, rcl, p.Volume, p.Destination, opts)
+}
+
+// ensureNoRunningSync refuses when a kind='sync' row is already open
+// for (volume, target). A volume that has no DB row yet can have no
+// running sync, so a not-found lookup is silently tolerated — the
+// downstream requireIndexedVolume call will produce the more
+// informative "never been indexed" error. The query itself
+// (store.FindRunningSync) is shared with the agent's scheduler (#39)
+// so the CLI and the scheduler block on the same row.
+func ensureNoRunningSync(ctx context.Context, s *store.Store, p Pair) error {
+	v, err := s.GetVolumeByName(ctx, p.Volume.Name)
+	if err != nil {
+		if store.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("lookup volume %q: %w", p.Volume.Name, err)
+	}
+	target := p.TargetName()
+	r, err := s.FindRunningSync(ctx, v.ID, target)
+	if err != nil {
+		if store.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("check for running sync: %w", err)
+	}
+	return fmt.Errorf("sync of %s → %s already running (run=%d, started %s)",
+		p.Volume.Name, target, r.ID,
+		time.Unix(0, r.StartedAtNs).UTC().Format(time.RFC3339))
 }
 
 // Sync runs one (volume, destination) pair via rclone. It:

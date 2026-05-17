@@ -376,6 +376,26 @@ func (s *Store) CountMissingFilesByRun(ctx context.Context, runID int64) (int, e
 	return n, nil
 }
 
+// FindRunningSync returns the in-progress kind='sync' run for
+// (volumeID, destination), if any. The destination column is exact-match
+// — caller passes the bucket destination name or the peer node name, the
+// same string `BeginRun`/`BeginPeerSyncRun` recorded on the open row.
+// Returns sql.ErrNoRows when no such run exists. Lives on the store
+// rather than in the sync package so the agent's scheduler (#39) can
+// gate against the same concurrency check the CLI uses. Stale rows
+// (crashed runs that never reached FinishRun) keep matching here until
+// cleared via the `runs fail` companion command (#37).
+func (s *Store) FindRunningSync(ctx context.Context, volumeID int64, destination string) (Run, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT `+runColumns+`
+		FROM runs
+		WHERE kind = 'sync' AND status = 'running'
+		  AND volume_id = ? AND destination = ?
+		ORDER BY id LIMIT 1
+	`, volumeID, destination)
+	return scanRun(row.Scan)
+}
+
 // LatestSuccessfulIndexRun returns the most recent index run for the given
 // volume that finished in status 'success' or 'partial'. Used by the sync
 // command as a prerequisite check: refusing to sync a volume that has never
