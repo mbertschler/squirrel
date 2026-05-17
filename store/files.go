@@ -82,11 +82,18 @@ type rowScanner interface {
 // SELECT with this method instead of hand-rolling another field-by-field
 // list.
 func (r *FileRow) scanFrom(s rowScanner) error {
-	return s.Scan(
+	return s.Scan(r.scanDests()...)
+}
+
+// scanDests returns the per-column destination pointers in fileColumns
+// order. scanFrom delegates here; collectJoined appends the volume
+// pointers on top so files-half scanning still has one source of truth.
+func (r *FileRow) scanDests() []any {
+	return []any{
 		&r.VolumeID, &r.Path, &r.Blake3, &r.SizeBytes, &r.MtimeNs,
 		&r.Status, &r.FirstSeenRunID, &r.LastSeenRunID, &r.IndexedAtNs,
 		&r.SourceNodeID, &r.SourceRunID,
-	)
+	}
 }
 
 // insertArgs returns the row's column values in fileColumns order, ready
@@ -418,19 +425,15 @@ func (s *Store) ListMissing(ctx context.Context) ([]FileWithVolume, error) {
 }
 
 // collectJoined drains a SELECT that pulls joinedColumns into a slice of
-// FileWithVolume. The file half delegates to FileRow.scanFrom so files
-// queries keep one source of truth for column order; the volume half is
-// short enough to inline.
+// FileWithVolume. The file half routes through FileRow.scanDests so the
+// file-column order stays defined in a single place; the volume pointers
+// are appended after.
 func collectJoined(rows *sql.Rows) ([]FileWithVolume, error) {
 	var out []FileWithVolume
 	for rows.Next() {
 		var fv FileWithVolume
-		if err := rows.Scan(
-			&fv.File.VolumeID, &fv.File.Path, &fv.File.Blake3, &fv.File.SizeBytes,
-			&fv.File.MtimeNs, &fv.File.Status, &fv.File.FirstSeenRunID, &fv.File.LastSeenRunID, &fv.File.IndexedAtNs,
-			&fv.File.SourceNodeID, &fv.File.SourceRunID,
-			&fv.Volume.ID, &fv.Volume.Name, &fv.Volume.Path,
-		); err != nil {
+		dests := append(fv.File.scanDests(), &fv.Volume.ID, &fv.Volume.Name, &fv.Volume.Path)
+		if err := rows.Scan(dests...); err != nil {
 			return nil, err
 		}
 		out = append(out, fv)

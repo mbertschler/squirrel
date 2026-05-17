@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"time"
 )
@@ -30,8 +29,9 @@ type migration struct {
 
 // buildMigrations returns the ordered registry, with mctx-dependent
 // migrations bound via closure so each entry shares the uniform
-// `func(ctx, db) error` shape from the issue plan. The slice MUST stay
-// strictly ascending by version; runMigrations relies on that order.
+// `func(ctx, db) error` shape. The slice MUST stay strictly ascending by
+// version; runMigrations relies on that order and a guard inside the
+// loop rejects misordered slices before they run.
 func buildMigrations(mctx migrationCtx) []migration {
 	return []migration{
 		{version: 3, up: migrateV2ToV3},
@@ -355,21 +355,18 @@ func migrateV3ToV4(ctx context.Context, db *sql.DB) error {
 // widen the kind CHECK to include 'restore', and add the kind↔destination
 // coupling CHECK. Existing v4 rows are all kind='index' with a non-NULL
 // volume_id, so they carry over verbatim with destination = NULL.
+//
+// Rebuild of a *parent* table referenced by FKs from another table follows
+// the standard SQLite recipe: PRAGMA foreign_keys=OFF, rebuild, verify
+// with foreign_key_check, then PRAGMA foreign_keys=ON. A single Conn is
+// pinned so the PRAGMA applies to the same session that runs the
+// migration transaction.
 func migrateV4ToV5(ctx context.Context, db *sql.DB) error {
-	// Rebuild of a *parent* table referenced by FKs from another table.
-	// The standard SQLite recipe is: PRAGMA foreign_keys=OFF, rebuild,
-	// verify with foreign_key_check, then PRAGMA foreign_keys=ON. We pin a
-	// single Conn so the PRAGMA is guaranteed to apply to the same session
-	// that runs the migration transaction.
-	conn, err := db.Conn(ctx)
+	conn, restore, err := disableForeignKeys(ctx, db)
 	if err != nil {
-		return fmt.Errorf("acquire conn: %w", err)
+		return err
 	}
-	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
-		return fmt.Errorf("disable foreign keys: %w", err)
-	}
-	defer func() { _, _ = conn.ExecContext(ctx, `PRAGMA foreign_keys = ON`) }()
+	defer restore()
 
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
@@ -377,6 +374,34 @@ func migrateV4ToV5(ctx context.Context, db *sql.DB) error {
 	}
 	defer tx.Rollback()
 
+	if err := rebuildRunsTableV5(ctx, tx); err != nil {
+		return err
+	}
+	if err := verifyForeignKeysClean(ctx, tx, "v4→v5"); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// disableForeignKeys pins a Conn, turns FK enforcement off on it, and
+// returns a restore func the caller defers. The cleanup re-enables FKs
+// and releases the Conn even if the migration fails partway through.
+func disableForeignKeys(ctx context.Context, db *sql.DB) (*sql.Conn, func(), error) {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("acquire conn: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+		conn.Close()
+		return nil, nil, fmt.Errorf("disable foreign keys: %w", err)
+	}
+	return conn, func() {
+		_, _ = conn.ExecContext(ctx, `PRAGMA foreign_keys = ON`)
+		conn.Close()
+	}, nil
+}
+
+func rebuildRunsTableV5(ctx context.Context, tx *sql.Tx) error {
 	stmts := []string{
 		`CREATE TABLE runs_v5 (
 			id            INTEGER PRIMARY KEY,
@@ -411,19 +436,23 @@ func migrateV4ToV5(ctx context.Context, db *sql.DB) error {
 			return fmt.Errorf("rebuild runs: %w", err)
 		}
 	}
-	// foreign_key_check is the explicit verification step the SQLite docs
-	// require when rebuilding with FKs off: anything in violation surfaces
-	// here as a row, not at commit. With the run ids preserved by SELECT,
-	// existing references in files remain valid.
+	return nil
+}
+
+// verifyForeignKeysClean runs PRAGMA foreign_key_check inside tx — the
+// explicit verification step the SQLite docs require when rebuilding with
+// FKs off. Anything in violation surfaces here as a row, not at commit,
+// so the transaction can be rolled back before damage spreads.
+func verifyForeignKeysClean(ctx context.Context, tx *sql.Tx, label string) error {
 	rows, err := tx.QueryContext(ctx, `PRAGMA foreign_key_check`)
 	if err != nil {
 		return fmt.Errorf("foreign_key_check: %w", err)
 	}
 	defer rows.Close()
 	if rows.Next() {
-		return errors.New("v4→v5 left dangling FK references; refusing to commit")
+		return fmt.Errorf("%s left dangling FK references; refusing to commit", label)
 	}
-	return tx.Commit()
+	return nil
 }
 
 // --- v5 → v6 ---
