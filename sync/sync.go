@@ -404,8 +404,12 @@ func (p Pair) IsNode() bool { return p.Node != nil }
 // silently clobber the live volume unless explicitly pointed at it.
 // IncludeFromFile, when non-empty, is a path to a newline-delimited
 // listing of volume-relative paths and gets forwarded to rclone as
-// --files-from. Used by `restore --from <node>` to ship only that
-// node's source-attributed paths back to the local tree.
+// --files-from-raw. Used by `restore --from <node>` to ship only that
+// node's source-attributed paths back to the local tree. We use the
+// raw variant (matching sync/node.go's writeFilesFrom flow) so paths
+// beginning with `#`/`;` or with surrounding whitespace are passed
+// through verbatim — the processed --files-from mode would treat
+// those as comments or trim them.
 type RestoreOptions struct {
 	ToPath          string
 	Shallow         bool
@@ -486,7 +490,7 @@ func buildRestoreArgs(vol *config.Volume, dest *config.Destination, opts Restore
 		args = append(args, "--dry-run")
 	}
 	if opts.IncludeFromFile != "" {
-		args = append(args, "--files-from", opts.IncludeFromFile)
+		args = append(args, "--files-from-raw", opts.IncludeFromFile)
 	}
 	args = append(args, srcArg, dstArg)
 	return args

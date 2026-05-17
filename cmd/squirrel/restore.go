@@ -114,50 +114,65 @@ type restoreSourceFilter struct {
 // resolveRestoreTarget decides what `--from <name>` means: a node name
 // (returns a source filter, picks the destination from sync_to), a
 // destination name (returns the destination, no filter), or empty
-// (auto-picks the destination). Names are unique across both kinds per
-// config.Load, so a single Store lookup suffices.
+// (auto-picks the destination).
+//
+// Resolution checks both namespaces and errors on a tie so a
+// `node_name` matching a destination name can't silently steal
+// `--from <self-node>`: config.Load enforces uniqueness across
+// [nodes.X] and [destinations.X], but does not check the top-level
+// node_name. An honest collision is surfaced rather than picked one
+// way or the other.
 func resolveRestoreTarget(cmd *cobra.Command, s *store.Store, cfg *config.Config, vol *config.Volume, fromName string) (*config.Destination, restoreSourceFilter, error) {
 	if fromName == "" {
 		dest, err := pickSingleRestoreDestination(cfg, vol)
 		return dest, restoreSourceFilter{}, err
 	}
-	if dest, ok := cfg.Destinations[fromName]; ok {
-		if !slices.Contains(vol.SyncTo, fromName) {
-			return nil, restoreSourceFilter{}, fmt.Errorf("destination %q is not in sync_to for volume %q", fromName, vol.Name)
-		}
-		return dest, restoreSourceFilter{}, nil
-	}
-	filter, err := resolveRestoreNodeFilter(cmd, s, fromName)
+	filter, nodeFound, err := lookupNodeFilter(cmd, s, fromName)
 	if err != nil {
 		return nil, restoreSourceFilter{}, err
 	}
-	dest, err := pickSingleRestoreDestination(cfg, vol)
-	if err != nil {
-		return nil, restoreSourceFilter{}, fmt.Errorf("--from %q is a node name; %w", fromName, err)
+	destMatch, destOK := cfg.Destinations[fromName]
+	if nodeFound && destOK {
+		return nil, restoreSourceFilter{}, fmt.Errorf("--from %q is ambiguous: it names both a node (self or peer) and a destination — rename one to disambiguate", fromName)
 	}
-	return dest, filter, nil
+	if nodeFound {
+		dest, err := pickSingleRestoreDestination(cfg, vol)
+		if err != nil {
+			return nil, restoreSourceFilter{}, fmt.Errorf("--from %q is a node name; %w", fromName, err)
+		}
+		return dest, filter, nil
+	}
+	if destOK {
+		if !slices.Contains(vol.SyncTo, fromName) {
+			return nil, restoreSourceFilter{}, fmt.Errorf("destination %q is not in sync_to for volume %q", fromName, vol.Name)
+		}
+		return destMatch, restoreSourceFilter{}, nil
+	}
+	return nil, restoreSourceFilter{}, fmt.Errorf("--from %q matches neither a configured destination nor a known node", fromName)
 }
 
-// resolveRestoreNodeFilter mirrors resolveSourceFilter in query.go: the
-// self-node's name → NULL filter (local writes); a peer name → that
-// peer's id; anything else → an explicit error pointing at both
-// possibilities so the user knows which namespace failed.
-func resolveRestoreNodeFilter(cmd *cobra.Command, s *store.Store, name string) (restoreSourceFilter, error) {
+// lookupNodeFilter asks the store whether name refers to a node — the
+// self-row's name (NULL filter) or a peer row (filter by id). The
+// found flag distinguishes "not a node, try the next namespace" from
+// "node lookup itself failed" so the caller can keep the dispatch
+// flat. A surfaced error reflects an underlying store failure, not a
+// missing row.
+func lookupNodeFilter(cmd *cobra.Command, s *store.Store, name string) (restoreSourceFilter, bool, error) {
 	self, err := s.GetSelfNode(cmd.Context())
 	if err != nil {
-		return restoreSourceFilter{}, fmt.Errorf("lookup self node: %w", err)
+		return restoreSourceFilter{}, false, fmt.Errorf("lookup self node: %w", err)
 	}
 	if name == self.Name {
-		return restoreSourceFilter{active: true}, nil
+		return restoreSourceFilter{active: true}, true, nil
 	}
 	node, err := s.GetNodeByName(cmd.Context(), name)
 	if err != nil {
 		if store.IsNotFound(err) {
-			return restoreSourceFilter{}, fmt.Errorf("--from %q matches neither a configured destination nor a known node", name)
+			return restoreSourceFilter{}, false, nil
 		}
-		return restoreSourceFilter{}, fmt.Errorf("lookup node %q: %w", name, err)
+		return restoreSourceFilter{}, false, fmt.Errorf("lookup node %q: %w", name, err)
 	}
-	return restoreSourceFilter{active: true, nodeID: sql.NullInt64{Int64: node.ID, Valid: true}}, nil
+	return restoreSourceFilter{active: true, nodeID: sql.NullInt64{Int64: node.ID, Valid: true}}, true, nil
 }
 
 // pickSingleRestoreDestination resolves the destination when --from
