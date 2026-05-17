@@ -744,6 +744,172 @@ root = "/o"
 	}
 }
 
+// TestLoadVolumeCadenceSyncOnly covers `sync_every` standalone:
+// IndexEvery stays zero because the scheduler issue will treat that
+// as "the pre-sync indexing is enough".
+func TestLoadVolumeCadenceSyncOnly(t *testing.T) {
+	p := writeConfig(t, `
+[volumes.pictures]
+path       = "/p"
+sync_every = "1h"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	v := cfg.Volumes["pictures"]
+	if v.SyncEvery != time.Hour {
+		t.Fatalf("SyncEvery = %s, want 1h", v.SyncEvery)
+	}
+	if v.IndexEvery != 0 {
+		t.Fatalf("IndexEvery = %s, want 0 (unset)", v.IndexEvery)
+	}
+}
+
+// TestLoadVolumeCadenceIndexOnly covers `index_every` standalone — a
+// volume that is never auto-synced but is periodically re-indexed
+// for forensic history.
+func TestLoadVolumeCadenceIndexOnly(t *testing.T) {
+	p := writeConfig(t, `
+[volumes.pictures]
+path        = "/p"
+index_every = "15m"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	v := cfg.Volumes["pictures"]
+	if v.IndexEvery != 15*time.Minute {
+		t.Fatalf("IndexEvery = %s, want 15m", v.IndexEvery)
+	}
+	if v.SyncEvery != 0 {
+		t.Fatalf("SyncEvery = %s, want 0 (unset)", v.SyncEvery)
+	}
+}
+
+// TestLoadVolumeCadenceBoth covers the canonical happy-path combo
+// from the issue example: index between syncs, sync hourly.
+func TestLoadVolumeCadenceBoth(t *testing.T) {
+	p := writeConfig(t, `
+[volumes.pictures]
+path        = "/p"
+sync_every  = "1h"
+index_every = "15m"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	v := cfg.Volumes["pictures"]
+	if v.SyncEvery != time.Hour || v.IndexEvery != 15*time.Minute {
+		t.Fatalf("cadence = %s / %s, want 1h / 15m", v.SyncEvery, v.IndexEvery)
+	}
+}
+
+// TestLoadVolumeCadenceDefaults: omitting both leaves them zero, the
+// "manual only — agent does not auto-trigger" mode.
+func TestLoadVolumeCadenceDefaults(t *testing.T) {
+	p := writeConfig(t, `
+[volumes.pictures]
+path = "/p"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	v := cfg.Volumes["pictures"]
+	if v.SyncEvery != 0 || v.IndexEvery != 0 {
+		t.Fatalf("default cadence = %s / %s, want 0 / 0", v.SyncEvery, v.IndexEvery)
+	}
+}
+
+// TestLoadVolumeCadenceRejectsIndexNotStrictlyShorter covers the
+// strict inequality at the heart of the issue: index_every == or >
+// sync_every is meaningless given pre-sync indexing.
+func TestLoadVolumeCadenceRejectsIndexNotStrictlyShorter(t *testing.T) {
+	cases := []struct{ name, sync, index string }{
+		{"equal", "30m", "30m"},
+		{"longer", "10m", "1h"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := writeConfig(t, `
+[volumes.pictures]
+path        = "/p"
+sync_every  = "`+c.sync+`"
+index_every = "`+c.index+`"
+`)
+			_, err := Load(p)
+			if err == nil || !strings.Contains(err.Error(), "index_every must be strictly shorter than sync_every") {
+				t.Fatalf("error = %v, want strict-inequality error", err)
+			}
+		})
+	}
+}
+
+// TestLoadVolumeCadenceRejectsNonPositive: zero/negative durations
+// are configuration errors (the absent-key form is the only legitimate
+// way to mean "off").
+func TestLoadVolumeCadenceRejectsNonPositive(t *testing.T) {
+	cases := []struct{ name, field, value string }{
+		{"sync_zero", "sync_every", "0s"},
+		{"sync_negative", "sync_every", "-5m"},
+		{"index_zero", "index_every", "0"},
+		{"index_negative", "index_every", "-1h"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := writeConfig(t, `
+[volumes.pictures]
+path = "/p"
+`+c.field+` = "`+c.value+`"
+`)
+			_, err := Load(p)
+			if err == nil || !strings.Contains(err.Error(), c.field) || !strings.Contains(err.Error(), "positive") {
+				t.Fatalf("error = %v, want %s positive-duration error", err, c.field)
+			}
+		})
+	}
+}
+
+// TestLoadVolumeCadenceRejectsBelowFloor catches the unit-typo class —
+// `5` (no suffix) parses to 5ns, which the floor (>= 1s) rejects.
+func TestLoadVolumeCadenceRejectsBelowFloor(t *testing.T) {
+	p := writeConfig(t, `
+[volumes.pictures]
+path       = "/p"
+sync_every = "500ms"
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "at least 1s") {
+		t.Fatalf("error = %v, want floor error", err)
+	}
+}
+
+// TestLoadVolumeCadenceRejectsUnparseable: any string time.ParseDuration
+// can't decode must surface as a load-time error rather than being
+// silently dropped to zero.
+func TestLoadVolumeCadenceRejectsUnparseable(t *testing.T) {
+	cases := []struct{ name, field, value string }{
+		{"sync_garbage", "sync_every", "tomorrow"},
+		{"index_no_unit", "index_every", "fifteen-minutes"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := writeConfig(t, `
+[volumes.pictures]
+path = "/p"
+`+c.field+` = "`+c.value+`"
+`)
+			_, err := Load(p)
+			if err == nil || !strings.Contains(err.Error(), c.field) {
+				t.Fatalf("error = %v, want %s parse error", err, c.field)
+			}
+		})
+	}
+}
+
 func TestMissingErrorWrappingChain(t *testing.T) {
 	// MissingError must be detectable both via IsMissing and errors.As so
 	// callers can choose either ergonomic form.
