@@ -18,8 +18,9 @@ import (
 // newScanServer returns a Server with one volume rooted under a fresh
 // temp directory plus the store backing it. Tests drive the audit
 // loop one tick at a time via runScanTick, keeping wall-clock
-// dependencies out of the assertions.
-func newScanServer(t *testing.T, strategy string) (*Server, *store.Store, *config.Volume) {
+// dependencies out of the assertions. ScanStrategy defaults to
+// shallow; tests that need deep mutate srv.cfg.ScanStrategy directly.
+func newScanServer(t *testing.T) (*Server, *store.Store, *config.Volume) {
 	t.Helper()
 	volRoot := t.TempDir()
 	vol := &config.Volume{Name: "pics", Path: volRoot}
@@ -36,7 +37,7 @@ func newScanServer(t *testing.T, strategy string) (*Server, *store.Store, *confi
 		Version:      "test",
 		Volumes:      map[string]*config.Volume{vol.Name: vol},
 		ScanInterval: 0, // tests drive runScanTick directly
-		ScanStrategy: strategy,
+		ScanStrategy: ScanStrategyShallow,
 	}, s)
 	if err != nil {
 		t.Fatalf("daemon.New: %v", err)
@@ -49,7 +50,7 @@ func newScanServer(t *testing.T, strategy string) (*Server, *store.Store, *confi
 // tick records an `audit` run, supersedes the prior row, and inserts
 // a fresh present row at the new digest.
 func TestScanTickRecordsAuditRun(t *testing.T) {
-	srv, s, vol := newScanServer(t, ScanStrategyShallow)
+	srv, s, vol := newScanServer(t)
 	ctx := context.Background()
 
 	target := filepath.Join(vol.Path, "doc.md")
@@ -138,7 +139,7 @@ func TestScanTickRecordsAuditRun(t *testing.T) {
 // tick arriving while a sync is in flight logs a skip and leaves
 // state alone — no audit run row materialises for the locked volume.
 func TestScanTickSkipsLockedVolume(t *testing.T) {
-	srv, s, vol := newScanServer(t, ScanStrategyShallow)
+	srv, s, vol := newScanServer(t)
 	ctx := context.Background()
 
 	// First, plant a volume row + one file so the scan has something
@@ -183,7 +184,7 @@ func TestScanTickSkipsLockedVolume(t *testing.T) {
 // cleanly. Goroutine leak detection in the test harness catches a
 // regression where ctx.Done() isn't honoured.
 func TestScanLoopRespectsContextCancellation(t *testing.T) {
-	srv, _, _ := newScanServer(t, ScanStrategyShallow)
+	srv, _, _ := newScanServer(t)
 	srv.cfg.ScanInterval = 10 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -218,7 +219,7 @@ func TestScanLoopRespectsContextCancellation(t *testing.T) {
 // listener exists only to satisfy Serve's signature; we don't issue
 // HTTP requests.
 func TestServeIntegratesScanLoop(t *testing.T) {
-	srv, _, vol := newScanServer(t, ScanStrategyShallow)
+	srv, _, vol := newScanServer(t)
 	srv.cfg.ScanInterval = 25 * time.Millisecond
 	if err := os.WriteFile(filepath.Join(vol.Path, "a.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
