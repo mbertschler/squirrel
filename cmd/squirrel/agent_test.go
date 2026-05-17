@@ -13,11 +13,13 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mbertschler/squirrel/store"
 )
 
 // reservePort claims a free localhost port via the kernel then releases
-// it; we feed the resulting "127.0.0.1:N" string to the daemon's `listen`
-// config. There is a tiny race between the close here and the daemon's
+// it; we feed the resulting "127.0.0.1:N" string to the agent's `listen`
+// config. There is a tiny race between the close here and the agent's
 // bind, but it's the standard pattern and is good enough for these
 // end-to-end smoke tests.
 func reservePort(t *testing.T) string {
@@ -33,13 +35,13 @@ func reservePort(t *testing.T) string {
 	return addr
 }
 
-// startDaemonCLI runs the cobra root with `daemon` in a goroutine. It
-// returns a cancel function (which terminates the daemon and waits for
+// startAgentCLI runs the cobra root with `agent` in a goroutine. It
+// returns a cancel function (which terminates the agent and waits for
 // graceful shutdown) and the listen address derived from the supplied
 // config. The captured stdout/stderr buffer is kept inside the closure
-// so failure messages still surface the daemon's own output, but
+// so failure messages still surface the agent's own output, but
 // callers don't need it directly.
-func startDaemonCLI(t *testing.T, configPath string) (cancel func(), addr string) {
+func startAgentCLI(t *testing.T, configPath string) (cancel func(), addr string) {
 	t.Helper()
 	isolateConfig(t)
 	ctx, c := context.WithCancel(context.Background())
@@ -47,7 +49,7 @@ func startDaemonCLI(t *testing.T, configPath string) (cancel func(), addr string
 	root := newRootCmd()
 	root.SetOut(buf)
 	root.SetErr(buf)
-	root.SetArgs([]string{"--config", configPath, "daemon"})
+	root.SetArgs([]string{"--config", configPath, "agent"})
 
 	done := make(chan error, 1)
 	go func() { done <- root.ExecuteContext(ctx) }()
@@ -58,10 +60,10 @@ func startDaemonCLI(t *testing.T, configPath string) (cancel func(), addr string
 		select {
 		case err := <-done:
 			if err != nil {
-				t.Fatalf("daemon exited with error: %v\noutput:\n%s", err, buf.String())
+				t.Fatalf("agent exited with error: %v\noutput:\n%s", err, buf.String())
 			}
 		case <-time.After(5 * time.Second):
-			t.Fatalf("daemon did not shut down within timeout\noutput:\n%s", buf.String())
+			t.Fatalf("agent did not shut down within timeout\noutput:\n%s", buf.String())
 		}
 	}, addr
 }
@@ -70,7 +72,7 @@ func waitForBanner(t *testing.T, buf *bytes.Buffer) string {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if rest, ok := strings.CutPrefix(buf.String(), "squirrel daemon listening on "); ok {
+		if rest, ok := strings.CutPrefix(buf.String(), "squirrel agent listening on "); ok {
 			// banner: "<scheme>://<addr> (version <v>)\n"
 			line, _, _ := strings.Cut(rest, "\n")
 			schemeAndAddr, _, _ := strings.Cut(line, " ")
@@ -81,26 +83,26 @@ func waitForBanner(t *testing.T, buf *bytes.Buffer) string {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("daemon banner never appeared:\n%s", buf.String())
+	t.Fatalf("agent banner never appeared:\n%s", buf.String())
 	return ""
 }
 
-func writeDaemonConfig(t *testing.T, listen, token string) string {
+func writeAgentConfig(t *testing.T, listen, token string) string {
 	t.Helper()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "index.db")
 	configPath := filepath.Join(dir, "config.toml")
-	body := fmt.Sprintf("db = %q\n\n[daemon]\nlisten = %q\nauth = { token = %q }\n", dbPath, listen, token)
+	body := fmt.Sprintf("db = %q\n\n[agent]\nlisten = %q\nauth = { token = %q }\n", dbPath, listen, token)
 	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 	return configPath
 }
 
-func TestCLIDaemonHealthEndpoint(t *testing.T) {
+func TestCLIAgentHealthEndpoint(t *testing.T) {
 	listen := reservePort(t)
-	cfgPath := writeDaemonConfig(t, listen, "the-token")
-	stop, addr := startDaemonCLI(t, cfgPath)
+	cfgPath := writeAgentConfig(t, listen, "the-token")
+	stop, addr := startAgentCLI(t, cfgPath)
 	defer stop()
 
 	resp, err := http.Get("http://" + addr + "/v1/health")
@@ -126,10 +128,10 @@ func TestCLIDaemonHealthEndpoint(t *testing.T) {
 	}
 }
 
-func TestCLIDaemonSyncRequiresBearer(t *testing.T) {
+func TestCLIAgentSyncRequiresBearer(t *testing.T) {
 	listen := reservePort(t)
-	cfgPath := writeDaemonConfig(t, listen, "secret-token")
-	stop, addr := startDaemonCLI(t, cfgPath)
+	cfgPath := writeAgentConfig(t, listen, "secret-token")
+	stop, addr := startAgentCLI(t, cfgPath)
 	defer stop()
 
 	// No auth → 401.
@@ -157,8 +159,8 @@ func TestCLIDaemonSyncRequiresBearer(t *testing.T) {
 	}
 }
 
-func TestCLIDaemonErrorsWhenBlockMissing(t *testing.T) {
-	// Config exists but lacks [daemon]: the subcommand surfaces the
+func TestCLIAgentErrorsWhenBlockMissing(t *testing.T) {
+	// Config exists but lacks [agent]: the subcommand surfaces the
 	// config path so the user knows where to add it.
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "index.db")
@@ -167,16 +169,52 @@ func TestCLIDaemonErrorsWhenBlockMissing(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := runCLIExpectErr(t, "--config", configPath, "daemon")
-	if !strings.Contains(err.Error(), "no [daemon] block in") {
-		t.Fatalf("expected missing-daemon-block error, got %v", err)
+	_, err := runCLIExpectErr(t, "--config", configPath, "agent")
+	if !strings.Contains(err.Error(), "no [agent] block in") {
+		t.Fatalf("expected missing-agent-block error, got %v", err)
 	}
 }
 
-func TestCLIDaemonRequiresConfig(t *testing.T) {
+func TestCLIAgentRequiresConfig(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "no-config.toml")
-	_, err := runCLIExpectErr(t, "--config", missing, "daemon")
+	_, err := runCLIExpectErr(t, "--config", missing, "agent")
 	if !strings.Contains(err.Error(), "no config at") {
 		t.Fatalf("expected missing-config error, got %v", err)
+	}
+}
+
+// TestCLIAgentSeedsConfiguredNodeName guards openAgentStore plumbing
+// `node_name` through to the store on first-DB seed. A fresh agent
+// run against a configured DB used to drop the name (calling
+// store.Open instead of OpenWithOptions) and seed the self row from
+// os.Hostname(), so the receiver advertised the wrong identity on
+// /v1/sync/begin.
+func TestCLIAgentSeedsConfiguredNodeName(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "index.db")
+	cfgPath := filepath.Join(dir, "config.toml")
+	listen := reservePort(t)
+	body := fmt.Sprintf(
+		"db = %q\nnode_name = %q\n\n[agent]\nlisten = %q\nauth = { token = %q }\n",
+		dbPath, "configured-name", listen, "tok")
+	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	stop, _ := startAgentCLI(t, cfgPath)
+	// Cancel the CLI so its defer s.Close() runs before we reopen.
+	stop()
+
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer s.Close()
+	self, err := s.GetSelfNode(context.Background())
+	if err != nil {
+		t.Fatalf("GetSelfNode: %v", err)
+	}
+	if self.Name != "configured-name" {
+		t.Fatalf("self node name = %q, want %q (os.Hostname leak from store.Open path)",
+			self.Name, "configured-name")
 	}
 }

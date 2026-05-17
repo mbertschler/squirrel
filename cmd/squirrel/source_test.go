@@ -13,7 +13,7 @@ import (
 // sourceFixture lays out a config with a `pics` volume, indexes a few
 // files, then injects synthetic peer-attribution rows directly into
 // the store so the read-side CLI can be exercised without a full
-// daemon round-trip. The peer's name is "peer-a"; the self-node's
+// agent round-trip. The peer's name is "peer-a"; the self-node's
 // name comes from the config's `node_name = "self-host"`.
 type sourceFixture struct {
 	configPath string

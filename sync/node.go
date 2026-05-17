@@ -31,7 +31,7 @@ const nodeSyncRetries = 2
 // flow described in issue #18. It mirrors Sync's shape — same Report,
 // same runs-row lifecycle, same prerequisite that the source volume
 // is indexed — but instead of invoking rclone directly against a
-// passive bucket it negotiates a plan with the receiver daemon and
+// passive bucket it negotiates a plan with the receiver agent and
 // runs rclone strictly between /plan and /verify, with --backup-dir
 // elided (the receiver pre-moves prior bytes itself).
 func SyncNode(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, node *config.Node, opts Options) (rep Report, err error) {
@@ -355,7 +355,7 @@ func buildTransport(n *config.Node) *http.Transport {
 	tr.TLSClientConfig = &tls.Config{
 		// We do our own verification below; skip the default chain
 		// check because pin-trust is the contract for self-signed
-		// LAN daemons.
+		// LAN agents.
 		InsecureSkipVerify: true, // #nosec G402 -- pinned via VerifyConnection
 		VerifyConnection: func(cs tls.ConnectionState) error {
 			if len(cs.PeerCertificates) == 0 {
@@ -458,7 +458,7 @@ func pathsInScope(plan syncproto.PlanResponse) []string {
 
 // failingPaths flattens the verify response's mismatched + missing
 // lists into a single retry scope. Unexpected paths aren't retried —
-// they're a daemon-side accounting issue, not something we can fix
+// they're an agent-side accounting issue, not something we can fix
 // from the initiator.
 func failingPaths(r syncproto.VerifyResponse) []string {
 	out := make([]string, 0, len(r.Mismatched)+len(r.Missing))

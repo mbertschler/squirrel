@@ -54,9 +54,9 @@ type Config struct {
 	// collide with an entry in Destinations — the syntactic split is the
 	// dispatch signal for sync.
 	Nodes map[string]*Node
-	// Daemon is non-nil when the config declares a `[daemon]` block. The
-	// daemon subcommand requires it; other subcommands ignore it.
-	Daemon *Daemon
+	// Agent is non-nil when the config declares an `[agent]` block. The
+	// agent subcommand requires it; other subcommands ignore it.
+	Agent *Agent
 }
 
 // Volume is one indexable root.
@@ -136,7 +136,7 @@ type rawConfig struct {
 	Volumes      map[string]rawVolume      `toml:"volumes"`
 	Destinations map[string]map[string]any `toml:"destinations"`
 	Nodes        map[string]rawNode        `toml:"nodes"`
-	Daemon       *rawDaemon                `toml:"daemon"`
+	Agent        *rawAgent                 `toml:"agent"`
 }
 
 type rawVolume struct {
@@ -188,12 +188,12 @@ func (r *rawConfig) resolve(path string) (*Config, error) {
 		}
 		cfg.Volumes[name] = vol
 	}
-	if r.Daemon != nil {
-		d, err := resolveDaemon(r.Daemon)
+	if r.Agent != nil {
+		a, err := resolveAgent(r.Agent)
 		if err != nil {
-			return nil, fmt.Errorf("daemon: %w", err)
+			return nil, fmt.Errorf("agent: %w", err)
 		}
-		cfg.Daemon = d
+		cfg.Agent = a
 	}
 	return cfg, nil
 }

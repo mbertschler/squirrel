@@ -1,4 +1,4 @@
-package daemon
+package agent
 
 import (
 	"context"
@@ -25,7 +25,7 @@ import (
 )
 
 // openTestStore builds a fresh on-disk SQLite database in t.TempDir.
-// The daemon's health endpoint reads schema_version from it, so we need
+// The agent's health endpoint reads schema_version from it, so we need
 // a migrated DB even when the test doesn't write file rows.
 func openTestStore(t *testing.T) *store.Store {
 	t.Helper()
@@ -51,7 +51,7 @@ func newTestServer(t *testing.T, cfg Config) *Server {
 	}
 	s, err := New(cfg, openTestStore(t))
 	if err != nil {
-		t.Fatalf("daemon.New: %v", err)
+		t.Fatalf("agent.New: %v", err)
 	}
 	return s
 }

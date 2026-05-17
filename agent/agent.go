@@ -1,13 +1,14 @@
-// Package daemon implements the squirrel HTTP daemon: the server-side
-// component a peer node runs so another node can sync against it.
+// Package agent implements the squirrel agent: the long-running
+// process that hosts the peer-sync HTTP server and the drift-detection
+// scheduler.
 //
-// This package owns the transport layer only — bearer-token auth, TLS
-// termination, the public API surface, the health endpoint. Sync logic
-// (plan negotiation, reconciliation, peer state) lives in higher-level
-// packages and is wired in via future endpoints; the placeholder POST
-// /v1/plan handler returns 501 so the auth middleware has something to
-// guard in tests until that lands.
-package daemon
+// The HTTP surface terminates bearer-token auth and (optionally) TLS,
+// serves the /v1/health endpoint, and handles the four /v1/sync/*
+// peer-sync routes (begin, plan, verify, close). The scheduler walks
+// every configured volume on ScanInterval and writes an `audit`-kind
+// run, sharing the per-volume lock with the sync routes so audit and
+// sync never overlap on the same volume.
+package agent
 
 import (
 	"crypto/sha256"
@@ -31,7 +32,7 @@ const (
 	ScanStrategyDeep    = "deep"
 )
 
-// Config configures one daemon listener. Fields are validated by New; all
+// Config configures one agent listener. Fields are validated by New; all
 // of them are required except TLSCert/TLSKey (which must be set together
 // or not at all — empty pair means plain HTTP).
 type Config struct {
@@ -41,11 +42,11 @@ type Config struct {
 	// against the Authorization header on every authenticated request.
 	Token string
 	// TLSCert and TLSKey are filesystem paths to a PEM-encoded certificate
-	// and matching private key. When both are empty the daemon serves
+	// and matching private key. When both are empty the agent serves
 	// plain HTTP; when both are set it terminates TLS natively.
 	TLSCert string
 	TLSKey  string
-	// Version is the daemon binary version reported via /v1/health.
+	// Version is the agent binary version reported via /v1/health.
 	// Required so the field is never an unset zero-value in responses.
 	Version string
 	// Volumes maps volume name → resolved config-side volume. The
@@ -56,7 +57,7 @@ type Config struct {
 	Volumes map[string]*config.Volume
 	// ScanInterval is the period between drift-detection passes over
 	// every hosted volume (#17). Zero (default) disables the
-	// scheduler; the daemon then only re-hashes during peer syncs.
+	// scheduler; the agent then only re-hashes during peer syncs.
 	ScanInterval time.Duration
 	// ScanStrategy selects the per-tick rehash policy:
 	// ScanStrategyShallow (the default; equivalent to today's
@@ -72,7 +73,7 @@ type Config struct {
 	ScanLogger io.Writer
 }
 
-// Server is one daemon instance. It holds the HTTP handler stack and a
+// Server is one agent instance. It holds the HTTP handler stack and a
 // reference to the underlying store for the health endpoint's
 // schema_version field; future endpoints (plan, reconcile, ...) will use
 // the same handle. The router is kept as a field so the scan scheduler
@@ -93,7 +94,7 @@ func New(cfg Config, s *store.Store) (*Server, error) {
 		return nil, err
 	}
 	if s == nil {
-		return nil, errors.New("daemon: store must not be nil")
+		return nil, errors.New("agent: store must not be nil")
 	}
 	srv := &Server{cfg: cfg, store: s}
 	srv.handler = srv.buildHandler()
@@ -104,7 +105,7 @@ func New(cfg Config, s *store.Store) (*Server, error) {
 // net/http/httptest without going through the network stack.
 func (s *Server) Handler() http.Handler { return s.handler }
 
-// HasTLS reports whether the configured daemon serves TLS. The CLI uses
+// HasTLS reports whether the configured agent serves TLS. The CLI uses
 // this for the startup banner; tests use it to decide which scheme to
 // dial.
 func (s *Server) HasTLS() bool { return s.cfg.TLSCert != "" }
@@ -116,31 +117,31 @@ func (s *Server) Addr() string { return s.cfg.Listen }
 
 func validateConfig(cfg Config) error {
 	if cfg.Listen == "" {
-		return errors.New("daemon: Config.Listen is required")
+		return errors.New("agent: Config.Listen is required")
 	}
 	if cfg.Token == "" {
-		return errors.New("daemon: Config.Token is required")
+		return errors.New("agent: Config.Token is required")
 	}
 	if (cfg.TLSCert == "") != (cfg.TLSKey == "") {
-		return errors.New("daemon: Config.TLSCert and Config.TLSKey must be set together")
+		return errors.New("agent: Config.TLSCert and Config.TLSKey must be set together")
 	}
 	if cfg.Version == "" {
-		return errors.New("daemon: Config.Version is required")
+		return errors.New("agent: Config.Version is required")
 	}
 	if cfg.ScanInterval < 0 {
-		return errors.New("daemon: Config.ScanInterval must not be negative")
+		return errors.New("agent: Config.ScanInterval must not be negative")
 	}
 	switch cfg.ScanStrategy {
 	case "", ScanStrategyShallow, ScanStrategyDeep:
 	default:
-		return errors.New("daemon: Config.ScanStrategy must be \"shallow\" or \"deep\"")
+		return errors.New("agent: Config.ScanStrategy must be \"shallow\" or \"deep\"")
 	}
 	return nil
 }
 
 // buildHandler wires the route table. /v1/health is intentionally outside
 // the auth wrapper so monitoring scripts can reach it without holding the
-// daemon's bearer token; every other route is wrapped individually so the
+// agent's bearer token; every other route is wrapped individually so the
 // pattern is obvious at the route declaration.
 func (s *Server) buildHandler() http.Handler {
 	mux := http.NewServeMux()

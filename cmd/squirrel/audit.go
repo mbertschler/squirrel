@@ -13,7 +13,7 @@ import (
 )
 
 // newAuditCmd returns the `squirrel audit [<volume>] [--deep]` cobra
-// command. It is the one-shot equivalent of the daemon's scheduled
+// command. It is the one-shot equivalent of the agent's scheduled
 // drift scan (#17): same code path (an index walk tagged with
 // kind='audit'), just driven by the operator instead of a ticker.
 //

@@ -404,40 +404,40 @@ path = "/tmp/pictures"
 	}
 }
 
-func TestLoadDaemonBlock(t *testing.T) {
-	t.Setenv("SQUIRREL_DAEMON_TOKEN", "s3cret")
+func TestLoadAgentBlock(t *testing.T) {
+	t.Setenv("SQUIRREL_AGENT_TOKEN", "s3cret")
 	p := writeConfig(t, `
-[daemon]
+[agent]
 listen = "0.0.0.0:8443"
 db     = "/var/db/squirrel.db"
 tls    = { cert = "/etc/squirrel/cert.pem", key = "/etc/squirrel/key.pem" }
-auth   = { token = { env = "SQUIRREL_DAEMON_TOKEN" } }
+auth   = { token = { env = "SQUIRREL_AGENT_TOKEN" } }
 `)
 	cfg, err := Load(p)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Daemon == nil {
-		t.Fatalf("Daemon block not parsed")
+	if cfg.Agent == nil {
+		t.Fatalf("Agent block not parsed")
 	}
-	if cfg.Daemon.Listen != "0.0.0.0:8443" {
-		t.Fatalf("Listen = %q", cfg.Daemon.Listen)
+	if cfg.Agent.Listen != "0.0.0.0:8443" {
+		t.Fatalf("Listen = %q", cfg.Agent.Listen)
 	}
-	if cfg.Daemon.DB != "/var/db/squirrel.db" {
-		t.Fatalf("DB = %q", cfg.Daemon.DB)
+	if cfg.Agent.DB != "/var/db/squirrel.db" {
+		t.Fatalf("DB = %q", cfg.Agent.DB)
 	}
-	if cfg.Daemon.TLSCert != "/etc/squirrel/cert.pem" || cfg.Daemon.TLSKey != "/etc/squirrel/key.pem" {
-		t.Fatalf("TLS pair = %q / %q", cfg.Daemon.TLSCert, cfg.Daemon.TLSKey)
+	if cfg.Agent.TLSCert != "/etc/squirrel/cert.pem" || cfg.Agent.TLSKey != "/etc/squirrel/key.pem" {
+		t.Fatalf("TLS pair = %q / %q", cfg.Agent.TLSCert, cfg.Agent.TLSKey)
 	}
-	if cfg.Daemon.Token != "s3cret" {
-		t.Fatalf("Token = %q, want resolved literal", cfg.Daemon.Token)
+	if cfg.Agent.Token != "s3cret" {
+		t.Fatalf("Token = %q, want resolved literal", cfg.Agent.Token)
 	}
 }
 
-func TestLoadDaemonMinimalNoTLS(t *testing.T) {
-	// No `[daemon.tls]` is the plain-HTTP path: TLSCert/TLSKey both empty.
+func TestLoadAgentMinimalNoTLS(t *testing.T) {
+	// No `[agent.tls]` is the plain-HTTP path: TLSCert/TLSKey both empty.
 	p := writeConfig(t, `
-[daemon]
+[agent]
 listen = "127.0.0.1:9000"
 auth   = { token = "literal-token" }
 `)
@@ -445,22 +445,22 @@ auth   = { token = "literal-token" }
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Daemon == nil {
-		t.Fatalf("Daemon block not parsed")
+	if cfg.Agent == nil {
+		t.Fatalf("Agent block not parsed")
 	}
-	if cfg.Daemon.TLSCert != "" || cfg.Daemon.TLSKey != "" {
-		t.Fatalf("expected no TLS, got %q / %q", cfg.Daemon.TLSCert, cfg.Daemon.TLSKey)
+	if cfg.Agent.TLSCert != "" || cfg.Agent.TLSKey != "" {
+		t.Fatalf("expected no TLS, got %q / %q", cfg.Agent.TLSCert, cfg.Agent.TLSKey)
 	}
-	if cfg.Daemon.Token != "literal-token" {
-		t.Fatalf("Token = %q", cfg.Daemon.Token)
+	if cfg.Agent.Token != "literal-token" {
+		t.Fatalf("Token = %q", cfg.Agent.Token)
 	}
 }
 
-func TestLoadDaemonMissingToken(t *testing.T) {
-	// auth = { } without a token must fail — an open daemon port is a
+func TestLoadAgentMissingToken(t *testing.T) {
+	// auth = { } without a token must fail — an open agent port is a
 	// footgun even in lab setups, so we refuse to start one.
 	p := writeConfig(t, `
-[daemon]
+[agent]
 listen = "127.0.0.1:9000"
 auth   = { }
 `)
@@ -470,9 +470,9 @@ auth   = { }
 	}
 }
 
-func TestLoadDaemonMissingListen(t *testing.T) {
+func TestLoadAgentMissingListen(t *testing.T) {
 	p := writeConfig(t, `
-[daemon]
+[agent]
 auth = { token = "x" }
 `)
 	_, err := Load(p)
@@ -481,11 +481,11 @@ auth = { token = "x" }
 	}
 }
 
-func TestLoadDaemonPartialTLS(t *testing.T) {
+func TestLoadAgentPartialTLS(t *testing.T) {
 	// One half of the cert/key pair must imply the other — partial TLS is
 	// almost certainly a typo.
 	p := writeConfig(t, `
-[daemon]
+[agent]
 listen = "127.0.0.1:9000"
 tls    = { cert = "/x.pem" }
 auth   = { token = "t" }
@@ -496,10 +496,10 @@ auth   = { token = "t" }
 	}
 }
 
-func TestLoadDaemonRejectsUnknownField(t *testing.T) {
-	// Strict per-field validation against typos in the [daemon] block.
+func TestLoadAgentRejectsUnknownField(t *testing.T) {
+	// Strict per-field validation against typos in the [agent] block.
 	p := writeConfig(t, `
-[daemon]
+[agent]
 listen      = "127.0.0.1:9000"
 auth        = { token = "t" }
 lisetnaddr  = "oops"
@@ -510,8 +510,8 @@ lisetnaddr  = "oops"
 	}
 }
 
-func TestLoadDaemonAbsent(t *testing.T) {
-	// Config without [daemon] is fine — only the daemon subcommand needs it.
+func TestLoadAgentAbsent(t *testing.T) {
+	// Config without [agent] is fine — only the agent subcommand needs it.
 	p := writeConfig(t, `
 [volumes.x]
 path = "/x"
@@ -520,18 +520,18 @@ path = "/x"
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Daemon != nil {
-		t.Fatalf("Daemon should be nil when block is absent")
+	if cfg.Agent != nil {
+		t.Fatalf("Agent should be nil when block is absent")
 	}
 }
 
-// TestLoadDaemonScanInterval parses the optional drift-detection
+// TestLoadAgentScanInterval parses the optional drift-detection
 // knobs and verifies (a) duration string parses round-trip,
 // (b) absent ScanInterval leaves the field zero (scheduler disabled),
 // and (c) ScanStrategy defaults to "shallow" when unspecified.
-func TestLoadDaemonScanInterval(t *testing.T) {
+func TestLoadAgentScanInterval(t *testing.T) {
 	p := writeConfig(t, `
-[daemon]
+[agent]
 listen        = "127.0.0.1:9000"
 auth          = { token = "t" }
 scan_interval = "30m"
@@ -541,17 +541,17 @@ scan_strategy = "deep"
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Daemon.ScanInterval != 30*time.Minute {
-		t.Fatalf("ScanInterval = %s, want 30m", cfg.Daemon.ScanInterval)
+	if cfg.Agent.ScanInterval != 30*time.Minute {
+		t.Fatalf("ScanInterval = %s, want 30m", cfg.Agent.ScanInterval)
 	}
-	if cfg.Daemon.ScanStrategy != ScanStrategyDeep {
-		t.Fatalf("ScanStrategy = %q, want %q", cfg.Daemon.ScanStrategy, ScanStrategyDeep)
+	if cfg.Agent.ScanStrategy != ScanStrategyDeep {
+		t.Fatalf("ScanStrategy = %q, want %q", cfg.Agent.ScanStrategy, ScanStrategyDeep)
 	}
 }
 
-func TestLoadDaemonScanDefaults(t *testing.T) {
+func TestLoadAgentScanDefaults(t *testing.T) {
 	p := writeConfig(t, `
-[daemon]
+[agent]
 listen = "127.0.0.1:9000"
 auth   = { token = "t" }
 `)
@@ -559,17 +559,17 @@ auth   = { token = "t" }
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Daemon.ScanInterval != 0 {
-		t.Fatalf("default ScanInterval = %s, want 0", cfg.Daemon.ScanInterval)
+	if cfg.Agent.ScanInterval != 0 {
+		t.Fatalf("default ScanInterval = %s, want 0", cfg.Agent.ScanInterval)
 	}
-	if cfg.Daemon.ScanStrategy != ScanStrategyShallow {
-		t.Fatalf("default ScanStrategy = %q, want %q", cfg.Daemon.ScanStrategy, ScanStrategyShallow)
+	if cfg.Agent.ScanStrategy != ScanStrategyShallow {
+		t.Fatalf("default ScanStrategy = %q, want %q", cfg.Agent.ScanStrategy, ScanStrategyShallow)
 	}
 }
 
-func TestLoadDaemonRejectsBadScanStrategy(t *testing.T) {
+func TestLoadAgentRejectsBadScanStrategy(t *testing.T) {
 	p := writeConfig(t, `
-[daemon]
+[agent]
 listen        = "127.0.0.1:9000"
 auth          = { token = "t" }
 scan_strategy = "fancy"
@@ -580,9 +580,9 @@ scan_strategy = "fancy"
 	}
 }
 
-func TestLoadDaemonRejectsBadScanInterval(t *testing.T) {
+func TestLoadAgentRejectsBadScanInterval(t *testing.T) {
 	p := writeConfig(t, `
-[daemon]
+[agent]
 listen        = "127.0.0.1:9000"
 auth          = { token = "t" }
 scan_interval = "not-a-duration"

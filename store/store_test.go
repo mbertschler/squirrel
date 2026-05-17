@@ -2128,7 +2128,7 @@ func TestFileRowScanInsertRoundTrip(t *testing.T) {
 // at the original path goes 'superseded' and a new 'present' row
 // appears at the conflict path carrying the prior blake3 + the
 // supplied provenance. Both halves must be visible together — the
-// transaction guarantee is what protects against a daemon crash
+// transaction guarantee is what protects against an agent crash
 // between the two updates.
 func TestRecordConflictPreStageAtomic(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "test.db"))

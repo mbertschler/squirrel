@@ -1,4 +1,4 @@
-package daemon
+package agent
 
 import (
 	"bytes"
@@ -40,7 +40,7 @@ func newScanServer(t *testing.T) (*Server, *store.Store, *config.Volume) {
 		ScanStrategy: ScanStrategyShallow,
 	}, s)
 	if err != nil {
-		t.Fatalf("daemon.New: %v", err)
+		t.Fatalf("agent.New: %v", err)
 	}
 	return srv, s, vol
 }
@@ -213,7 +213,7 @@ func TestScanLoopRespectsContextCancellation(t *testing.T) {
 	}
 }
 
-// TestServeIntegratesScanLoop ties the scan loop into the daemon's
+// TestServeIntegratesScanLoop ties the scan loop into the agent's
 // Serve method: with ScanInterval set, the loop fires while the HTTP
 // server is up, and a context cancel cleans both up together. The
 // listener exists only to satisfy Serve's signature; we don't issue
@@ -265,7 +265,7 @@ func TestServeIntegratesScanLoop(t *testing.T) {
 	}
 }
 
-// TestNewRejectsBadScanConfig validates the daemon.Config guards on
+// TestNewRejectsBadScanConfig validates the agent.Config guards on
 // the new fields. Negative intervals and unknown strategies must be
 // caught at New() time rather than surfacing later as silent
 // no-scans.
