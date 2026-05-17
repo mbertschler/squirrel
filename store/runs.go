@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -376,24 +377,75 @@ func (s *Store) CountMissingFilesByRun(ctx context.Context, runID int64) (int, e
 	return n, nil
 }
 
-// FindRunningSync returns the in-progress kind='sync' run for
-// (volumeID, destination), if any. The destination column is exact-match
-// — caller passes the bucket destination name or the peer node name, the
-// same string `BeginRun`/`BeginPeerSyncRun` recorded on the open row.
-// Returns sql.ErrNoRows when no such run exists. Lives on the store
-// rather than in the sync package so the agent's scheduler (#39) can
-// gate against the same concurrency check the CLI uses. Stale rows
-// (crashed runs that never reached FinishRun) keep matching here until
-// cleared via the `runs fail` companion command (#37).
-func (s *Store) FindRunningSync(ctx context.Context, volumeID int64, destination string) (Run, error) {
-	row := s.db.QueryRowContext(ctx, `
+// SyncRunSpec captures the columns BeginSyncRunIfClear writes onto a
+// kind='sync' row. PeerNodeID and CorrelatedRunID are zero values
+// (sql.NullInt64{Valid: false}) for bucket syncs and carry the peer
+// linkage for node syncs. Destination is exact-match against the same
+// string the guard query checks (bucket destination name, or peer node
+// name from the initiator's config).
+type SyncRunSpec struct {
+	VolumeID        int64
+	Destination     string
+	PeerNodeID      sql.NullInt64
+	CorrelatedRunID sql.NullInt64
+}
+
+// BeginSyncRunIfClear atomically inserts a 'running' kind='sync' row for
+// (volume, destination) iff no other such row is currently in flight.
+// The check and the insert run inside a single BEGIN IMMEDIATE
+// transaction (the store's DSN sets `_txlock=immediate`), so two
+// concurrent callers cannot both observe "no running run" and both
+// insert — the second one's transaction sees the first one's row and
+// returns it as the blocker.
+//
+// Returns (newID, nil, nil) when the row was inserted; (0, &blocker,
+// nil) when refused — the caller is expected to render a diagnostic
+// using the blocker's id and started_at_ns. Stale rows from crashed
+// runs keep blocking here until cleared via `runs fail` (#37); the
+// agent's scheduler (#39) uses the same call so CLI and scheduler
+// share one gate.
+func (s *Store) BeginSyncRunIfClear(ctx context.Context, spec SyncRunSpec) (int64, *Run, error) {
+	if spec.Destination == "" {
+		return 0, nil, fmt.Errorf("BeginSyncRunIfClear: destination must be non-empty")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, nil, fmt.Errorf("begin sync-run tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	row := tx.QueryRowContext(ctx, `
 		SELECT `+runColumns+`
 		FROM runs
 		WHERE kind = 'sync' AND status = 'running'
 		  AND volume_id = ? AND destination = ?
 		ORDER BY id LIMIT 1
-	`, volumeID, destination)
-	return scanRun(row.Scan)
+	`, spec.VolumeID, spec.Destination)
+	blocker, scanErr := scanRun(row.Scan)
+	if scanErr == nil {
+		return 0, &blocker, nil
+	}
+	if !errors.Is(scanErr, sql.ErrNoRows) {
+		return 0, nil, fmt.Errorf("check running sync: %w", scanErr)
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		INSERT INTO runs (
+			kind, volume_id, destination, started_at_ns, status, file_count,
+			peer_node_id, correlated_run_id
+		) VALUES ('sync', ?, ?, ?, 'running', 0, ?, ?)
+	`, spec.VolumeID, spec.Destination, NowNs(), spec.PeerNodeID, spec.CorrelatedRunID)
+	if err != nil {
+		return 0, nil, fmt.Errorf("insert sync run: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, nil, fmt.Errorf("sync run last insert id: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, nil, fmt.Errorf("commit sync run: %w", err)
+	}
+	return id, nil, nil
 }
 
 // LatestSuccessfulIndexRun returns the most recent index run for the given

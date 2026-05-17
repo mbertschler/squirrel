@@ -95,51 +95,34 @@ type Report struct {
 // per-flavour functions (Sync, SyncNode) remain exported for tests
 // and for callers that already have the typed destination in hand.
 //
-// Before dispatching, RunPair refuses if another kind='sync' run is
-// already in flight for the same (volume, target) — the runs-row guard
-// described in #36. Stale 'running' rows from crashed processes keep
+// Concurrency: both flows allocate the 'running' kind='sync' row via
+// store.BeginSyncRunIfClear, which does the check + insert atomically
+// inside a BEGIN IMMEDIATE transaction. Two concurrent RunPair calls
+// against the same (volume, target) cannot both win — the loser sees
+// the winner's row and returns the "already running" diagnostic from
+// alreadyRunningErr. Stale 'running' rows from crashed runs keep
 // blocking here until cleared by `squirrel runs fail` (#37).
 func RunPair(ctx context.Context, s *store.Store, rcl *Rclone, p Pair, opts Options) (Report, error) {
-	if err := ensureNoRunningSync(ctx, s, p); err != nil {
-		return Report{Volume: p.Volume.Name, Destination: p.TargetName()}, err
-	}
 	if p.IsNode() {
 		return SyncNode(ctx, s, rcl, p.Volume, p.Node, opts)
 	}
 	return Sync(ctx, s, rcl, p.Volume, p.Destination, opts)
 }
 
-// ensureNoRunningSync refuses when a kind='sync' row is already open
-// for (volume, target). A volume that has no DB row yet can have no
-// running sync, so a not-found lookup is silently tolerated — the
-// downstream requireIndexedVolume call will produce the more
-// informative "never been indexed" error. The query itself
-// (store.FindRunningSync) is shared with the agent's scheduler (#39)
-// so the CLI and the scheduler block on the same row.
-func ensureNoRunningSync(ctx context.Context, s *store.Store, p Pair) error {
-	v, err := s.GetVolumeByName(ctx, p.Volume.Name)
-	if err != nil {
-		if store.IsNotFound(err) {
-			return nil
-		}
-		return fmt.Errorf("lookup volume %q: %w", p.Volume.Name, err)
-	}
-	target := p.TargetName()
-	r, err := s.FindRunningSync(ctx, v.ID, target)
-	if err != nil {
-		if store.IsNotFound(err) {
-			return nil
-		}
-		return fmt.Errorf("check for running sync: %w", err)
-	}
+// alreadyRunningErr formats the diagnostic returned when a sync is
+// refused because another run of the same (volume, target) is still in
+// flight. Centralised so the bucket and peer paths surface identical
+// wording.
+func alreadyRunningErr(volName, target string, blocker *store.Run) error {
 	return fmt.Errorf("sync of %s → %s already running (run=%d, started %s)",
-		p.Volume.Name, target, r.ID,
-		time.Unix(0, r.StartedAtNs).UTC().Format(time.RFC3339))
+		volName, target, blocker.ID,
+		time.Unix(0, blocker.StartedAtNs).UTC().Format(time.RFC3339))
 }
 
 // Sync runs one (volume, destination) pair via rclone. It:
 //  1. Checks the volume has been indexed (errors otherwise).
-//  2. Inserts a runs row and defers its terminal update.
+//  2. Atomically inserts a 'running' runs row (refusing if another sync
+//     of the pair is already in flight) and defers its terminal update.
 //  3. Composes rclone arguments: copy, integrity flags, backup-dir under
 //     the destination's per-volume HistoryDirName/<run-id>/, and a filter
 //     that hides .squirrel-history from rclone's comparison entirely.
@@ -155,34 +138,56 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 		return rep, err
 	}
 
-	err = runRcloneOperation(ctx, s, rcl, store.RunKindSync, opts.DryRun, volID, dest.Name, &rep,
+	runID, err := beginSyncRunGuarded(ctx, s, opts.DryRun, store.SyncRunSpec{
+		VolumeID:    volID,
+		Destination: dest.Name,
+	}, vol.Name)
+	if err != nil {
+		return rep, err
+	}
+
+	err = runRcloneOperation(ctx, s, rcl, opts.DryRun, runID, &rep,
 		func(runID int64) []string {
 			return buildRcloneArgs(vol, dest, runID, opts)
 		})
 	return rep, err
 }
 
-// runRcloneOperation is the shared scaffold for Sync and Restore: begin a
-// runs row, invoke rclone via buildArgs, coerce a bare invocation failure
-// into FatalError, and arrange the deferred FinishRun that mutates *rep
-// before the helper returns. Each caller keeps its own preflight
-// (requireIndexedVolume / getOrCreateVolumeForRestore) and just hands the
-// arg-builder closure in.
+// beginSyncRunGuarded is the sync-allocator the bucket and peer paths
+// share. It honours dry-run (returns 0 with no DB write) and delegates
+// to store.BeginSyncRunIfClear for the atomic gate. A blocked attempt
+// is rendered via alreadyRunningErr using the supplied volume name —
+// the caller knows it, the store row only carries the destination
+// string.
+func beginSyncRunGuarded(ctx context.Context, s *store.Store, dryRun bool, spec store.SyncRunSpec, volName string) (int64, error) {
+	if dryRun {
+		return 0, nil
+	}
+	id, blocker, err := s.BeginSyncRunIfClear(ctx, spec)
+	if err != nil {
+		return 0, fmt.Errorf("begin sync run: %w", err)
+	}
+	if blocker != nil {
+		return 0, alreadyRunningErr(volName, spec.Destination, blocker)
+	}
+	return id, nil
+}
+
+// runRcloneOperation is the shared scaffold for Sync and Restore: it
+// invokes rclone via buildArgs, coerces a bare invocation failure into
+// FatalError, and arranges the deferred FinishRun that mutates *rep
+// before the helper returns. The runs row is allocated by the caller
+// (Sync uses the guarded sync allocator; Restore uses beginRestoreRun)
+// so the gate logic stays out of the rclone scaffold.
 func runRcloneOperation(
 	ctx context.Context,
 	s *store.Store,
 	rcl *Rclone,
-	kind string,
 	dryRun bool,
-	volID int64,
-	destName string,
+	runID int64,
 	rep *Report,
 	buildArgs func(runID int64) []string,
 ) (err error) {
-	runID, err := beginRun(ctx, s, dryRun, kind, volID, destName)
-	if err != nil {
-		return err
-	}
 	rep.RunID = runID
 	defer func() {
 		finishRun(ctx, s, dryRun, runID, rep)
@@ -220,16 +225,18 @@ func requireIndexedVolume(ctx context.Context, s *store.Store, vol *config.Volum
 	return v.ID, nil
 }
 
-// beginRun inserts a runs row of the given kind, unless dryRun is set in
-// which case it returns (0, nil) and no row is written. Kind is folded
-// into the error wrap so a failure here points at the right phase.
-func beginRun(ctx context.Context, s *store.Store, dryRun bool, kind string, volID int64, destName string) (int64, error) {
+// beginRestoreRun inserts a kind='restore' runs row, unless dryRun is
+// set in which case it returns (0, nil) and no row is written. Restore
+// is not gated against concurrency the way sync is — the destination is
+// the read side here, and parallel restores into separate ToPath
+// targets are a legitimate workflow.
+func beginRestoreRun(ctx context.Context, s *store.Store, dryRun bool, volID int64, destName string) (int64, error) {
 	if dryRun {
 		return 0, nil
 	}
-	id, err := s.BeginRun(ctx, kind, volID, destName)
+	id, err := s.BeginRun(ctx, store.RunKindRestore, volID, destName)
 	if err != nil {
-		return 0, fmt.Errorf("begin %s run: %w", kind, err)
+		return 0, fmt.Errorf("begin restore run: %w", err)
 	}
 	return id, nil
 }
@@ -479,7 +486,12 @@ func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volum
 		return rep, err
 	}
 
-	err = runRcloneOperation(ctx, s, rcl, store.RunKindRestore, opts.DryRun, v.ID, dest.Name, &rep,
+	runID, err := beginRestoreRun(ctx, s, opts.DryRun, v.ID, dest.Name)
+	if err != nil {
+		return rep, err
+	}
+
+	err = runRcloneOperation(ctx, s, rcl, opts.DryRun, runID, &rep,
 		func(_ int64) []string {
 			return buildRestoreArgs(vol, dest, opts)
 		})
