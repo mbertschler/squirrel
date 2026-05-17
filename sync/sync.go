@@ -465,8 +465,13 @@ func getOrCreateVolumeForRestore(ctx context.Context, s *store.Store, vol *confi
 
 // buildRestoreArgs flips the source/destination of sync: source is
 // <dest>:<root>/<volume>/, destination is the local volume path (or
-// override). The same .squirrel-history filter applies — we don't want
-// the destination's historical snapshots to land in the user's tree.
+// override). The .squirrel-history filter applies in the listing-based
+// flow so the destination's historical snapshots don't land in the
+// user's tree; the include-list flow doesn't need it because the
+// list is the authoritative subset. rclone in fact rejects --filter
+// alongside --files-from-raw ("the usage of --files-from-raw overrides
+// all other filters") so we must pick one or the other.
+//
 // Restore does not pass --backup-dir: the local target is the recovery
 // surface, and the user opted in to overwrites by invoking restore.
 // Squirrel-side append-only semantics live in the destination tree, not
@@ -479,18 +484,17 @@ func buildRestoreArgs(vol *config.Volume, dest *config.Destination, opts Restore
 	}
 	dstArg := withTrailingSlash(target)
 
-	args := []string{
-		"copy",
-		"--filter", "- /" + HistoryDirName + "/**",
+	args := []string{"copy"}
+	if opts.IncludeFromFile != "" {
+		args = append(args, "--files-from-raw", opts.IncludeFromFile)
+	} else {
+		args = append(args, "--filter", "- /"+HistoryDirName+"/**")
 	}
 	if !opts.Shallow {
 		args = append(args, "--checksum", "--hash", "blake3")
 	}
 	if opts.DryRun {
 		args = append(args, "--dry-run")
-	}
-	if opts.IncludeFromFile != "" {
-		args = append(args, "--files-from-raw", opts.IncludeFromFile)
 	}
 	args = append(args, srcArg, dstArg)
 	return args
