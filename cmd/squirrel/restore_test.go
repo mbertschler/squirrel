@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/mbertschler/squirrel/store"
 )
 
 // TestCLIRestoreRoundTrip is the end-to-end smoke test: sync a volume,
@@ -108,6 +111,107 @@ func TestCLIRestoreInfersDestinationWhenUnambiguous(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(target, "a.txt")); err != nil {
 		t.Fatalf("recovered a.txt missing: %v", err)
+	}
+}
+
+// TestCLIRestoreFromNodeFiltersByAttribution covers the issue-#15
+// acceptance criterion: a receiver-side restore with --from <peer>
+// produces a tree containing only that peer's source-attributed
+// paths, even when other peers / local writes share the volume. The
+// fixture indexes three local files, then re-stamps two of them with
+// distinct peer provenance via Upsert(prov). Restoring with
+// --from peer-a should land only the from-a path in the target tree.
+func TestCLIRestoreFromNodeFiltersByAttribution(t *testing.T) {
+	requireRcloneCLI(t)
+	f := writeSyncFixture(t)
+	writeTestFile(t, filepath.Join(f.volumeDir, "from-a.txt"), "alpha")
+	writeTestFile(t, filepath.Join(f.volumeDir, "from-b.txt"), "beta")
+	writeTestFile(t, filepath.Join(f.volumeDir, "local.txt"), "local")
+
+	runCLI(t, "--config", f.configPath, "index", f.volumeName)
+	runCLI(t, "--config", f.configPath, "sync", "pics")
+
+	// Inject peer attribution onto the from-* paths directly. The
+	// destination tree was just written by sync, so the rclone-side
+	// content is unchanged — restore will pull only the path subset
+	// we ask for via --files-from.
+	s, err := store.OpenWithOptions(f.dbPath, store.OpenOptions{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	peerA, _ := s.CreateNode(ctx, "peer-a", "https://a.example")
+	peerB, _ := s.CreateNode(ctx, "peer-b", "https://b.example")
+	vol, _ := s.GetVolumeByName(ctx, "pics")
+	runA, _ := s.BeginPeerSyncRun(ctx, vol.ID, peerA.ID, 1, peerA.Name)
+	if err := s.FinishRun(ctx, runA, store.RunStatusSuccess, "", 1); err != nil {
+		t.Fatal(err)
+	}
+	runB, _ := s.BeginPeerSyncRun(ctx, vol.ID, peerB.ID, 1, peerB.Name)
+	if err := s.FinishRun(ctx, runB, store.RunStatusSuccess, "", 1); err != nil {
+		t.Fatal(err)
+	}
+	stamp := func(relPath string, prov *store.Provenance) {
+		row, err := s.GetByPath(ctx, vol.ID, relPath)
+		if err != nil {
+			t.Fatalf("GetByPath %s: %v", relPath, err)
+		}
+		if err := s.Upsert(ctx, row, prov); err != nil {
+			t.Fatalf("Upsert %s: %v", relPath, err)
+		}
+	}
+	stamp("from-a.txt", &store.Provenance{NodeID: peerA.ID, RunID: runA})
+	stamp("from-b.txt", &store.Provenance{NodeID: peerB.ID, RunID: runB})
+
+	target := filepath.Join(t.TempDir(), "recovered")
+	out := runCLI(t, "--config", f.configPath, "restore", "pics", "--from", "peer-a", "--to", target)
+	if !strings.Contains(out, "status=success") {
+		t.Fatalf("restore did not succeed:\n%s", out)
+	}
+
+	if _, err := os.Stat(filepath.Join(target, "from-a.txt")); err != nil {
+		t.Fatalf("peer-a path missing from restore tree: %v", err)
+	}
+	for _, leaked := range []string{"from-b.txt", "local.txt"} {
+		if _, err := os.Stat(filepath.Join(target, leaked)); err == nil {
+			t.Fatalf("restore --from peer-a leaked %s into the target tree", leaked)
+		}
+	}
+}
+
+// TestCLIRestoreFromUnknownName rejects a name that is neither a
+// configured destination nor a known node. The error message must
+// surface both possibilities so the user knows which namespace they
+// missed.
+func TestCLIRestoreFromUnknownName(t *testing.T) {
+	f := writeSyncFixture(t)
+	runCLI(t, "--config", f.configPath, "index", f.volumeName)
+	_, err := runCLIExpectErr(t, "--config", f.configPath, "restore", "pics", "--from", "nobody")
+	if !strings.Contains(err.Error(), "neither a configured destination nor a known node") {
+		t.Fatalf("expected destination-or-node error, got %v", err)
+	}
+}
+
+// TestCLIRestoreFromNodeWithNoAttributedRows errors rather than
+// silently invoking rclone with an empty path set. An empty
+// --files-from would have rclone copy the entire tree, which would
+// defeat the filter — so the CLI must short-circuit.
+func TestCLIRestoreFromNodeWithNoAttributedRows(t *testing.T) {
+	f := writeSyncFixture(t)
+	writeTestFile(t, filepath.Join(f.volumeDir, "a.txt"), "alpha")
+	runCLI(t, "--config", f.configPath, "index", f.volumeName)
+
+	s, _ := store.OpenWithOptions(f.dbPath, store.OpenOptions{})
+	defer s.Close()
+	if _, err := s.CreateNode(context.Background(), "stranger", "https://stranger.example"); err != nil {
+		t.Fatalf("CreateNode: %v", err)
+	}
+
+	_, err := runCLIExpectErr(t, "--config", f.configPath, "restore", "pics", "--from", "stranger", "--to", filepath.Join(t.TempDir(), "x"))
+	if !strings.Contains(err.Error(), "no rows attributed") {
+		t.Fatalf("expected no-rows-attributed error, got %v", err)
 	}
 }
 

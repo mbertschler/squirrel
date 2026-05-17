@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -21,6 +22,7 @@ func newQueryCmd() *cobra.Command {
 		duplicates bool
 		missing    bool
 		history    bool
+		fromNode   string
 	)
 	cmd := &cobra.Command{
 		Use:   "query [<hash-or-path>]",
@@ -37,29 +39,83 @@ func newQueryCmd() *cobra.Command {
 			}
 			defer s.Close()
 
+			filter, err := resolveSourceFilter(cmd, s, fromNode)
+			if err != nil {
+				return err
+			}
+
 			switch {
 			case duplicates:
 				if len(args) != 0 {
 					return errors.New("--duplicates does not take a positional argument")
 				}
-				return queryDuplicates(cmd, s)
+				return queryDuplicates(cmd, s, filter)
 			case missing:
 				if len(args) != 0 {
 					return errors.New("--missing does not take a positional argument")
 				}
-				return queryMissing(cmd, s)
+				return queryMissing(cmd, s, filter)
 			default:
-				if len(args) != 1 {
-					return errors.New("query requires <hash>, <path>, --duplicates, or --missing")
+				if len(args) == 1 {
+					return queryArg(cmd, s, args[0], history, filter)
 				}
-				return queryArg(cmd, s, args[0], history)
+				if filter.active {
+					return queryBySource(cmd, s, filter)
+				}
+				return errors.New("query requires <hash>, <path>, --duplicates, --missing, or --from")
 			}
 		},
 	}
 	cmd.Flags().BoolVar(&duplicates, "duplicates", false, "list hashes that appear at more than one path")
 	cmd.Flags().BoolVar(&missing, "missing", false, "list previously-indexed paths no longer on disk")
 	cmd.Flags().BoolVar(&history, "history", false, "when querying a path, also print the full content history at that path")
+	cmd.Flags().StringVar(&fromNode, "from", "", "restrict results to rows whose source_node_id matches this node name (use the self-node name for local writes)")
 	return cmd
+}
+
+// sourceFilter encodes the result of `--from <name>`. active=false means
+// no filter; nodeID.Valid==true filters to that node id; nodeID.Valid==false
+// (and active==true) means "self / local writes" (source_node_id IS NULL).
+type sourceFilter struct {
+	active bool
+	nodeID sql.NullInt64
+}
+
+// matches reports whether the row's source_node_id passes the filter.
+// A non-active filter matches everything.
+func (f sourceFilter) matches(rowSource sql.NullInt64) bool {
+	if !f.active {
+		return true
+	}
+	if !f.nodeID.Valid {
+		return !rowSource.Valid
+	}
+	return rowSource.Valid && rowSource.Int64 == f.nodeID.Int64
+}
+
+// resolveSourceFilter turns the --from <name> argument into a
+// sourceFilter. The self-node's name resolves to "match NULL source"
+// (local writes); any other named node resolves to that node's id.
+// An empty name produces an inactive filter.
+func resolveSourceFilter(cmd *cobra.Command, s *store.Store, name string) (sourceFilter, error) {
+	if name == "" {
+		return sourceFilter{}, nil
+	}
+	self, err := s.GetSelfNode(cmd.Context())
+	if err != nil {
+		return sourceFilter{}, fmt.Errorf("lookup self node: %w", err)
+	}
+	if name == self.Name {
+		return sourceFilter{active: true}, nil
+	}
+	node, err := s.GetNodeByName(cmd.Context(), name)
+	if err != nil {
+		if store.IsNotFound(err) {
+			return sourceFilter{}, fmt.Errorf("no node named %q (use the self-node name %q for local writes)", name, self.Name)
+		}
+		return sourceFilter{}, fmt.Errorf("lookup node %q: %w", name, err)
+	}
+	return sourceFilter{active: true, nodeID: sql.NullInt64{Int64: node.ID, Valid: true}}, nil
 }
 
 // queryArg disambiguates between a path lookup and a hex digest lookup. A
@@ -68,14 +124,14 @@ func newQueryCmd() *cobra.Command {
 // protects content-addressed workloads where filenames are themselves hex.
 // withHistory is only meaningful for path queries — hash lookups already
 // list every row for the digest.
-func queryArg(cmd *cobra.Command, s *store.Store, arg string, withHistory bool) error {
+func queryArg(cmd *cobra.Command, s *store.Store, arg string, withHistory bool, filter sourceFilter) error {
 	if !looksLikePath(arg) && isHashLike(arg) {
 		if withHistory {
 			return errors.New("--history applies to path queries, not hash queries (hash queries already list every row)")
 		}
-		return queryByHash(cmd, s, arg)
+		return queryByHash(cmd, s, arg, filter)
 	}
-	return queryByPath(cmd, s, arg, withHistory)
+	return queryByPath(cmd, s, arg, withHistory, filter)
 }
 
 func looksLikePath(arg string) bool {
@@ -86,7 +142,7 @@ func looksLikePath(arg string) bool {
 	return err == nil
 }
 
-func queryByHash(cmd *cobra.Command, s *store.Store, hexDigest string) error {
+func queryByHash(cmd *cobra.Command, s *store.Store, hexDigest string, filter sourceFilter) error {
 	digest, err := hex.DecodeString(hexDigest)
 	if err != nil {
 		return fmt.Errorf("decode hash: %w", err)
@@ -95,17 +151,25 @@ func queryByHash(cmd *cobra.Command, s *store.Store, hexDigest string) error {
 	if err != nil {
 		return err
 	}
-	if len(rows) == 0 {
-		return fmt.Errorf("no rows for blake3 %s", hexDigest)
-	}
 	out := cmd.OutOrStdout()
+	var any bool
 	for _, r := range rows {
+		if !filter.matches(r.File.SourceNodeID) {
+			continue
+		}
 		fmt.Fprintf(out, "%s\t%s\t%d\n", r.File.Status, joinVolumePath(r.Volume.Path, r.File.Path), r.File.SizeBytes)
+		any = true
+	}
+	if !any {
+		if filter.active {
+			return fmt.Errorf("no rows for blake3 %s matching --from filter", hexDigest)
+		}
+		return fmt.Errorf("no rows for blake3 %s", hexDigest)
 	}
 	return nil
 }
 
-func queryByPath(cmd *cobra.Command, s *store.Store, arg string, withHistory bool) error {
+func queryByPath(cmd *cobra.Command, s *store.Store, arg string, withHistory bool, filter sourceFilter) error {
 	absPath, err := filepath.Abs(arg)
 	if err != nil {
 		return err
@@ -116,6 +180,9 @@ func queryByPath(cmd *cobra.Command, s *store.Store, arg string, withHistory boo
 			return fmt.Errorf("no row for path %s (not under any indexed volume)", absPath)
 		}
 		return err
+	}
+	if !filter.matches(fv.File.SourceNodeID) {
+		return fmt.Errorf("row at %s does not match --from filter", absPath)
 	}
 	out := cmd.OutOrStdout()
 	fmt.Fprintf(out, "volume:        %s\n", fv.Volume.Name)
@@ -160,7 +227,7 @@ func printPathHistory(cmd *cobra.Command, s *store.Store, volumeID int64, relPat
 	return tw.Flush()
 }
 
-func queryDuplicates(cmd *cobra.Command, s *store.Store) error {
+func queryDuplicates(cmd *cobra.Command, s *store.Store, filter sourceFilter) error {
 	rows, err := s.ListDuplicates(cmd.Context())
 	if err != nil {
 		return err
@@ -168,6 +235,9 @@ func queryDuplicates(cmd *cobra.Command, s *store.Store) error {
 	out := cmd.OutOrStdout()
 	var lastHex string
 	for _, r := range rows {
+		if !filter.matches(r.File.SourceNodeID) {
+			continue
+		}
 		h := hex.EncodeToString(r.File.Blake3)
 		if h != lastHex {
 			if lastHex != "" {
@@ -181,14 +251,39 @@ func queryDuplicates(cmd *cobra.Command, s *store.Store) error {
 	return nil
 }
 
-func queryMissing(cmd *cobra.Command, s *store.Store) error {
+func queryMissing(cmd *cobra.Command, s *store.Store, filter sourceFilter) error {
 	rows, err := s.ListMissing(cmd.Context())
 	if err != nil {
 		return err
 	}
 	out := cmd.OutOrStdout()
 	for _, r := range rows {
+		if !filter.matches(r.File.SourceNodeID) {
+			continue
+		}
 		fmt.Fprintf(out, "%s\t%s\n", hex.EncodeToString(r.File.Blake3), joinVolumePath(r.Volume.Path, r.File.Path))
+	}
+	return nil
+}
+
+// queryBySource lists every present row across volumes whose source
+// matches the filter — the bare `--from <name>` case with no
+// positional, duplicates, or missing flag. The underlying
+// ListPresentBySource is per-volume so we iterate (today's volume
+// counts are small); cross-volume widening is out of scope for #15.
+func queryBySource(cmd *cobra.Command, s *store.Store, filter sourceFilter) error {
+	vols, err := s.ListVolumes(cmd.Context())
+	if err != nil {
+		return fmt.Errorf("list volumes: %w", err)
+	}
+	out := cmd.OutOrStdout()
+	for _, v := range vols {
+		for row, err := range s.ListPresentBySource(cmd.Context(), v.ID, filter.nodeID) {
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "%s\t%s\n", hex.EncodeToString(row.Blake3), joinVolumePath(v.Path, row.Path))
+		}
 	}
 	return nil
 }

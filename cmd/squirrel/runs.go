@@ -66,11 +66,43 @@ func runRuns(cmd *cobra.Command, volumeName string, limit int) error {
 	if err != nil {
 		return err
 	}
+	nodes, err := loadNodeNames(cmd, s, runs)
+	if err != nil {
+		return err
+	}
 	conflicts, err := loadConflictCounts(cmd, s, runs)
 	if err != nil {
 		return err
 	}
-	return printRuns(cmd.OutOrStdout(), runs, volumes, conflicts)
+	return printRuns(cmd.OutOrStdout(), runs, volumes, nodes, conflicts)
+}
+
+// loadNodeNames builds an id→name map for the peer_node_id values
+// referenced by the listing. Only peer-sync rows carry a non-NULL
+// peer_node_id, so this typically resolves to a small set of distinct
+// nodes; we fetch only those rather than every row in `nodes`.
+func loadNodeNames(cmd *cobra.Command, s *store.Store, runs []store.Run) (map[int64]string, error) {
+	out := map[int64]string{}
+	seen := map[int64]struct{}{}
+	for _, r := range runs {
+		if !r.PeerNodeID.Valid {
+			continue
+		}
+		id := r.PeerNodeID.Int64
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		node, err := s.GetNodeByID(cmd.Context(), id)
+		if err != nil {
+			if store.IsNotFound(err) {
+				continue
+			}
+			return nil, fmt.Errorf("lookup node id=%d: %w", id, err)
+		}
+		out[id] = node.Name
+	}
+	return out, nil
 }
 
 // loadConflictCounts derives the conflict count for every peer-sync
@@ -109,13 +141,14 @@ func loadVolumeNames(cmd *cobra.Command, s *store.Store) (map[int64]string, erro
 	return out, nil
 }
 
-func printRuns(out io.Writer, runs []store.Run, volumes map[int64]string, conflicts map[int64]int) error {
+func printRuns(out io.Writer, runs []store.Run, volumes map[int64]string, nodes map[int64]string, conflicts map[int64]int) error {
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tKIND\tVOLUME\tDESTINATION\tSTARTED\tDURATION\tSTATUS\tFILES\tCONFLICTS\tERROR")
+	fmt.Fprintln(tw, "ID\tKIND\tVOLUME\tDESTINATION\tPEER\tSTARTED\tDURATION\tSTATUS\tFILES\tCONFLICTS\tERROR")
 	for _, r := range runs {
-		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n",
+		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n",
 			r.ID, r.Kind, volumeLabel(r.VolumeID, volumes),
 			destinationLabel(r.Destination),
+			peerLabel(r, nodes),
 			formatStarted(r.StartedAtNs),
 			formatDuration(r.StartedAtNs, r.EndedAtNs),
 			r.Status, r.FileCount, conflictLabel(r, conflicts),
@@ -123,6 +156,27 @@ func printRuns(out io.Writer, runs []store.Run, volumes map[int64]string, confli
 		)
 	}
 	return tw.Flush()
+}
+
+// peerLabel formats the peer attribution for a runs row. Bucket-sync
+// and non-sync rows print "—"; peer-sync rows print
+// "<peer-name> correlated=<id>" so the operator can pair the two
+// halves of one logical sync against the receiver's `squirrel runs`
+// without scrolling between separate columns. A dropped node row
+// (FK should prevent this, but defensive) prints "id=N" rather than
+// silently rendering nothing.
+func peerLabel(r store.Run, nodes map[int64]string) string {
+	if !r.PeerNodeID.Valid {
+		return "—"
+	}
+	name, ok := nodes[r.PeerNodeID.Int64]
+	if !ok {
+		name = fmt.Sprintf("id=%d", r.PeerNodeID.Int64)
+	}
+	if r.CorrelatedRunID.Valid {
+		return fmt.Sprintf("%s correlated=%d", name, r.CorrelatedRunID.Int64)
+	}
+	return name
 }
 
 // conflictLabel formats the per-run conflict count for the listing.

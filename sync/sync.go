@@ -402,10 +402,15 @@ func (p Pair) IsNode() bool { return p.Node != nil }
 // target directory; when empty, the volume's declared path is used. The
 // override is for "pull a recovery copy somewhere else" — squirrel won't
 // silently clobber the live volume unless explicitly pointed at it.
+// IncludeFromFile, when non-empty, is a path to a newline-delimited
+// listing of volume-relative paths and gets forwarded to rclone as
+// --files-from. Used by `restore --from <node>` to ship only that
+// node's source-attributed paths back to the local tree.
 type RestoreOptions struct {
-	ToPath  string
-	Shallow bool
-	DryRun  bool
+	ToPath          string
+	Shallow         bool
+	DryRun          bool
+	IncludeFromFile string
 }
 
 // Restore reverses Sync: it copies from the destination's per-volume tree
@@ -479,6 +484,9 @@ func buildRestoreArgs(vol *config.Volume, dest *config.Destination, opts Restore
 	}
 	if opts.DryRun {
 		args = append(args, "--dry-run")
+	}
+	if opts.IncludeFromFile != "" {
+		args = append(args, "--files-from", opts.IncludeFromFile)
 	}
 	args = append(args, srcArg, dstArg)
 	return args
