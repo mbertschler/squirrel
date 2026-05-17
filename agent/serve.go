@@ -1,4 +1,4 @@
-package daemon
+package agent
 
 import (
 	"context"
@@ -20,7 +20,7 @@ const shutdownGrace = 5 * time.Second
 
 // readHeaderTimeout caps how long a client can take to send request
 // headers, the principal slowloris mitigation for net/http. Reasonable
-// floor for the LAN/VPN exposure model this daemon is built for.
+// floor for the LAN/VPN exposure model this agent is built for.
 //
 // We deliberately don't set ReadTimeout or WriteTimeout: plan
 // negotiation (PR 3) streams the initiator's index slice and the
@@ -52,7 +52,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 //
 // The dispatch between plain HTTP and TLS is decided by whether the
 // Config has a cert/key pair. Tests can construct a listener bound to
-// :0, observe the resolved port via ln.Addr(), and drive the daemon
+// :0, observe the resolved port via ln.Addr(), and drive the agent
 // end-to-end without binding a fixed port.
 //
 // When Config.ScanInterval is non-zero the drift-detection scheduler

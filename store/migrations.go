@@ -522,7 +522,7 @@ func migrateV5ToV6(ctx context.Context, db *sql.DB, nodeName string) error {
 
 // migrateV6ToV7 rebuilds the runs table to widen the kind CHECK to
 // include 'audit', the run-kind for periodic drift detection on
-// daemon-hosted volumes (#17). 'audit' joins 'index' in the
+// agent-hosted volumes (#17). 'audit' joins 'index' in the
 // destination-NULL branch of the kind↔destination coupling CHECK —
 // audits, like indexes, are scoped to one volume with no rclone
 // target.

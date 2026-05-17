@@ -9,7 +9,7 @@ import (
 )
 
 // Node is a resolved `[nodes.X]` block — a peer destination running a
-// squirrel daemon. The relationship is symmetric: either side can
+// squirrel agent. The relationship is symmetric: either side can
 // initiate a sync of a shared volume against the other's HTTP API.
 //
 // Endpoint is the parsed URL the initiator dials for the sync API
@@ -18,7 +18,7 @@ import (
 // receiver's TLS certificate — when set, the initiator verifies the
 // presented cert's SHA-256 fingerprint against this value before
 // trusting the connection (self-signed certs are normal for LAN
-// daemons; pinning is the trust anchor in lieu of a CA chain). Path
+// agents; pinning is the trust anchor in lieu of a CA chain). Path
 // is the rclone-URI prefix the initiator copies bytes into, joined
 // with `/<volume>/<file-path>` per transfer; it lives in the node
 // block (not derived from the endpoint) because the HTTP API and the

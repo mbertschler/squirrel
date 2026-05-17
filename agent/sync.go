@@ -1,4 +1,4 @@
-package daemon
+package agent
 
 import (
 	"context"
@@ -21,10 +21,10 @@ import (
 	"github.com/mbertschler/squirrel/syncproto"
 )
 
-// HistoryDirName mirrors sync.HistoryDirName at the daemon side — the
+// HistoryDirName mirrors sync.HistoryDirName at the agent side — the
 // reserved directory at the volume root where pre-supersede moves
 // stage prior bytes. Lowercase-duplicated here rather than imported to
-// keep the daemon package free of the sync package's rclone
+// keep the agent package free of the sync package's rclone
 // dependency.
 const HistoryDirName = ".squirrel-history"
 
@@ -49,7 +49,7 @@ type peerSyncRouter struct {
 }
 
 // peerSession captures everything one in-flight sync run carries
-// between the four endpoint calls. Lives in memory; daemon restart
+// between the four endpoint calls. Lives in memory; agent restart
 // drops all in-flight sessions (acceptable for v1 — the next sync
 // replans from scratch).
 type peerSession struct {
@@ -294,7 +294,7 @@ func (r *peerSyncRouter) collectDriftWarnings(ctx context.Context, volumeName st
 }
 
 // peerEndpoint resolves the endpoint string to store on the peer
-// nodes row. Single-writer initiators don't expose a daemon of their
+// nodes row. Single-writer initiators don't expose an agent of their
 // own, so the empty case yields a stable name-derived placeholder
 // that satisfies the "non-empty endpoint" invariant without leaking a
 // real URL onto the wire.
@@ -540,7 +540,7 @@ func (r *peerSyncRouter) preMoveSupersedes(sess *peerSession) error {
 //
 // Disk-mv runs first; the DB mutations run together in one transaction
 // via the store helper. The window between the mv and the DB commit
-// is the only crash-unsafe step — a daemon restart there leaves the
+// is the only crash-unsafe step — an agent restart there leaves the
 // file at the conflict path with both index rows in pre-call state,
 // and the next /plan replans the same conflict, which is the correct
 // recovery path: content stays preserved through retries.

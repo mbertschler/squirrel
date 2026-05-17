@@ -13,16 +13,16 @@ import (
 	"testing"
 
 	"github.com/mbertschler/squirrel/config"
-	"github.com/mbertschler/squirrel/daemon"
+	"github.com/mbertschler/squirrel/agent"
 	"github.com/mbertschler/squirrel/index"
 	"github.com/mbertschler/squirrel/store"
 	"github.com/mbertschler/squirrel/syncproto"
 )
 
 // nodeFixture wires an in-process initiator + receiver pair. The
-// initiator has its own store/volume; the receiver has a daemon
+// initiator has its own store/volume; the receiver has an agent
 // running off another store + on-disk volume directory. Tests drive
-// the public `SyncNode` API end-to-end; the daemon is reached via
+// the public `SyncNode` API end-to-end; the agent is reached via
 // httptest.Server so no TCP port is opened.
 type nodeFixture struct {
 	initStore *store.Store
@@ -48,7 +48,7 @@ func setupNodeFixture(t *testing.T) *nodeFixture {
 
 // buildNodeFixture is the rclone-agnostic core of setupNodeFixture:
 // it lays down the on-disk volume dirs, opens initiator and receiver
-// stores, and spins an in-process daemon to back the receiver. Tests
+// stores, and spins an in-process agent to back the receiver. Tests
 // that need rclone wrap with the requireRclone skip + config write
 // via setupNodeFixture; tests that drive the HTTP surface directly
 // call this helper and leave fixture.rcl nil.
@@ -70,14 +70,14 @@ func buildNodeFixture(t *testing.T) (*nodeFixture, string) {
 	initVol := &config.Volume{Name: "pics", Path: initVolPath}
 	recvVol := &config.Volume{Name: "pics", Path: recvVolPath}
 
-	srv, err := daemon.New(daemon.Config{
+	srv, err := agent.New(agent.Config{
 		Listen:  "127.0.0.1:0",
 		Token:   "test-token",
 		Version: "test",
 		Volumes: map[string]*config.Volume{"pics": recvVol},
 	}, recvStore)
 	if err != nil {
-		t.Fatalf("daemon.New: %v", err)
+		t.Fatalf("agent.New: %v", err)
 	}
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
@@ -255,7 +255,7 @@ func TestNodeSyncSupersedeMovesPriorBytes(t *testing.T) {
 		t.Fatalf("live content = %q, want v2-different", live)
 	}
 
-	histDir := filepath.Join(f.recvVol.Path, daemon.HistoryDirName)
+	histDir := filepath.Join(f.recvVol.Path, agent.HistoryDirName)
 	matches, _ := filepath.Glob(filepath.Join(histDir, "run-*", "doc.md"))
 	if len(matches) == 0 {
 		t.Fatalf("no pre-moved prior copy under %s", histDir)
@@ -269,7 +269,7 @@ func TestNodeSyncSupersedeMovesPriorBytes(t *testing.T) {
 // TestNodeSyncResolvesConflictOnLocalWriteOnReceiver covers the v1
 // multi-writer scenario: the receiver has a `present` row at a path
 // authored locally (source_node_id NULL — a NAS web-app upload or a
-// daemon-side `squirrel index` after a manual edit), and an initiator
+// agent-side `squirrel index` after a manual edit), and an initiator
 // sync arrives carrying a different blake3 at the same path.
 //
 // The expected resolution is "initiator wins live, loser preserved":
@@ -419,7 +419,7 @@ func TestNodeSyncResolvesConflictOnLocalWriteOnReceiver(t *testing.T) {
 }
 
 // TestNodeSyncVerifyMismatchPartialStatus simulates rclone "succeeding"
-// but the on-disk content being wrong (the daemon's re-hash will
+// but the on-disk content being wrong (the agent's re-hash will
 // catch it). We inject the mismatch by writing different content
 // directly into the receiver volume between rclone-finish and verify,
 // using a stub Rclone wrapper. Since wiring a stub here is heavy, we
@@ -428,7 +428,7 @@ func TestNodeSyncResolvesConflictOnLocalWriteOnReceiver(t *testing.T) {
 // verify+report on the original successful run. So we end up
 // validating the "verify-returns-partial" code path by directly
 // driving the receiver's verifySession via a unit test in
-// daemon/sync_test.go. The integration here just sanity-checks that
+// agent/sync_test.go. The integration here just sanity-checks that
 // "files-from" only ships transfer-bucket paths in the rclone
 // invocation; the supersede + already-correct paths skip transfer.
 func TestNodeSyncIdempotentRerun(t *testing.T) {
@@ -465,7 +465,7 @@ func TestNodeSyncIdempotentRerun(t *testing.T) {
 	}
 }
 
-// TestNodeSyncRejectsUnknownVolume exercises the daemon-side guard:
+// TestNodeSyncRejectsUnknownVolume exercises the agent-side guard:
 // /begin against a volume the receiver doesn't declare must 404.
 func TestNodeSyncRejectsUnknownVolume(t *testing.T) {
 	f := setupNodeFixture(t)
@@ -490,7 +490,7 @@ func TestNodeSyncRejectsUnknownVolume(t *testing.T) {
 	}
 }
 
-// TestVerifyReportsMismatch is a daemon-side check: drive begin →
+// TestVerifyReportsMismatch is an agent-side check: drive begin →
 // plan → corrupt the on-disk content → verify. The verify endpoint
 // must surface the mismatch. We intentionally don't go through
 // rclone here so the test is independent of the rclone-version
@@ -581,7 +581,7 @@ func TestVolumeLockSerializesInFlightSyncs(t *testing.T) {
 	}
 }
 
-// TestPlanResponseContainsAllDispositions is a daemon-side white-box
+// TestPlanResponseContainsAllDispositions is an agent-side white-box
 // check that the four dispositions emerge from one mixed payload. It
 // doesn't go through rclone — just /begin and /plan via the test
 // HTTP server.
@@ -604,7 +604,7 @@ func TestPlanResponseContainsAllDispositions(t *testing.T) {
 		t.Fatalf("seed receiver volume: %v", err)
 	}
 	// Seed initiator on receiver's nodes table with the same
-	// synthetic placeholder endpoint the daemon uses for
+	// synthetic placeholder endpoint the agent uses for
 	// single-writer initiators, so the subsequent /begin call's
 	// GetOrCreatePeerNode finds the row and treats it as existing.
 	initSelf, _ := f.initStore.GetSelfNode(ctx)
@@ -704,16 +704,16 @@ func TestPlanResponseContainsAllDispositions(t *testing.T) {
 	}
 
 	// Supersede side-effect: prior bytes moved into history dir.
-	matches, _ := filepath.Glob(filepath.Join(f.recvVol.Path, daemon.HistoryDirName, "run-*", "evolved.txt"))
+	matches, _ := filepath.Glob(filepath.Join(f.recvVol.Path, agent.HistoryDirName, "run-*", "evolved.txt"))
 	if len(matches) == 0 {
 		t.Fatalf("evolved.txt prior bytes were not pre-moved")
 	}
 	// Conflict side-effect: local.txt prior bytes moved into the
 	// conflicts dir; the original path is empty so rclone could
 	// deliver the initiator's bytes there. Index reflects both rows.
-	confMatches, _ := filepath.Glob(filepath.Join(f.recvVol.Path, daemon.ConflictsDirName, "run-*", "local.txt"))
+	confMatches, _ := filepath.Glob(filepath.Join(f.recvVol.Path, agent.ConflictsDirName, "run-*", "local.txt"))
 	if len(confMatches) == 0 {
-		t.Fatalf("local.txt prior bytes were not moved to %s/run-N/", daemon.ConflictsDirName)
+		t.Fatalf("local.txt prior bytes were not moved to %s/run-N/", agent.ConflictsDirName)
 	}
 	if _, err := os.Stat(filepath.Join(f.recvVol.Path, "local.txt")); !os.IsNotExist(err) {
 		t.Fatalf("local.txt still present at original path after conflict pre-stage: %v", err)
@@ -727,14 +727,14 @@ func TestPlanResponseContainsAllDispositions(t *testing.T) {
 	}
 }
 
-// TestNodeSyncEndToEndConflictAfterDaemonSideIndex walks the full
+// TestNodeSyncEndToEndConflictAfterAgentSideIndex walks the full
 // acceptance scenario from #22: initiator → sync round 1 (blake3 X) →
-// daemon-side `squirrel index` after the file is edited locally on
+// agent-side `squirrel index` after the file is edited locally on
 // the receiver (blake3 Y, local-write provenance) → initiator
 // re-syncs with a third version (blake3 Z), expecting Z to land
 // live, Y preserved under .squirrel-conflicts/run-<id>/, and X
 // reachable in the receiver's `.squirrel-history/` from round 1.
-func TestNodeSyncEndToEndConflictAfterDaemonSideIndex(t *testing.T) {
+func TestNodeSyncEndToEndConflictAfterAgentSideIndex(t *testing.T) {
 	f := setupNodeFixture(t)
 	ctx := context.Background()
 	target := filepath.Join(f.initVol.Path, "doc.md")
@@ -753,7 +753,7 @@ func TestNodeSyncEndToEndConflictAfterDaemonSideIndex(t *testing.T) {
 	}
 
 	// Receiver's web-app / operator edits the file in-place to Y and
-	// runs `squirrel index` on the receiver host. The daemon and CLI
+	// runs `squirrel index` on the receiver host. The agent and CLI
 	// share the same DB file in this scenario, so the local index
 	// run writes through the receiver's store and the resulting row
 	// has source_node_id NULL (local write).
@@ -762,7 +762,7 @@ func TestNodeSyncEndToEndConflictAfterDaemonSideIndex(t *testing.T) {
 	}
 	if _, err := index.Index(ctx, f.recvStore, f.recvVol.Path,
 		index.Options{Name: f.recvVol.Name}); err != nil {
-		t.Fatalf("daemon-side index: %v", err)
+		t.Fatalf("agent-side index: %v", err)
 	}
 	v, err := f.recvStore.GetVolumeByName(ctx, f.recvVol.Name)
 	if err != nil {
@@ -968,7 +968,7 @@ func TestCollectIndexEntriesSkipsReservedDirs(t *testing.T) {
 // acceptance path: the receiver runs an audit against an out-of-band
 // file modification, then a subsequent /v1/sync/begin returns a
 // PendingWarnings line. Exercised via the nodeClient directly (no
-// rclone) so the daemon→syncproto→client→Report propagation is
+// rclone) so the agent→syncproto→client→Report propagation is
 // pinned without depending on the rclone binary at test time.
 func TestBeginPendingWarningsSurfaceAuditDrift(t *testing.T) {
 	f := setupNodeFixtureNoRclone(t)
@@ -1200,7 +1200,7 @@ func TestBeginPendingWarningsEmptyAfterWatermark(t *testing.T) {
 }
 
 // setupNodeFixtureNoRclone is the lighter-weight variant of
-// setupNodeFixture for tests that drive the daemon HTTP surface
+// setupNodeFixture for tests that drive the agent HTTP surface
 // directly. Skipping the rclone-prerequisite means these tests run
 // under CI conditions where rclone is missing or below the supported
 // version.

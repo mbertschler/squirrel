@@ -21,7 +21,7 @@ type Node struct {
 
 // GetSelfNode returns the self-row: the single nodes row with
 // endpoint IS NULL inserted by the v6 migration. It is the identity
-// the daemon presents to incoming peers and the FK target for
+// the agent presents to incoming peers and the FK target for
 // locally-written file provenance (today's only path uses NULL on
 // the file row, but a future #14-style dedup path may attribute
 // rebuilds to self).

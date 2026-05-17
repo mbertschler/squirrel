@@ -1,6 +1,6 @@
 // Package syncproto defines the JSON wire types exchanged between an
 // initiator and a receiver during a node-to-node sync. The types are
-// shared by daemon (server-side handlers) and sync (client-side
+// shared by agent (server-side handlers) and sync (client-side
 // driver) so the wire contract has exactly one definition.
 //
 // Endpoint summary (all under /v1/sync/, all bearer-authenticated):
@@ -214,7 +214,7 @@ type CloseResponse struct {
 	Committed     int   `json:"committed"`
 }
 
-// ErrorResponse is the uniform error body. Mirrors daemon's
+// ErrorResponse is the uniform error body. Mirrors agent's
 // errorResponse type but is exported so client-side decoding can name it.
 type ErrorResponse struct {
 	Error string `json:"error"`

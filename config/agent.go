@@ -6,21 +6,21 @@ import (
 	"time"
 )
 
-// Scan strategy constants for Daemon.ScanStrategy.
+// Scan strategy constants for Agent.ScanStrategy.
 const (
 	ScanStrategyShallow = "shallow"
 	ScanStrategyDeep    = "deep"
 )
 
-// Daemon is the resolved `[daemon]` block. It is nil on Config when the
-// block is absent; the daemon subcommand errors with a config-pointer if
+// Agent is the resolved `[agent]` block. It is nil on Config when the
+// block is absent; the agent subcommand errors with a config-pointer if
 // callers try to start without it.
-type Daemon struct {
-	// Listen is the TCP address the daemon binds to, e.g. "0.0.0.0:8443".
+type Agent struct {
+	// Listen is the TCP address the agent binds to, e.g. "0.0.0.0:8443".
 	// Required.
 	Listen string
-	// DB optionally overrides the top-level db for the daemon process. The
-	// daemon binary resolves --db > Daemon.DB > top-level db > default; an
+	// DB optionally overrides the top-level db for the agent process. The
+	// agent binary resolves --db > Agent.DB > top-level db > default; an
 	// empty value here means "use the top-level / default".
 	DB string
 	// TLSCert and TLSKey are absolute filesystem paths to a PEM-encoded
@@ -28,14 +28,14 @@ type Daemon struct {
 	// empty disables TLS (plain HTTP).
 	TLSCert string
 	TLSKey  string
-	// Token is the resolved bearer token literal. Required: a daemon
+	// Token is the resolved bearer token literal. Required: an agent
 	// without a token is an unauthenticated open port and we refuse to
 	// start one.
 	Token string
 	// ScanInterval is the period between drift-detection passes the
-	// daemon runs over its hosted volumes (#17). Zero (the default,
+	// agent runs over its hosted volumes (#17). Zero (the default,
 	// when the TOML key is absent) disables the scheduler — the
-	// daemon then only re-hashes during peer syncs.
+	// agent then only re-hashes during peer syncs.
 	ScanInterval time.Duration
 	// ScanStrategy picks the per-tick rehash policy:
 	// ScanStrategyShallow (default) skips files whose (size, mtime)
@@ -44,10 +44,10 @@ type Daemon struct {
 	ScanStrategy string
 }
 
-// rawDaemon mirrors the `[daemon]` TOML block. We use typed sub-structs
+// rawAgent mirrors the `[agent]` TOML block. We use typed sub-structs
 // (rather than map[string]any) so DisallowUnknownFields catches typos like
 // `cret` or `lisetn` at load time instead of silently dropping them.
-type rawDaemon struct {
+type rawAgent struct {
 	Listen       string   `toml:"listen"`
 	DB           string   `toml:"db"`
 	TLS          *rawTLS  `toml:"tls"`
@@ -68,37 +68,37 @@ type rawAuth struct {
 	Token any `toml:"token"`
 }
 
-func resolveDaemon(r *rawDaemon) (*Daemon, error) {
+func resolveAgent(r *rawAgent) (*Agent, error) {
 	if r.Listen == "" {
 		return nil, errors.New("listen is required")
 	}
-	d := &Daemon{Listen: r.Listen}
+	a := &Agent{Listen: r.Listen}
 	if r.DB != "" {
 		expanded, err := expandPath(r.DB)
 		if err != nil {
 			return nil, fmt.Errorf("db: %w", err)
 		}
-		d.DB = expanded
+		a.DB = expanded
 	}
-	if err := resolveDaemonTLS(r.TLS, d); err != nil {
+	if err := resolveAgentTLS(r.TLS, a); err != nil {
 		return nil, err
 	}
-	if err := resolveDaemonAuth(r.Auth, d); err != nil {
+	if err := resolveAgentAuth(r.Auth, a); err != nil {
 		return nil, err
 	}
-	if err := resolveDaemonScan(r, d); err != nil {
+	if err := resolveAgentScan(r, a); err != nil {
 		return nil, err
 	}
-	return d, nil
+	return a, nil
 }
 
-// resolveDaemonScan parses the drift-detection scheduler knobs. Both
+// resolveAgentScan parses the drift-detection scheduler knobs. Both
 // are optional; absent means "no scheduled audits". A scan_strategy
 // without a scan_interval is accepted as effectively dead config (the
 // strategy is ignored when interval is zero) — emitting an error
 // would force users who toggle scheduling off to also delete the
 // strategy line.
-func resolveDaemonScan(r *rawDaemon, d *Daemon) error {
+func resolveAgentScan(r *rawAgent, a *Agent) error {
 	if r.ScanInterval != "" {
 		dur, err := time.ParseDuration(r.ScanInterval)
 		if err != nil {
@@ -107,13 +107,13 @@ func resolveDaemonScan(r *rawDaemon, d *Daemon) error {
 		if dur < 0 {
 			return fmt.Errorf("scan_interval must not be negative, got %s", dur)
 		}
-		d.ScanInterval = dur
+		a.ScanInterval = dur
 	}
 	switch r.ScanStrategy {
 	case "":
-		d.ScanStrategy = ScanStrategyShallow
+		a.ScanStrategy = ScanStrategyShallow
 	case ScanStrategyShallow, ScanStrategyDeep:
-		d.ScanStrategy = r.ScanStrategy
+		a.ScanStrategy = r.ScanStrategy
 	default:
 		return fmt.Errorf("scan_strategy %q is invalid (want %q or %q)",
 			r.ScanStrategy, ScanStrategyShallow, ScanStrategyDeep)
@@ -121,7 +121,7 @@ func resolveDaemonScan(r *rawDaemon, d *Daemon) error {
 	return nil
 }
 
-func resolveDaemonTLS(r *rawTLS, d *Daemon) error {
+func resolveAgentTLS(r *rawTLS, a *Agent) error {
 	if r == nil {
 		return nil
 	}
@@ -140,18 +140,18 @@ func resolveDaemonTLS(r *rawTLS, d *Daemon) error {
 	if err != nil {
 		return fmt.Errorf("tls.key: %w", err)
 	}
-	d.TLSCert = cert
-	d.TLSKey = key
+	a.TLSCert = cert
+	a.TLSKey = key
 	return nil
 }
 
-func resolveDaemonAuth(r *rawAuth, d *Daemon) error {
+func resolveAgentAuth(r *rawAuth, a *Agent) error {
 	if r == nil || r.Token == nil {
-		return errors.New("auth.token is required (no daemon without authentication)")
+		return errors.New("auth.token is required (no agent without authentication)")
 	}
 	// resolveSecret takes a map[string]any and pulls the named key. We pass
 	// a synthetic single-entry map so the same code handles plain strings
-	// and `{ env = "VAR" }` tables for the daemon token just like it does
+	// and `{ env = "VAR" }` tables for the agent token just like it does
 	// for destination credentials.
 	tok, err := resolveSecret(map[string]any{"token": r.Token}, "token")
 	if err != nil {
@@ -160,6 +160,6 @@ func resolveDaemonAuth(r *rawAuth, d *Daemon) error {
 	if tok == "" {
 		return errors.New("auth.token must not be empty")
 	}
-	d.Token = tok
+	a.Token = tok
 	return nil
 }

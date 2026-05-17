@@ -310,7 +310,7 @@ func supersedeLiveRow(ctx context.Context, tx *sql.Tx, volumeID int64, relPath s
 // RecordConflictPreStage atomically supersedes the live row at
 // originalPath and inserts a new 'present' row at conflictRow.Path
 // carrying the prior blake3 and the supplied provenance. The two
-// updates run inside one transaction so a daemon crash between them
+// updates run inside one transaction so an agent crash between them
 // rolls both back rather than leaving the receiver in a state where
 // the prior content is reachable only by path or only by hash.
 //

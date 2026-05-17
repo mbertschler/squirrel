@@ -30,7 +30,7 @@ type Options struct {
 	// QueueDepth: maximum pending entries between walker and workers. 0 means 4 * Workers.
 	QueueDepth int
 	// Kind selects the runs.kind label written for this invocation.
-	// Empty defaults to store.RunKindIndex. The daemon's drift-detection
+	// Empty defaults to store.RunKindIndex. The agent's drift-detection
 	// scheduler (#17) sets store.RunKindAudit so out-of-band re-walks
 	// are distinguishable from regular indexing in `squirrel runs`.
 	Kind string

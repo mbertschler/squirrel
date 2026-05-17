@@ -22,13 +22,13 @@ import (
 // from `ls -a`.
 const HistoryDirName = ".squirrel-history"
 
-// ConflictsDirName is the daemon-side equivalent of HistoryDirName for
+// ConflictsDirName is the agent-side equivalent of HistoryDirName for
 // node syncs: when a peer-sync diff produces a `conflict` disposition,
 // the receiver moves the losing version under
 // .squirrel-conflicts/run-<id>/<path> and seeds an index row there.
-// Mirrors daemon.ConflictsDirName; duplicated rather than imported so
+// Mirrors agent.ConflictsDirName; duplicated rather than imported so
 // non-sync packages (the CLI's `runs` listing, mainly) don't pull in
-// the daemon transitively.
+// the agent transitively.
 const ConflictsDirName = ".squirrel-conflicts"
 
 // Options shapes one Sync invocation.
