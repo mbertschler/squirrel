@@ -2,13 +2,12 @@
 // process that hosts the peer-sync HTTP server and the drift-detection
 // scheduler.
 //
-// This package owns the transport layer for the HTTP surface — bearer-
-// token auth, TLS termination, the public API, the health endpoint —
-// plus the drift-detection scheduler. Sync logic (plan negotiation,
-// reconciliation, peer state) lives in higher-level packages and is
-// wired in via future endpoints; the placeholder POST /v1/plan handler
-// returns 501 so the auth middleware has something to guard in tests
-// until that lands.
+// The HTTP surface terminates bearer-token auth and (optionally) TLS,
+// serves the /v1/health endpoint, and handles the four /v1/sync/*
+// peer-sync routes (begin, plan, verify, close). The scheduler walks
+// every configured volume on ScanInterval and writes an `audit`-kind
+// run, sharing the per-volume lock with the sync routes so audit and
+// sync never overlap on the same volume.
 package agent
 
 import (

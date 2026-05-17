@@ -427,8 +427,8 @@ func TestNodeSyncResolvesConflictOnLocalWriteOnReceiver(t *testing.T) {
 // and re-run sync — except this time we ALSO snapshot the
 // verify+report on the original successful run. So we end up
 // validating the "verify-returns-partial" code path by directly
-// driving the receiver's verifySession via a unit test in
-// agent/sync_test.go. The integration here just sanity-checks that
+// driving the receiver's verifySession via TestVerifyReportsMismatch
+// below. The integration here just sanity-checks that
 // "files-from" only ships transfer-bucket paths in the rclone
 // invocation; the supersede + already-correct paths skip transfer.
 func TestNodeSyncIdempotentRerun(t *testing.T) {
