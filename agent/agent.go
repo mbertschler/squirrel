@@ -1,16 +1,19 @@
 // Package agent implements the squirrel agent: the long-running
-// process that hosts the peer-sync HTTP server and the drift-detection
-// scheduler.
+// process that hosts the peer-sync HTTP server and the two background
+// schedulers.
 //
 // The HTTP surface terminates bearer-token auth and (optionally) TLS,
 // serves the /v1/health endpoint, and handles the four /v1/sync/*
-// peer-sync routes (begin, plan, verify, close). The scheduler walks
-// every configured volume on ScanInterval and writes an `audit`-kind
-// run, sharing the per-volume lock with the sync routes so audit and
-// sync never overlap on the same volume.
+// peer-sync routes (begin, plan, verify, close). The drift-detection
+// scan loop walks every configured volume on ScanInterval and writes
+// an `audit`-kind run; the cadence scheduler (#39) fires automatic
+// index and sync runs on the per-volume sync_every / index_every
+// knobs. Both loops share the per-volume lock with the sync routes so
+// no two operations on the same volume overlap.
 package agent
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
@@ -32,6 +35,24 @@ const (
 	ScanStrategyShallow = "shallow"
 	ScanStrategyDeep    = "deep"
 )
+
+// SyncRunner is the function shape the cadence scheduler delegates a
+// (volume, destination) sync to. Returning Err != nil with RunID == 0
+// means the sync was refused before a runs row was inserted (e.g.
+// destination not in config); a non-zero RunID with Err != nil means
+// the run was created but failed mid-flight. Status is one of
+// store.RunStatus*; empty falls back to "failed" in the scheduler's
+// own log line.
+type SyncRunner func(ctx context.Context, vol *config.Volume, destName string) SyncRunReport
+
+// SyncRunReport is the SyncRunner result surfaced to the scheduler.
+// Kept minimal — anything richer belongs in the runs table the CLI
+// inspects via `squirrel runs`, not on the agent's hot path.
+type SyncRunReport struct {
+	RunID  int64
+	Status string
+	Err    error
+}
 
 // Config configures one agent listener. Fields are validated by New; all
 // of them are required except TLSCert/TLSKey (which must be set together
@@ -56,6 +77,26 @@ type Config struct {
 	// disables the sync endpoints (they return 404 on every volume),
 	// which is what tests of the auth/health surface want.
 	Volumes map[string]*config.Volume
+	// SyncRunner is the cadence scheduler's (#39) hook for invoking
+	// one (volume, destination) sync. The CLI wires this to a closure
+	// that calls sync.RunPair against a configured rclone wrapper.
+	// Nil disables sync-kicking; index-only cadences still work, and
+	// an agent without any cadence-configured volume ignores this
+	// field entirely.
+	//
+	// The indirection keeps the agent package free of an import on
+	// the sync package — sync's tests already pull in agent for the
+	// peer-sync receiver fixture, and a direct agent→sync edge would
+	// close the cycle.
+	SyncRunner SyncRunner
+	// SchedulerTick overrides the scheduler's evaluation period.
+	// Zero falls back to DefaultSchedulerTick. Tests pin it to a
+	// small value; production rarely needs to touch it.
+	SchedulerTick time.Duration
+	// Now is the scheduler's time source. Nil falls back to
+	// time.Now; tests inject a fake clock so cadence behaviour is
+	// deterministic.
+	Now func() time.Time
 	// ScanInterval is the period between drift-detection passes over
 	// every hosted volume (#17). Zero (default) disables the
 	// scheduler; the agent then only re-hashes during peer syncs.
