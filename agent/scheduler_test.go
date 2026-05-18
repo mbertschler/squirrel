@@ -330,9 +330,11 @@ func TestSchedulerSyncRunsPreSyncIndexFirst(t *testing.T) {
 
 // TestSchedulerSkipsSyncWhenPreSyncIndexFails proves the issue's
 // failure-mode rule: "If index fails, sync is skipped this tick."
-// We make the index fail by removing the volume directory between
-// resolveVolume and Index — the deferred FinishRun marks the run
-// failed, and the scheduler must not invoke the sync runner.
+// We make the index fail by removing the volume directory so
+// index.Index errors out at the root-stat before it allocates its own
+// runs row. The scheduler synthesises a failed kind='index' row in
+// that case (so the cadence watermark and the `squirrel runs` audit
+// trail aren't blind to the failure) and skips the sync.
 func TestSchedulerSkipsSyncWhenPreSyncIndexFails(t *testing.T) {
 	volRoot := t.TempDir()
 	f := newSchedulerFixture(t, &config.Volume{
@@ -352,6 +354,25 @@ func TestSchedulerSkipsSyncWhenPreSyncIndexFails(t *testing.T) {
 
 	if got := len(f.syncLog.Calls()); got != 0 {
 		t.Fatalf("sync invoked %d times after failed pre-sync index; want 0", got)
+	}
+	// The synthetic failed run row keeps cadence math honest. Without
+	// it, every subsequent tick would re-kick the same broken volume
+	// because LatestFinishedRun would return sql.ErrNoRows.
+	runs, err := f.store.ListRuns(context.Background(), store.ListRunsOpts{})
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	var sawFailedIndex bool
+	for _, r := range runs {
+		if r.Kind == store.RunKindIndex && r.Status == store.RunStatusFailed {
+			sawFailedIndex = true
+			if !r.Error.Valid || r.Error.String == "" {
+				t.Errorf("synthetic failed index has empty error message: %+v", r)
+			}
+		}
+	}
+	if !sawFailedIndex {
+		t.Fatalf("expected a synthesised failed index row; got runs=%+v", runs)
 	}
 }
 

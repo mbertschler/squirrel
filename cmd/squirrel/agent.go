@@ -51,7 +51,7 @@ func runAgent(cmd *cobra.Command) error {
 	defer s.Close()
 
 	logger := slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), &slog.HandlerOptions{Level: slog.LevelInfo}))
-	rcl, err := resolveSchedulerRclone(cfg)
+	rcl, err := resolveSchedulerRclone(cmd, cfg)
 	if err != nil {
 		return err
 	}
@@ -131,13 +131,23 @@ func resolveAgentDBPath(cmd *cobra.Command, cfg *config.Config) (string, error) 
 // index-only schedules (or no scheduled volumes at all) skip the
 // lookup so a host without rclone installed can still run the agent
 // for its peer-sync surface or its index cadences.
-func resolveSchedulerRclone(cfg *config.Config) (*sync.Rclone, error) {
+//
+// EnsureMinVersion runs with shallow=false because scheduled syncs go
+// through sync.RunPair with the default sync.Options{} (Shallow=false)
+// — i.e. they will pass `--hash blake3`, which is only available in
+// rclone ≥ MinRcloneVersion. Failing here means the operator gets a
+// clear startup error rather than a midnight pager when the first
+// scheduled sync fires and rclone rejects the flag.
+func resolveSchedulerRclone(cmd *cobra.Command, cfg *config.Config) (*sync.Rclone, error) {
 	if !anyVolumeNeedsScheduledSync(cfg) {
 		return nil, nil
 	}
 	rcl, err := sync.Find()
 	if err != nil {
 		return nil, fmt.Errorf("scheduler needs rclone for scheduled syncs: %w", err)
+	}
+	if err := sync.EnsureMinVersion(cmd.Context(), rcl, cmd.ErrOrStderr(), false); err != nil {
+		return nil, fmt.Errorf("scheduler rclone preflight: %w", err)
 	}
 	if err := rcl.WriteRcloneConfig(rcloneConfigPathFor(cfg), cfg.Destinations); err != nil {
 		return nil, fmt.Errorf("write rclone config: %w", err)

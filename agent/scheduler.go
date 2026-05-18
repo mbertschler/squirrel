@@ -255,7 +255,7 @@ func (s *scheduler) maybeRunIndex(ctx context.Context, vol *config.Volume, volum
 		return false
 	}
 	defer s.locks.releaseVolumeLock(volumeID)
-	return s.executeIndex(ctx, vol, reason)
+	return s.executeIndex(ctx, vol, volumeID, reason)
 }
 
 // indexGatePassed runs the two pre-flight checks an index kick needs:
@@ -292,7 +292,14 @@ func (s *scheduler) indexGatePassed(ctx context.Context, vol *config.Volume, vol
 // executeIndex runs the index pass and emits kicked/finished/error
 // logs. The caller owns the volume lock for the duration of the call.
 // Returns true on success/partial, false on fatal failure.
-func (s *scheduler) executeIndex(ctx context.Context, vol *config.Volume, reason string) bool {
+//
+// When index.Index fails before it can allocate a runs row (e.g. the
+// root path stat fails in newIndexer), the report carries RunID == 0
+// and no row was written. In that case we synthesise a failed
+// kind='index' row ourselves so the cadence math has a watermark to
+// compute against (otherwise the next tick re-kicks the same broken
+// volume and the failure is invisible in `squirrel runs`).
+func (s *scheduler) executeIndex(ctx context.Context, vol *config.Volume, volumeID int64, reason string) bool {
 	s.logger.Info("scheduler.kicked",
 		"kind", "index", "volume", vol.Name, "reason", reason)
 	start := s.now()
@@ -302,6 +309,9 @@ func (s *scheduler) executeIndex(ctx context.Context, vol *config.Volume, reason
 		Shallow: true,
 	})
 	duration := s.now().Sub(start)
+	if err != nil && rep.RunID == 0 {
+		rep.RunID = s.recordFailedIndex(ctx, vol, volumeID, err)
+	}
 	status, ok := indexRunStatus(rep, err)
 	s.logger.Info("scheduler.finished",
 		"kind", "index", "volume", vol.Name,
@@ -314,6 +324,30 @@ func (s *scheduler) executeIndex(ctx context.Context, vol *config.Volume, reason
 			"run_id", rep.RunID, "err", err.Error())
 	}
 	return ok
+}
+
+// recordFailedIndex inserts and immediately finishes a failed
+// kind='index' run for volumeID, carrying runErr as the row's error
+// message. Used when index.Index couldn't even allocate its own
+// run row (typically a pre-walk stat failure). A failure of the
+// BeginRun/FinishRun pair itself surfaces via scheduler.error so an
+// operator notices that the watermark write also failed; the function
+// still returns the (best-effort) run id so the kicked/finished log
+// pair carries a non-zero correlation when possible.
+func (s *scheduler) recordFailedIndex(ctx context.Context, vol *config.Volume, volumeID int64, runErr error) int64 {
+	id, err := s.store.BeginRun(ctx, store.RunKindIndex, volumeID, "")
+	if err != nil {
+		s.logger.Error("scheduler.error",
+			"kind", "index", "volume", vol.Name,
+			"err", fmt.Sprintf("record failed index: %v", err))
+		return 0
+	}
+	if err := s.store.FinishRun(ctx, id, store.RunStatusFailed, runErr.Error(), 0); err != nil {
+		s.logger.Error("scheduler.error",
+			"kind", "index", "volume", vol.Name, "run_id", id,
+			"err", fmt.Sprintf("finish failed index: %v", err))
+	}
+	return id
 }
 
 // indexRunStatus derives a terminal status string from an index report.

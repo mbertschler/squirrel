@@ -506,25 +506,31 @@ func (s *Store) LatestFinishedRun(ctx context.Context, kind string, volumeID int
 // The scheduler calls this before kicking a new run so a stale
 // 'running' row (from a crashed prior run, cleared via `runs fail`)
 // or a concurrent CLI invocation produces a clean skip log rather
-// than racing into a duplicate.
+// than racing into a duplicate. Implemented via SELECT EXISTS so
+// SQLite short-circuits at the first match rather than walking every
+// matching row (COUNT(*) semantics).
 func (s *Store) HasRunningRun(ctx context.Context, kind string, volumeID int64, destination string) (bool, error) {
-	var n int
+	var found bool
 	var err error
 	if destination == "" {
 		err = s.db.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM runs
-			 WHERE kind = ? AND volume_id = ? AND destination IS NULL
-			   AND status = 'running'`,
-			kind, volumeID).Scan(&n)
+			`SELECT EXISTS (
+			   SELECT 1 FROM runs
+			   WHERE kind = ? AND volume_id = ? AND destination IS NULL
+			     AND status = 'running'
+			 )`,
+			kind, volumeID).Scan(&found)
 	} else {
 		err = s.db.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM runs
-			 WHERE kind = ? AND volume_id = ? AND destination = ?
-			   AND status = 'running'`,
-			kind, volumeID, destination).Scan(&n)
+			`SELECT EXISTS (
+			   SELECT 1 FROM runs
+			   WHERE kind = ? AND volume_id = ? AND destination = ?
+			     AND status = 'running'
+			 )`,
+			kind, volumeID, destination).Scan(&found)
 	}
 	if err != nil {
 		return false, fmt.Errorf("check running run: %w", err)
 	}
-	return n > 0, nil
+	return found, nil
 }
