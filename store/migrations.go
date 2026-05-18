@@ -4,11 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 	"time"
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 7
+const SchemaVersion = 8
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -41,6 +42,7 @@ func buildMigrations(mctx migrationCtx) []migration {
 			return migrateV5ToV6(ctx, db, mctx.nodeName)
 		}},
 		{version: 7, up: migrateV6ToV7},
+		{version: 8, up: migrateV7ToV8},
 	}
 }
 
@@ -588,6 +590,380 @@ func rebuildRunsTableV7(ctx context.Context, tx *sql.Tx) error {
 	for _, q := range stmts {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("rebuild runs: %w", err)
+		}
+	}
+	return nil
+}
+
+// --- v7 → v8 ---
+
+// migrateV7ToV8 introduces the folders table for path-prefix dedup and
+// per-folder Merkle hashes (#44). It (1) creates the folders table, (2)
+// seeds one folder row per distinct directory path in the existing files
+// table plus all ancestors up to the volume root, (3) rebuilds the files
+// table to key off (folder_id, name) instead of (volume_id, path), and
+// (4) backfills folder hashes bottom-up so the freshly migrated database
+// is in the same shape a from-scratch v8 indexer would have produced.
+//
+// FK enforcement is disabled across the rebuild because files references
+// folders and runs, and we drop the old files table mid-migration. The
+// final foreign_key_check verifies no dangling refs slipped through
+// before the transaction commits.
+func migrateV7ToV8(ctx context.Context, db *sql.DB) error {
+	conn, restore, err := disableForeignKeys(ctx, db)
+	if err != nil {
+		return err
+	}
+	defer restore()
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := createFoldersTableV8(ctx, tx); err != nil {
+		return err
+	}
+	if err := seedFoldersFromFilesV8(ctx, tx); err != nil {
+		return err
+	}
+	if err := rebuildFilesV8(ctx, tx); err != nil {
+		return err
+	}
+	if err := backfillFolderHashesV8(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (8)`); err != nil {
+		return fmt.Errorf("record schema v8: %w", err)
+	}
+	if err := verifyForeignKeysClean(ctx, tx, "v7→v8"); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func createFoldersTableV8(ctx context.Context, tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE folders (
+			id                  INTEGER PRIMARY KEY,
+			volume_id           INTEGER NOT NULL REFERENCES volumes(id),
+			parent_id           INTEGER REFERENCES folders(id),
+			path                TEXT NOT NULL,
+			shallow_blake3      BLOB CHECK (shallow_blake3 IS NULL OR length(shallow_blake3) = 32),
+			deep_blake3         BLOB CHECK (deep_blake3    IS NULL OR length(deep_blake3)    = 32),
+			last_changed_run_id INTEGER REFERENCES runs(id),
+			UNIQUE (volume_id, path)
+		)`,
+		// parent_id is queried on every ancestor walk (hash bubble-up and
+		// child-folder enumeration); without an index those become full
+		// scans of the folders table.
+		`CREATE INDEX idx_folders_parent ON folders(parent_id)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("create folders: %w", err)
+		}
+	}
+	return nil
+}
+
+// seedFoldersFromFilesV8 builds the full set of (volume_id, folder_path)
+// tuples the new files table will reference, then inserts them with
+// correct parent_id links. The set is the union of:
+//
+//   - every directory containing a file in v7 files
+//   - every ancestor of those directories up to the volume root
+//   - the volume root ("") for every volume that exists at all (so empty
+//     volumes still have a hashable root)
+//
+// Insert order is by path length ascending so each row's parent already
+// exists when the child INSERT runs.
+// folderSeedKey is the local (volume_id, folder_path) tuple keyed in the
+// seed phase. Kept package-scoped (lowercase) so the helpers below share
+// a single named type rather than restating the literal at every call.
+type folderSeedKey struct {
+	volumeID int64
+	path     string
+}
+
+func seedFoldersFromFilesV8(ctx context.Context, tx *sql.Tx) error {
+	needed, err := collectNeededFolders(ctx, tx)
+	if err != nil {
+		return err
+	}
+	return insertSeededFolders(ctx, tx, needed)
+}
+
+// collectNeededFolders returns the full set of (volume_id, folder_path)
+// tuples that the v8 files table will reference: every directory holding
+// a v7 file, every ancestor up to the root, and the root itself for every
+// volume (so empty volumes still have a hashable root).
+func collectNeededFolders(ctx context.Context, tx *sql.Tx) (map[folderSeedKey]struct{}, error) {
+	needed := map[folderSeedKey]struct{}{}
+	if err := forEachVolume(ctx, tx, func(id int64) {
+		needed[folderSeedKey{volumeID: id, path: ""}] = struct{}{}
+	}); err != nil {
+		return nil, err
+	}
+	if err := forEachDistinctFilePath(ctx, tx, func(volumeID int64, p string) {
+		folderPath, _ := splitFilePath(p)
+		for {
+			needed[folderSeedKey{volumeID: volumeID, path: folderPath}] = struct{}{}
+			if folderPath == "" {
+				return
+			}
+			folderPath = parentFolderPath(folderPath)
+		}
+	}); err != nil {
+		return nil, err
+	}
+	return needed, nil
+}
+
+// insertSeededFolders writes the rows in an order where every parent
+// precedes its children, recording each row's id so the next sibling /
+// child can wire parent_id correctly.
+func insertSeededFolders(ctx context.Context, tx *sql.Tx, needed map[folderSeedKey]struct{}) error {
+	keys := make([]folderSeedKey, 0, len(needed))
+	for k := range needed {
+		keys = append(keys, k)
+	}
+	// Path length is a strict order on ancestry (every ancestor has a
+	// shorter path); secondary keys give a deterministic insert order.
+	sort.SliceStable(keys, func(i, j int) bool {
+		a, b := keys[i], keys[j]
+		if la, lb := len(a.path), len(b.path); la != lb {
+			return la < lb
+		}
+		if a.volumeID != b.volumeID {
+			return a.volumeID < b.volumeID
+		}
+		return a.path < b.path
+	})
+
+	ids := make(map[folderSeedKey]int64, len(keys))
+	for _, k := range keys {
+		var parent sql.NullInt64
+		if k.path != "" {
+			pk := folderSeedKey{volumeID: k.volumeID, path: parentFolderPath(k.path)}
+			parent = sql.NullInt64{Int64: ids[pk], Valid: true}
+		}
+		res, err := tx.ExecContext(ctx,
+			`INSERT INTO folders (volume_id, parent_id, path, shallow_blake3, deep_blake3)
+			 VALUES (?, ?, ?, NULL, NULL)`,
+			k.volumeID, parent, k.path)
+		if err != nil {
+			return fmt.Errorf("insert folder (volume=%d path=%q): %w", k.volumeID, k.path, err)
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			return fmt.Errorf("last insert id for folder: %w", err)
+		}
+		ids[k] = id
+	}
+	return nil
+}
+
+func forEachVolume(ctx context.Context, tx *sql.Tx, fn func(id int64)) error {
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM volumes`)
+	if err != nil {
+		return fmt.Errorf("list volumes for folder seed: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return fmt.Errorf("scan volume id: %w", err)
+		}
+		fn(id)
+	}
+	return rows.Err()
+}
+
+func forEachDistinctFilePath(ctx context.Context, tx *sql.Tx, fn func(volumeID int64, path string)) error {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT DISTINCT volume_id, path FROM files`)
+	if err != nil {
+		return fmt.Errorf("list distinct file paths: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var v int64
+		var p string
+		if err := rows.Scan(&v, &p); err != nil {
+			return fmt.Errorf("scan file path: %w", err)
+		}
+		fn(v, p)
+	}
+	return rows.Err()
+}
+
+// rebuildFilesV8 creates the new files schema (folder_id + name) and
+// copies every row from the v7 table into it, resolving the folder_id
+// via a JOIN on the freshly seeded folders. Indexes are recreated
+// matching v7 semantics but rekeyed to (folder_id, name).
+func rebuildFilesV8(ctx context.Context, tx *sql.Tx) error {
+	if err := createFilesV8Stage(ctx, tx); err != nil {
+		return err
+	}
+	if err := copyFilesIntoV8(ctx, tx); err != nil {
+		return err
+	}
+	return finishFilesV8Rebuild(ctx, tx)
+}
+
+func createFilesV8Stage(ctx context.Context, tx *sql.Tx) error {
+	const ddl = `CREATE TABLE files_v8 (
+		folder_id         INTEGER NOT NULL REFERENCES folders(id),
+		name              TEXT NOT NULL,
+		blake3            BLOB NOT NULL CHECK (length(blake3) = 32),
+		size_bytes        INTEGER NOT NULL,
+		mtime_ns          INTEGER NOT NULL,
+		status            TEXT NOT NULL CHECK (status IN ('present','missing','superseded')),
+		first_seen_run_id INTEGER NOT NULL REFERENCES runs(id),
+		last_seen_run_id  INTEGER NOT NULL REFERENCES runs(id),
+		indexed_at_ns     INTEGER NOT NULL,
+		source_node_id    INTEGER REFERENCES nodes(id),
+		source_run_id     INTEGER REFERENCES runs(id),
+		PRIMARY KEY (folder_id, name, blake3)
+	)`
+	if _, err := tx.ExecContext(ctx, ddl); err != nil {
+		return fmt.Errorf("create files_v8: %w", err)
+	}
+	return nil
+}
+
+// copyFilesIntoV8 reads every v7 row into memory, then writes each one
+// into files_v8 with the resolved folder_id. The folder lookup runs in
+// Go because SQLite has no portable last-slash helper; this also keeps
+// the migration easy to reason about against test fixtures.
+func copyFilesIntoV8(ctx context.Context, tx *sql.Tx) error {
+	batch, err := readV7Files(ctx, tx)
+	if err != nil {
+		return err
+	}
+	for _, r := range batch {
+		folderPath, name := splitFilePath(r.path)
+		var folderID int64
+		if err := tx.QueryRowContext(ctx,
+			`SELECT id FROM folders WHERE volume_id = ? AND path = ?`,
+			r.volumeID, folderPath).Scan(&folderID); err != nil {
+			return fmt.Errorf("lookup folder for (volume=%d path=%q): %w", r.volumeID, r.path, err)
+		}
+		_, err := tx.ExecContext(ctx,
+			`INSERT INTO files_v8 (folder_id, name, blake3, size_bytes, mtime_ns,
+				status, first_seen_run_id, last_seen_run_id, indexed_at_ns,
+				source_node_id, source_run_id)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			folderID, name, r.blake3, r.sizeBytes, r.mtimeNs, r.status,
+			r.firstSeen, r.lastSeen, r.indexedAt, r.sourceNodeID, r.sourceRunID)
+		if err != nil {
+			return fmt.Errorf("copy file row (volume=%d path=%q): %w", r.volumeID, r.path, err)
+		}
+	}
+	return nil
+}
+
+// v7FileRow is the in-memory shape of a single v7 files row. The
+// transition is read-then-rewrite so capturing every column from the old
+// schema is the simplest path.
+type v7FileRow struct {
+	volumeID     int64
+	path         string
+	blake3       []byte
+	sizeBytes    int64
+	mtimeNs      int64
+	status       string
+	firstSeen    int64
+	lastSeen     int64
+	indexedAt    int64
+	sourceNodeID sql.NullInt64
+	sourceRunID  sql.NullInt64
+}
+
+func readV7Files(ctx context.Context, tx *sql.Tx) ([]v7FileRow, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT volume_id, path, blake3, size_bytes, mtime_ns,
+		status, first_seen_run_id, last_seen_run_id, indexed_at_ns, source_node_id, source_run_id
+		FROM files`)
+	if err != nil {
+		return nil, fmt.Errorf("scan v7 files: %w", err)
+	}
+	defer rows.Close()
+	var batch []v7FileRow
+	for rows.Next() {
+		var r v7FileRow
+		if err := rows.Scan(&r.volumeID, &r.path, &r.blake3, &r.sizeBytes, &r.mtimeNs,
+			&r.status, &r.firstSeen, &r.lastSeen, &r.indexedAt, &r.sourceNodeID, &r.sourceRunID); err != nil {
+			return nil, fmt.Errorf("scan v7 row: %w", err)
+		}
+		batch = append(batch, r)
+	}
+	return batch, rows.Err()
+}
+
+// finishFilesV8Rebuild swaps the staged table into place and recreates
+// every index + trigger the v7 files table carried, rekeyed to
+// (folder_id, name) where applicable.
+func finishFilesV8Rebuild(ctx context.Context, tx *sql.Tx) error {
+	tail := []string{
+		`DROP TABLE files`,
+		`ALTER TABLE files_v8 RENAME TO files`,
+		`CREATE INDEX idx_files_blake3 ON files(blake3, folder_id, name)`,
+		`CREATE INDEX idx_files_missing ON files(folder_id, name) WHERE status = 'missing'`,
+		`CREATE UNIQUE INDEX uniq_files_live_per_path ON files(folder_id, name) WHERE status != 'superseded'`,
+		`CREATE INDEX idx_files_source_node ON files(source_node_id)
+		 WHERE status = 'present' AND source_node_id IS NOT NULL`,
+		`CREATE TRIGGER files_blake3_immutable BEFORE UPDATE OF blake3 ON files
+		 BEGIN
+		     SELECT RAISE(ABORT, 'blake3 is immutable; supersede the row and insert a new one');
+		 END`,
+	}
+	for _, q := range tail {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("finish files rebuild: %w", err)
+		}
+	}
+	return nil
+}
+
+// backfillFolderHashesV8 visits every folder in length-descending order
+// (leaves first) and writes its shallow + deep digests. By the time the
+// loop reaches an ancestor, every child's deep_blake3 is already
+// populated, so the deep computation is a single pass with no recursion.
+// last_changed_run_id stays NULL — there is no run that "caused" the
+// migration's content, so claiming one would falsify the audit log.
+func backfillFolderHashesV8(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM folders ORDER BY length(path) DESC, path DESC`)
+	if err != nil {
+		return fmt.Errorf("list folders for backfill: %w", err)
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan folder id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	for _, id := range ids {
+		shallow, err := computeShallowForFolderTx(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		deep, err := computeDeepForFolderTx(ctx, tx, id, shallow)
+		if err != nil {
+			return err
+		}
+		if err := writeFolderHashesTx(ctx, tx, id, shallow, deep, 0); err != nil {
+			return err
 		}
 	}
 	return nil

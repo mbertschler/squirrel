@@ -899,13 +899,14 @@ func TestMigrateV3ToV4(t *testing.T) {
 		t.Fatalf("schema_version = %d, want %d", v, SchemaVersion)
 	}
 
-	// PK should now include blake3 — confirm by inserting a second row at the
-	// same (volume_id, path) but different blake3, which would have collided
-	// pre-migration.
+	// PK now includes blake3 — confirm by inserting a second row at the
+	// same (folder, name) but different blake3, which would have collided
+	// pre-v4. v8 keys files off (folder_id, name) but the same widening
+	// invariant applies.
 	d2 := digest(0x66)
 	if _, err := s.db.ExecContext(ctx, `
-		INSERT INTO files (volume_id, path, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
-		VALUES (1, 'photo.jpg', ?, 1024, 60, 'superseded', 1, 1, 60)
+		INSERT INTO files (folder_id, name, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
+		VALUES ((SELECT id FROM folders WHERE volume_id = 1 AND path = ''), 'photo.jpg', ?, 1024, 60, 'superseded', 1, 1, 60)
 	`, d2); err != nil {
 		t.Fatalf("insert second blake3 at same path failed (PK not widened?): %v", err)
 	}
@@ -1059,7 +1060,8 @@ func TestTriggerRejectsBlake3Update(t *testing.T) {
 	// Direct UPDATE bypassing the Upsert state machine — the trigger must
 	// abort it.
 	_, err = s.db.ExecContext(ctx,
-		`UPDATE files SET blake3 = ? WHERE volume_id = ? AND path = ?`,
+		`UPDATE files SET blake3 = ?
+		 WHERE folder_id = (SELECT id FROM folders WHERE volume_id = ? AND path = '') AND name = ?`,
 		digest(0xbb), vID, "x")
 	if err == nil {
 		t.Fatalf("direct UPDATE of blake3 succeeded; trigger did not fire")
@@ -1101,12 +1103,17 @@ func TestUniqueIndexRejectsSecondLiveRow(t *testing.T) {
 		t.Fatalf("Upsert: %v", err)
 	}
 
-	// Try to insert a second live row at the same (volume, path) without
+	// Try to insert a second live row at the same (folder, name) without
 	// superseding the first. The UNIQUE index must abort this.
+	var rootFolderID int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT id FROM folders WHERE volume_id = ? AND path = ''`, vID).Scan(&rootFolderID); err != nil {
+		t.Fatalf("lookup root folder: %v", err)
+	}
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO files (volume_id, path, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
+		INSERT INTO files (folder_id, name, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
 		VALUES (?, ?, ?, ?, ?, 'present', ?, ?, ?)
-	`, vID, "x", digest(0xbb), 1, 2, run, run, 2)
+	`, rootFolderID, "x", digest(0xbb), 1, 2, run, run, 2)
 	if err == nil {
 		t.Fatalf("direct INSERT of second live row succeeded; unique index did not fire")
 	}
@@ -1114,13 +1121,13 @@ func TestUniqueIndexRejectsSecondLiveRow(t *testing.T) {
 		t.Fatalf("got error %q, want one mentioning UNIQUE constraint", err)
 	}
 
-	// Inserting a 'superseded' row at the same (V, P) is allowed — superseded
-	// rows are exempt from the partial unique constraint, so the schema
-	// supports unbounded historical depth per path.
+	// Inserting a 'superseded' row at the same (folder, name) is allowed —
+	// superseded rows are exempt from the partial unique constraint, so the
+	// schema supports unbounded historical depth per path.
 	if _, err := s.db.ExecContext(ctx, `
-		INSERT INTO files (volume_id, path, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
+		INSERT INTO files (folder_id, name, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
 		VALUES (?, ?, ?, ?, ?, 'superseded', ?, ?, ?)
-	`, vID, "x", digest(0xcc), 1, 3, run, run, 3); err != nil {
+	`, rootFolderID, "x", digest(0xcc), 1, 3, run, run, 3); err != nil {
 		t.Fatalf("inserting superseded row should be allowed, got: %v", err)
 	}
 }
@@ -1160,15 +1167,19 @@ func TestMigrateV3ToV4InstallsSchemaGuards(t *testing.T) {
 	ctx := context.Background()
 
 	// Trigger must reject blake3 updates on the migrated DB.
-	_, err = s.db.ExecContext(ctx, `UPDATE files SET blake3 = ? WHERE volume_id = 1 AND path = 'x'`, digest(0xbb))
+	_, err = s.db.ExecContext(ctx,
+		`UPDATE files SET blake3 = ?
+		 WHERE folder_id = (SELECT id FROM folders WHERE volume_id = 1 AND path = '') AND name = 'x'`,
+		digest(0xbb))
 	if err == nil || !strings.Contains(err.Error(), "blake3 is immutable") {
 		t.Fatalf("trigger missing after migration; err = %v", err)
 	}
 
-	// Partial UNIQUE index must reject a second live row at the same (V, P).
+	// Partial UNIQUE index must reject a second live row at the same
+	// (folder, name).
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO files (volume_id, path, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
-		VALUES (1, 'x', ?, 1, 2, 'present', 1, 1, 2)
+		INSERT INTO files (folder_id, name, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
+		VALUES ((SELECT id FROM folders WHERE volume_id = 1 AND path = ''), 'x', ?, 1, 2, 'present', 1, 1, 2)
 	`, digest(0xcc))
 	if err == nil || !strings.Contains(err.Error(), "UNIQUE") {
 		t.Fatalf("unique index missing after migration; err = %v", err)
@@ -2065,10 +2076,11 @@ func TestBuildMigrationsAscending(t *testing.T) {
 }
 
 // TestFileRowScanInsertRoundTrip locks in the column-order invariant
-// between fileColumns, scanFrom, and insertArgs. A row inserted via
-// insertArgs and read back via scanFrom must equal the original. Adding
-// a column without updating every helper would surface here as a Scan
-// arity mismatch or a field whose value lands in the wrong slot.
+// between the files INSERT shape, scanFrom, and the JOIN-based SELECT
+// projection. A row written via Upsert and read back via GetByPath must
+// equal the original. Adding a column without updating every helper would
+// surface here as a Scan arity mismatch or a field whose value lands in
+// the wrong slot.
 func TestFileRowScanInsertRoundTrip(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "test.db")
 	s, err := Open(dsn)
@@ -2080,6 +2092,11 @@ func TestFileRowScanInsertRoundTrip(t *testing.T) {
 
 	volID := makeVolume(t, s, "/photos")
 	runID := makeRun(t, s, volID)
+	peerNode, err := s.GetOrCreatePeerNode(ctx, "peer-x", "https://peer-x.example")
+	if err != nil {
+		t.Fatalf("GetOrCreatePeerNode: %v", err)
+	}
+	peerNodeID := peerNode.ID
 
 	want := FileRow{
 		VolumeID:       volID,
@@ -2091,22 +2108,17 @@ func TestFileRowScanInsertRoundTrip(t *testing.T) {
 		FirstSeenRunID: runID,
 		LastSeenRunID:  runID,
 		IndexedAtNs:    1_700_000_500_000_000_000,
-		SourceNodeID:   sql.NullInt64{Int64: 1, Valid: true},
+		SourceNodeID:   sql.NullInt64{Int64: peerNodeID, Valid: true},
 		SourceRunID:    sql.NullInt64{Int64: runID, Valid: true},
 	}
 
-	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO files (`+fileColumns+`) VALUES (`+filePlaceholders+`)`,
-		want.insertArgs()...); err != nil {
-		t.Fatalf("insert via insertArgs: %v", err)
+	if err := s.Upsert(ctx, want, &Provenance{NodeID: want.SourceNodeID.Int64, RunID: want.SourceRunID.Int64}); err != nil {
+		t.Fatalf("Upsert: %v", err)
 	}
 
-	var got FileRow
-	row := s.db.QueryRowContext(ctx,
-		`SELECT `+fileColumns+` FROM files WHERE volume_id = ? AND path = ? AND blake3 = ?`,
-		want.VolumeID, want.Path, want.Blake3)
-	if err := got.scanFrom(row); err != nil {
-		t.Fatalf("scanFrom: %v", err)
+	got, err := s.GetByPath(ctx, want.VolumeID, want.Path)
+	if err != nil {
+		t.Fatalf("GetByPath: %v", err)
 	}
 
 	if got.VolumeID != want.VolumeID || got.Path != want.Path ||
@@ -2119,11 +2131,6 @@ func TestFileRowScanInsertRoundTrip(t *testing.T) {
 		t.Fatalf("round-trip mismatch:\n got=%+v\nwant=%+v", got, want)
 	}
 }
-
-// TestFilePlaceholdersMatchesFileColumns guards the derived placeholder
-// list against drift from fileColumns. A column added to fileColumns but
-// forgotten elsewhere (or vice versa) trips here before any INSERT hits
-// SQLite and produces an opaque parameter-count error.
 
 // TestRecordConflictPreStageAtomic exercises the supersede + insert
 // transaction used by the receiver's conflict pre-stage: the live row
@@ -2434,20 +2441,6 @@ func TestListRunsByPeer(t *testing.T) {
 	}
 	if len(capped) != 1 || capped[0].ID != r2 {
 		t.Fatalf("limit=1 returned %+v, want only r2 (%d)", capped, r2)
-	}
-}
-
-func TestFilePlaceholdersMatchesFileColumns(t *testing.T) {
-	gotCols := strings.Count(fileColumns, ",") + 1
-	gotPlaceholders := strings.Count(filePlaceholders, "?")
-	if gotCols != gotPlaceholders {
-		t.Fatalf("fileColumns has %d entries, filePlaceholders has %d ?s", gotCols, gotPlaceholders)
-	}
-	// insertArgs is the third leg of the invariant — its return length
-	// must match too. Use a zero-value row; the only thing we sample is
-	// the slice length.
-	if n := len(FileRow{}.insertArgs()); n != gotCols {
-		t.Fatalf("insertArgs returns %d args, fileColumns has %d entries", n, gotCols)
 	}
 }
 
@@ -2973,7 +2966,8 @@ func TestGetPresentByBlake3InVolume(t *testing.T) {
 		t.Fatalf("Upsert gone: %v", err)
 	}
 	if _, err := s.db.ExecContext(ctx,
-		`UPDATE files SET status = 'missing' WHERE volume_id = ? AND path = ?`,
+		`UPDATE files SET status = 'missing'
+		 WHERE folder_id = (SELECT id FROM folders WHERE volume_id = ? AND path = '') AND name = ?`,
 		volA, "gone.jpg"); err != nil {
 		t.Fatalf("flip gone to missing: %v", err)
 	}

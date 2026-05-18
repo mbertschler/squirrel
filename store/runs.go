@@ -273,12 +273,13 @@ func (s *Store) CountFilesFirstSeenByRunWithPathPrefix(ctx context.Context, runI
 	for _, id := range runIDs {
 		args = append(args, id)
 	}
-	args = append(args, escapeLikePrefix(pathPrefix)+"/%")
+	args = append(args, pathPrefix, escapeLikePrefix(pathPrefix)+"/%")
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT first_seen_run_id, COUNT(*) FROM files
-		 WHERE first_seen_run_id IN (`+placeholders+`)
-		   AND path LIKE ? ESCAPE '\'
-		 GROUP BY first_seen_run_id`, args...)
+		`SELECT f.first_seen_run_id, COUNT(*) FROM files f
+		 JOIN folders fo ON fo.id = f.folder_id
+		 WHERE f.first_seen_run_id IN (`+placeholders+`)
+		   AND (fo.path = ? OR fo.path LIKE ? ESCAPE '\')
+		 GROUP BY f.first_seen_run_id`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("count files by run: %w", err)
 	}
@@ -338,7 +339,7 @@ func (s *Store) ListAuditRunsSince(ctx context.Context, volumeID int64, sinceNs 
 
 // CountModifiedFilesByRun returns the number of files rows whose
 // first_seen_run_id is the given runID and that have a prior superseded
-// row at the same (volume_id, path). This is the "the bytes changed
+// row at the same (folder_id, name). This is the "the bytes changed
 // during this run" count, derivable without an audit-specific schema
 // column because the supersede chain already records the prior content.
 // Returns 0 when no such rows exist (a clean audit). New content at a
@@ -351,7 +352,7 @@ func (s *Store) CountModifiedFilesByRun(ctx context.Context, runID int64) (int, 
 		 WHERE f.first_seen_run_id = ? AND f.status = 'present'
 		   AND EXISTS (
 		       SELECT 1 FROM files p
-		       WHERE p.volume_id = f.volume_id AND p.path = f.path
+		       WHERE p.folder_id = f.folder_id AND p.name = f.name
 		         AND p.status = 'superseded'
 		   )`, runID).Scan(&n)
 	if err != nil {
