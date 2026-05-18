@@ -63,10 +63,9 @@ func (c *fakeClock) Add(d time.Duration) {
 // a successful report. Tests can swap the inner func for failure
 // scenarios.
 type fakeSyncRunner struct {
-	mu     sync.Mutex
-	calls  []syncCall
-	runFn  func(ctx context.Context, vol *config.Volume, destName string, callIdx int) SyncRunReport
-	nextID int64
+	mu    sync.Mutex
+	calls []syncCall
+	runFn func(ctx context.Context, vol *config.Volume, destName string) SyncRunReport
 }
 
 type syncCall struct {
@@ -76,7 +75,7 @@ type syncCall struct {
 
 func newFakeSyncRunner(s *store.Store) *fakeSyncRunner {
 	f := &fakeSyncRunner{}
-	f.runFn = func(ctx context.Context, vol *config.Volume, destName string, callIdx int) SyncRunReport {
+	f.runFn = func(ctx context.Context, vol *config.Volume, destName string) SyncRunReport {
 		// Default: insert a sync run + finish it 'success'. This is
 		// what makes the scheduler's "last sync" cadence calculation
 		// progress between ticks.
@@ -105,11 +104,10 @@ func newFakeSyncRunner(s *store.Store) *fakeSyncRunner {
 func (f *fakeSyncRunner) Runner() SyncRunner {
 	return func(ctx context.Context, vol *config.Volume, destName string) SyncRunReport {
 		f.mu.Lock()
-		idx := len(f.calls)
 		f.calls = append(f.calls, syncCall{Volume: vol.Name, Destination: destName})
 		fn := f.runFn
 		f.mu.Unlock()
-		return fn(ctx, vol, destName, idx)
+		return fn(ctx, vol, destName)
 	}
 }
 
@@ -184,14 +182,15 @@ func (f *schedulerFixture) scheduler() *scheduler {
 	}
 }
 
-func (f *schedulerFixture) writeFile(rel, body string) {
+// seedFile drops a single regular file under the fixture's volume
+// root so the index walker has something to hash. The contents don't
+// matter to any assertion — what matters is that filepath.WalkDir
+// produces at least one entry the indexer's worker pool processes.
+func (f *schedulerFixture) seedFile() {
 	f.t.Helper()
 	for _, vol := range f.srv.cfg.Volumes {
-		p := filepath.Join(vol.Path, rel)
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			f.t.Fatalf("mkdir %s: %v", filepath.Dir(p), err)
-		}
-		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		p := filepath.Join(vol.Path, "a.txt")
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
 			f.t.Fatalf("write %s: %v", p, err)
 		}
 		return
@@ -226,7 +225,7 @@ func (f *schedulerFixture) containsLogLine(fields ...string) bool {
 // scheduler activity, no matter how many ticks pass.
 func TestSchedulerIgnoresVolumesWithoutCadence(t *testing.T) {
 	f := newSchedulerFixture(t, &config.Volume{Name: "idle"})
-	f.writeFile("a.txt", "hello")
+	f.seedFile()
 	sch := f.scheduler()
 
 	for i := 0; i < 3; i++ {
@@ -254,7 +253,7 @@ func TestSchedulerKicksStandaloneIndex(t *testing.T) {
 		Name:       "pics",
 		IndexEvery: 10 * time.Minute,
 	})
-	f.writeFile("a.txt", "hello")
+	f.seedFile()
 	sch := f.scheduler()
 	ctx := context.Background()
 
@@ -305,7 +304,7 @@ func TestSchedulerSyncRunsPreSyncIndexFirst(t *testing.T) {
 		SyncTo:    []string{"backup"},
 		SyncEvery: time.Hour,
 	})
-	f.writeFile("a.txt", "hello")
+	f.seedFile()
 	sch := f.scheduler()
 	ctx := context.Background()
 
@@ -366,7 +365,7 @@ func TestSchedulerSkipsWhenInFlightIndexRun(t *testing.T) {
 		Name:       "pics",
 		IndexEvery: 10 * time.Minute,
 	})
-	f.writeFile("a.txt", "x")
+	f.seedFile()
 
 	// Resolve the volume up front (so the runs.volume_id FK has a row
 	// to point at) then plant a 'running' index row.
@@ -401,7 +400,7 @@ func TestSchedulerSkipsWhenInFlightSyncRun(t *testing.T) {
 		SyncTo:    []string{"backup"},
 		SyncEvery: time.Hour,
 	})
-	f.writeFile("a.txt", "x")
+	f.seedFile()
 
 	v, err := f.store.CreateVolume(context.Background(), "pics", f.srv.cfg.Volumes["pics"].Path)
 	if err != nil {
@@ -455,7 +454,7 @@ func TestSchedulerSkipsWhenVolumeLockHeld(t *testing.T) {
 		Name:       "pics",
 		IndexEvery: 10 * time.Minute,
 	})
-	f.writeFile("a.txt", "x")
+	f.seedFile()
 
 	v, err := f.store.CreateVolume(context.Background(), "pics", f.srv.cfg.Volumes["pics"].Path)
 	if err != nil {
@@ -489,7 +488,7 @@ func TestSchedulerCadenceUsesLastFinished(t *testing.T) {
 		SyncTo:    []string{"backup"},
 		SyncEvery: time.Hour,
 	})
-	f.writeFile("a.txt", "x")
+	f.seedFile()
 
 	sch := f.scheduler()
 	ctx := context.Background()
@@ -525,11 +524,11 @@ func TestSchedulerFailedSyncStillConsumesCadence(t *testing.T) {
 		SyncTo:    []string{"backup"},
 		SyncEvery: time.Hour,
 	})
-	f.writeFile("a.txt", "x")
+	f.seedFile()
 
 	// First call fails; subsequent calls also fail (but won't run).
 	var calls atomic.Int32
-	f.syncLog.runFn = func(ctx context.Context, vol *config.Volume, destName string, callIdx int) SyncRunReport {
+	f.syncLog.runFn = func(ctx context.Context, vol *config.Volume, destName string) SyncRunReport {
 		calls.Add(1)
 		v, _ := f.store.GetVolumeByName(ctx, vol.Name)
 		id, _, _ := f.store.BeginSyncRunIfClear(ctx, store.SyncRunSpec{VolumeID: v.ID, Destination: destName})
@@ -572,7 +571,7 @@ func TestSchedulerBothCadencesShareIndexRun(t *testing.T) {
 		SyncEvery:  time.Hour,
 		IndexEvery: 15 * time.Minute,
 	})
-	f.writeFile("a.txt", "x")
+	f.seedFile()
 	sch := f.scheduler()
 	ctx := context.Background()
 
@@ -601,7 +600,7 @@ func TestSchedulerStandaloneIndexAfterSyncCadenceWaits(t *testing.T) {
 		SyncEvery:  time.Hour,
 		IndexEvery: 15 * time.Minute,
 	})
-	f.writeFile("a.txt", "x")
+	f.seedFile()
 	sch := f.scheduler()
 	ctx := context.Background()
 
@@ -769,7 +768,7 @@ func TestSchedulerDropsSyncWhenRunnerNil(t *testing.T) {
 		SyncTo:    []string{"backup"},
 		SyncEvery: time.Hour,
 	})
-	f.writeFile("a.txt", "x")
+	f.seedFile()
 	sch := f.scheduler()
 	sch.syncRun = nil
 
