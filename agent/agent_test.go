@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -11,6 +12,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -74,6 +76,37 @@ func TestNewRejectsBadConfig(t *testing.T) {
 				t.Fatalf("expected %q in error, got %v", c.want, err)
 			}
 		})
+	}
+}
+
+// TestNewDefaultsLoggerToDiscard pins the contract that callers may
+// leave Config.Logger nil and the agent will still be safe to use:
+// New() substitutes a discard logger so the future scheduler can
+// always log unconditionally.
+func TestNewDefaultsLoggerToDiscard(t *testing.T) {
+	srv, err := New(Config{Listen: ":0", Token: "t", Version: "v"}, openTestStore(t))
+	if err != nil {
+		t.Fatalf("agent.New: %v", err)
+	}
+	if srv.Logger() == nil {
+		t.Fatalf("Logger() returned nil; want a usable logger")
+	}
+	srv.Logger().Info("smoke", "ok", true) // must not panic
+}
+
+// TestNewKeepsConfiguredLogger pins the converse: a caller-supplied
+// logger is what Server.Logger() returns, so log output reaches the
+// destination the CLI (or a test) wired up.
+func TestNewKeepsConfiguredLogger(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	srv, err := New(Config{Listen: ":0", Token: "t", Version: "v", Logger: logger}, openTestStore(t))
+	if err != nil {
+		t.Fatalf("agent.New: %v", err)
+	}
+	srv.Logger().Info("marker", "k", "v")
+	if !strings.Contains(buf.String(), `msg=marker`) || !strings.Contains(buf.String(), "k=v") {
+		t.Fatalf("logger output = %q, want marker + k=v", buf.String())
 	}
 }
 

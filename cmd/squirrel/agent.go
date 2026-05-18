@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -46,6 +47,7 @@ func runAgent(cmd *cobra.Command) error {
 	}
 	defer s.Close()
 
+	logger := slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), &slog.HandlerOptions{Level: slog.LevelInfo}))
 	srv, err := agent.New(agent.Config{
 		Listen:       cfg.Agent.Listen,
 		Token:        cfg.Agent.Token,
@@ -56,11 +58,12 @@ func runAgent(cmd *cobra.Command) error {
 		ScanInterval: cfg.Agent.ScanInterval,
 		ScanStrategy: cfg.Agent.ScanStrategy,
 		ScanLogger:   cmd.ErrOrStderr(),
+		Logger:       logger,
 	}, s)
 	if err != nil {
 		return err
 	}
-	printAgentBanner(cmd, srv)
+	logAgentStartup(logger, srv)
 	return srv.ListenAndServe(cmd.Context())
 }
 
@@ -105,16 +108,19 @@ func resolveAgentDBPath(cmd *cobra.Command, cfg *config.Config) (string, error) 
 	return def, nil
 }
 
-// printAgentBanner emits a single startup line to stdout so the user
-// (or a systemd unit's journal) can see what's listening where. We
-// deliberately avoid logging during request handling — that belongs to
-// the http handler middleware once we have one in PR 3.
-func printAgentBanner(cmd *cobra.Command, srv *agent.Server) {
+// logAgentStartup emits a single structured startup line via slog so a
+// systemd unit's journal (or a developer running in the foreground) can
+// see what's listening where. We deliberately avoid per-request logging —
+// HTTP middleware is out of scope here; the scheduler's event stream
+// (#39) will use the same logger handle.
+func logAgentStartup(logger *slog.Logger, srv *agent.Server) {
 	scheme := "http"
 	if srv.HasTLS() {
 		scheme = "https"
 	}
-	fmt.Fprintf(cmd.OutOrStdout(),
-		"squirrel agent listening on %s://%s (version %s)\n",
-		scheme, srv.Addr(), agentVersion)
+	logger.Info("agent listening",
+		"addr", srv.Addr(),
+		"scheme", scheme,
+		"version", agentVersion,
+	)
 }

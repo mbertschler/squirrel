@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -71,6 +72,11 @@ type Config struct {
 	// notes on lock contention). Nil discards. The CLI wires this
 	// to os.Stderr; tests inject a buffer.
 	ScanLogger io.Writer
+	// Logger is the structured logger shared with future long-lived
+	// components (notably the scheduler in #39). The CLI wires this
+	// to a slog.TextHandler over stderr; nil falls back to a discard
+	// logger so callers that don't care never have to set it.
+	Logger *slog.Logger
 }
 
 // Server is one agent instance. It holds the HTTP handler stack and a
@@ -96,10 +102,18 @@ func New(cfg Config, s *store.Store) (*Server, error) {
 	if s == nil {
 		return nil, errors.New("agent: store must not be nil")
 	}
+	if cfg.Logger == nil {
+		cfg.Logger = slog.New(slog.DiscardHandler)
+	}
 	srv := &Server{cfg: cfg, store: s}
 	srv.handler = srv.buildHandler()
 	return srv, nil
 }
+
+// Logger returns the structured logger the agent was configured with.
+// Long-lived components started by the agent (the scheduler in #39)
+// share this handle.
+func (s *Server) Logger() *slog.Logger { return s.cfg.Logger }
 
 // Handler exposes the internal HTTP handler so tests can drive it via
 // net/http/httptest without going through the network stack.

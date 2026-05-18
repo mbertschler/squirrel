@@ -72,18 +72,34 @@ func waitForBanner(t *testing.T, buf *bytes.Buffer) string {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if rest, ok := strings.CutPrefix(buf.String(), "squirrel agent listening on "); ok {
-			// banner: "<scheme>://<addr> (version <v>)\n"
-			line, _, _ := strings.Cut(rest, "\n")
-			schemeAndAddr, _, _ := strings.Cut(line, " ")
-			_, addr, _ := strings.Cut(schemeAndAddr, "://")
-			if addr != "" {
-				return addr
-			}
+		if addr := parseStartupAddr(buf.String()); addr != "" {
+			return addr
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("agent banner never appeared:\n%s", buf.String())
+	return ""
+}
+
+// parseStartupAddr extracts the listen address from the slog TextHandler
+// line emitted at agent startup. Format:
+//
+//	time=... level=INFO msg="agent listening" addr=127.0.0.1:54321 scheme=http version=...
+//
+// We scan line by line for the "agent listening" message rather than
+// pattern-matching the whole buffer so unrelated log lines that may
+// appear later don't confuse the parser.
+func parseStartupAddr(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.Contains(line, `msg="agent listening"`) {
+			continue
+		}
+		for _, field := range strings.Fields(line) {
+			if v, ok := strings.CutPrefix(field, "addr="); ok {
+				return v
+			}
+		}
+	}
 	return ""
 }
 
