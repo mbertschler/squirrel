@@ -3,6 +3,8 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 
@@ -46,6 +48,7 @@ func runAgent(cmd *cobra.Command) error {
 	}
 	defer s.Close()
 
+	logger := slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), &slog.HandlerOptions{Level: slog.LevelInfo}))
 	srv, err := agent.New(agent.Config{
 		Listen:       cfg.Agent.Listen,
 		Token:        cfg.Agent.Token,
@@ -56,12 +59,22 @@ func runAgent(cmd *cobra.Command) error {
 		ScanInterval: cfg.Agent.ScanInterval,
 		ScanStrategy: cfg.Agent.ScanStrategy,
 		ScanLogger:   cmd.ErrOrStderr(),
+		Logger:       logger,
 	}, s)
 	if err != nil {
 		return err
 	}
-	printAgentBanner(cmd, srv)
-	return srv.ListenAndServe(cmd.Context())
+	// Bind first so a port-in-use (or any other listen failure) surfaces
+	// as a CLI error and never logs a misleading "agent listening" line.
+	// We also log the listener's resolved Addr so `:0` (and other
+	// kernel-assigned ports) shows the actual port, not the configured
+	// placeholder.
+	ln, err := net.Listen("tcp", cfg.Agent.Listen)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", cfg.Agent.Listen, err)
+	}
+	logAgentStartup(logger, srv, ln.Addr().String())
+	return srv.Serve(cmd.Context(), ln)
 }
 
 // openAgentStore extends the standard resolveDBPath precedence with the
@@ -105,16 +118,20 @@ func resolveAgentDBPath(cmd *cobra.Command, cfg *config.Config) (string, error) 
 	return def, nil
 }
 
-// printAgentBanner emits a single startup line to stdout so the user
-// (or a systemd unit's journal) can see what's listening where. We
-// deliberately avoid logging during request handling — that belongs to
-// the http handler middleware once we have one in PR 3.
-func printAgentBanner(cmd *cobra.Command, srv *agent.Server) {
+// logAgentStartup emits a single structured startup line via slog so a
+// systemd unit's journal (or a developer running in the foreground) can
+// see what's listening where. addr is the resolved listener address (so
+// `:0` reports the kernel-assigned port). We deliberately avoid
+// per-request logging — HTTP middleware is out of scope here; the
+// scheduler's event stream (#39) will use the same logger handle.
+func logAgentStartup(logger *slog.Logger, srv *agent.Server, addr string) {
 	scheme := "http"
 	if srv.HasTLS() {
 		scheme = "https"
 	}
-	fmt.Fprintf(cmd.OutOrStdout(),
-		"squirrel agent listening on %s://%s (version %s)\n",
-		scheme, srv.Addr(), agentVersion)
+	logger.Info("agent listening",
+		"addr", addr,
+		"scheme", scheme,
+		"version", agentVersion,
+	)
 }

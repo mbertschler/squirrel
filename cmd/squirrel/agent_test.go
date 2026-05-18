@@ -11,11 +11,34 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/mbertschler/squirrel/store"
 )
+
+// syncBuf is a tiny mutex-wrapped bytes.Buffer for capturing the agent
+// CLI's stdout/stderr. cobra runs the agent's RunE on a goroutine while
+// the test polls the buffer for the startup line, and bytes.Buffer is
+// explicitly not safe for concurrent use — direct sharing trips `go
+// test -race`.
+type syncBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuf) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuf) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 // reservePort claims a free localhost port via the kernel then releases
 // it; we feed the resulting "127.0.0.1:N" string to the agent's `listen`
@@ -45,7 +68,7 @@ func startAgentCLI(t *testing.T, configPath string) (cancel func(), addr string)
 	t.Helper()
 	isolateConfig(t)
 	ctx, c := context.WithCancel(context.Background())
-	buf := &bytes.Buffer{}
+	buf := &syncBuf{}
 	root := newRootCmd()
 	root.SetOut(buf)
 	root.SetErr(buf)
@@ -68,22 +91,38 @@ func startAgentCLI(t *testing.T, configPath string) (cancel func(), addr string)
 	}, addr
 }
 
-func waitForBanner(t *testing.T, buf *bytes.Buffer) string {
+func waitForBanner(t *testing.T, buf *syncBuf) string {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if rest, ok := strings.CutPrefix(buf.String(), "squirrel agent listening on "); ok {
-			// banner: "<scheme>://<addr> (version <v>)\n"
-			line, _, _ := strings.Cut(rest, "\n")
-			schemeAndAddr, _, _ := strings.Cut(line, " ")
-			_, addr, _ := strings.Cut(schemeAndAddr, "://")
-			if addr != "" {
-				return addr
-			}
+		if addr := parseStartupAddr(buf.String()); addr != "" {
+			return addr
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("agent banner never appeared:\n%s", buf.String())
+	return ""
+}
+
+// parseStartupAddr extracts the listen address from the slog TextHandler
+// line emitted at agent startup. Format:
+//
+//	time=... level=INFO msg="agent listening" addr=127.0.0.1:54321 scheme=http version=...
+//
+// We scan line by line for the "agent listening" message rather than
+// pattern-matching the whole buffer so unrelated log lines that may
+// appear later don't confuse the parser.
+func parseStartupAddr(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.Contains(line, `msg="agent listening"`) {
+			continue
+		}
+		for _, field := range strings.Fields(line) {
+			if v, ok := strings.CutPrefix(field, "addr="); ok {
+				return v
+			}
+		}
+	}
 	return ""
 }
 
