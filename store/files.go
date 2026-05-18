@@ -196,6 +196,28 @@ func relPathUnder(base, abs string) (string, bool) {
 	return abs[len(prefix):], true
 }
 
+// GetPresentByBlake3InVolume returns the first present row whose
+// blake3 digest matches in the given volume, or sql.ErrNoRows when no
+// such row exists. The result is used by the sync planner to satisfy
+// a CopyFromExisting disposition: when the receiver already holds the
+// requested content at some other path in the same volume, the bytes
+// can be materialised locally instead of crossing the network.
+//
+// Ordering by path makes the choice of source deterministic across
+// runs even when several paths share the same blake3, which keeps
+// audit trails predictable. The existing idx_files_blake3 index
+// (`(blake3, volume_id, path)`) covers this query.
+func (s *Store) GetPresentByBlake3InVolume(ctx context.Context, volumeID int64, digest []byte) (FileRow, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT `+fileColumns+` FROM files
+		 WHERE blake3 = ? AND volume_id = ? AND status = 'present'
+		 ORDER BY path LIMIT 1`,
+		digest, volumeID)
+	var r FileRow
+	err := r.scanFrom(row)
+	return r, err
+}
+
 // GetByBlake3 returns all rows matching the given BLAKE3 digest (raw 32 bytes),
 // joined with their volume.
 func (s *Store) GetByBlake3(ctx context.Context, digest []byte) ([]FileWithVolume, error) {

@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
+	"github.com/mbertschler/squirrel/syncproto"
 )
 
 // Node is a resolved `[nodes.X]` block — a peer destination running a
@@ -29,6 +31,13 @@ type Node struct {
 	Token           string
 	CertFingerprint string
 	Path            string
+	// DedupStrategy is the initiator's preference for receiver-side
+	// content-addressable dedup when syncing to this peer. Resolved
+	// values are "copy" (default, lets the receiver materialise a
+	// missing path by copying an existing same-blake3 file in the same
+	// volume) or "off" (always Transfer). The literal travels in the
+	// /v1/sync/begin payload; the receiver validates and applies it.
+	DedupStrategy string
 }
 
 // rawNode mirrors the `[nodes.X]` TOML block. Token is `any` so the
@@ -36,10 +45,11 @@ type Node struct {
 // it transparently — accepting either a literal string or
 // `{ env = "VAR" }`.
 type rawNode struct {
-	Endpoint string       `toml:"endpoint"`
-	Path     string       `toml:"path"`
-	Auth     *rawNodeAuth `toml:"auth"`
-	TLS      *rawNodeTLS  `toml:"tls"`
+	Endpoint      string       `toml:"endpoint"`
+	Path          string       `toml:"path"`
+	DedupStrategy string       `toml:"dedup_strategy"`
+	Auth          *rawNodeAuth `toml:"auth"`
+	TLS           *rawNodeTLS  `toml:"tls"`
 }
 
 type rawNodeAuth struct {
@@ -56,6 +66,21 @@ type rawNodeTLS struct {
 // any other shape is a misconfiguration we'd rather reject at load
 // time than at first sync.
 var fingerprintRE = regexp.MustCompile(`^sha256:[a-fA-F0-9]{64}$`)
+
+// resolveDedupStrategy maps the raw TOML value (which may be the empty
+// string when the user omitted the key) to the canonical syncproto
+// constant. Unknown values are rejected at config-load time so a typo
+// surfaces before the first sync rather than as a wire-level 400.
+func resolveDedupStrategy(raw string) (string, error) {
+	switch raw {
+	case "", syncproto.DedupStrategyCopy:
+		return syncproto.DedupStrategyCopy, nil
+	case syncproto.DedupStrategyOff:
+		return syncproto.DedupStrategyOff, nil
+	}
+	return "", fmt.Errorf("dedup_strategy %q is invalid (allowed: %q, %q)",
+		raw, syncproto.DedupStrategyCopy, syncproto.DedupStrategyOff)
+}
 
 func resolveNode(name string, r *rawNode) (*Node, error) {
 	if !nameRE.MatchString(name) {
@@ -87,11 +112,16 @@ func resolveNode(name string, r *rawNode) (*Node, error) {
 	if tok == "" {
 		return nil, errors.New("auth.bearer must not be empty")
 	}
+	strategy, err := resolveDedupStrategy(r.DedupStrategy)
+	if err != nil {
+		return nil, err
+	}
 	node := &Node{
-		Name:     name,
-		Endpoint: u,
-		Token:    tok,
-		Path:     r.Path,
+		Name:          name,
+		Endpoint:      u,
+		Token:         tok,
+		Path:          r.Path,
+		DedupStrategy: strategy,
 	}
 	if r.TLS != nil && r.TLS.CertFingerprint != "" {
 		fp := strings.ToLower(r.TLS.CertFingerprint)

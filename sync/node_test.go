@@ -10,7 +10,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+
+	"github.com/zeebo/blake3"
 
 	"github.com/mbertschler/squirrel/agent"
 	"github.com/mbertschler/squirrel/config"
@@ -1219,4 +1222,399 @@ func bytesDigest(b byte) []byte {
 // hexDigest returns the hex encoding of bytesDigest(b).
 func hexDigest(b byte) string {
 	return hex.EncodeToString(bytesDigest(b))
+}
+
+// fileInode returns the inode number of the file at abs. Used by the
+// CopyFromExisting tests to assert the pre-stage produced an
+// independent inode (not a hardlink) — the receiver's invariant that
+// paths are independent observations of content.
+func fileInode(t *testing.T, abs string) uint64 {
+	t.Helper()
+	info, err := os.Stat(abs)
+	if err != nil {
+		t.Fatalf("stat %s: %v", abs, err)
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("stat %s: unexpected Sys() type %T", abs, info.Sys())
+	}
+	return uint64(st.Ino)
+}
+
+// TestNodeSyncCopyFromExistingDedup is the headline acceptance test
+// for issue #14. Sync round 1 plants `a.jpg` on the receiver. The
+// initiator then renames its copy to `pets/a.jpg` (same content,
+// different path). Round 2 must satisfy `pets/a.jpg` from the
+// receiver's existing `a.jpg` via the CopyFromExisting branch — no
+// rclone transfer happens, and the materialised path is an
+// independent inode (not a hardlink to the source) so a future
+// per-path edit on either side can't propagate through shared inode
+// metadata.
+func TestNodeSyncCopyFromExistingDedup(t *testing.T) {
+	f := setupNodeFixture(t)
+	ctx := context.Background()
+
+	body := []byte("the same exact bytes for both paths")
+	original := filepath.Join(f.initVol.Path, "a.jpg")
+	if err := os.WriteFile(original, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.indexInitiator(t)
+	if _, err := SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true}); err != nil {
+		t.Fatalf("first SyncNode: %v", err)
+	}
+
+	// Rename on the initiator: remove the old path, write the same
+	// content at a new path. Re-indexing flips the old row to missing
+	// and inserts a new present row at the new path.
+	if err := os.Remove(original); err != nil {
+		t.Fatal(err)
+	}
+	renamed := filepath.Join(f.initVol.Path, "pets", "a.jpg")
+	if err := os.MkdirAll(filepath.Dir(renamed), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(renamed, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.indexInitiator(t)
+
+	rep, err := SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	if err != nil {
+		t.Fatalf("second SyncNode: %v", err)
+	}
+	if rep.Status != store.RunStatusSuccess {
+		t.Fatalf("Status = %q, want success: %+v", rep.Status, rep)
+	}
+
+	// rclone must not have been invoked: pets/a.jpg was the only
+	// thing to sync, and the receiver materialised it locally. The
+	// zero-valued RcloneResult is the signal that phaseTransfer
+	// short-circuited.
+	if rep.RcloneResult.Transferred != 0 {
+		t.Fatalf("RcloneResult.Transferred = %d, want 0 (CopyFromExisting should bypass rclone)", rep.RcloneResult.Transferred)
+	}
+
+	// The new path lives on the receiver with the expected content.
+	recvNew := filepath.Join(f.recvVol.Path, "pets", "a.jpg")
+	got, err := os.ReadFile(recvNew)
+	if err != nil {
+		t.Fatalf("read receiver pets/a.jpg: %v", err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("pets/a.jpg content = %q, want %q", got, body)
+	}
+
+	// The new path is an independent inode, not a hardlink to the
+	// receiver's pre-existing a.jpg.
+	recvSource := filepath.Join(f.recvVol.Path, "a.jpg")
+	if a, b := fileInode(t, recvSource), fileInode(t, recvNew); a == b {
+		t.Fatalf("inode collision: a.jpg and pets/a.jpg share inode %d (hardlink slipped in)", a)
+	}
+
+	// Verify report confirms exactly one matched path (pets/a.jpg).
+	if len(rep.NodeVerify.Matched) != 1 || rep.NodeVerify.Matched[0] != "pets/a.jpg" {
+		t.Fatalf("Verify.Matched = %+v, want [pets/a.jpg]", rep.NodeVerify.Matched)
+	}
+
+	// Receiver's index has the new row with initiator provenance,
+	// matching the shape a Transfer would have produced.
+	v, _ := f.recvStore.GetVolumeByName(ctx, "pics")
+	newRow, err := f.recvStore.GetByPath(ctx, v.ID, "pets/a.jpg")
+	if err != nil {
+		t.Fatalf("GetByPath pets/a.jpg: %v", err)
+	}
+	if !newRow.SourceNodeID.Valid {
+		t.Fatalf("pets/a.jpg row has NULL source_node_id; want initiator attribution")
+	}
+}
+
+// TestPlanCopyFromExistingDirectAPI drives /v1/sync/plan against a
+// receiver pre-loaded with one file. The initiator presents the same
+// content at a different path; the plan must respond with
+// CopyFromExisting and the pre-stage must have left the bytes at the
+// new path with an independent inode.
+func TestPlanCopyFromExistingDirectAPI(t *testing.T) {
+	f := setupNodeFixtureNoRclone(t)
+	ctx := context.Background()
+
+	body := []byte("dedup-me-locally")
+	existingAbs := filepath.Join(f.recvVol.Path, "existing.jpg")
+	if err := os.WriteFile(existingAbs, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	existingDigest := hashFile(t, existingAbs)
+
+	v, err := f.recvStore.GetOrCreateVolume(ctx, f.recvVol.Path)
+	if err != nil {
+		t.Fatalf("GetOrCreateVolume: %v", err)
+	}
+	runID, err := f.recvStore.BeginRun(ctx, store.RunKindIndex, v.ID, "")
+	if err != nil {
+		t.Fatalf("BeginRun: %v", err)
+	}
+	if err := f.recvStore.Upsert(ctx, store.FileRow{
+		VolumeID: v.ID, Path: "existing.jpg", Blake3: existingDigest,
+		SizeBytes: int64(len(body)), MtimeNs: 1, Status: store.StatusPresent,
+		FirstSeenRunID: runID, LastSeenRunID: runID, IndexedAtNs: 1,
+	}, nil); err != nil {
+		t.Fatalf("seed existing row: %v", err)
+	}
+
+	initSelf, _ := f.initStore.GetSelfNode(ctx)
+	client := newNodeClient(f.node)
+	begin, err := client.begin(ctx, syncproto.BeginRequest{
+		Volume:            f.recvVol.Name,
+		InitiatorNodeName: initSelf.Name,
+		InitiatorRunID:    1,
+	})
+	if err != nil {
+		t.Fatalf("/begin: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = client.close(ctx, syncproto.CloseRequest{
+			ReceiverRunID: begin.ReceiverRunID,
+			Status:        store.RunStatusFailed,
+		})
+	})
+
+	plan, err := client.plan(ctx, syncproto.PlanRequest{
+		ReceiverRunID: begin.ReceiverRunID,
+		Entries: []syncproto.IndexEntry{
+			{Path: "pets/new.jpg", Blake3Hex: hex.EncodeToString(existingDigest), SizeBytes: int64(len(body)), MtimeNs: 1},
+		},
+	})
+	if err != nil {
+		t.Fatalf("/plan: %v", err)
+	}
+	if len(plan.Dispositions) != 1 {
+		t.Fatalf("Dispositions = %+v, want one", plan.Dispositions)
+	}
+	d := plan.Dispositions[0]
+	if d.Disposition != syncproto.DispositionCopyFromExisting {
+		t.Fatalf("Disposition = %q, want %q", d.Disposition, syncproto.DispositionCopyFromExisting)
+	}
+	if d.CopyFromPath != "existing.jpg" {
+		t.Fatalf("CopyFromPath = %q, want %q", d.CopyFromPath, "existing.jpg")
+	}
+
+	// Pre-stage materialised the bytes locally.
+	newAbs := filepath.Join(f.recvVol.Path, "pets", "new.jpg")
+	got, err := os.ReadFile(newAbs)
+	if err != nil {
+		t.Fatalf("read materialised path: %v", err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("content mismatch: got %q, want %q", got, body)
+	}
+	if a, b := fileInode(t, existingAbs), fileInode(t, newAbs); a == b {
+		t.Fatalf("shared inode %d — pre-stage produced a hardlink, want independent file", a)
+	}
+}
+
+// TestPlanDedupStrategyOff asserts that an initiator opting out of
+// dedup (BeginRequest.DedupStrategy = "off") gets the plain Transfer
+// disposition even when the receiver holds the same blake3 at another
+// path. No pre-stage copy must happen; the initiator's rclone is the
+// only path that will deliver the bytes.
+func TestPlanDedupStrategyOff(t *testing.T) {
+	f := setupNodeFixtureNoRclone(t)
+	ctx := context.Background()
+
+	body := []byte("dedup-disabled")
+	existingAbs := filepath.Join(f.recvVol.Path, "existing.jpg")
+	if err := os.WriteFile(existingAbs, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	existingDigest := hashFile(t, existingAbs)
+
+	v, err := f.recvStore.GetOrCreateVolume(ctx, f.recvVol.Path)
+	if err != nil {
+		t.Fatalf("GetOrCreateVolume: %v", err)
+	}
+	runID, err := f.recvStore.BeginRun(ctx, store.RunKindIndex, v.ID, "")
+	if err != nil {
+		t.Fatalf("BeginRun: %v", err)
+	}
+	if err := f.recvStore.Upsert(ctx, store.FileRow{
+		VolumeID: v.ID, Path: "existing.jpg", Blake3: existingDigest,
+		SizeBytes: int64(len(body)), MtimeNs: 1, Status: store.StatusPresent,
+		FirstSeenRunID: runID, LastSeenRunID: runID, IndexedAtNs: 1,
+	}, nil); err != nil {
+		t.Fatalf("seed existing row: %v", err)
+	}
+
+	initSelf, _ := f.initStore.GetSelfNode(ctx)
+	client := newNodeClient(f.node)
+	begin, err := client.begin(ctx, syncproto.BeginRequest{
+		Volume:            f.recvVol.Name,
+		InitiatorNodeName: initSelf.Name,
+		InitiatorRunID:    1,
+		DedupStrategy:     syncproto.DedupStrategyOff,
+	})
+	if err != nil {
+		t.Fatalf("/begin: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = client.close(ctx, syncproto.CloseRequest{
+			ReceiverRunID: begin.ReceiverRunID,
+			Status:        store.RunStatusFailed,
+		})
+	})
+
+	plan, err := client.plan(ctx, syncproto.PlanRequest{
+		ReceiverRunID: begin.ReceiverRunID,
+		Entries: []syncproto.IndexEntry{
+			{Path: "pets/new.jpg", Blake3Hex: hex.EncodeToString(existingDigest), SizeBytes: int64(len(body)), MtimeNs: 1},
+		},
+	})
+	if err != nil {
+		t.Fatalf("/plan: %v", err)
+	}
+	if d := plan.Dispositions[0]; d.Disposition != syncproto.DispositionTransfer {
+		t.Fatalf("Disposition = %q, want %q (dedup off)", d.Disposition, syncproto.DispositionTransfer)
+	}
+	if plan.Dispositions[0].CopyFromPath != "" {
+		t.Fatalf("CopyFromPath = %q, want empty (dedup off)", plan.Dispositions[0].CopyFromPath)
+	}
+
+	// Pre-stage did not materialise anything at the new path.
+	newAbs := filepath.Join(f.recvVol.Path, "pets", "new.jpg")
+	if _, err := os.Stat(newAbs); !os.IsNotExist(err) {
+		t.Fatalf("stat %s: err = %v, want IsNotExist (no pre-stage copy under dedup=off)", newAbs, err)
+	}
+}
+
+// TestPlanSupersedeWinsOverDedup proves the classifier consults the
+// by-path lookup before the blake3-wide lookup: an existing live row
+// at the target path takes precedence (Supersede or Conflict) even if
+// the requested blake3 also lives at another path. Without this
+// ordering, the dedup branch would paper over real content
+// divergences the provenance check should surface.
+func TestPlanSupersedeWinsOverDedup(t *testing.T) {
+	f := setupNodeFixtureNoRclone(t)
+	ctx := context.Background()
+
+	// Receiver holds two rows: target path has content Y (from this
+	// peer at an earlier shared run), and dedup-source has content X.
+	// Initiator wants target path to become X.
+	bodyTarget := []byte("old-content-Y")
+	bodySource := []byte("dedup-content-X")
+	targetAbs := filepath.Join(f.recvVol.Path, "target.jpg")
+	sourceAbs := filepath.Join(f.recvVol.Path, "elsewhere.jpg")
+	if err := os.WriteFile(targetAbs, bodyTarget, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sourceAbs, bodySource, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	digestTarget := hashFile(t, targetAbs)
+	digestSource := hashFile(t, sourceAbs)
+
+	v, err := f.recvStore.GetOrCreateVolume(ctx, f.recvVol.Path)
+	if err != nil {
+		t.Fatalf("GetOrCreateVolume: %v", err)
+	}
+
+	// Stand up the peer-side bookkeeping the supersede branch needs:
+	// a peer node row, a runs row attributed to it, a peer_sync_state
+	// watermark that puts the target row's provenance "at or before"
+	// the shared watermark.
+	initSelf, _ := f.initStore.GetSelfNode(ctx)
+	peer, err := f.recvStore.GetOrCreatePeerNode(ctx, initSelf.Name, "peer://"+initSelf.Name)
+	if err != nil {
+		t.Fatalf("GetOrCreatePeerNode: %v", err)
+	}
+	priorRunID, err := f.recvStore.BeginPeerSyncRun(ctx, v.ID, peer.ID, 1, initSelf.Name)
+	if err != nil {
+		t.Fatalf("BeginPeerSyncRun: %v", err)
+	}
+	if err := f.recvStore.Upsert(ctx, store.FileRow{
+		VolumeID: v.ID, Path: "target.jpg", Blake3: digestTarget,
+		SizeBytes: int64(len(bodyTarget)), MtimeNs: 1, Status: store.StatusPresent,
+		FirstSeenRunID: priorRunID, LastSeenRunID: priorRunID, IndexedAtNs: 1,
+	}, &store.Provenance{NodeID: peer.ID, RunID: priorRunID}); err != nil {
+		t.Fatalf("seed target row: %v", err)
+	}
+	if err := f.recvStore.Upsert(ctx, store.FileRow{
+		VolumeID: v.ID, Path: "elsewhere.jpg", Blake3: digestSource,
+		SizeBytes: int64(len(bodySource)), MtimeNs: 1, Status: store.StatusPresent,
+		FirstSeenRunID: priorRunID, LastSeenRunID: priorRunID, IndexedAtNs: 1,
+	}, &store.Provenance{NodeID: peer.ID, RunID: priorRunID}); err != nil {
+		t.Fatalf("seed source row: %v", err)
+	}
+	if err := f.recvStore.UpsertPeerSyncState(ctx, v.ID, peer.ID, 1); err != nil {
+		t.Fatalf("UpsertPeerSyncState: %v", err)
+	}
+	if err := f.recvStore.FinishRun(ctx, priorRunID, store.RunStatusSuccess, "", 2); err != nil {
+		t.Fatalf("FinishRun: %v", err)
+	}
+
+	client := newNodeClient(f.node)
+	begin, err := client.begin(ctx, syncproto.BeginRequest{
+		Volume:            f.recvVol.Name,
+		InitiatorNodeName: initSelf.Name,
+		InitiatorRunID:    99,
+	})
+	if err != nil {
+		t.Fatalf("/begin: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = client.close(ctx, syncproto.CloseRequest{
+			ReceiverRunID: begin.ReceiverRunID,
+			Status:        store.RunStatusFailed,
+		})
+	})
+
+	plan, err := client.plan(ctx, syncproto.PlanRequest{
+		ReceiverRunID: begin.ReceiverRunID,
+		Entries: []syncproto.IndexEntry{
+			{Path: "target.jpg", Blake3Hex: hex.EncodeToString(digestSource), SizeBytes: int64(len(bodySource)), MtimeNs: 1},
+		},
+	})
+	if err != nil {
+		t.Fatalf("/plan: %v", err)
+	}
+	if d := plan.Dispositions[0]; d.Disposition != syncproto.DispositionSupersede {
+		t.Fatalf("Disposition = %q, want %q (provenance check beats dedup)", d.Disposition, syncproto.DispositionSupersede)
+	}
+	if plan.Dispositions[0].CopyFromPath != "" {
+		t.Fatalf("CopyFromPath = %q, want empty (no dedup for non-missing path)", plan.Dispositions[0].CopyFromPath)
+	}
+}
+
+// TestBeginRejectsUnknownDedupStrategy guards the wire-level
+// validation: a typo'd strategy must surface at /begin (400), not as
+// silently-applied wrong behaviour during classify.
+func TestBeginRejectsUnknownDedupStrategy(t *testing.T) {
+	f := setupNodeFixtureNoRclone(t)
+	ctx := context.Background()
+
+	initSelf, _ := f.initStore.GetSelfNode(ctx)
+	client := newNodeClient(f.node)
+	_, err := client.begin(ctx, syncproto.BeginRequest{
+		Volume:            f.recvVol.Name,
+		InitiatorNodeName: initSelf.Name,
+		InitiatorRunID:    1,
+		DedupStrategy:     "hardlink", // deliberately rejected
+	})
+	if err == nil || !strings.Contains(err.Error(), "dedup_strategy") {
+		t.Fatalf("err = %v, want substring 'dedup_strategy'", err)
+	}
+}
+
+// hashFile is a small test helper that re-hashes a file on disk with
+// BLAKE3 so tests can refer to the digest of fixture content without
+// hard-coding hex constants.
+func hashFile(t *testing.T, abs string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		t.Fatalf("read %s: %v", abs, err)
+	}
+	h := blake3.New()
+	if _, err := h.Write(data); err != nil {
+		t.Fatalf("hash %s: %v", abs, err)
+	}
+	return h.Sum(nil)
 }

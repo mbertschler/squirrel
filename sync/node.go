@@ -158,6 +158,7 @@ func (d *nodeSyncDriver) phaseBegin() error {
 		Volume:            d.vol.Name,
 		InitiatorNodeName: self.Name,
 		InitiatorRunID:    runID,
+		DedupStrategy:     d.node.DedupStrategy,
 	})
 	if err != nil {
 		return err
@@ -455,6 +456,10 @@ func (c *nodeClient) do(ctx context.Context, urlPath string, body, out any) erro
 // pathsInScope returns the relative paths from the plan whose
 // disposition needs rclone to deliver bytes — transfer, supersede,
 // conflict. Already-correct paths are skipped (no bytes need move).
+// Copy-from-existing paths are skipped too: the receiver has already
+// materialised them locally during pre-stage, and the initiator's
+// verify step picks them up via the receiver-side scope (which
+// includes them) rather than via a redundant rclone pass.
 func pathsInScope(plan syncproto.PlanResponse) []string {
 	out := make([]string, 0, len(plan.Dispositions))
 	for _, d := range plan.Dispositions {
