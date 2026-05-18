@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -2928,5 +2929,86 @@ func TestBeginSyncRunIfClearRejectsEmptyDestination(t *testing.T) {
 	_, _, err = s.BeginSyncRunIfClear(ctx, SyncRunSpec{VolumeID: vID, Destination: ""})
 	if err == nil || !strings.Contains(err.Error(), "destination must be non-empty") {
 		t.Fatalf("want destination-empty error, got %v", err)
+	}
+}
+
+// TestGetPresentByBlake3InVolume covers the planner's blake3-wide
+// lookup used to satisfy CopyFromExisting: the query must return only
+// rows in the same volume, only rows that are present, and must pick a
+// deterministic source when several paths share the digest.
+func TestGetPresentByBlake3InVolume(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	volA := makeVolume(t, s, "/a")
+	volB := makeVolume(t, s, "/b")
+	runA := makeRun(t, s, volA)
+	runB := makeRun(t, s, volB)
+
+	x := digest(0xab)
+
+	// volA: two present rows with the same blake3 (path-order tiebreak).
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: volA, Path: "zeta.jpg", Blake3: x, SizeBytes: 1, MtimeNs: 1,
+		Status: StatusPresent, FirstSeenRunID: runA, LastSeenRunID: runA, IndexedAtNs: 1,
+	}, nil); err != nil {
+		t.Fatalf("Upsert zeta: %v", err)
+	}
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: volA, Path: "alpha.jpg", Blake3: x, SizeBytes: 1, MtimeNs: 1,
+		Status: StatusPresent, FirstSeenRunID: runA, LastSeenRunID: runA, IndexedAtNs: 1,
+	}, nil); err != nil {
+		t.Fatalf("Upsert alpha: %v", err)
+	}
+	// volA: same blake3 but missing — must be skipped.
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: volA, Path: "gone.jpg", Blake3: x, SizeBytes: 1, MtimeNs: 1,
+		Status: StatusPresent, FirstSeenRunID: runA, LastSeenRunID: runA, IndexedAtNs: 1,
+	}, nil); err != nil {
+		t.Fatalf("Upsert gone: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE files SET status = 'missing' WHERE volume_id = ? AND path = ?`,
+		volA, "gone.jpg"); err != nil {
+		t.Fatalf("flip gone to missing: %v", err)
+	}
+	// volB: same blake3 — must be skipped because we're scoping to volA.
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: volB, Path: "other.jpg", Blake3: x, SizeBytes: 1, MtimeNs: 1,
+		Status: StatusPresent, FirstSeenRunID: runB, LastSeenRunID: runB, IndexedAtNs: 1,
+	}, nil); err != nil {
+		t.Fatalf("Upsert other: %v", err)
+	}
+	// volA reserved subtree: a conflict-preservation row with the
+	// same blake3. Must be skipped — dedup must not elevate a
+	// conflict-preserved version back into a live user path.
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: volA, Path: ".squirrel-conflicts/run-1/preserved.jpg", Blake3: x,
+		SizeBytes: 1, MtimeNs: 1, Status: StatusPresent,
+		FirstSeenRunID: runA, LastSeenRunID: runA, IndexedAtNs: 1,
+	}, nil); err != nil {
+		t.Fatalf("Upsert reserved: %v", err)
+	}
+
+	got, err := s.GetPresentByBlake3InVolume(ctx, volA, x)
+	if err != nil {
+		t.Fatalf("GetPresentByBlake3InVolume: %v", err)
+	}
+	if got.Path != "alpha.jpg" {
+		t.Fatalf("path = %q, want alpha.jpg (deterministic path-order tiebreak)", got.Path)
+	}
+	if got.VolumeID != volA {
+		t.Fatalf("volume = %d, want %d (volA)", got.VolumeID, volA)
+	}
+
+	// Different blake3 → not found.
+	_, err = s.GetPresentByBlake3InVolume(ctx, volA, digest(0xcd))
+	if err == nil || !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("want ErrNoRows for unknown digest, got %v", err)
 	}
 }

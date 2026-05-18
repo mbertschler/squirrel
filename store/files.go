@@ -196,6 +196,36 @@ func relPathUnder(base, abs string) (string, bool) {
 	return abs[len(prefix):], true
 }
 
+// GetPresentByBlake3InVolume returns the first present row whose
+// blake3 digest matches in the given volume, or sql.ErrNoRows when no
+// such row exists. The result is used by the sync planner to satisfy
+// a CopyFromExisting disposition: when the receiver already holds the
+// requested content at some other path in the same volume, the bytes
+// can be materialised locally instead of crossing the network.
+//
+// Rows under the receiver-owned reserved subtrees
+// (`.squirrel-history/`, `.squirrel-conflicts/`) are excluded: a
+// conflict-preservation row carrying a prior blake3 is reachable for
+// historical lookup but must not be elevated back into a live user
+// path via dedup. The store layer enforces this so every caller
+// inherits the policy without restating it.
+//
+// Ordering by path makes the choice of source deterministic across
+// runs even when several paths share the same blake3, which keeps
+// audit trails predictable.
+func (s *Store) GetPresentByBlake3InVolume(ctx context.Context, volumeID int64, digest []byte) (FileRow, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT `+fileColumns+` FROM files
+		 WHERE blake3 = ? AND volume_id = ? AND status = 'present'
+		   AND path NOT LIKE '.squirrel-history/%'
+		   AND path NOT LIKE '.squirrel-conflicts/%'
+		 ORDER BY path LIMIT 1`,
+		digest, volumeID)
+	var r FileRow
+	err := r.scanFrom(row)
+	return r, err
+}
+
 // GetByBlake3 returns all rows matching the given BLAKE3 digest (raw 32 bytes),
 // joined with their volume.
 func (s *Store) GetByBlake3(ctx context.Context, digest []byte) ([]FileWithVolume, error) {

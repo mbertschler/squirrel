@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/zeebo/blake3"
 
@@ -58,6 +59,11 @@ type peerSession struct {
 	volumeID        int64
 	peerNodeID      int64
 	correlatedRunID int64
+	// dedupStrategy is the initiator-supplied preference applied by
+	// classify: "copy" enables the CopyFromExisting branch, "off"
+	// disables it (every missing path stays a Transfer). Validated at
+	// /begin so an unknown value never reaches the classifier.
+	dedupStrategy string
 	// dispositions stores the receiver's verdict per path so /verify
 	// and /close can rehash and commit without re-running the diff.
 	dispositions map[string]*sessionEntry
@@ -90,6 +96,13 @@ type sessionEntry struct {
 	// were moved to during conflict pre-stage. Empty until pre-stage
 	// completes (or for non-conflict dispositions).
 	preservedAtPath string
+	// copyFromPath is the volume-relative path whose bytes were
+	// copied to satisfy a CopyFromExisting disposition. Stamped by
+	// classify, consumed by preStageCopyFromExisting, and echoed onto
+	// the /plan response. Cleared if pre-stage downgrades the entry
+	// to Transfer (e.g., the source file vanished between the index
+	// observation and the sync).
+	copyFromPath string
 }
 
 func newPeerSyncRouter(srv *Server, volumes map[string]*config.Volume) *peerSyncRouter {
@@ -178,6 +191,10 @@ func (r *peerSyncRouter) beginSession(ctx context.Context, body syncproto.BeginR
 	if body.Volume == "" || body.InitiatorNodeName == "" || body.InitiatorRunID == 0 {
 		return syncproto.BeginResponse{}, http.StatusBadRequest, errors.New("volume, initiator_node_name, and initiator_run_id are required")
 	}
+	strategy, err := normalizeDedupStrategy(body.DedupStrategy)
+	if err != nil {
+		return syncproto.BeginResponse{}, http.StatusBadRequest, err
+	}
 	vol, ok := r.volumes[body.Volume]
 	if !ok {
 		return syncproto.BeginResponse{}, http.StatusNotFound, fmt.Errorf("volume %q is not declared on this node", body.Volume)
@@ -189,11 +206,27 @@ func (r *peerSyncRouter) beginSession(ctx context.Context, body syncproto.BeginR
 	if !r.acquireVolumeLock(v.ID) {
 		return syncproto.BeginResponse{}, http.StatusConflict, fmt.Errorf("volume %q already has an in-flight sync", body.Volume)
 	}
-	resp, status, err := r.finishBegin(ctx, body, vol, v)
+	resp, status, err := r.finishBegin(ctx, body, vol, v, strategy)
 	if err != nil {
 		r.releaseVolumeLock(v.ID)
 	}
 	return resp, status, err
+}
+
+// normalizeDedupStrategy resolves the wire field to a canonical value
+// or returns an error for an unknown literal. The empty string maps to
+// "copy" so older initiators (and tests that don't set the field) keep
+// the default-on behaviour without dragging back-compat plumbing
+// elsewhere.
+func normalizeDedupStrategy(raw string) (string, error) {
+	switch raw {
+	case "", syncproto.DedupStrategyCopy:
+		return syncproto.DedupStrategyCopy, nil
+	case syncproto.DedupStrategyOff:
+		return syncproto.DedupStrategyOff, nil
+	}
+	return "", fmt.Errorf("dedup_strategy %q is invalid (allowed: %q, %q)",
+		raw, syncproto.DedupStrategyCopy, syncproto.DedupStrategyOff)
 }
 
 // ensureVolumeRow looks up the volume by name on the receiver side
@@ -218,7 +251,7 @@ func (r *peerSyncRouter) ensureVolumeRow(ctx context.Context, name, absPath stri
 // finishBegin runs the post-lock steps: peer/self lookup, runs-row
 // insertion, in-memory session registration. The caller releases the
 // volume lock on any non-nil error.
-func (r *peerSyncRouter) finishBegin(ctx context.Context, body syncproto.BeginRequest, vol *config.Volume, v store.Volume) (syncproto.BeginResponse, int, error) {
+func (r *peerSyncRouter) finishBegin(ctx context.Context, body syncproto.BeginRequest, vol *config.Volume, v store.Volume, dedupStrategy string) (syncproto.BeginResponse, int, error) {
 	peer, err := r.srv.store.GetOrCreatePeerNode(ctx, body.InitiatorNodeName, peerEndpoint(body))
 	if err != nil {
 		return syncproto.BeginResponse{}, http.StatusConflict, err
@@ -241,6 +274,7 @@ func (r *peerSyncRouter) finishBegin(ctx context.Context, body syncproto.BeginRe
 		volumeID:        v.ID,
 		peerNodeID:      peer.ID,
 		correlatedRunID: body.InitiatorRunID,
+		dedupStrategy:   dedupStrategy,
 		dispositions:    make(map[string]*sessionEntry),
 	})
 	return syncproto.BeginResponse{
@@ -327,15 +361,20 @@ func (r *peerSyncRouter) handlePlan(w http.ResponseWriter, req *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// planSession computes the four-bucket diff for the given entries and
-// performs pre-moves for the supersede + conflict buckets. Errors here
-// roll the session back to a clean state (no partial pre-moves on
-// failure). The conflict list is assembled after pre-stage so its
-// PreservedAtPath field is populated.
+// planSession computes the per-path verdict for the given entries and
+// performs pre-stages for the buckets that need them (copy-from-existing,
+// supersede, conflict). Errors here roll the session back to a clean
+// state (no partial pre-moves on failure). The response is assembled
+// after pre-stage so a copy-from-existing entry that downgrades to
+// Transfer (source missing on disk) surfaces with the corrected
+// disposition.
+//
+// Pre-stage order: copy-from-existing runs first so a source path
+// being simultaneously superseded or made into a conflict is read
+// while its bytes are still at the live path. Supersede and conflict
+// only ever move bytes off paths the initiator is overwriting, never
+// onto paths the dedup branch needs.
 func (r *peerSyncRouter) planSession(ctx context.Context, sess *peerSession, entries []syncproto.IndexEntry) (syncproto.PlanResponse, error) {
-	resp := syncproto.PlanResponse{
-		Dispositions: make([]syncproto.PlanDisposition, 0, len(entries)),
-	}
 	for _, e := range entries {
 		if err := validateRelPath(e.Path); err != nil {
 			return syncproto.PlanResponse{}, fmt.Errorf("path %q: %w", e.Path, err)
@@ -354,15 +393,27 @@ func (r *peerSyncRouter) planSession(ctx context.Context, sess *peerSession, ent
 		if disp == syncproto.DispositionConflict {
 			sess.conflictOrder = append(sess.conflictOrder, e.Path)
 		}
-		resp.Dispositions = append(resp.Dispositions, syncproto.PlanDisposition{
-			Path: e.Path, Disposition: disp, Blake3Hex: e.Blake3Hex,
-		})
+	}
+	if err := r.preStageCopyFromExisting(sess); err != nil {
+		return syncproto.PlanResponse{}, fmt.Errorf("pre-stage copy-from-existing: %w", err)
 	}
 	if err := r.preMoveSupersedes(sess); err != nil {
 		return syncproto.PlanResponse{}, fmt.Errorf("pre-move supersedes: %w", err)
 	}
 	if err := r.preStageConflicts(ctx, sess); err != nil {
 		return syncproto.PlanResponse{}, fmt.Errorf("pre-stage conflicts: %w", err)
+	}
+	resp := syncproto.PlanResponse{
+		Dispositions: make([]syncproto.PlanDisposition, 0, len(entries)),
+	}
+	for _, e := range entries {
+		entry := sess.dispositions[e.Path]
+		resp.Dispositions = append(resp.Dispositions, syncproto.PlanDisposition{
+			Path:         e.Path,
+			Disposition:  entry.disposition,
+			Blake3Hex:    e.Blake3Hex,
+			CopyFromPath: entry.copyFromPath,
+		})
 	}
 	resp.Conflicts = collectConflicts(sess)
 	return resp, nil
@@ -417,32 +468,60 @@ func collectConflicts(sess *peerSession) []syncproto.ConflictDetail {
 	return out
 }
 
-// classify is the four-bucket decision per path. Supersede + conflict
+// classify is the five-bucket decision per path. Supersede + conflict
 // stash the prior row on the session entry so the pre-stage step (run
 // after every entry has been classified) doesn't have to re-fetch it.
+// When the by-path lookup misses, the dedup branch consults the
+// blake3-wide index (volume-scoped): a hit yields CopyFromExisting,
+// satisfied locally by the pre-stage io.Copy; a miss falls back to
+// Transfer. The dedup branch is skipped entirely when the session's
+// strategy is "off" (initiator opted out).
 func (r *peerSyncRouter) classify(ctx context.Context, sess *peerSession, relPath string, entry *sessionEntry) (string, error) {
 	existing, err := r.srv.store.GetByPath(ctx, sess.volumeID, relPath)
 	if err != nil {
 		if store.IsNotFound(err) {
-			return syncproto.DispositionTransfer, nil
+			return r.classifyMissingPath(ctx, sess, entry)
 		}
 		return "", err
 	}
 	if existing.Status != store.StatusPresent {
 		// A live row in 'missing' status is treated as "no file here";
-		// the initiator's bytes are new content.
-		return syncproto.DispositionTransfer, nil
+		// the initiator's bytes are new content. Dedup still applies —
+		// the bytes may exist at another path.
+		return r.classifyMissingPath(ctx, sess, entry)
 	}
 	if bytesEqual(existing.Blake3, entry.blake3) {
 		return syncproto.DispositionAlreadyCorrect, nil
 	}
-	// Different blake3 at this path. Provenance decides the verdict.
+	// Different blake3 at this path. Provenance decides the verdict
+	// (Supersede / Conflict). Content at a path takes precedence over
+	// a cross-path dedup — we don't let dedup paper over a divergence
+	// the provenance check would otherwise surface.
 	disp, reason := r.dispositionForExisting(ctx, sess, existing)
 	entry.priorRow = &existing
 	if disp == syncproto.DispositionConflict {
 		entry.conflictReason = reason
 	}
 	return disp, nil
+}
+
+// classifyMissingPath is the no-live-row branch of classify: try to
+// satisfy the path from existing content elsewhere in the volume
+// (CopyFromExisting), or fall back to Transfer. Strategy "off" skips
+// the lookup entirely.
+func (r *peerSyncRouter) classifyMissingPath(ctx context.Context, sess *peerSession, entry *sessionEntry) (string, error) {
+	if sess.dedupStrategy != syncproto.DedupStrategyCopy {
+		return syncproto.DispositionTransfer, nil
+	}
+	source, err := r.srv.store.GetPresentByBlake3InVolume(ctx, sess.volumeID, entry.blake3)
+	if err != nil {
+		if store.IsNotFound(err) {
+			return syncproto.DispositionTransfer, nil
+		}
+		return "", err
+	}
+	entry.copyFromPath = source.Path
+	return syncproto.DispositionCopyFromExisting, nil
 }
 
 // dispositionForExisting is the provenance check that distinguishes
@@ -495,6 +574,107 @@ func (r *peerSyncRouter) dispositionForExisting(ctx context.Context, sess *peerS
 		return syncproto.DispositionConflict, "peer attribution newer than the last shared watermark"
 	}
 	return syncproto.DispositionSupersede, ""
+}
+
+// preStageCopyFromExisting materialises every CopyFromExisting path
+// locally by copying bytes from the entry's source path (the same
+// volume, found by classify via a blake3-wide lookup). Each
+// destination is written through a sibling tempfile + atomic rename
+// so a crash mid pre-stage leaves no half-written live path.
+//
+// Hardlinks were deliberately rejected: an io.Copy yields an
+// independent inode, so an editor (or web app) that later modifies one
+// path does not propagate through shared metadata to the other. The
+// trade-off — paying local write I/O once per deduped file — is the
+// price of preserving the index's "paths are independent observations
+// of content" invariant.
+//
+// When the source path is gone from disk (drift between the index
+// observation and the sync) the entry is silently downgraded to
+// Transfer: the response builder later picks up the corrected
+// disposition, and the initiator delivers the bytes via rclone on
+// the same /plan→/verify cycle. Any other I/O error aborts the plan
+// after unlinking every destination this pre-stage already
+// materialised — partial mutation of the receiver volume is worse
+// than no mutation when /plan is going to fail, and rolling back
+// only the bytes this pre-stage actually wrote is bounded and safe.
+func (r *peerSyncRouter) preStageCopyFromExisting(sess *peerSession) error {
+	var materialised []string
+	for relPath, entry := range sess.dispositions {
+		if entry.disposition != syncproto.DispositionCopyFromExisting {
+			continue
+		}
+		srcAbs := filepath.Join(sess.volume.Path, entry.copyFromPath)
+		dstAbs := filepath.Join(sess.volume.Path, relPath)
+		if err := copyFileToPath(srcAbs, dstAbs, entry.mtimeNs); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				entry.disposition = syncproto.DispositionTransfer
+				entry.copyFromPath = ""
+				continue
+			}
+			for _, p := range materialised {
+				_ = os.Remove(p)
+			}
+			return fmt.Errorf("copy %s → %s: %w", entry.copyFromPath, relPath, err)
+		}
+		materialised = append(materialised, dstAbs)
+	}
+	return nil
+}
+
+// copyFileToPath copies srcAbs to dstAbs via a sibling tempfile +
+// atomic rename. The destination inherits the source's file mode so a
+// dedup'd file isn't surprisingly less readable than the original
+// (os.CreateTemp produces 0o600, which would silently downgrade a
+// 0o644 user file). The mtime is set to mtimeNs (the initiator's
+// claim, zero means "don't touch") so a subsequent `squirrel index`
+// run on the receiver doesn't trip its mtime heuristic and rehash the
+// file for no reason. Returns os.ErrNotExist when srcAbs is missing
+// so the caller can downgrade the disposition to Transfer.
+func copyFileToPath(srcAbs, dstAbs string, mtimeNs int64) error {
+	src, err := os.Open(srcAbs)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	srcInfo, err := src.Stat()
+	if err != nil {
+		return fmt.Errorf("stat source: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(dstAbs), 0o755); err != nil {
+		return fmt.Errorf("mkdir dest dir: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(dstAbs), ".squirrel-copy-*")
+	if err != nil {
+		return fmt.Errorf("create temp: %w", err)
+	}
+	tmpPath := tmp.Name()
+	cleanup := func() { _ = os.Remove(tmpPath) }
+	if _, err := io.Copy(tmp, src); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return fmt.Errorf("copy bytes: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return fmt.Errorf("close temp: %w", err)
+	}
+	if err := os.Chmod(tmpPath, srcInfo.Mode().Perm()); err != nil {
+		cleanup()
+		return fmt.Errorf("chmod temp: %w", err)
+	}
+	if mtimeNs != 0 {
+		t := time.Unix(0, mtimeNs)
+		if err := os.Chtimes(tmpPath, t, t); err != nil {
+			cleanup()
+			return fmt.Errorf("set mtime: %w", err)
+		}
+	}
+	if err := os.Rename(tmpPath, dstAbs); err != nil {
+		cleanup()
+		return fmt.Errorf("rename temp: %w", err)
+	}
+	return nil
 }
 
 // preMoveSupersedes copies prior bytes for every supersede-bucket
@@ -614,17 +794,17 @@ func (r *peerSyncRouter) handleVerify(w http.ResponseWriter, req *http.Request) 
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// verifySession re-hashes every path the receiver pre-staged for
-// rclone (transfer + supersede + conflict) and returns the
-// reconciliation report. When scope is nil/empty the full pre-staged
-// set is checked; non-empty narrows to those paths (used by
+// verifySession re-hashes every path the receiver expects bytes at
+// post-pre-stage (transfer + supersede + conflict + copy-from-existing)
+// and returns the reconciliation report. When scope is nil/empty the
+// full set is checked; non-empty narrows to those paths (used by
 // initiator-driven retry).
 func (r *peerSyncRouter) verifySession(sess *peerSession, scope []string) (syncproto.VerifyResponse, error) {
 	resp := syncproto.VerifyResponse{}
 	paths := scope
 	if len(paths) == 0 {
 		for p, e := range sess.dispositions {
-			if rcloneScoped(e.disposition) {
+			if materializesAtPath(e.disposition) {
 				paths = append(paths, p)
 			}
 		}
@@ -699,12 +879,13 @@ func (r *peerSyncRouter) handleClose(w http.ResponseWriter, req *http.Request) {
 	})
 }
 
-// closeSession persists the new file rows for every path rclone was
-// asked to deliver (transfer + supersede + conflict) that did not
-// appear in failedPaths, advances the watermark on success, and
-// finalises the receiver-side runs row. Returns the number of file
-// rows the function wrote, distinct from the original plan size when
-// some paths were dropped due to verify mismatch.
+// closeSession persists the new file rows for every path the receiver
+// expected bytes at post-pre-stage (transfer + supersede + conflict +
+// copy-from-existing) that did not appear in failedPaths, advances the
+// watermark on success, and finalises the receiver-side runs row.
+// Returns the number of file rows the function wrote, distinct from
+// the original plan size when some paths were dropped due to verify
+// mismatch.
 func (r *peerSyncRouter) closeSession(ctx context.Context, sess *peerSession, status string, failedPaths []string) (int, error) {
 	skip := make(map[string]struct{}, len(failedPaths))
 	for _, p := range failedPaths {
@@ -713,7 +894,7 @@ func (r *peerSyncRouter) closeSession(ctx context.Context, sess *peerSession, st
 	prov := &store.Provenance{NodeID: sess.peerNodeID, RunID: sess.receiverRunID}
 	committed := 0
 	for path, entry := range sess.dispositions {
-		if !rcloneScoped(entry.disposition) {
+		if !materializesAtPath(entry.disposition) {
 			continue
 		}
 		if _, dropped := skip[path]; dropped {
@@ -762,15 +943,19 @@ func decodeJSON(req *http.Request, v any) error {
 	return nil
 }
 
-// rcloneScoped reports whether the given disposition implies rclone
-// has been asked (or will be asked) to deliver bytes at the original
-// path. Used uniformly by verify (which paths to re-hash) and close
-// (which paths warrant a new live row) so the two stay in lockstep.
-func rcloneScoped(disposition string) bool {
+// materializesAtPath reports whether the receiver expects bytes at the
+// path once pre-stage finishes (whether delivered by rclone for
+// transfer/supersede/conflict or by the local copy for
+// copy-from-existing). Verify uses it to pick which paths to re-hash,
+// close uses it to pick which paths warrant a new live row; keeping
+// the two in lockstep means a successful local copy is committed with
+// the same provenance shape as a successful rclone transfer.
+func materializesAtPath(disposition string) bool {
 	switch disposition {
 	case syncproto.DispositionTransfer,
 		syncproto.DispositionSupersede,
-		syncproto.DispositionConflict:
+		syncproto.DispositionConflict,
+		syncproto.DispositionCopyFromExisting:
 		return true
 	}
 	return false

@@ -647,6 +647,47 @@ auth     = { bearer = "literal-bearer" }
 	if n.CertFingerprint != "" {
 		t.Fatalf("CertFingerprint = %q, want empty (no tls block)", n.CertFingerprint)
 	}
+	if n.DedupStrategy != "copy" {
+		t.Fatalf("DedupStrategy = %q, want %q (default)", n.DedupStrategy, "copy")
+	}
+}
+
+// TestLoadNodeDedupStrategy covers the three resolved outcomes: an
+// explicit "copy" passes through, an explicit "off" disables the
+// dedup branch, and an unknown value is rejected at load time so a
+// typo surfaces before the first sync.
+func TestLoadNodeDedupStrategy(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		body    string
+		want    string
+		wantErr string
+	}{
+		{"explicit-copy", `dedup_strategy = "copy"`, "copy", ""},
+		{"explicit-off", `dedup_strategy = "off"`, "off", ""},
+		{"unknown", `dedup_strategy = "hardlink"`, "", "dedup_strategy"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg, err := Load(writeConfig(t, `
+[nodes.lan]
+endpoint = "http://lan.local"
+path     = "/r"
+auth     = { bearer = "t" }
+`+c.body))
+			if c.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+					t.Fatalf("error = %v, want substring %q", err, c.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got := cfg.Nodes["lan"].DedupStrategy; got != c.want {
+				t.Fatalf("DedupStrategy = %q, want %q", got, c.want)
+			}
+		})
+	}
 }
 
 // TestLoadNodeRejectsBadEndpoint covers the parse + scheme + host

@@ -51,6 +51,29 @@ const DispositionSupersede = "supersede"
 // inserts a new `present` row there with `source_node_id = initiator`.
 const DispositionConflict = "conflict"
 
+// DispositionCopyFromExisting — receiver has no live row at this path
+// but holds the requested blake3 at a different path in the same volume.
+// Instead of forcing the initiator to re-transfer the bytes over the
+// network, the receiver materialises the new path locally by copying
+// from `CopyFromPath` (an independent inode — not a hardlink). The
+// initiator excludes the path from the rclone scope but still verifies
+// the post-copy hash and writes a `present` row on /close, with
+// `source_node_id = initiator` (the path is logically initiator-owned
+// from the receiver's view, identical to a successful Transfer).
+const DispositionCopyFromExisting = "copy-from-existing"
+
+// DedupStrategyCopy enables receiver-side local dedup: when a /plan
+// classifier hit on a different path with the same blake3 in the same
+// volume would otherwise produce a Transfer, the receiver materialises
+// the new path from the existing one with io.Copy. The default.
+const DedupStrategyCopy = "copy"
+
+// DedupStrategyOff disables the dedup branch entirely: the receiver
+// always classifies missing paths as Transfer and never copies from
+// existing content. Useful when the initiator (or the user driving it)
+// wants conservative behaviour against a given peer.
+const DedupStrategyOff = "off"
+
 // BeginRequest opens a peer-sync session.
 type BeginRequest struct {
 	// Volume is the volume name (matched against the receiver's
@@ -72,6 +95,13 @@ type BeginRequest struct {
 	// later as peer_sync_state.last_shared_run_id; the two sides
 	// thus share one logical identifier without negotiating a UUID.
 	InitiatorRunID int64 `json:"initiator_run_id"`
+	// DedupStrategy is the initiator's preference for receiver-side
+	// content-addressable dedup. "copy" (or empty for back-compat with
+	// older initiators) enables io.Copy from an existing same-blake3
+	// path in the same volume when the destination is otherwise a
+	// Transfer; "off" disables the dedup branch entirely. The receiver
+	// validates the value at /begin and stashes it on the session.
+	DedupStrategy string `json:"dedup_strategy,omitempty"`
 }
 
 // BeginResponse closes the handshake.
@@ -136,6 +166,13 @@ type PlanDisposition struct {
 	// client can sanity-check that path↔hash didn't get reordered
 	// across the wire.
 	Blake3Hex string `json:"blake3"`
+	// CopyFromPath is set only for Disposition == CopyFromExisting:
+	// the volume-relative receiver path whose bytes were copied to
+	// satisfy this path during pre-stage. Surfaced on the wire for
+	// diagnostic clarity (the initiator's CLI can render "deduped from
+	// X") and so the initiator can sanity-check that the receiver
+	// picked a sane source. Empty for every other disposition.
+	CopyFromPath string `json:"copy_from_path,omitempty"`
 }
 
 // ConflictDetail names a conflicting path and surfaces enough metadata
