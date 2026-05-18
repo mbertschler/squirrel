@@ -585,6 +585,33 @@ func (s *Store) ListPresentPathsUnder(ctx context.Context, volumeID int64) (map[
 	return out, rows.Err()
 }
 
+// ListPresentFilesInFolder returns every present file row in one
+// folder, ordered by name ascending so the caller's downstream
+// processing is deterministic. Used by the Merkle walk's initiator
+// to assemble the /plan slice from only the folders the walk found
+// differing — orders of magnitude smaller than the full-volume
+// listing the flat protocol sends.
+func (s *Store) ListPresentFilesInFolder(ctx context.Context, folderID int64) ([]FileRow, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+fileSelectColumns+` FROM `+fileFromJoin+`
+		 WHERE f.folder_id = ? AND f.status = 'present'
+		 ORDER BY f.name`,
+		folderID)
+	if err != nil {
+		return nil, fmt.Errorf("list files in folder %d: %w", folderID, err)
+	}
+	defer rows.Close()
+	var out []FileRow
+	for rows.Next() {
+		var r FileRow
+		if err := r.scanFrom(rows); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // ListPresentBySource yields every present row in volumeID whose
 // source_node_id matches nodeID. A valid nodeID matches that node id
 // and exploits idx_files_source_node (the partial index on

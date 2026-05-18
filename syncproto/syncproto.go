@@ -74,6 +74,20 @@ const DedupStrategyCopy = "copy"
 // wants conservative behaviour against a given peer.
 const DedupStrategyOff = "off"
 
+// ProtocolVersionFlat is the original per-path /plan exchange: the
+// initiator sends every present (path, blake3) tuple in its volume and
+// the receiver classifies them one by one. Kept for one release as the
+// fallback when an older receiver doesn't speak the folder walk.
+const ProtocolVersionFlat = 1
+
+// ProtocolVersionMerkleWalk is the folder Merkle walk introduced in
+// #44: the initiator descends the folders tree level by level via
+// /v1/sync/plan-folders, identifies the (typically small) set of leaf
+// folders whose shallow hashes differ, and only sends those folders'
+// files to /plan. The classifier behind /plan is unchanged; this is a
+// scope reduction on the input, not a new disposition.
+const ProtocolVersionMerkleWalk = 2
+
 // BeginRequest opens a peer-sync session.
 type BeginRequest struct {
 	// Volume is the volume name (matched against the receiver's
@@ -102,6 +116,13 @@ type BeginRequest struct {
 	// Transfer; "off" disables the dedup branch entirely. The receiver
 	// validates the value at /begin and stashes it on the session.
 	DedupStrategy string `json:"dedup_strategy,omitempty"`
+	// ProtocolVersion is the highest plan exchange the initiator can
+	// drive. The receiver echoes the minimum of (its own max,
+	// initiator's). Omitted (zero) means ProtocolVersionFlat — the
+	// only behaviour older initiators ever spoke. The session caches
+	// the negotiated value so every subsequent endpoint sees a single
+	// authoritative number.
+	ProtocolVersion int `json:"protocol_version,omitempty"`
 }
 
 // BeginResponse closes the handshake.
@@ -124,9 +145,63 @@ type BeginResponse struct {
 	// initiator's CLI renders them alongside its own warnings.
 	// Empty in the common "no drift" case and omitted on the wire.
 	PendingWarnings []string `json:"pending_warnings,omitempty"`
+	// ProtocolVersion is the version both sides agreed to drive this
+	// session at. The receiver picks min(its own max, initiator's
+	// requested). An older receiver omits this field; the initiator
+	// treats absent as ProtocolVersionFlat. Initiators that asked for
+	// ProtocolVersionMerkleWalk and got ProtocolVersionFlat fall back
+	// to today's full-volume /plan exchange transparently.
+	ProtocolVersion int `json:"protocol_version,omitempty"`
 }
 
-// PlanRequest carries the initiator's index slice.
+// PlanFoldersRequest asks the receiver for folder digests and direct
+// child listings for one or more folder paths. The initiator drives a
+// breadth-first walk: it sends every folder at depth N in one request,
+// the receiver replies with their (shallow, deep, children) tuples,
+// and the initiator picks which children at depth N+1 to query next.
+// One round-trip per tree level is the design target; the request size
+// is bounded by the number of folders sharing that depth.
+//
+// Paths are volume-relative folder paths with no trailing slash; the
+// volume root is the empty string. The receiver looks up by exact
+// match against folders.path — there is no wildcard.
+type PlanFoldersRequest struct {
+	ReceiverRunID int64    `json:"receiver_run_id"`
+	Paths         []string `json:"paths"`
+}
+
+// PlanFoldersResponse echoes one entry per requested path, in the same
+// order the initiator sent them so a positional join stays cheap.
+type PlanFoldersResponse struct {
+	Folders []FolderDigest `json:"folders"`
+}
+
+// FolderDigest is the receiver's snapshot of one folder. Present=false
+// means the receiver has no folder at this path (the entire subtree is
+// initiator-only and every direct file under it will end up in /plan).
+// When Present=true the digests and children together let the
+// initiator decide which child folders to descend into next.
+type FolderDigest struct {
+	Path       string        `json:"path"`
+	Present    bool          `json:"present"`
+	ShallowHex string        `json:"shallow,omitempty"`
+	DeepHex    string        `json:"deep,omitempty"`
+	Children   []ChildDigest `json:"children,omitempty"`
+}
+
+// ChildDigest carries one direct subfolder of a queried folder. Name
+// is the last path segment (not the full path) so the initiator can
+// reconstruct the child's path by appending to its parent — and so
+// the wire size scales with name length, not depth.
+type ChildDigest struct {
+	Name    string `json:"name"`
+	DeepHex string `json:"deep"`
+}
+
+// PlanRequest carries the initiator's index slice. Under
+// ProtocolVersionMerkleWalk the slice contains only files in folders
+// the walk identified as differing; under ProtocolVersionFlat it is
+// every present file in the volume, as in v1.
 type PlanRequest struct {
 	ReceiverRunID int64        `json:"receiver_run_id"`
 	Entries       []IndexEntry `json:"entries"`

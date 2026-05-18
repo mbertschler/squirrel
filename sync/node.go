@@ -96,6 +96,10 @@ type nodeSyncDriver struct {
 	// receiverRunID is filled in after the begin handshake; rclone +
 	// verify + close reference it.
 	receiverRunID int64
+	// protocolVersion is the plan-exchange version negotiated at
+	// /begin. Defaults to ProtocolVersionFlat so a missing field in
+	// the receiver's response (older agent) keeps today's behaviour.
+	protocolVersion int
 }
 
 func (d *nodeSyncDriver) run() error {
@@ -159,11 +163,17 @@ func (d *nodeSyncDriver) phaseBegin() error {
 		InitiatorNodeName: self.Name,
 		InitiatorRunID:    runID,
 		DedupStrategy:     d.node.DedupStrategy,
+		ProtocolVersion:   syncproto.ProtocolVersionMerkleWalk,
 	})
 	if err != nil {
 		return err
 	}
 	d.receiverRunID = resp.ReceiverRunID
+	if resp.ProtocolVersion <= 0 {
+		d.protocolVersion = syncproto.ProtocolVersionFlat
+	} else {
+		d.protocolVersion = resp.ProtocolVersion
+	}
 	if err := d.store.SetCorrelatedRunID(d.ctx, runID, resp.ReceiverRunID); err != nil {
 		return fmt.Errorf("stamp correlated run id: %w", err)
 	}
@@ -173,9 +183,11 @@ func (d *nodeSyncDriver) phaseBegin() error {
 }
 
 // phasePlan streams the initiator's index slice and parses the
-// receiver's verdict.
+// receiver's verdict. Under ProtocolVersionMerkleWalk the slice is
+// scoped to files in folders the walk identified as differing; under
+// ProtocolVersionFlat it is every present file in the volume.
 func (d *nodeSyncDriver) phasePlan() (syncproto.PlanResponse, error) {
-	entries, err := d.collectIndexEntries()
+	entries, err := d.collectPlanEntries()
 	if err != nil {
 		return syncproto.PlanResponse{}, fmt.Errorf("collect index entries: %w", err)
 	}
@@ -183,6 +195,138 @@ func (d *nodeSyncDriver) phasePlan() (syncproto.PlanResponse, error) {
 		ReceiverRunID: d.receiverRunID,
 		Entries:       entries,
 	})
+}
+
+// collectPlanEntries chooses between the v2 walk and the v1 flat
+// enumeration based on the negotiated protocol version, so phasePlan
+// itself stays a thin wrapper around the wire call.
+func (d *nodeSyncDriver) collectPlanEntries() ([]syncproto.IndexEntry, error) {
+	if d.protocolVersion >= syncproto.ProtocolVersionMerkleWalk {
+		return d.collectEntriesViaWalk()
+	}
+	return d.collectIndexEntries()
+}
+
+// collectEntriesViaWalk drives the Merkle walk: it asks the receiver
+// for folder digests level by level, identifies which folders differ
+// (so their files need /plan classification), and returns just those
+// folders' files. The breadth-first order means one HTTP round-trip
+// per tree depth regardless of how many folders share that depth.
+// Folder paths reserved for sync internals (.squirrel-history/,
+// .squirrel-conflicts/) are filtered before queueing so the walk
+// never crosses into them.
+func (d *nodeSyncDriver) collectEntriesViaWalk() ([]syncproto.IndexEntry, error) {
+	queue := []string{""}
+	var differingFolderIDs []int64
+	for len(queue) > 0 {
+		resp, err := d.client.planFolders(d.ctx, syncproto.PlanFoldersRequest{
+			ReceiverRunID: d.receiverRunID,
+			Paths:         queue,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("plan-folders walk: %w", err)
+		}
+		next, leaves, err := d.processWalkResponse(resp)
+		if err != nil {
+			return nil, err
+		}
+		differingFolderIDs = append(differingFolderIDs, leaves...)
+		queue = next
+	}
+	return d.entriesFromFolders(differingFolderIDs)
+}
+
+// processWalkResponse zips the receiver's reply with the initiator's
+// local view of each folder. It returns (a) the next-level paths to
+// descend into and (b) the local folder IDs whose direct files must
+// be sent to /plan. A folder where deep_blake3 matches contributes
+// neither: the subtree is identical on both sides.
+func (d *nodeSyncDriver) processWalkResponse(resp syncproto.PlanFoldersResponse) ([]string, []int64, error) {
+	var next []string
+	var differingIDs []int64
+	for _, fd := range resp.Folders {
+		local, err := d.store.GetFolderByPath(d.ctx, d.volID, fd.Path)
+		if store.IsNotFound(err) {
+			// Initiator queued this only when its own walk surfaced it,
+			// so a missing local row would mean the DB was mutated
+			// mid-sync. Skip gracefully — the divergence will resurface
+			// on the next sync.
+			continue
+		}
+		if err != nil {
+			return nil, nil, fmt.Errorf("local folder %q: %w", fd.Path, err)
+		}
+		localDeepHex := hex.EncodeToString(local.DeepBlake3)
+		if fd.Present && fd.DeepHex == localDeepHex {
+			continue
+		}
+		localShallowHex := hex.EncodeToString(local.ShallowBlake3)
+		shallowDiffers := !fd.Present || fd.ShallowHex != localShallowHex
+		if shallowDiffers && !isReservedSyncPath(fd.Path) {
+			differingIDs = append(differingIDs, local.ID)
+		}
+		childNext, err := d.queueChildrenToDescend(local, fd)
+		if err != nil {
+			return nil, nil, err
+		}
+		next = append(next, childNext...)
+	}
+	return next, differingIDs, nil
+}
+
+// queueChildrenToDescend returns the local children of one folder
+// whose deep_blake3 differs from the receiver's (or who exist only on
+// the initiator). Reserved-name children are filtered so the walk
+// never enters .squirrel-history/ or .squirrel-conflicts/. Receiver-
+// only children are intentionally ignored: those subtrees hold files
+// the initiator doesn't have, which the initiator can't push.
+func (d *nodeSyncDriver) queueChildrenToDescend(local store.Folder, fd syncproto.FolderDigest) ([]string, error) {
+	localKids, err := d.store.ListChildFolders(d.ctx, local.ID)
+	if err != nil {
+		return nil, fmt.Errorf("list child folders of %q: %w", local.Path, err)
+	}
+	recvDeepByName := make(map[string]string, len(fd.Children))
+	for _, c := range fd.Children {
+		recvDeepByName[c.Name] = c.DeepHex
+	}
+	var out []string
+	for _, k := range localKids {
+		if isReservedSyncPath(k.Path) {
+			continue
+		}
+		recvDeep, hasRecv := recvDeepByName[k.Name()]
+		if hasRecv && recvDeep == hex.EncodeToString(k.DeepBlake3) {
+			continue
+		}
+		out = append(out, k.Path)
+	}
+	return out, nil
+}
+
+// entriesFromFolders flattens the per-folder file rows the walk
+// surfaced into a /plan-shaped slice. Reserved-path rows are filtered
+// here too (the walk already skips reserved folder paths, but a stray
+// file directly at the reserved-name boundary still needs guarding).
+func (d *nodeSyncDriver) entriesFromFolders(folderIDs []int64) ([]syncproto.IndexEntry, error) {
+	var entries []syncproto.IndexEntry
+	for _, fid := range folderIDs {
+		files, err := d.store.ListPresentFilesInFolder(d.ctx, fid)
+		if err != nil {
+			return nil, fmt.Errorf("list files in folder %d: %w", fid, err)
+		}
+		for _, row := range files {
+			if isReservedSyncPath(row.Path) {
+				continue
+			}
+			entries = append(entries, syncproto.IndexEntry{
+				Path:      row.Path,
+				Blake3Hex: hex.EncodeToString(row.Blake3),
+				SizeBytes: row.SizeBytes,
+				MtimeNs:   row.MtimeNs,
+			})
+		}
+	}
+	return entries, nil
 }
 
 // collectIndexEntries walks the present rows for this volume and
@@ -401,6 +545,11 @@ func (c *nodeClient) begin(ctx context.Context, body syncproto.BeginRequest) (sy
 func (c *nodeClient) plan(ctx context.Context, body syncproto.PlanRequest) (syncproto.PlanResponse, error) {
 	var resp syncproto.PlanResponse
 	return resp, c.do(ctx, "/v1/sync/plan", body, &resp)
+}
+
+func (c *nodeClient) planFolders(ctx context.Context, body syncproto.PlanFoldersRequest) (syncproto.PlanFoldersResponse, error) {
+	var resp syncproto.PlanFoldersResponse
+	return resp, c.do(ctx, "/v1/sync/plan-folders", body, &resp)
 }
 
 func (c *nodeClient) verify(ctx context.Context, body syncproto.VerifyRequest) (syncproto.VerifyResponse, error) {

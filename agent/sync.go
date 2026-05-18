@@ -64,6 +64,12 @@ type peerSession struct {
 	// disables it (every missing path stays a Transfer). Validated at
 	// /begin so an unknown value never reaches the classifier.
 	dedupStrategy string
+	// protocolVersion is the negotiated plan-exchange version for this
+	// session, set once during /begin and consulted by /plan-folders to
+	// refuse calls from sessions still on ProtocolVersionFlat. The flat
+	// /plan endpoint accepts every session regardless so a flat session
+	// can sit alongside a walk session on the same agent.
+	protocolVersion int
 	// dispositions stores the receiver's verdict per path so /verify
 	// and /close can rehash and commit without re-running the diff.
 	dispositions map[string]*sessionEntry
@@ -120,6 +126,7 @@ func newPeerSyncRouter(srv *Server, volumes map[string]*config.Volume) *peerSync
 func (r *peerSyncRouter) register(mux *http.ServeMux) {
 	mux.Handle("POST /v1/sync/begin", r.srv.requireBearer(http.HandlerFunc(r.handleBegin)))
 	mux.Handle("POST /v1/sync/plan", r.srv.requireBearer(http.HandlerFunc(r.handlePlan)))
+	mux.Handle("POST /v1/sync/plan-folders", r.srv.requireBearer(http.HandlerFunc(r.handlePlanFolders)))
 	mux.Handle("POST /v1/sync/verify", r.srv.requireBearer(http.HandlerFunc(r.handleVerify)))
 	mux.Handle("POST /v1/sync/close", r.srv.requireBearer(http.HandlerFunc(r.handleClose)))
 }
@@ -268,6 +275,7 @@ func (r *peerSyncRouter) finishBegin(ctx context.Context, body syncproto.BeginRe
 	if err != nil {
 		return syncproto.BeginResponse{}, http.StatusInternalServerError, fmt.Errorf("collect drift warnings: %w", err)
 	}
+	protocol := negotiateProtocol(body.ProtocolVersion)
 	r.storeSession(&peerSession{
 		receiverRunID:   runID,
 		volume:          vol,
@@ -275,13 +283,32 @@ func (r *peerSyncRouter) finishBegin(ctx context.Context, body syncproto.BeginRe
 		peerNodeID:      peer.ID,
 		correlatedRunID: body.InitiatorRunID,
 		dedupStrategy:   dedupStrategy,
+		protocolVersion: protocol,
 		dispositions:    make(map[string]*sessionEntry),
 	})
 	return syncproto.BeginResponse{
 		ReceiverRunID:    runID,
 		ReceiverNodeName: self.Name,
 		PendingWarnings:  warnings,
+		ProtocolVersion:  protocol,
 	}, http.StatusOK, nil
+}
+
+// negotiateProtocol picks the highest plan exchange both sides speak.
+// An initiator that omits the field (or sends zero) is treated as
+// ProtocolVersionFlat — the only behaviour we ever spoke before #44.
+// A future initiator that asks for a version this receiver doesn't
+// know is clamped down to ProtocolVersionMerkleWalk rather than
+// rejected, so a partial rollout doesn't break syncs.
+func negotiateProtocol(requested int) int {
+	const receiverMax = syncproto.ProtocolVersionMerkleWalk
+	if requested <= 0 {
+		return syncproto.ProtocolVersionFlat
+	}
+	if requested > receiverMax {
+		return receiverMax
+	}
+	return requested
 }
 
 // collectDriftWarnings produces one PendingWarnings line per audit run
@@ -417,6 +444,122 @@ func (r *peerSyncRouter) planSession(ctx context.Context, sess *peerSession, ent
 	}
 	resp.Conflicts = collectConflicts(sess)
 	return resp, nil
+}
+
+// handlePlanFolders implements POST /v1/sync/plan-folders: look up the
+// receiver's folder rows for each requested path and return the
+// (shallow, deep, direct children) tuple. The endpoint is the
+// per-level building block of the initiator's Merkle walk; sessions
+// negotiated below ProtocolVersionMerkleWalk should never reach it
+// (the initiator wouldn't issue the request).
+//
+// validateRelPath isn't reused here because folder paths include the
+// volume root "", which validateRelPath rejects. The folder-path
+// rules are simpler — reject any traversal segment — and any path the
+// receiver doesn't have surfaces via Present=false rather than as an
+// error, so a stale initiator's request for a removed subtree doesn't
+// abort the whole walk.
+func (r *peerSyncRouter) handlePlanFolders(w http.ResponseWriter, req *http.Request) {
+	var body syncproto.PlanFoldersRequest
+	if err := decodeJSON(req, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	sess := r.lookupSession(body.ReceiverRunID)
+	if sess == nil {
+		writeError(w, http.StatusNotFound, "no session for receiver_run_id")
+		return
+	}
+	if sess.protocolVersion < syncproto.ProtocolVersionMerkleWalk {
+		writeError(w, http.StatusBadRequest, "session negotiated a flat plan; /plan-folders requires protocol_version >= 2")
+		return
+	}
+	for _, p := range body.Paths {
+		if err := validateFolderPath(p); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("path %q: %v", p, err))
+			return
+		}
+	}
+	resp, err := r.planFoldersSession(req.Context(), sess, body.Paths)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// planFoldersSession assembles the per-folder digest response for the
+// requested paths. The response preserves request order so the
+// initiator can positionally zip the two slices instead of rebuilding
+// a map keyed by path.
+func (r *peerSyncRouter) planFoldersSession(ctx context.Context, sess *peerSession, paths []string) (syncproto.PlanFoldersResponse, error) {
+	out := syncproto.PlanFoldersResponse{Folders: make([]syncproto.FolderDigest, 0, len(paths))}
+	for _, p := range paths {
+		fd, err := r.folderDigest(ctx, sess, p)
+		if err != nil {
+			return syncproto.PlanFoldersResponse{}, fmt.Errorf("folder %q: %w", p, err)
+		}
+		out.Folders = append(out.Folders, fd)
+	}
+	return out, nil
+}
+
+// folderDigest builds one FolderDigest for path. A path the receiver
+// doesn't have (no subtree yet, or a subtree the receiver removed
+// out-of-band) returns Present=false; the initiator's walk treats
+// that as "every file under here needs /plan classification" without
+// a special error case.
+func (r *peerSyncRouter) folderDigest(ctx context.Context, sess *peerSession, path string) (syncproto.FolderDigest, error) {
+	folder, err := r.srv.store.GetFolderByPath(ctx, sess.volumeID, path)
+	if err != nil {
+		if store.IsNotFound(err) {
+			return syncproto.FolderDigest{Path: path, Present: false}, nil
+		}
+		return syncproto.FolderDigest{}, err
+	}
+	children, err := r.srv.store.ListChildFolders(ctx, folder.ID)
+	if err != nil {
+		return syncproto.FolderDigest{}, err
+	}
+	childDigests := make([]syncproto.ChildDigest, 0, len(children))
+	for _, c := range children {
+		childDigests = append(childDigests, syncproto.ChildDigest{
+			Name:    c.Name(),
+			DeepHex: hex.EncodeToString(c.DeepBlake3),
+		})
+	}
+	return syncproto.FolderDigest{
+		Path:       path,
+		Present:    true,
+		ShallowHex: hex.EncodeToString(folder.ShallowBlake3),
+		DeepHex:    hex.EncodeToString(folder.DeepBlake3),
+		Children:   childDigests,
+	}, nil
+}
+
+// validateFolderPath is the looser sibling of validateRelPath:
+// folder paths include the volume root (empty string), don't need to
+// be nonempty, but still must not traverse outside the volume or
+// land under a reserved subtree.
+func validateFolderPath(p string) error {
+	if strings.ContainsRune(p, 0) {
+		return errors.New("path must not contain a NUL byte")
+	}
+	if p == "" {
+		return nil
+	}
+	if filepath.IsAbs(p) || strings.HasPrefix(p, "/") || strings.HasPrefix(p, `\`) {
+		return errors.New("path must be relative")
+	}
+	cleaned := filepath.ToSlash(filepath.Clean(p))
+	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return errors.New("path escapes the volume root")
+	}
+	if cleaned == HistoryDirName || strings.HasPrefix(cleaned, HistoryDirName+"/") ||
+		cleaned == ConflictsDirName || strings.HasPrefix(cleaned, ConflictsDirName+"/") {
+		return errors.New("path is under a reserved sync directory")
+	}
+	return nil
 }
 
 // validateRelPath rejects wire paths that would escape the volume
