@@ -56,8 +56,10 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 // end-to-end without binding a fixed port.
 //
 // When Config.ScanInterval is non-zero the drift-detection scheduler
-// (#17) runs in a sibling goroutine off the same context; cancelling
-// ctx stops both.
+// (#17) runs in a sibling goroutine off the same context; when any
+// volume declares a sync_every / index_every cadence the cadence
+// scheduler (#39) runs in another sibling. Cancelling ctx stops all of
+// them.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	httpSrv := &http.Server{
 		Handler:           s.handler,
@@ -69,20 +71,21 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		errCh <- runServer(httpSrv, ln, s.cfg.TLSCert, s.cfg.TLSKey)
 	}()
 
-	scanCtx, cancelScan := context.WithCancel(ctx)
-	defer cancelScan()
-	var scanWG sync.WaitGroup
-	s.startScanLoop(scanCtx, &scanWG, s.scanLogger())
+	loopCtx, cancelLoops := context.WithCancel(ctx)
+	defer cancelLoops()
+	var loopWG sync.WaitGroup
+	s.startScanLoop(loopCtx, &loopWG, s.scanLogger())
+	s.startSchedulerLoop(loopCtx, &loopWG)
 
 	select {
 	case <-ctx.Done():
 		err := gracefulShutdown(httpSrv, errCh)
-		cancelScan()
-		scanWG.Wait()
+		cancelLoops()
+		loopWG.Wait()
 		return err
 	case err := <-errCh:
-		cancelScan()
-		scanWG.Wait()
+		cancelLoops()
+		loopWG.Wait()
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
@@ -102,6 +105,22 @@ func (s *Server) startScanLoop(ctx context.Context, wg *sync.WaitGroup, logger i
 	go func() {
 		defer wg.Done()
 		s.runScanLoop(ctx, logger)
+	}()
+}
+
+// startSchedulerLoop spins up the cadence scheduler (#39) in a sibling
+// goroutine, but only when at least one volume declares a sync_every
+// or index_every cadence. The WaitGroup parallel to startScanLoop's
+// usage lets Serve block on a clean exit during shutdown.
+func (s *Server) startSchedulerLoop(ctx context.Context, wg *sync.WaitGroup) {
+	sched := newScheduler(s, s.cfg.SchedulerTick, s.cfg.Now)
+	if !sched.anyScheduledVolume() {
+		return
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		sched.run(ctx)
 	}()
 }
 

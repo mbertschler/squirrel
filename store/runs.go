@@ -463,3 +463,74 @@ func (s *Store) LatestSuccessfulIndexRun(ctx context.Context, volumeID int64) (R
 	`, volumeID)
 	return scanRun(row.Scan)
 }
+
+// LatestFinishedRun returns the most recent terminal-status (success,
+// partial, or failed) run of the given kind for (volumeID, destination).
+// destination must be "" for index/audit kinds (the schema CHECK ensures
+// those carry no destination) and the rclone destination or peer node
+// name for sync/restore kinds. Returns sql.ErrNoRows when no matching
+// run exists.
+//
+// The scheduler (#39) computes `now - last_finished` from this row to
+// decide whether a cadence-driven run is due. Failed terminal states
+// count: per the issue's failure-policy (no special retry, the next
+// tick re-evaluates), a failed run consumes the cadence window like
+// any other.
+func (s *Store) LatestFinishedRun(ctx context.Context, kind string, volumeID int64, destination string) (Run, error) {
+	var row *sql.Row
+	if destination == "" {
+		row = s.db.QueryRowContext(ctx,
+			`SELECT `+runColumns+`
+			 FROM runs
+			 WHERE kind = ? AND volume_id = ? AND destination IS NULL
+			   AND status IN ('success','partial','failed')
+			 ORDER BY id DESC LIMIT 1`,
+			kind, volumeID)
+	} else {
+		row = s.db.QueryRowContext(ctx,
+			`SELECT `+runColumns+`
+			 FROM runs
+			 WHERE kind = ? AND volume_id = ? AND destination = ?
+			   AND status IN ('success','partial','failed')
+			 ORDER BY id DESC LIMIT 1`,
+			kind, volumeID, destination)
+	}
+	return scanRun(row.Scan)
+}
+
+// HasRunningRun reports whether any 'running' run of the given kind
+// exists for (volumeID, destination). destination "" matches the
+// SQL NULL column (the schema constraint for index/audit kinds); a
+// non-empty destination is matched exactly.
+//
+// The scheduler calls this before kicking a new run so a stale
+// 'running' row (from a crashed prior run, cleared via `runs fail`)
+// or a concurrent CLI invocation produces a clean skip log rather
+// than racing into a duplicate. Implemented via SELECT EXISTS so
+// SQLite short-circuits at the first match rather than walking every
+// matching row (COUNT(*) semantics).
+func (s *Store) HasRunningRun(ctx context.Context, kind string, volumeID int64, destination string) (bool, error) {
+	var found bool
+	var err error
+	if destination == "" {
+		err = s.db.QueryRowContext(ctx,
+			`SELECT EXISTS (
+			   SELECT 1 FROM runs
+			   WHERE kind = ? AND volume_id = ? AND destination IS NULL
+			     AND status = 'running'
+			 )`,
+			kind, volumeID).Scan(&found)
+	} else {
+		err = s.db.QueryRowContext(ctx,
+			`SELECT EXISTS (
+			   SELECT 1 FROM runs
+			   WHERE kind = ? AND volume_id = ? AND destination = ?
+			     AND status = 'running'
+			 )`,
+			kind, volumeID, destination).Scan(&found)
+	}
+	if err != nil {
+		return false, fmt.Errorf("check running run: %w", err)
+	}
+	return found, nil
+}

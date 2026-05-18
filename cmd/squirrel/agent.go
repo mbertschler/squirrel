@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"github.com/mbertschler/squirrel/agent"
 	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/store"
+	"github.com/mbertschler/squirrel/sync"
 )
 
 // agentVersion is the value reported by GET /v1/health. A real release
@@ -26,7 +28,7 @@ const agentVersion = "0.0.0-dev"
 func newAgentCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "agent",
-		Short: "Run the squirrel agent (HTTP server + scheduled audits)",
+		Short: "Run the squirrel agent (HTTP server + scheduled audits + cadence-driven index/sync)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runAgent(cmd)
@@ -49,6 +51,10 @@ func runAgent(cmd *cobra.Command) error {
 	defer s.Close()
 
 	logger := slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), &slog.HandlerOptions{Level: slog.LevelInfo}))
+	rcl, err := resolveSchedulerRclone(cmd, cfg)
+	if err != nil {
+		return err
+	}
 	srv, err := agent.New(agent.Config{
 		Listen:       cfg.Agent.Listen,
 		Token:        cfg.Agent.Token,
@@ -56,6 +62,7 @@ func runAgent(cmd *cobra.Command) error {
 		TLSKey:       cfg.Agent.TLSKey,
 		Version:      agentVersion,
 		Volumes:      cfg.Volumes,
+		SyncRunner:   buildSchedulerSyncRunner(cfg, s, rcl),
 		ScanInterval: cfg.Agent.ScanInterval,
 		ScanStrategy: cfg.Agent.ScanStrategy,
 		ScanLogger:   cmd.ErrOrStderr(),
@@ -118,12 +125,83 @@ func resolveAgentDBPath(cmd *cobra.Command, cfg *config.Config) (string, error) 
 	return def, nil
 }
 
+// resolveSchedulerRclone locates the rclone binary and writes the
+// squirrel-managed rclone.conf when at least one volume declares a
+// sync_every cadence with at least one destination on sync_to. Pure
+// index-only schedules (or no scheduled volumes at all) skip the
+// lookup so a host without rclone installed can still run the agent
+// for its peer-sync surface or its index cadences.
+//
+// EnsureMinVersion runs with shallow=false because scheduled syncs go
+// through sync.RunPair with the default sync.Options{} (Shallow=false)
+// — i.e. they will pass `--hash blake3`, which is only available in
+// rclone ≥ MinRcloneVersion. Failing here means the operator gets a
+// clear startup error rather than a midnight pager when the first
+// scheduled sync fires and rclone rejects the flag.
+func resolveSchedulerRclone(cmd *cobra.Command, cfg *config.Config) (*sync.Rclone, error) {
+	if !anyVolumeNeedsScheduledSync(cfg) {
+		return nil, nil
+	}
+	rcl, err := sync.Find()
+	if err != nil {
+		return nil, fmt.Errorf("scheduler needs rclone for scheduled syncs: %w", err)
+	}
+	if err := sync.EnsureMinVersion(cmd.Context(), rcl, cmd.ErrOrStderr(), false); err != nil {
+		return nil, fmt.Errorf("scheduler rclone preflight: %w", err)
+	}
+	if err := rcl.WriteRcloneConfig(rcloneConfigPathFor(cfg), cfg.Destinations); err != nil {
+		return nil, fmt.Errorf("write rclone config: %w", err)
+	}
+	return rcl, nil
+}
+
+func anyVolumeNeedsScheduledSync(cfg *config.Config) bool {
+	for _, v := range cfg.Volumes {
+		if v.SyncEvery > 0 && len(v.SyncTo) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// buildSchedulerSyncRunner returns the closure the agent's cadence
+// scheduler invokes when it kicks a (volume, destination) sync. It
+// resolves the destination/node by name against the same config the
+// CLI's `squirrel sync` uses and delegates to sync.RunPair so the two
+// surfaces share one code path. A nil rcl (no volume needs scheduled
+// sync) returns a nil runner, which the scheduler interprets as
+// "sync-kicking disabled".
+func buildSchedulerSyncRunner(cfg *config.Config, s *store.Store, rcl *sync.Rclone) agent.SyncRunner {
+	if rcl == nil {
+		return nil
+	}
+	return func(ctx context.Context, vol *config.Volume, destName string) agent.SyncRunReport {
+		pair, err := schedulerPairFor(cfg, vol, destName)
+		if err != nil {
+			return agent.SyncRunReport{Err: err}
+		}
+		rep, runErr := sync.RunPair(ctx, s, rcl, pair, sync.Options{})
+		return agent.SyncRunReport{RunID: rep.RunID, Status: rep.Status, Err: runErr}
+	}
+}
+
+func schedulerPairFor(cfg *config.Config, vol *config.Volume, destName string) (sync.Pair, error) {
+	if d, ok := cfg.Destinations[destName]; ok {
+		return sync.Pair{Volume: vol, Destination: d}, nil
+	}
+	if n, ok := cfg.Nodes[destName]; ok {
+		return sync.Pair{Volume: vol, Node: n}, nil
+	}
+	return sync.Pair{}, fmt.Errorf("destination %q is not declared in config", destName)
+}
+
 // logAgentStartup emits a single structured startup line via slog so a
 // systemd unit's journal (or a developer running in the foreground) can
 // see what's listening where. addr is the resolved listener address (so
 // `:0` reports the kernel-assigned port). We deliberately avoid
 // per-request logging — HTTP middleware is out of scope here; the
-// scheduler's event stream (#39) will use the same logger handle.
+// cadence scheduler shares this same logger handle to emit its own
+// scheduler.kicked / scheduler.skipped / scheduler.finished events.
 func logAgentStartup(logger *slog.Logger, srv *agent.Server, addr string) {
 	scheme := "http"
 	if srv.HasTLS() {
