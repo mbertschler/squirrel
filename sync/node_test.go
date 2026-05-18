@@ -1238,7 +1238,7 @@ func fileInode(t *testing.T, abs string) uint64 {
 	if !ok {
 		t.Fatalf("stat %s: unexpected Sys() type %T", abs, info.Sys())
 	}
-	return uint64(st.Ino)
+	return st.Ino
 }
 
 // TestNodeSyncCopyFromExistingDedup is the headline acceptance test
