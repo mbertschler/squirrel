@@ -34,13 +34,13 @@ func init() {
 // steady state on a fully-seeded volume they are always non-NULL — the empty
 // folder hash is well-defined (keyed hash of the empty input).
 type Folder struct {
-	ID                int64
-	VolumeID          int64
-	ParentID          sql.NullInt64
-	Path              string
-	ShallowBlake3     []byte
-	DeepBlake3        []byte
-	LastChangedRunID  sql.NullInt64
+	ID               int64
+	VolumeID         int64
+	ParentID         sql.NullInt64
+	Path             string
+	ShallowBlake3    []byte
+	DeepBlake3       []byte
+	LastChangedRunID sql.NullInt64
 }
 
 // FolderName returns the last path segment of the folder, i.e. its name
@@ -188,11 +188,14 @@ func scanFolder(row *sql.Row) (Folder, error) {
 func ComputeShallowHash(entries []ShallowEntry) []byte {
 	h, _ := blake3.NewKeyed(folderHashKey[:])
 	var lenBuf [4]byte
+	// blake3.Hasher.Write never returns an error (it accumulates into a
+	// fixed-size sponge), but errcheck flags the discarded result anyway.
+	// Bind to blank to make the discard explicit.
 	for _, e := range entries {
 		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(e.Name)))
-		h.Write(lenBuf[:])
-		h.Write([]byte(e.Name))
-		h.Write(e.Blake3)
+		_, _ = h.Write(lenBuf[:])
+		_, _ = h.Write([]byte(e.Name))
+		_, _ = h.Write(e.Blake3)
 	}
 	return h.Sum(nil)
 }
@@ -209,13 +212,13 @@ type ShallowEntry struct {
 // ascending by name before being fed in.
 func ComputeDeepHash(shallow []byte, children []ChildFolder) []byte {
 	h, _ := blake3.NewKeyed(folderHashKey[:])
-	h.Write(shallow)
+	_, _ = h.Write(shallow)
 	var lenBuf [4]byte
 	for _, c := range children {
 		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(c.Name)))
-		h.Write(lenBuf[:])
-		h.Write([]byte(c.Name))
-		h.Write(c.DeepBlake3)
+		_, _ = h.Write(lenBuf[:])
+		_, _ = h.Write([]byte(c.Name))
+		_, _ = h.Write(c.DeepBlake3)
 	}
 	return h.Sum(nil)
 }

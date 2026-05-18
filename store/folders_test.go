@@ -54,9 +54,9 @@ func TestComputeShallowHashIndependentReimpl(t *testing.T) {
 	var lenBuf [4]byte
 	for _, e := range entries {
 		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(e.Name)))
-		h.Write(lenBuf[:])
-		h.Write([]byte(e.Name))
-		h.Write(e.Blake3)
+		_, _ = h.Write(lenBuf[:])
+		_, _ = h.Write([]byte(e.Name))
+		_, _ = h.Write(e.Blake3)
 	}
 	want := h.Sum(nil)
 
@@ -127,8 +127,8 @@ func TestUpsertInvalidatesExactlyAncestors(t *testing.T) {
 
 	// Seed three branches.
 	seed := []struct {
-		path  string
-		hash  byte
+		path string
+		hash byte
 	}{
 		{"a/b/c/leaf-a.txt", 0x01},
 		{"a/d/leaf-d.txt", 0x02},
@@ -638,4 +638,3 @@ func v7Fixture() []string {
 		 VALUES (1, 'index', 1, 1, 'success', 5)`,
 	}
 }
-
