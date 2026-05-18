@@ -1410,6 +1410,21 @@ func TestPlanCopyFromExistingDirectAPI(t *testing.T) {
 	if a, b := fileInode(t, existingAbs), fileInode(t, newAbs); a == b {
 		t.Fatalf("shared inode %d — pre-stage produced a hardlink, want independent file", a)
 	}
+
+	// File mode is inherited from the source: the user wrote the
+	// source as 0o644 above; the dedup'd path must not silently
+	// downgrade to the os.CreateTemp default (0o600).
+	srcInfo, err := os.Stat(existingAbs)
+	if err != nil {
+		t.Fatalf("stat source: %v", err)
+	}
+	newInfo, err := os.Stat(newAbs)
+	if err != nil {
+		t.Fatalf("stat materialised: %v", err)
+	}
+	if srcInfo.Mode().Perm() != newInfo.Mode().Perm() {
+		t.Fatalf("mode mismatch: source=%v dedup=%v", srcInfo.Mode().Perm(), newInfo.Mode().Perm())
+	}
 }
 
 // TestPlanDedupStrategyOff asserts that an initiator opting out of

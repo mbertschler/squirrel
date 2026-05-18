@@ -203,14 +203,22 @@ func relPathUnder(base, abs string) (string, bool) {
 // requested content at some other path in the same volume, the bytes
 // can be materialised locally instead of crossing the network.
 //
+// Rows under the receiver-owned reserved subtrees
+// (`.squirrel-history/`, `.squirrel-conflicts/`) are excluded: a
+// conflict-preservation row carrying a prior blake3 is reachable for
+// historical lookup but must not be elevated back into a live user
+// path via dedup. The store layer enforces this so every caller
+// inherits the policy without restating it.
+//
 // Ordering by path makes the choice of source deterministic across
 // runs even when several paths share the same blake3, which keeps
-// audit trails predictable. The existing idx_files_blake3 index
-// (`(blake3, volume_id, path)`) covers this query.
+// audit trails predictable.
 func (s *Store) GetPresentByBlake3InVolume(ctx context.Context, volumeID int64, digest []byte) (FileRow, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT `+fileColumns+` FROM files
 		 WHERE blake3 = ? AND volume_id = ? AND status = 'present'
+		   AND path NOT LIKE '.squirrel-history/%'
+		   AND path NOT LIKE '.squirrel-conflicts/%'
 		 ORDER BY path LIMIT 1`,
 		digest, volumeID)
 	var r FileRow

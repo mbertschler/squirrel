@@ -578,11 +578,9 @@ func (r *peerSyncRouter) dispositionForExisting(ctx context.Context, sess *peerS
 
 // preStageCopyFromExisting materialises every CopyFromExisting path
 // locally by copying bytes from the entry's source path (the same
-// volume, found by classify via a blake3-wide lookup). The destination
-// is written through a sibling tempfile + atomic rename so a crash mid
-// pre-stage leaves no half-written live path; the leftover tempfile is
-// cleaned on cleanup paths and otherwise picked up by the next
-// `squirrel index` run.
+// volume, found by classify via a blake3-wide lookup). Each
+// destination is written through a sibling tempfile + atomic rename
+// so a crash mid pre-stage leaves no half-written live path.
 //
 // Hardlinks were deliberately rejected: an io.Copy yields an
 // independent inode, so an editor (or web app) that later modifies one
@@ -595,8 +593,13 @@ func (r *peerSyncRouter) dispositionForExisting(ctx context.Context, sess *peerS
 // observation and the sync) the entry is silently downgraded to
 // Transfer: the response builder later picks up the corrected
 // disposition, and the initiator delivers the bytes via rclone on
-// the same /plan→/verify cycle. Any other I/O error aborts the plan.
+// the same /plan→/verify cycle. Any other I/O error aborts the plan
+// after unlinking every destination this pre-stage already
+// materialised — partial mutation of the receiver volume is worse
+// than no mutation when /plan is going to fail, and rolling back
+// only the bytes this pre-stage actually wrote is bounded and safe.
 func (r *peerSyncRouter) preStageCopyFromExisting(sess *peerSession) error {
+	var materialised []string
 	for relPath, entry := range sess.dispositions {
 		if entry.disposition != syncproto.DispositionCopyFromExisting {
 			continue
@@ -609,24 +612,35 @@ func (r *peerSyncRouter) preStageCopyFromExisting(sess *peerSession) error {
 				entry.copyFromPath = ""
 				continue
 			}
+			for _, p := range materialised {
+				_ = os.Remove(p)
+			}
 			return fmt.Errorf("copy %s → %s: %w", entry.copyFromPath, relPath, err)
 		}
+		materialised = append(materialised, dstAbs)
 	}
 	return nil
 }
 
 // copyFileToPath copies srcAbs to dstAbs via a sibling tempfile +
-// atomic rename. The mtime is set to mtimeNs (the initiator's claim,
-// zero means "don't touch") so a subsequent `squirrel index` run on
-// the receiver doesn't trip its mtime heuristic and rehash the file
-// for no reason. Returns os.ErrNotExist when srcAbs is missing so the
-// caller can downgrade the disposition to Transfer.
+// atomic rename. The destination inherits the source's file mode so a
+// dedup'd file isn't surprisingly less readable than the original
+// (os.CreateTemp produces 0o600, which would silently downgrade a
+// 0o644 user file). The mtime is set to mtimeNs (the initiator's
+// claim, zero means "don't touch") so a subsequent `squirrel index`
+// run on the receiver doesn't trip its mtime heuristic and rehash the
+// file for no reason. Returns os.ErrNotExist when srcAbs is missing
+// so the caller can downgrade the disposition to Transfer.
 func copyFileToPath(srcAbs, dstAbs string, mtimeNs int64) error {
 	src, err := os.Open(srcAbs)
 	if err != nil {
 		return err
 	}
 	defer src.Close()
+	srcInfo, err := src.Stat()
+	if err != nil {
+		return fmt.Errorf("stat source: %w", err)
+	}
 	if err := os.MkdirAll(filepath.Dir(dstAbs), 0o755); err != nil {
 		return fmt.Errorf("mkdir dest dir: %w", err)
 	}
@@ -644,6 +658,10 @@ func copyFileToPath(srcAbs, dstAbs string, mtimeNs int64) error {
 	if err := tmp.Close(); err != nil {
 		cleanup()
 		return fmt.Errorf("close temp: %w", err)
+	}
+	if err := os.Chmod(tmpPath, srcInfo.Mode().Perm()); err != nil {
+		cleanup()
+		return fmt.Errorf("chmod temp: %w", err)
 	}
 	if mtimeNs != 0 {
 		t := time.Unix(0, mtimeNs)

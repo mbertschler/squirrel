@@ -2984,6 +2984,16 @@ func TestGetPresentByBlake3InVolume(t *testing.T) {
 	}, nil); err != nil {
 		t.Fatalf("Upsert other: %v", err)
 	}
+	// volA reserved subtree: a conflict-preservation row with the
+	// same blake3. Must be skipped — dedup must not elevate a
+	// conflict-preserved version back into a live user path.
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: volA, Path: ".squirrel-conflicts/run-1/preserved.jpg", Blake3: x,
+		SizeBytes: 1, MtimeNs: 1, Status: StatusPresent,
+		FirstSeenRunID: runA, LastSeenRunID: runA, IndexedAtNs: 1,
+	}, nil); err != nil {
+		t.Fatalf("Upsert reserved: %v", err)
+	}
 
 	got, err := s.GetPresentByBlake3InVolume(ctx, volA, x)
 	if err != nil {
