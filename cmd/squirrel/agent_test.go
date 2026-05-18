@@ -11,11 +11,34 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/mbertschler/squirrel/store"
 )
+
+// syncBuf is a tiny mutex-wrapped bytes.Buffer for capturing the agent
+// CLI's stdout/stderr. cobra runs the agent's RunE on a goroutine while
+// the test polls the buffer for the startup line, and bytes.Buffer is
+// explicitly not safe for concurrent use — direct sharing trips `go
+// test -race`.
+type syncBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuf) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuf) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 // reservePort claims a free localhost port via the kernel then releases
 // it; we feed the resulting "127.0.0.1:N" string to the agent's `listen`
@@ -45,7 +68,7 @@ func startAgentCLI(t *testing.T, configPath string) (cancel func(), addr string)
 	t.Helper()
 	isolateConfig(t)
 	ctx, c := context.WithCancel(context.Background())
-	buf := &bytes.Buffer{}
+	buf := &syncBuf{}
 	root := newRootCmd()
 	root.SetOut(buf)
 	root.SetErr(buf)
@@ -68,7 +91,7 @@ func startAgentCLI(t *testing.T, configPath string) (cancel func(), addr string)
 	}, addr
 }
 
-func waitForBanner(t *testing.T, buf *bytes.Buffer) string {
+func waitForBanner(t *testing.T, buf *syncBuf) string {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
