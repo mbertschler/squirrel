@@ -127,6 +127,13 @@ type indexer struct {
 	// seen is populated only in DryRun mode; finalizeMissing uses it to count
 	// rows that exist in the DB but were not encountered during the walk.
 	seen map[string]struct{}
+
+	// preloaded is the per-volume snapshot of live rows, loaded once at the
+	// start of the run. Workers consult it instead of calling GetByPath per
+	// file, which would funnel every lookup through the single shared sqlite
+	// connection. nil for fresh volumes (no rows to load) and for DryRun
+	// runs against never-indexed paths.
+	preloaded map[string]store.FileRow
 }
 
 func newIndexer(ctx context.Context, s *store.Store, root string, opts Options) (*indexer, error) {
@@ -171,6 +178,13 @@ func newIndexer(ctx context.Context, s *store.Store, root string, opts Options) 
 	}
 	if opts.DryRun {
 		idx.seen = make(map[string]struct{})
+	}
+	if exists {
+		preloaded, err := s.LoadVolumeIndex(ctx, vol.ID)
+		if err != nil {
+			return nil, fmt.Errorf("preload volume index: %w", err)
+		}
+		idx.preloaded = preloaded
 	}
 	return idx, nil
 }
@@ -437,12 +451,10 @@ func (i *indexer) finalizeMissing(report *Report) error {
 func (i *indexer) process(w workItem) resultItem {
 	var existing store.FileRow
 	var hasExisting bool
-	if i.volumeExists {
-		row, err := i.store.GetByPath(i.ctx, i.volumeID, w.relPath)
-		if err != nil && !store.IsNotFound(err) {
-			return resultItem{err: fmt.Errorf("lookup %s/%s: %w", i.absRoot, w.relPath, err)}
-		}
-		if err == nil {
+	if i.preloaded != nil {
+		// Workers read the preloaded map concurrently; map reads are safe
+		// because the map is never written after newIndexer populated it.
+		if row, ok := i.preloaded[w.relPath]; ok {
 			existing, hasExisting = row, true
 		}
 	}

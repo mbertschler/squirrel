@@ -142,6 +142,42 @@ func (s *Store) ListHistoryByPath(ctx context.Context, volumeID int64, relPath s
 	return out, rows.Err()
 }
 
+// LoadVolumeIndex returns every non-superseded row in the volume keyed by
+// volume-relative path. The indexer uses this to replace the per-file
+// GetByPath round-trip on its hot path: with MaxOpenConns=1, every worker
+// that calls GetByPath funnels through the same database/sql connection,
+// so the lookups serialise even though they are read-only. Loading the
+// whole index once amortises that cost across the entire run and lets
+// workers proceed without contending on the DB.
+//
+// The returned map reflects the database state at the moment of the
+// SELECT. Callers that interleave LoadVolumeIndex with concurrent writes
+// (sync, audit) get a snapshot that can go stale — the indexer is fine
+// with this because every write goes through ApplyIndexBatch in the same
+// process and only the indexer's own observations matter for the run.
+func (s *Store) LoadVolumeIndex(ctx context.Context, volumeID int64) (map[string]FileRow, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+fileSelectColumns+` FROM `+fileFromJoin+`
+		 WHERE fo.volume_id = ? AND f.status != 'superseded'`,
+		volumeID)
+	if err != nil {
+		return nil, fmt.Errorf("load volume index: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[string]FileRow)
+	for rows.Next() {
+		var r FileRow
+		if err := r.scanFrom(rows); err != nil {
+			return nil, fmt.Errorf("scan volume index row: %w", err)
+		}
+		out[r.Path] = r
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // GetByAbsolutePath finds the file whose volume.path + '/' + file.path equals
 // abs. Resolution is done by longest-prefix match against the known volumes.
 // Used by `squirrel query <path>` when the caller does not know the volume.
