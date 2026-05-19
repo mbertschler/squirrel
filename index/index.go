@@ -314,11 +314,28 @@ func (i *indexer) sendWork(w workItem) error {
 	}
 }
 
+// batchSize is the number of result rows the collector buffers before
+// flushing a single store.ApplyIndexBatch transaction. Chosen empirically:
+// large enough to amortise BeginTx/Commit/fsync across many ops, small
+// enough that a fatal error in the middle of a run still surfaces quickly.
+const batchSize = 256
+
 // collect drains the results channel, updates the report, and writes to the
-// store (or records seen paths for dry-run). Returns the partial report
-// alongside any fatal write error.
+// store in batched transactions (or records seen paths for dry-run).
+// Returns the partial report alongside any fatal write error.
 func (i *indexer) collect() (Report, error) {
 	report := Report{}
+	batch := make([]store.IndexBatchEntry, 0, batchSize)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		if err := i.store.ApplyIndexBatch(i.ctx, batch); err != nil {
+			return fmt.Errorf("apply index batch: %w", err)
+		}
+		batch = batch[:0]
+		return nil
+	}
 	for r := range i.results {
 		if r.err != nil {
 			report.Errors++
@@ -330,11 +347,30 @@ func (i *indexer) collect() (Report, error) {
 			i.seen[r.row.Path] = struct{}{}
 			continue
 		}
-		if err := i.persist(r); err != nil {
-			return report, err
+		batch = append(batch, i.batchEntry(r))
+		if len(batch) >= batchSize {
+			if err := flush(); err != nil {
+				return report, err
+			}
 		}
 	}
+	if err := flush(); err != nil {
+		return report, err
+	}
 	return report, nil
+}
+
+// batchEntry translates a resultItem into the store-level batch op shape.
+// Unchanged rows become TouchSeen with LastSeenRunID pinned to the current
+// run; added/modified rows become Upsert. The store-side helpers read the
+// fields each op needs and ignore the rest.
+func (i *indexer) batchEntry(r resultItem) store.IndexBatchEntry {
+	if r.kind == kindUnchanged {
+		row := r.row
+		row.LastSeenRunID = i.runID
+		return store.IndexBatchEntry{Kind: store.BatchOpTouchSeen, Row: row}
+	}
+	return store.IndexBatchEntry{Kind: store.BatchOpUpsert, Row: r.row}
 }
 
 func tally(report *Report, kind changeKind) {
@@ -346,19 +382,6 @@ func tally(report *Report, kind changeKind) {
 	case kindUnchanged:
 		report.Unchanged++
 	}
-}
-
-func (i *indexer) persist(r resultItem) error {
-	if r.kind == kindUnchanged {
-		if err := i.store.TouchSeen(i.ctx, r.row.VolumeID, r.row.Path, i.runID); err != nil {
-			return fmt.Errorf("touch %s/%s: %w", i.absRoot, r.row.Path, err)
-		}
-		return nil
-	}
-	if err := i.store.Upsert(i.ctx, r.row, nil); err != nil {
-		return fmt.Errorf("upsert %s/%s: %w", i.absRoot, r.row.Path, err)
-	}
-	return nil
 }
 
 func (i *indexer) waitForWalker() error {
