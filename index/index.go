@@ -151,7 +151,12 @@ func newIndexer(ctx context.Context, s *store.Store, root string, opts Options) 
 
 	workers := opts.Workers
 	if workers <= 0 {
-		workers = runtime.NumCPU()
+		// Each worker spends roughly half its wall time blocked on file
+		// I/O and half hashing on CPU, so NumCPU workers leave NumCPU/2
+		// cores idle on average. Doubling the count keeps the cores busy
+		// (the hash phases interleave across workers) and increases the
+		// NVMe in-flight read count, which APFS rewards.
+		workers = 2 * runtime.NumCPU()
 	}
 	queueDepth := opts.QueueDepth
 	if queueDepth <= 0 {
