@@ -165,6 +165,33 @@ func (s *Store) GetFolderByPath(ctx context.Context, volumeID int64, path string
 	return scanFolder(row)
 }
 
+// ListChildFolders returns the direct subfolders of parentID, ordered
+// by full path ascending — which, because the WHERE clause restricts to
+// one parent, is the same byte-wise order the Merkle walk's deep-hash
+// reconstruction expects (children of a single parent share the same
+// prefix, so sorting by path is identical to sorting by name). Returns
+// the empty slice when parentID has no children.
+func (s *Store) ListChildFolders(ctx context.Context, parentID int64) ([]Folder, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, volume_id, parent_id, path, shallow_blake3, deep_blake3, last_changed_run_id
+		 FROM folders WHERE parent_id = ?
+		 ORDER BY path`,
+		parentID)
+	if err != nil {
+		return nil, fmt.Errorf("list child folders: %w", err)
+	}
+	defer rows.Close()
+	var out []Folder
+	for rows.Next() {
+		var f Folder
+		if err := rows.Scan(&f.ID, &f.VolumeID, &f.ParentID, &f.Path, &f.ShallowBlake3, &f.DeepBlake3, &f.LastChangedRunID); err != nil {
+			return nil, fmt.Errorf("scan child folder: %w", err)
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
 // GetFolderByID returns the folder row by primary key.
 func (s *Store) GetFolderByID(ctx context.Context, id int64) (Folder, error) {
 	row := s.db.QueryRowContext(ctx,
