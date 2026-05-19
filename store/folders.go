@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/zeebo/blake3"
@@ -255,6 +256,89 @@ func ComputeDeepHash(shallow []byte, children []ChildFolder) []byte {
 type ChildFolder struct {
 	Name       string
 	DeepBlake3 []byte
+}
+
+// recomputeFoldersClosure recomputes shallow + deep for every folder in
+// the union (leafIDs ∪ all-ancestors-of-leafIDs), in deepest-first order
+// so each folder's deep_blake3 is up-to-date by the time its parent reads
+// it from computeDeepForFolderTx. Equivalent to calling
+// recomputeFolderAndAncestors once per leaf, except every folder along
+// every walk path is visited exactly once instead of once per descendant
+// that shares it. For a steady-state indexer batch this collapses tens of
+// redundant ancestor walks per file into a single dedup'd pass and is the
+// main lever behind the batched-index speedup.
+//
+// A leafIDs entry of 0 is treated as "no row to process" and skipped — it
+// matches the convention upsertRowInTx / touchSeenRowInTx return when no
+// row was touched.
+func recomputeFoldersClosure(ctx context.Context, tx *sql.Tx, leafIDs map[int64]struct{}, runID int64) error {
+	if len(leafIDs) == 0 {
+		return nil
+	}
+	parents := make(map[int64]sql.NullInt64, len(leafIDs))
+	queue := make([]int64, 0, len(leafIDs))
+	for id := range leafIDs {
+		if id == 0 {
+			continue
+		}
+		queue = append(queue, id)
+	}
+	for len(queue) > 0 {
+		id := queue[len(queue)-1]
+		queue = queue[:len(queue)-1]
+		if _, seen := parents[id]; seen {
+			continue
+		}
+		var parentID sql.NullInt64
+		if err := tx.QueryRowContext(ctx,
+			`SELECT parent_id FROM folders WHERE id = ?`, id).Scan(&parentID); err != nil {
+			return fmt.Errorf("lookup folder %d: %w", id, err)
+		}
+		parents[id] = parentID
+		if parentID.Valid {
+			queue = append(queue, parentID.Int64)
+		}
+	}
+	if len(parents) == 0 {
+		return nil
+	}
+
+	// Memoised depth so we can sort the closure deepest-first.
+	depth := make(map[int64]int, len(parents))
+	var depthOf func(id int64) int
+	depthOf = func(id int64) int {
+		if d, ok := depth[id]; ok {
+			return d
+		}
+		p := parents[id]
+		if !p.Valid {
+			depth[id] = 0
+			return 0
+		}
+		d := depthOf(p.Int64) + 1
+		depth[id] = d
+		return d
+	}
+	order := make([]int64, 0, len(parents))
+	for id := range parents {
+		order = append(order, id)
+	}
+	sort.Slice(order, func(i, j int) bool { return depthOf(order[i]) > depthOf(order[j]) })
+
+	for _, id := range order {
+		shallow, err := computeShallowForFolderTx(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		deep, err := computeDeepForFolderTx(ctx, tx, id, shallow)
+		if err != nil {
+			return err
+		}
+		if err := writeFolderHashesTx(ctx, tx, id, shallow, deep, runID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // recomputeFolderAndAncestors recomputes shallow and deep hashes for the
