@@ -166,9 +166,11 @@ func (s *Store) GetFolderByPath(ctx context.Context, volumeID int64, path string
 }
 
 // ListChildFolders returns the direct subfolders of parentID, ordered
-// by name ascending (byte-wise) so the Merkle walk's deep-hash
-// reconstruction sees the same order on every node. Returns the empty
-// slice when parentID has no children.
+// by full path ascending — which, because the WHERE clause restricts to
+// one parent, is the same byte-wise order the Merkle walk's deep-hash
+// reconstruction expects (children of a single parent share the same
+// prefix, so sorting by path is identical to sorting by name). Returns
+// the empty slice when parentID has no children.
 func (s *Store) ListChildFolders(ctx context.Context, parentID int64) ([]Folder, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, volume_id, parent_id, path, shallow_blake3, deep_blake3, last_changed_run_id

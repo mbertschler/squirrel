@@ -256,14 +256,31 @@ func (d *nodeSyncDriver) processWalkResponse(resp syncproto.PlanFoldersResponse)
 		if err != nil {
 			return nil, nil, fmt.Errorf("local folder %q: %w", fd.Path, err)
 		}
+		// Treat an empty digest on either side as "unknown" and force
+		// descent — comparing two empty hex strings would otherwise
+		// silently skip a real divergence (e.g. an as-yet-unhashed
+		// folder seeded by the migration's second pass).
 		localDeepHex := hex.EncodeToString(local.DeepBlake3)
-		if fd.Present && fd.DeepHex == localDeepHex {
+		if fd.Present && localDeepHex != "" && fd.DeepHex != "" && fd.DeepHex == localDeepHex {
 			continue
 		}
 		localShallowHex := hex.EncodeToString(local.ShallowBlake3)
-		shallowDiffers := !fd.Present || fd.ShallowHex != localShallowHex
-		if shallowDiffers && !isReservedSyncPath(fd.Path) {
+		shallowDiffers := !fd.Present || localShallowHex == "" || fd.ShallowHex == "" || fd.ShallowHex != localShallowHex
+		if shallowDiffers && !isReservedFolderPath(fd.Path) {
 			differingIDs = append(differingIDs, local.ID)
+		}
+		// When the receiver has no folder at this path, the entire
+		// local subtree is initiator-only — every descendant folder's
+		// files belong in /plan. Collecting them locally saves N
+		// round-trips that would just confirm "still absent" against
+		// the receiver.
+		if !fd.Present {
+			descIDs, err := d.collectInitiatorOnlySubtree(local.ID)
+			if err != nil {
+				return nil, nil, err
+			}
+			differingIDs = append(differingIDs, descIDs...)
+			continue
 		}
 		childNext, err := d.queueChildrenToDescend(local, fd)
 		if err != nil {
@@ -272,6 +289,37 @@ func (d *nodeSyncDriver) processWalkResponse(resp syncproto.PlanFoldersResponse)
 		next = append(next, childNext...)
 	}
 	return next, differingIDs, nil
+}
+
+// collectInitiatorOnlySubtree returns every descendant folder ID
+// under parentID whose files should be sent to /plan as a single
+// initiator-only subtree. Used when the receiver reported the parent
+// as absent: rather than walking each level just to confirm "still
+// absent", we resolve the whole subtree locally in O(subtree-size)
+// store queries with no network round-trips. Reserved-folder
+// descendants are filtered so .squirrel-history / .squirrel-conflicts
+// subtrees never end up in /plan.
+func (d *nodeSyncDriver) collectInitiatorOnlySubtree(parentID int64) ([]int64, error) {
+	var out []int64
+	queue := []int64{parentID}
+	for len(queue) > 0 {
+		var next []int64
+		for _, id := range queue {
+			kids, err := d.store.ListChildFolders(d.ctx, id)
+			if err != nil {
+				return nil, fmt.Errorf("list children of %d: %w", id, err)
+			}
+			for _, k := range kids {
+				if isReservedFolderPath(k.Path) {
+					continue
+				}
+				out = append(out, k.ID)
+				next = append(next, k.ID)
+			}
+		}
+		queue = next
+	}
+	return out, nil
 }
 
 // queueChildrenToDescend returns the local children of one folder
@@ -291,11 +339,12 @@ func (d *nodeSyncDriver) queueChildrenToDescend(local store.Folder, fd syncproto
 	}
 	var out []string
 	for _, k := range localKids {
-		if isReservedSyncPath(k.Path) {
+		if isReservedFolderPath(k.Path) {
 			continue
 		}
+		localDeep := hex.EncodeToString(k.DeepBlake3)
 		recvDeep, hasRecv := recvDeepByName[k.Name()]
-		if hasRecv && recvDeep == hex.EncodeToString(k.DeepBlake3) {
+		if hasRecv && localDeep != "" && recvDeep != "" && recvDeep == localDeep {
 			continue
 		}
 		out = append(out, k.Path)
@@ -365,10 +414,22 @@ func (d *nodeSyncDriver) collectIndexEntries() ([]syncproto.IndexEntry, error) {
 // isReservedSyncPath reports whether p lives under one of the
 // receiver-owned reserved subtrees. Kept here rather than in the
 // store because the reserved-ness is a sync-layer concern: the DB
-// happily stores rows under any path.
+// happily stores rows under any path. Matches *files* under those
+// subtrees — a file at the bare reserved-dir name is impossible.
 func isReservedSyncPath(p string) bool {
 	return strings.HasPrefix(p, HistoryDirName+"/") ||
 		strings.HasPrefix(p, ConflictsDirName+"/")
+}
+
+// isReservedFolderPath is the folder-path variant of
+// isReservedSyncPath: a folder whose path is *exactly* the reserved
+// directory name (e.g. ".squirrel-history") also qualifies. Folder
+// paths carry no trailing slash, so the file-path predicate would
+// miss the exact bare-name match and queue the reserved folder into
+// the Merkle walk — which the receiver's validateFolderPath then
+// rejects, aborting the whole walk.
+func isReservedFolderPath(p string) bool {
+	return p == HistoryDirName || p == ConflictsDirName || isReservedSyncPath(p)
 }
 
 // phaseTransfer invokes rclone exactly once over the transfer +

@@ -28,7 +28,6 @@ import (
 // the sync returns.
 type walkStats struct {
 	planFoldersCalls atomic.Int64
-	planFolderPaths  atomic.Int64
 	planCalls        atomic.Int64
 	maxPlanEntries   atomic.Int64
 }
@@ -46,7 +45,6 @@ func instrumentAgent(h http.Handler, stats *walkStats) http.Handler {
 			var req syncproto.PlanFoldersRequest
 			if err := json.Unmarshal(body, &req); err == nil {
 				stats.planFoldersCalls.Add(1)
-				stats.planFolderPaths.Add(int64(len(req.Paths)))
 			}
 			r.Body = io.NopCloser(bytes.NewReader(body))
 		case "/v1/sync/plan":
@@ -170,7 +168,6 @@ func TestNodeSyncMerkleWalkSecondSyncIsScoped(t *testing.T) {
 
 	// Reset counters; modify two files in one leaf and re-sync.
 	stats.planFoldersCalls.Store(0)
-	stats.planFolderPaths.Store(0)
 	stats.planCalls.Store(0)
 	stats.maxPlanEntries.Store(0)
 
@@ -224,6 +221,52 @@ func TestNodeSyncMerkleWalkSecondSyncIsScoped(t *testing.T) {
 		if want := "changed-" + name; string(got) != want {
 			t.Fatalf("%s/%s = %q, want %q", dirtyLeaf, name, got, want)
 		}
+	}
+}
+
+// TestNodeSyncMerkleWalkInitiatorOnlySubtreeShortCircuits exercises
+// the "receiver returns Present=false at the top of a subtree" branch:
+// instead of probing every descendant level by level (which would
+// waste one round-trip per depth), the initiator must resolve the
+// whole subtree locally via collectInitiatorOnlySubtree. The
+// assertion bounds the /plan-folders count by the depth at which the
+// first Present=false reply lands, not by the subtree's own depth.
+func TestNodeSyncMerkleWalkInitiatorOnlySubtreeShortCircuits(t *testing.T) {
+	f, stats := buildInstrumentedFixture(t)
+	rcl := requireRclone(t)
+	rcl.Config = filepath.Join(filepath.Dir(f.initVol.Path), "rclone.conf")
+	if err := os.WriteFile(rcl.Config, []byte{}, 0o600); err != nil {
+		t.Fatalf("write rclone.conf: %v", err)
+	}
+	f.rcl = rcl
+
+	// Six-level chain on the initiator; receiver has nothing — every
+	// folder is initiator-only. Without the short-circuit, the walk
+	// would issue six /plan-folders requests (one per level). With it,
+	// the root reply already returns Present=false for every child and
+	// the rest is resolved locally — one request total.
+	leaf := "a/b/c/d/e/f"
+	if err := os.MkdirAll(filepath.Join(f.initVol.Path, leaf), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", leaf, err)
+	}
+	if err := os.WriteFile(filepath.Join(f.initVol.Path, leaf, "leaf.txt"), []byte("deep"), 0o644); err != nil {
+		t.Fatalf("write leaf: %v", err)
+	}
+	f.indexInitiator(t)
+
+	if _, err := SyncNode(context.Background(), f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true}); err != nil {
+		t.Fatalf("SyncNode: %v", err)
+	}
+	// One request for the root (which finds the whole subtree
+	// initiator-only); allow up to two so a future refactor that splits
+	// the root probe into a two-request pre-check doesn't fail loudly.
+	if got := stats.planFoldersCalls.Load(); got > 2 {
+		t.Fatalf("/plan-folders calls = %d, want ≤2 — initiator-only subtree was not short-circuited", got)
+	}
+	if got, err := os.ReadFile(filepath.Join(f.recvVol.Path, leaf, "leaf.txt")); err != nil {
+		t.Fatalf("leaf not delivered: %v", err)
+	} else if string(got) != "deep" {
+		t.Fatalf("leaf content = %q, want %q", got, "deep")
 	}
 }
 
