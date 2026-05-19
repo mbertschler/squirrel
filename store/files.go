@@ -573,6 +573,11 @@ type IndexBatchEntry struct {
 // volume root, the union is topologically ordered (deepest first), and
 // each folder's shallow + deep hashes are recomputed exactly once.
 //
+// runID stamps last_changed_run_id on every folder hash write made by the
+// closure recompute, and the caller is expected to populate each entry's
+// FileRow.LastSeenRunID with the same value so the SQL row writes carry
+// it too.
+//
 // The per-op semantics match the single-row methods (Upsert / TouchSeen)
 // one-for-one. The deduped recompute is observationally equivalent to N
 // independent per-op recomputes because every per-op walk would have re-
@@ -582,7 +587,7 @@ type IndexBatchEntry struct {
 // Errors abort the batch: the transaction rolls back, so partial writes are
 // never visible. The returned error names the index of the failing entry to
 // aid debugging.
-func (s *Store) ApplyIndexBatch(ctx context.Context, entries []IndexBatchEntry) error {
+func (s *Store) ApplyIndexBatch(ctx context.Context, runID int64, entries []IndexBatchEntry) error {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -593,7 +598,6 @@ func (s *Store) ApplyIndexBatch(ctx context.Context, entries []IndexBatchEntry) 
 	defer tx.Rollback()
 
 	leafFolders := make(map[int64]struct{})
-	var runID int64 // pinned to the run id of the ops in this batch
 	for i, e := range entries {
 		var folderID int64
 		switch e.Kind {
@@ -612,12 +616,6 @@ func (s *Store) ApplyIndexBatch(ctx context.Context, entries []IndexBatchEntry) 
 		}
 		if folderID != 0 {
 			leafFolders[folderID] = struct{}{}
-		}
-		// Every entry in one indexer batch shares a run id (set by the
-		// indexer's batchEntry), so the last non-zero value wins and any
-		// folder hash writes are stamped with it.
-		if e.Row.LastSeenRunID != 0 {
-			runID = e.Row.LastSeenRunID
 		}
 	}
 

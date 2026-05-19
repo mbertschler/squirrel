@@ -258,9 +258,9 @@ func (i *indexer) startWorkers() {
 func (i *indexer) worker() {
 	defer i.workerWG.Done()
 	// One scratch buffer per worker, reused for every file this worker
-	// hashes. Allocating it per-file (67 k+ × 1 MiB) created enough GC
-	// pressure to outweigh the syscall savings — see benchmarks.md.test
-	// step 4 vs step 4b on the indexing-performance-improvements branch.
+	// hashes. Allocating per-file made the resulting alloc traffic
+	// (workers × files × bufsize) outweigh the syscall reduction the
+	// bigger buffer was meant to buy.
 	buf := make([]byte, hashReadBufferSize)
 	for w := range i.work {
 		i.results <- i.process(w, buf)
@@ -354,7 +354,7 @@ func (i *indexer) collect() (Report, error) {
 		if len(batch) == 0 {
 			return nil
 		}
-		if err := i.store.ApplyIndexBatch(i.ctx, batch); err != nil {
+		if err := i.store.ApplyIndexBatch(i.ctx, i.runID, batch); err != nil {
 			return fmt.Errorf("apply index batch: %w", err)
 		}
 		batch = batch[:0]
