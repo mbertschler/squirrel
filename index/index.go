@@ -554,6 +554,14 @@ func resolveNamedVolume(ctx context.Context, s *store.Store, name, absRoot strin
 	return created, true, nil
 }
 
+// hashReadBufferSize is the read buffer io.CopyBuffer hands to the file →
+// BLAKE3 copy. io.Copy's default 32 KiB triggers ~80 read syscalls on the
+// 2.5 MB average file in this volume; at 1 MiB it's 3. Bigger reads also
+// let APFS readahead engage, since the kernel grows its readahead window
+// based on observed read sizes. The buffer is goroutine-local (allocated
+// per hashFile call) so there's no sharing across workers.
+const hashReadBufferSize = 1 << 20
+
 func hashFile(path string) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -561,7 +569,8 @@ func hashFile(path string) ([]byte, error) {
 	}
 	defer f.Close()
 	h := blake3.New()
-	if _, err := io.Copy(h, f); err != nil {
+	buf := make([]byte, hashReadBufferSize)
+	if _, err := io.CopyBuffer(h, f, buf); err != nil {
 		return nil, err
 	}
 	return h.Sum(nil), nil
