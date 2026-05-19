@@ -85,6 +85,13 @@ func validateDBPath(path string) error {
 // the "supersede prior live row" step. With MaxOpenConns=1 today this is
 // theoretical, but the schema-level invariants would still let a buggy
 // future change land bad state — IMMEDIATE keeps the contract explicit.
+//
+// synchronous stays at the SQLite default (FULL). Lowering it to NORMAL
+// would save ~1-3 % of wall time on a steady-state indexing run (a few
+// hundred fsyncs amortised across many batched writes), but the trade is
+// "a crash can lose every commit since the last WAL checkpoint" — at odds
+// with the project's never-lose-track-of-content principle. Keep the
+// stronger guarantee.
 func buildDSN(path string) string {
 	return path + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_txlock=immediate"
 }

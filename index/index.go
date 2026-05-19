@@ -127,6 +127,14 @@ type indexer struct {
 	// seen is populated only in DryRun mode; finalizeMissing uses it to count
 	// rows that exist in the DB but were not encountered during the walk.
 	seen map[string]struct{}
+
+	// preloaded is the per-volume snapshot of live rows, loaded once at the
+	// start of the run. Workers consult it instead of calling GetByPath per
+	// file, which would funnel every lookup through the single shared sqlite
+	// connection. nil only for DryRun runs against a never-indexed path
+	// (where the volume row itself doesn't exist yet); a freshly-created
+	// non-dry-run volume gets an empty, non-nil map.
+	preloaded map[string]store.FileRow
 }
 
 func newIndexer(ctx context.Context, s *store.Store, root string, opts Options) (*indexer, error) {
@@ -144,7 +152,12 @@ func newIndexer(ctx context.Context, s *store.Store, root string, opts Options) 
 
 	workers := opts.Workers
 	if workers <= 0 {
-		workers = runtime.NumCPU()
+		// Each worker spends roughly half its wall time blocked on file
+		// I/O and half hashing on CPU, so NumCPU workers leave NumCPU/2
+		// cores idle on average. Doubling the count keeps the cores busy
+		// (the hash phases interleave across workers) and increases the
+		// NVMe in-flight read count, which APFS rewards.
+		workers = 2 * runtime.NumCPU()
 	}
 	queueDepth := opts.QueueDepth
 	if queueDepth <= 0 {
@@ -171,6 +184,13 @@ func newIndexer(ctx context.Context, s *store.Store, root string, opts Options) 
 	}
 	if opts.DryRun {
 		idx.seen = make(map[string]struct{})
+	}
+	if exists {
+		preloaded, err := s.LoadVolumeIndex(ctx, vol.ID)
+		if err != nil {
+			return nil, fmt.Errorf("preload volume index: %w", err)
+		}
+		idx.preloaded = preloaded
 	}
 	return idx, nil
 }
@@ -238,8 +258,13 @@ func (i *indexer) startWorkers() {
 
 func (i *indexer) worker() {
 	defer i.workerWG.Done()
+	// One scratch buffer per worker, reused for every file this worker
+	// hashes. Allocating per-file made the resulting alloc traffic
+	// (workers × files × bufsize) outweigh the syscall reduction the
+	// bigger buffer was meant to buy.
+	buf := make([]byte, hashReadBufferSize)
 	for w := range i.work {
-		i.results <- i.process(w)
+		i.results <- i.process(w, buf)
 	}
 }
 
@@ -314,11 +339,28 @@ func (i *indexer) sendWork(w workItem) error {
 	}
 }
 
+// batchSize is the number of result rows the collector buffers before
+// flushing a single store.ApplyIndexBatch transaction. Chosen empirically:
+// large enough to amortise BeginTx/Commit/fsync across many ops, small
+// enough that a fatal error in the middle of a run still surfaces quickly.
+const batchSize = 256
+
 // collect drains the results channel, updates the report, and writes to the
-// store (or records seen paths for dry-run). Returns the partial report
-// alongside any fatal write error.
+// store in batched transactions (or records seen paths for dry-run).
+// Returns the partial report alongside any fatal write error.
 func (i *indexer) collect() (Report, error) {
 	report := Report{}
+	batch := make([]store.IndexBatchEntry, 0, batchSize)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		if err := i.store.ApplyIndexBatch(i.ctx, i.runID, batch); err != nil {
+			return fmt.Errorf("apply index batch: %w", err)
+		}
+		batch = batch[:0]
+		return nil
+	}
 	for r := range i.results {
 		if r.err != nil {
 			report.Errors++
@@ -330,11 +372,30 @@ func (i *indexer) collect() (Report, error) {
 			i.seen[r.row.Path] = struct{}{}
 			continue
 		}
-		if err := i.persist(r); err != nil {
-			return report, err
+		batch = append(batch, i.batchEntry(r))
+		if len(batch) >= batchSize {
+			if err := flush(); err != nil {
+				return report, err
+			}
 		}
 	}
+	if err := flush(); err != nil {
+		return report, err
+	}
 	return report, nil
+}
+
+// batchEntry translates a resultItem into the store-level batch op shape.
+// Unchanged rows become TouchSeen with LastSeenRunID pinned to the current
+// run; added/modified rows become Upsert. The store-side helpers read the
+// fields each op needs and ignore the rest.
+func (i *indexer) batchEntry(r resultItem) store.IndexBatchEntry {
+	if r.kind == kindUnchanged {
+		row := r.row
+		row.LastSeenRunID = i.runID
+		return store.IndexBatchEntry{Kind: store.BatchOpTouchSeen, Row: row}
+	}
+	return store.IndexBatchEntry{Kind: store.BatchOpUpsert, Row: r.row}
 }
 
 func tally(report *Report, kind changeKind) {
@@ -346,19 +407,6 @@ func tally(report *Report, kind changeKind) {
 	case kindUnchanged:
 		report.Unchanged++
 	}
-}
-
-func (i *indexer) persist(r resultItem) error {
-	if r.kind == kindUnchanged {
-		if err := i.store.TouchSeen(i.ctx, r.row.VolumeID, r.row.Path, i.runID); err != nil {
-			return fmt.Errorf("touch %s/%s: %w", i.absRoot, r.row.Path, err)
-		}
-		return nil
-	}
-	if err := i.store.Upsert(i.ctx, r.row, nil); err != nil {
-		return fmt.Errorf("upsert %s/%s: %w", i.absRoot, r.row.Path, err)
-	}
-	return nil
 }
 
 func (i *indexer) waitForWalker() error {
@@ -410,16 +458,16 @@ func (i *indexer) finalizeMissing(report *Report) error {
 }
 
 // process is the per-file decision: shallow shortcut, hash, classify as
-// added/modified/unchanged.
-func (i *indexer) process(w workItem) resultItem {
+// added/modified/unchanged. buf is the worker-local scratch buffer threaded
+// through to hashFile so the 1 MiB io.CopyBuffer allocation happens once
+// per worker, not once per file.
+func (i *indexer) process(w workItem, buf []byte) resultItem {
 	var existing store.FileRow
 	var hasExisting bool
-	if i.volumeExists {
-		row, err := i.store.GetByPath(i.ctx, i.volumeID, w.relPath)
-		if err != nil && !store.IsNotFound(err) {
-			return resultItem{err: fmt.Errorf("lookup %s/%s: %w", i.absRoot, w.relPath, err)}
-		}
-		if err == nil {
+	if i.preloaded != nil {
+		// Workers read the preloaded map concurrently; map reads are safe
+		// because the map is never written after newIndexer populated it.
+		if row, ok := i.preloaded[w.relPath]; ok {
 			existing, hasExisting = row, true
 		}
 	}
@@ -428,7 +476,7 @@ func (i *indexer) process(w workItem) resultItem {
 		return resultItem{row: existing, kind: kindUnchanged}
 	}
 
-	digest, err := hashFile(w.absPath)
+	digest, err := hashFile(w.absPath, buf)
 	if err != nil {
 		return resultItem{err: fmt.Errorf("hash %s: %w", w.absPath, err)}
 	}
@@ -519,14 +567,23 @@ func resolveNamedVolume(ctx context.Context, s *store.Store, name, absRoot strin
 	return created, true, nil
 }
 
-func hashFile(path string) ([]byte, error) {
+// hashReadBufferSize is the read buffer io.CopyBuffer hands to the file →
+// BLAKE3 copy. io.Copy's default 32 KiB triggers ~80 read syscalls on the
+// 2.5 MB average file in this volume; at 1 MiB it's 3. Bigger reads also
+// let APFS readahead engage, since the kernel grows its readahead window
+// based on observed read sizes. The buffer is allocated once per worker
+// (see (*indexer).worker) and threaded through to amortise the cost across
+// the run; allocating per-file made GC pressure outweigh the syscall win.
+const hashReadBufferSize = 1 << 20
+
+func hashFile(path string, buf []byte) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 	h := blake3.New()
-	if _, err := io.Copy(h, f); err != nil {
+	if _, err := io.CopyBuffer(h, f, buf); err != nil {
 		return nil, err
 	}
 	return h.Sum(nil), nil

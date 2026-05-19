@@ -142,6 +142,42 @@ func (s *Store) ListHistoryByPath(ctx context.Context, volumeID int64, relPath s
 	return out, rows.Err()
 }
 
+// LoadVolumeIndex returns every non-superseded row in the volume keyed by
+// volume-relative path. The indexer uses this to replace the per-file
+// GetByPath round-trip on its hot path: with MaxOpenConns=1, every worker
+// that calls GetByPath funnels through the same database/sql connection,
+// so the lookups serialise even though they are read-only. Loading the
+// whole index once amortises that cost across the entire run and lets
+// workers proceed without contending on the DB.
+//
+// The returned map reflects the database state at the moment of the
+// SELECT. Callers that interleave LoadVolumeIndex with concurrent writes
+// (sync, audit) get a snapshot that can go stale — the indexer is fine
+// with this because every write goes through ApplyIndexBatch in the same
+// process and only the indexer's own observations matter for the run.
+func (s *Store) LoadVolumeIndex(ctx context.Context, volumeID int64) (map[string]FileRow, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+fileSelectColumns+` FROM `+fileFromJoin+`
+		 WHERE fo.volume_id = ? AND f.status != 'superseded'`,
+		volumeID)
+	if err != nil {
+		return nil, fmt.Errorf("load volume index: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[string]FileRow)
+	for rows.Next() {
+		var r FileRow
+		if err := r.scanFrom(rows); err != nil {
+			return nil, fmt.Errorf("scan volume index row: %w", err)
+		}
+		out[r.Path] = r
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // GetByAbsolutePath finds the file whose volume.path + '/' + file.path equals
 // abs. Resolution is done by longest-prefix match against the known volumes.
 // Used by `squirrel query <path>` when the caller does not know the volume.
@@ -266,10 +302,36 @@ func (s *Store) Upsert(ctx context.Context, r FileRow, prov *Provenance) error {
 	}
 	defer tx.Rollback()
 
+	if _, err := upsertInTx(ctx, tx, r, prov); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// upsertInTx is the body of Upsert without its own transaction. Returns the
+// folder_id of the affected row.
+func upsertInTx(ctx context.Context, tx *sql.Tx, r FileRow, prov *Provenance) (int64, error) {
+	folderID, err := upsertRowInTx(ctx, tx, r, prov)
+	if err != nil {
+		return 0, err
+	}
+	if err := recomputeFolderAndAncestors(ctx, tx, folderID, r.LastSeenRunID); err != nil {
+		return 0, err
+	}
+	return folderID, nil
+}
+
+// upsertRowInTx applies the Upsert row-level state machine without the
+// folder Merkle recompute that single-row Upsert appends afterwards.
+// Batched callers (ApplyIndexBatch) use this so the recompute can be
+// deduplicated across many ops on overlapping folders / ancestors.
+// Returns the folder_id touched by this op so the batched caller can
+// accumulate the set of affected folders.
+func upsertRowInTx(ctx context.Context, tx *sql.Tx, r FileRow, prov *Provenance) (int64, error) {
 	folderPath, name := splitFilePath(r.Path)
 	folderID, err := getOrCreateFolderTx(ctx, tx, r.VolumeID, folderPath)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	var existingStatus string
@@ -281,34 +343,29 @@ func (s *Store) Upsert(ctx context.Context, r FileRow, prov *Provenance) error {
 	case err == nil && existingStatus != StatusSuperseded:
 		// Case 1: exact row exists and is live — touch it.
 		if err := updateLiveRow(ctx, tx, folderID, name, r, prov); err != nil {
-			return err
+			return 0, err
 		}
 	case err == nil && existingStatus == StatusSuperseded:
 		// Case 2: content revert — supersede whatever is live now, then
 		// revive the matched (formerly superseded) row.
 		if err := supersedeLiveRow(ctx, tx, folderID, name); err != nil {
-			return err
+			return 0, err
 		}
 		if err := updateLiveRow(ctx, tx, folderID, name, r, prov); err != nil {
-			return err
+			return 0, err
 		}
 	case errors.Is(err, sql.ErrNoRows):
 		// Case 3: brand new content at this path (possibly first-ever).
 		if err := supersedeLiveRow(ctx, tx, folderID, name); err != nil {
-			return err
+			return 0, err
 		}
 		if err := insertNewRow(ctx, tx, folderID, name, r, prov); err != nil {
-			return err
+			return 0, err
 		}
 	default:
-		return fmt.Errorf("lookup existing: %w", err)
+		return 0, fmt.Errorf("lookup existing: %w", err)
 	}
-
-	if err := recomputeFolderAndAncestors(ctx, tx, folderID, r.LastSeenRunID); err != nil {
-		return err
-	}
-
-	return tx.Commit()
+	return folderID, nil
 }
 
 // provColumns returns the (source_node_id, source_run_id) pair as
@@ -445,25 +502,127 @@ func (s *Store) TouchSeen(ctx context.Context, volumeID int64, relPath string, r
 		return fmt.Errorf("begin touch seen: %w", err)
 	}
 	defer tx.Rollback()
+	if _, err := touchSeenInTx(ctx, tx, volumeID, relPath, runID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
+// touchSeenInTx is the body of TouchSeen without its own transaction.
+// Returns the folder_id resolved for the path (0 only when the path's
+// folder row itself is absent) so batched callers can dedupe Merkle
+// recomputes. A folder is returned even if the file-row UPDATE matched
+// zero rows: the row may have been superseded or missing, but the
+// folder still exists and may need its hashes refreshed against the
+// current live set.
+func touchSeenInTx(ctx context.Context, tx *sql.Tx, volumeID int64, relPath string, runID int64) (int64, error) {
+	folderID, err := touchSeenRowInTx(ctx, tx, volumeID, relPath, runID)
+	if err != nil || folderID == 0 {
+		return folderID, err
+	}
+	if err := recomputeFolderAndAncestors(ctx, tx, folderID, runID); err != nil {
+		return 0, err
+	}
+	return folderID, nil
+}
+
+// touchSeenRowInTx updates the row but skips the folder Merkle recompute,
+// for the same reason upsertRowInTx splits it out: batched callers fold
+// many ops' worth of recompute into one deduped pass.
+func touchSeenRowInTx(ctx context.Context, tx *sql.Tx, volumeID int64, relPath string, runID int64) (int64, error) {
 	folderPath, name := splitFilePath(relPath)
 	var folderID int64
 	if err := tx.QueryRowContext(ctx,
 		`SELECT id FROM folders WHERE volume_id = ? AND path = ?`,
 		volumeID, folderPath).Scan(&folderID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			// No folder ⇒ no row to touch.
-			return nil
+			return 0, nil
 		}
-		return fmt.Errorf("lookup folder: %w", err)
+		return 0, fmt.Errorf("lookup folder: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE files SET last_seen_run_id = ?, status = 'present'
 		 WHERE folder_id = ? AND name = ? AND status != 'superseded'`,
 		runID, folderID, name); err != nil {
-		return fmt.Errorf("touch seen: %w", err)
+		return 0, fmt.Errorf("touch seen: %w", err)
 	}
-	if err := recomputeFolderAndAncestors(ctx, tx, folderID, runID); err != nil {
+	return folderID, nil
+}
+
+// IndexBatchOpKind selects which write operation an IndexBatchEntry represents.
+type IndexBatchOpKind int
+
+const (
+	// BatchOpTouchSeen records that content at Row.Path in volume Row.VolumeID
+	// was re-observed unchanged. Only VolumeID, Path, and LastSeenRunID are
+	// read off the row; the rest is ignored.
+	BatchOpTouchSeen IndexBatchOpKind = iota
+	// BatchOpUpsert records a new or modified file. All FileRow fields are
+	// used, and Prov is forwarded as the provenance.
+	BatchOpUpsert
+)
+
+// IndexBatchEntry is one row-level operation queued for a batched apply.
+type IndexBatchEntry struct {
+	Kind IndexBatchOpKind
+	Row  FileRow
+	Prov *Provenance
+}
+
+// ApplyIndexBatch runs every entry inside a single transaction, amortising
+// BeginTx/Commit/fsync across many file observations and deduping the
+// folder Merkle recompute across them. After the row work is done, the set
+// of affected leaf folders is expanded to include every ancestor up to the
+// volume root, the union is topologically ordered (deepest first), and
+// each folder's shallow + deep hashes are recomputed exactly once.
+//
+// runID stamps last_changed_run_id on every folder hash write made by the
+// closure recompute, and the caller is expected to populate each entry's
+// FileRow.LastSeenRunID with the same value so the SQL row writes carry
+// it too.
+//
+// The per-op semantics match the single-row methods (Upsert / TouchSeen)
+// one-for-one. The deduped recompute is observationally equivalent to N
+// independent per-op recomputes because every per-op walk would have re-
+// derived the same shallow/deep values from the same final-state files
+// and child-folders rows.
+//
+// Errors abort the batch: the transaction rolls back, so partial writes are
+// never visible. The returned error names the index of the failing entry to
+// aid debugging.
+func (s *Store) ApplyIndexBatch(ctx context.Context, runID int64, entries []IndexBatchEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin index batch: %w", err)
+	}
+	defer tx.Rollback()
+
+	leafFolders := make(map[int64]struct{})
+	for i, e := range entries {
+		var folderID int64
+		switch e.Kind {
+		case BatchOpTouchSeen:
+			folderID, err = touchSeenRowInTx(ctx, tx, e.Row.VolumeID, e.Row.Path, e.Row.LastSeenRunID)
+			if err != nil {
+				return fmt.Errorf("batch op %d (touch_seen %s): %w", i, e.Row.Path, err)
+			}
+		case BatchOpUpsert:
+			folderID, err = upsertRowInTx(ctx, tx, e.Row, e.Prov)
+			if err != nil {
+				return fmt.Errorf("batch op %d (upsert %s): %w", i, e.Row.Path, err)
+			}
+		default:
+			return fmt.Errorf("batch op %d: unknown kind %d", i, e.Kind)
+		}
+		if folderID != 0 {
+			leafFolders[folderID] = struct{}{}
+		}
+	}
+
+	if err := recomputeFoldersClosure(ctx, tx, leafFolders, runID); err != nil {
 		return err
 	}
 	return tx.Commit()
