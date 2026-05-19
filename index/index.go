@@ -252,8 +252,13 @@ func (i *indexer) startWorkers() {
 
 func (i *indexer) worker() {
 	defer i.workerWG.Done()
+	// One scratch buffer per worker, reused for every file this worker
+	// hashes. Allocating it per-file (67 k+ × 1 MiB) created enough GC
+	// pressure to outweigh the syscall savings — see benchmarks.md.test
+	// step 4 vs step 4b on the indexing-performance-improvements branch.
+	buf := make([]byte, hashReadBufferSize)
 	for w := range i.work {
-		i.results <- i.process(w)
+		i.results <- i.process(w, buf)
 	}
 }
 
@@ -447,8 +452,10 @@ func (i *indexer) finalizeMissing(report *Report) error {
 }
 
 // process is the per-file decision: shallow shortcut, hash, classify as
-// added/modified/unchanged.
-func (i *indexer) process(w workItem) resultItem {
+// added/modified/unchanged. buf is the worker-local scratch buffer threaded
+// through to hashFile so the 1 MiB io.CopyBuffer allocation happens once
+// per worker, not once per file.
+func (i *indexer) process(w workItem, buf []byte) resultItem {
 	var existing store.FileRow
 	var hasExisting bool
 	if i.preloaded != nil {
@@ -463,7 +470,7 @@ func (i *indexer) process(w workItem) resultItem {
 		return resultItem{row: existing, kind: kindUnchanged}
 	}
 
-	digest, err := hashFile(w.absPath)
+	digest, err := hashFile(w.absPath, buf)
 	if err != nil {
 		return resultItem{err: fmt.Errorf("hash %s: %w", w.absPath, err)}
 	}
@@ -558,18 +565,18 @@ func resolveNamedVolume(ctx context.Context, s *store.Store, name, absRoot strin
 // BLAKE3 copy. io.Copy's default 32 KiB triggers ~80 read syscalls on the
 // 2.5 MB average file in this volume; at 1 MiB it's 3. Bigger reads also
 // let APFS readahead engage, since the kernel grows its readahead window
-// based on observed read sizes. The buffer is goroutine-local (allocated
-// per hashFile call) so there's no sharing across workers.
+// based on observed read sizes. The buffer is allocated once per worker
+// (see (*indexer).worker) and threaded through to amortise the cost across
+// the run; allocating per-file made GC pressure outweigh the syscall win.
 const hashReadBufferSize = 1 << 20
 
-func hashFile(path string) ([]byte, error) {
+func hashFile(path string, buf []byte) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 	h := blake3.New()
-	buf := make([]byte, hashReadBufferSize)
 	if _, err := io.CopyBuffer(h, f, buf); err != nil {
 		return nil, err
 	}
