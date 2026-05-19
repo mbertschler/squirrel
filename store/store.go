@@ -86,10 +86,15 @@ func validateDBPath(path string) error {
 // theoretical, but the schema-level invariants would still let a buggy
 // future change land bad state — IMMEDIATE keeps the contract explicit.
 //
-// synchronous=NORMAL is safe under WAL: the WAL itself is fsynced at every
-// commit so a power loss never corrupts the database, only loses the most
-// recently committed transactions. We accept that trade for the order-of-
-// magnitude write-throughput gain on indexing workloads.
+// synchronous=NORMAL is safe under WAL — the database stays consistent
+// across power loss — but unlike synchronous=FULL it does NOT fsync the
+// WAL at every commit. Fsyncs happen at checkpoints; between checkpoints
+// many committed transactions can sit in the OS page cache. A crash
+// before the next checkpoint can therefore lose every commit since the
+// last fsync, not just the most recent one. We accept that trade for the
+// write-throughput gain on indexing workloads; the indexer re-runs from a
+// stable filesystem snapshot anyway, so any lost commits are reproduced
+// on the next run.
 func buildDSN(path string) string {
 	return path + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_txlock=immediate"
 }

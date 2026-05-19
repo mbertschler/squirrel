@@ -268,9 +268,11 @@ type ChildFolder struct {
 // redundant ancestor walks per file into a single dedup'd pass and is the
 // main lever behind the batched-index speedup.
 //
-// A leafIDs entry of 0 is treated as "no row to process" and skipped — it
-// matches the convention upsertRowInTx / touchSeenRowInTx return when no
-// row was touched.
+// A leafIDs entry of 0 is treated as "no folder" and skipped. The row-
+// level helpers return folderID=0 when their folder lookup found nothing
+// (touchSeenRowInTx for an unknown folder); they do NOT return 0 when a
+// file UPDATE merely affected zero rows, so this filter handles missing
+// folders rather than missing files.
 func recomputeFoldersClosure(ctx context.Context, tx *sql.Tx, leafIDs map[int64]struct{}, runID int64) error {
 	if len(leafIDs) == 0 {
 		return nil

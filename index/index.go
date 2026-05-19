@@ -131,8 +131,9 @@ type indexer struct {
 	// preloaded is the per-volume snapshot of live rows, loaded once at the
 	// start of the run. Workers consult it instead of calling GetByPath per
 	// file, which would funnel every lookup through the single shared sqlite
-	// connection. nil for fresh volumes (no rows to load) and for DryRun
-	// runs against never-indexed paths.
+	// connection. nil only for DryRun runs against a never-indexed path
+	// (where the volume row itself doesn't exist yet); a freshly-created
+	// non-dry-run volume gets an empty, non-nil map.
 	preloaded map[string]store.FileRow
 }
 

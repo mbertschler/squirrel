@@ -509,9 +509,12 @@ func (s *Store) TouchSeen(ctx context.Context, volumeID int64, relPath string, r
 }
 
 // touchSeenInTx is the body of TouchSeen without its own transaction.
-// Returns the affected folder_id (0 when no live row was found, i.e. the
-// path's folder doesn't exist in the DB) so batched callers can dedupe
-// Merkle recomputes.
+// Returns the folder_id resolved for the path (0 only when the path's
+// folder row itself is absent) so batched callers can dedupe Merkle
+// recomputes. A folder is returned even if the file-row UPDATE matched
+// zero rows: the row may have been superseded or missing, but the
+// folder still exists and may need its hashes refreshed against the
+// current live set.
 func touchSeenInTx(ctx context.Context, tx *sql.Tx, volumeID int64, relPath string, runID int64) (int64, error) {
 	folderID, err := touchSeenRowInTx(ctx, tx, volumeID, relPath, runID)
 	if err != nil || folderID == 0 {
