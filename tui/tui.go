@@ -100,12 +100,11 @@ func newRootModel(s *store.Store, cfg *config.Config) *rootModel {
 }
 
 func (m *rootModel) Init() tea.Cmd {
-	return tea.Batch(
-		tick(),
-		m.dashboard.Init(),
-		m.runs.Init(),
-		m.volumes.Init(),
-	)
+	// Only the starting screen needs to fetch — the others load lazily on
+	// first activation via switchTo. Matches the per-tick activation model
+	// so we don't pay for off-screen screens here only to ignore them
+	// later.
+	return tea.Batch(tick(), m.activeScreen().Init())
 }
 
 func (m *rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -131,15 +130,13 @@ func (m *rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status = ""
 			}
 		}
-		// Fan the tick out to every screen — they each decide what to refresh.
-		// Re-arm the timer.
-		return m, tea.Batch(
-			tick(),
-			forwardTick(m.dashboard, msg),
-			forwardTick(m.runs, msg),
-			forwardTick(m.volumes, msg),
-			forwardTick(m.browse, msg),
-		)
+		// Only the active screen gets a tick. Forwarding to every screen
+		// each second triples DB load needlessly (the store pins
+		// MaxOpenConns(1), so off-screen tab queries serialize behind the
+		// visible one). Background screens stay stale until reactivated;
+		// the activate-on-switch path below kicks them with a fresh
+		// fetch the moment the user does switch.
+		return m, tea.Batch(tick(), forwardTick(m.activeScreen(), msg))
 
 	case errMsg:
 		m.status = msg.err.Error()
@@ -164,49 +161,28 @@ func (m *rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q":
 			if m.active == screenBrowse {
 				// In Browse, q backs out to the Volumes list instead of quitting.
-				m.active = screenVolumes
-				return m, nil
+				return m, m.switchTo(screenVolumes)
 			}
 			return m, tea.Quit
 		case "tab":
-			m.cycleTab(+1)
-			return m, nil
+			return m, m.switchTo(m.nextTab(+1))
 		case "shift+tab":
-			m.cycleTab(-1)
-			return m, nil
+			return m, m.switchTo(m.nextTab(-1))
 		case "1":
-			m.active = screenDashboard
-			return m, nil
+			return m, m.switchTo(screenDashboard)
 		case "2":
-			m.active = screenRuns
-			return m, nil
+			return m, m.switchTo(screenRuns)
 		case "3":
-			m.active = screenVolumes
-			return m, nil
+			return m, m.switchTo(screenVolumes)
 		case "esc":
 			if m.active == screenBrowse {
-				m.active = screenVolumes
-				return m, nil
+				return m, m.switchTo(screenVolumes)
 			}
 		}
 	}
 
-	// Delegate to the active screen.
-	switch m.active {
-	case screenDashboard:
-		_, cmd := m.dashboard.Update(msg)
-		return m, cmd
-	case screenRuns:
-		_, cmd := m.runs.Update(msg)
-		return m, cmd
-	case screenVolumes:
-		_, cmd := m.volumes.Update(msg)
-		return m, cmd
-	case screenBrowse:
-		_, cmd := m.browse.Update(msg)
-		return m, cmd
-	}
-	return m, nil
+	_, cmd := m.activeScreen().Update(msg)
+	return m, cmd
 }
 
 func (m *rootModel) View() string {
@@ -221,18 +197,7 @@ func (m *rootModel) View() string {
 		bodyHeight = 1
 	}
 
-	var body string
-	switch m.active {
-	case screenDashboard:
-		body = m.dashboard.View()
-	case screenRuns:
-		body = m.runs.View()
-	case screenVolumes:
-		body = m.volumes.View()
-	case screenBrowse:
-		body = m.browse.View()
-	}
-
+	body := m.activeScreen().View()
 	body = lipgloss.NewStyle().
 		Width(m.width).
 		Height(bodyHeight).
@@ -262,19 +227,49 @@ func (m *rootModel) modalConsumesKey(key string) bool {
 	return false
 }
 
-func (m *rootModel) cycleTab(delta int) {
-	// Tabs cycle through Dashboard / Runs / Volumes only — Browse is reached
-	// from Volumes, not from the tab bar.
+// nextTab returns the screen `delta` steps away in the tab cycle.
+// Browse is excluded because it is reached from Volumes, not from the
+// tab bar.
+func (m *rootModel) nextTab(delta int) screen {
 	tabs := []screen{screenDashboard, screenRuns, screenVolumes}
-	var idx int
+	idx := 0
 	for i, t := range tabs {
 		if t == m.active {
 			idx = i
 			break
 		}
 	}
-	idx = (idx + delta + len(tabs)) % len(tabs)
-	m.active = tabs[idx]
+	return tabs[(idx+delta+len(tabs))%len(tabs)]
+}
+
+// switchTo activates the given screen and returns a Cmd that triggers a
+// fresh data fetch on it. The immediate fetch on switch is necessary
+// because off-screen tabs no longer receive periodic tickMsgs — without
+// it the user would see stale data for up to one polling interval after
+// switching.
+func (m *rootModel) switchTo(s screen) tea.Cmd {
+	if s == m.active {
+		return nil
+	}
+	m.active = s
+	return m.activeScreen().Init()
+}
+
+// activeScreen returns the tea.Model for whichever screen is currently
+// focused. Used by tickMsg dispatch and switchTo so the routing logic
+// stays in one place.
+func (m *rootModel) activeScreen() tea.Model {
+	switch m.active {
+	case screenDashboard:
+		return m.dashboard
+	case screenRuns:
+		return m.runs
+	case screenVolumes:
+		return m.volumes
+	case screenBrowse:
+		return m.browse
+	}
+	return m.dashboard
 }
 
 func (m *rootModel) renderTabs() string {

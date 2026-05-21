@@ -25,8 +25,8 @@ import (
 // Two columns ("files", "size") are reserved for the future cumulative
 // rollup work that lands with the folders-table migration in a separate
 // PR. Today they render "—" for folder rows; file rows fill the size
-// column with the file's own SizeBytes (which we already have) and leave
-// files blank because a single file is one item.
+// column with the file's own SizeBytes (which we already have) and the
+// files column with "1" since a single file is one item.
 type browseModel struct {
 	store *store.Store
 
