@@ -45,7 +45,7 @@ func New(deps Deps) (http.Handler, error) {
 	bh := handlers.NewBrowse(deps.Config, deps.Store)
 	qh := handlers.NewQuery(deps.Config, deps.Store)
 	rh := handlers.NewRuns(deps.Config, deps.Store)
-	fh := handlers.NewFiles(deps.Config, deps.Store)
+	fh := handlers.NewFiles(deps.Store)
 
 	mux.HandleFunc("GET /{$}", vh.ServeIndex)
 	mux.HandleFunc("GET /volumes", vh.ServeIndex)

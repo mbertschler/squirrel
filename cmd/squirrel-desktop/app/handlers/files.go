@@ -8,7 +8,6 @@ import (
 
 	"github.com/a-h/templ"
 	"github.com/mbertschler/squirrel/cmd/squirrel-desktop/app/templates"
-	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/store"
 )
 
@@ -16,11 +15,10 @@ import (
 // segment is a 64-character lowercase hex BLAKE3 digest; the page lists
 // every files row (live and superseded) that has ever held the digest.
 type Files struct {
-	Config *config.Config
-	Store  *store.Store
+	Store *store.Store
 }
 
-func NewFiles(c *config.Config, s *store.Store) *Files { return &Files{Config: c, Store: s} }
+func NewFiles(s *store.Store) *Files { return &Files{Store: s} }
 
 func (h *Files) ServeDetail(w http.ResponseWriter, r *http.Request) {
 	hashStr := strings.ToLower(r.PathValue("hash"))
