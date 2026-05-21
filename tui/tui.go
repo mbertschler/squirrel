@@ -67,13 +67,11 @@ func Run(ctx context.Context, s *store.Store, cfg *config.Config) error {
 	return err
 }
 
-// rootModel is the top-level Bubble Tea model. It owns the shared state and
-// delegates Update/View to the active screen model.
+// rootModel is the top-level Bubble Tea model. It owns the per-screen
+// models, the terminal size, and the status bar; the SQLite store, config,
+// and agent client are passed down to whichever screens need them at
+// construction time rather than parked on the root.
 type rootModel struct {
-	store  *store.Store
-	cfg    *config.Config
-	client *agentClient
-
 	width, height int
 	active        screen
 
@@ -93,9 +91,6 @@ func newRootModel(s *store.Store, cfg *config.Config) *rootModel {
 	dash := newDashboardModel(s)
 	dash.attachClient(client)
 	return &rootModel{
-		store:     s,
-		cfg:       cfg,
-		client:    client,
 		active:    screenDashboard,
 		dashboard: dash,
 		runs:      newRunsModel(s),
