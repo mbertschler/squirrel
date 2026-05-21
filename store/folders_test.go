@@ -398,12 +398,12 @@ func TestMigrateV8ToV9BackfillsAggregates(t *testing.T) {
 		count int64
 		size  int64
 	}{
-		"":        {5, 7 + 11 + 13 + 17 + 19},
-		"a":       {3, 11 + 13 + 17},
-		"a/b":     {1, 17},
-		"x":       {1, 19},
-		"x/y":     {1, 19},
-		"x/y/z":   {1, 19},
+		"":      {5, 7 + 11 + 13 + 17 + 19},
+		"a":     {3, 11 + 13 + 17},
+		"a/b":   {1, 17},
+		"x":     {1, 19},
+		"x/y":   {1, 19},
+		"x/y/z": {1, 19},
 	}
 	for p, w := range want {
 		f, err := s.GetFolderByPath(ctx, 1, p)
