@@ -45,6 +45,7 @@ func New(deps Deps) (http.Handler, error) {
 	bh := handlers.NewBrowse(deps.Config, deps.Store)
 	qh := handlers.NewQuery(deps.Config, deps.Store)
 	rh := handlers.NewRuns(deps.Config, deps.Store)
+	fh := handlers.NewFiles(deps.Config, deps.Store)
 
 	mux.HandleFunc("GET /{$}", vh.ServeIndex)
 	mux.HandleFunc("GET /volumes", vh.ServeIndex)
@@ -55,6 +56,7 @@ func New(deps Deps) (http.Handler, error) {
 	mux.HandleFunc("GET /query/missing", qh.ServeMissing)
 	mux.HandleFunc("GET /runs", rh.ServeIndex)
 	mux.HandleFunc("GET /runs/{id}", rh.ServeDetail)
+	mux.HandleFunc("GET /files/{hash}", fh.ServeDetail)
 
 	return logRequests(mux), nil
 }

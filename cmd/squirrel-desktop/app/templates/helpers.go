@@ -85,7 +85,11 @@ func destEndpoint(d *config.Destination) string {
 }
 
 // shortHash truncates a hex BLAKE3 digest for inline display.
-func shortHash(hex string) string {
+func shortHash(hex string) string { return ShortHash(hex) }
+
+// ShortHash is the exported variant used by handlers that need to derive
+// a page title from a digest.
+func ShortHash(hex string) string {
 	if len(hex) <= 12 {
 		return hex
 	}
