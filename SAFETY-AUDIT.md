@@ -76,19 +76,15 @@ issue we should open for that item.
    — removing a volume or node from config silently leaves orphan rows;
    there's no `archive` / `decommission` workflow with the required
    multi-step confirmation the project's philosophy calls for.
-10. [#H6](#h6-v1-database-is-quoted-as-delete-and-re-index) — opening a
-    v1 DB returns an error that literally tells the user to `delete the
-    database`. That message is the policy; no migration path, no
-    automatic backup, no export.
-11. [#H7](#h7-no-pre-migration-snapshot-of-the-index) — schema
+10. [#H6](#h6-no-pre-migration-snapshot-of-the-index) — schema
     migrations run in a transaction (good) but there is no on-disk
     snapshot taken before the migration starts. A corruption or
     in-flight crash leaves no point-in-time backup to fall back to.
-12. [#H8](#h8-the-watermark-and-correlated-run-id-are-overwrite-in-place)
+11. [#H7](#h7-the-watermark-and-correlated-run-id-are-overwrite-in-place)
     — `UpsertPeerSyncState` and `SetCorrelatedRunID` rewrite values
     with no audit row. If a bug or hostile peer pushes a bad
     watermark, the prior watermark is lost.
-13. [#H9](#h9-destination-root-and-restore-target-are-not-marker-guarded)
+12. [#H8](#h8-destination-root-and-restore-target-are-not-marker-guarded)
     — sync writes into `<dest.root>/<volume>/` and restore writes into
     `vol.Path`; nothing validates that those locations are the squirrel-
     owned tree we think they are.
@@ -624,52 +620,7 @@ stay. That's correct from a "never forget metadata" angle, BUT:
 
 ---
 
-### H6: v1 database is quoted as "delete and re-index"
-
-**Severity:** High • **Likelihood:** Only triggers on legacy users
-upgrading from a very early build, but the impact is total.
-
-**Where**
-
-- `store/migrations.go:71-73`.
-
-**What can go wrong**
-
-```
-return fmt.Errorf("database schema version 1 is no longer supported
-(binary expects v%d); delete the database and re-index",
-SchemaVersion)
-```
-
-The error message _is the recovery procedure_. There is no automatic
-migration, no automatic backup, no export-then-re-import. If a user
-has a v1 DB carrying years of supersede chains and run history, the
-binary's instructions are "delete it".
-
-This is at direct odds with "never forget metadata about files or
-volumes that were used recently".
-
-**Proposed mitigation**
-
-- Before refusing, the migration runner should automatically
-  `VACUUM INTO ~/.squirrel/backups/pre-v1-removal-<timestamp>.db`.
-  (This relies on #C3 landing first.) That way the operator at
-  least has a copy of the bytes.
-- Resurrect the v1→v2 migration in a separate side-car package
-  (e.g. `store/legacy/migrate_v1.go`), invoked behind a CLI flag
-  (`--allow-v1-migrate`) so the default refusal stays but recovery is
-  possible.
-
-**Acceptance**
-
-- Opening a v1 DB writes a backup before erroring.
-- Documentation describes the recovery path.
-
-**Issue:** `migrations: write a backup before refusing a v1 database; consider opt-in legacy migrator`
-
----
-
-### H7: No pre-migration snapshot of the index
+### H6: No pre-migration snapshot of the index
 
 **Severity:** High • **Likelihood:** Every binary upgrade.
 
@@ -709,7 +660,7 @@ mid-migration rolls back). But:
 
 ---
 
-### H8: The watermark and correlated_run_id are overwrite-in-place
+### H7: The watermark and correlated_run_id are overwrite-in-place
 
 **Severity:** High (forensic) • **Likelihood:** Low today, but the
 record loss is permanent.
@@ -749,7 +700,7 @@ exactly.
 
 ---
 
-### H9: Destination root and restore target are not marker-guarded
+### H8: Destination root and restore target are not marker-guarded
 
 **Severity:** High • **Likelihood:** Low (requires misconfiguration),
 but blast radius is very high.
