@@ -21,6 +21,7 @@ import (
 	"sync"
 
 	"github.com/mbertschler/squirrel/config"
+	"github.com/mbertschler/squirrel/runevents"
 )
 
 // MinRcloneVersion is the lowest rclone version this binary supports.
@@ -196,17 +197,27 @@ const maxFailedFiles = 100
 // exited non-zero; per-file errors land in RunResult.FailedFiles without
 // failing the call so the caller can decide how to surface them.
 func (r *Rclone) Run(ctx context.Context, args ...string) (RunResult, error) {
+	return r.RunWithProgress(ctx, nil, args...)
+}
+
+// RunWithProgress is the variant that emits in-flight Progress events
+// derived from rclone's periodic stats lines. The callback is invoked
+// synchronously from the stderr-reader goroutine; it must not block.
+// onProgress may be nil, in which case behaviour is identical to Run.
+//
+// --stats 1s is appended so rclone emits a stats event every second
+// while the copy is in flight (its default cadence is 1 minute, which
+// is uselessly coarse for the desktop's live-progress UI). The final
+// stats line at end-of-run is unaffected.
+func (r *Rclone) RunWithProgress(ctx context.Context, onProgress func(runevents.Progress), args ...string) (RunResult, error) {
 	if r.Config == "" {
 		return RunResult{}, errors.New("rclone wrapper: Config not set (call WriteRcloneConfig first)")
 	}
-	// --log-level INFO is required for rclone to emit the per-file events
-	// and final stats line we parse below. Without it the run is silent and
-	// we'd have no way to compute Transferred / Checked beyond the exit
-	// code. --stats 1s ensures the stats line lands at end-of-run.
 	full := append([]string{
 		"--config", r.Config,
 		"--use-json-log",
 		"--log-level", "INFO",
+		"--stats", "1s",
 	}, args...)
 	cmd := exec.CommandContext(ctx, r.Binary, full...)
 	stderr, err := cmd.StderrPipe()
@@ -228,7 +239,7 @@ func (r *Rclone) Run(ctx context.Context, args ...string) (RunResult, error) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		parseJSONLog(stderr, &result)
+		parseJSONLog(stderr, &result, onProgress)
 	}()
 	go func() {
 		defer wg.Done()
@@ -278,8 +289,9 @@ func isRetrySummary(msg string) bool { return retrySummaryRE.MatchString(msg) }
 // parseJSONLog reads JSON-per-line events from r and updates result in
 // place. Non-JSON lines (e.g. an early startup notice on an older rclone)
 // are skipped — we cannot make decisions on them and surfacing them as
-// errors would create false positives.
-func parseJSONLog(r io.Reader, result *RunResult) {
+// errors would create false positives. onProgress, if non-nil, is
+// invoked once per stats event so callers can drive a live UI.
+func parseJSONLog(r io.Reader, result *RunResult, onProgress func(runevents.Progress)) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -303,6 +315,15 @@ func parseJSONLog(r io.Reader, result *RunResult) {
 			}
 			if ev.Stats.FatalError {
 				result.FatalError = true
+			}
+			if onProgress != nil {
+				onProgress(runevents.Progress{
+					Stage:      runevents.StageUploading,
+					Done:       result.Transferred,
+					Total:      ev.Stats.TotalTransfers + ev.Stats.TotalChecks,
+					BytesDone:  result.Bytes,
+					BytesTotal: 0,
+				})
 			}
 			continue
 		}

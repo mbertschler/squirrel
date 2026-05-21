@@ -158,6 +158,9 @@ func (d *nodeSyncDriver) phaseBegin() error {
 		return alreadyRunningErr(d.vol.Name, d.node.Name, blocker)
 	}
 	d.report.RunID = runID
+	if d.opts.OnRunID != nil && runID != 0 {
+		d.opts.OnRunID(runID)
+	}
 	resp, err := d.client.begin(d.ctx, syncproto.BeginRequest{
 		Volume:            d.vol.Name,
 		InitiatorNodeName: self.Name,
@@ -472,7 +475,7 @@ func (d *nodeSyncDriver) invokeRclone(transferPaths []string) error {
 	}
 	args = append(args, withTrailingSlash(d.vol.Path), nodeRcloneDest(d.node, d.vol.Name))
 
-	result, err := d.rcl.Run(d.ctx, args...)
+	result, err := d.rcl.RunWithProgress(d.ctx, d.opts.Progress, args...)
 	d.report.RcloneResult = result
 	if err != nil {
 		return fmt.Errorf("rclone: %w", err)

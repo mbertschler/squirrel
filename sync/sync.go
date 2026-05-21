@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/mbertschler/squirrel/config"
+	"github.com/mbertschler/squirrel/runevents"
 	"github.com/mbertschler/squirrel/store"
 	"github.com/mbertschler/squirrel/syncproto"
 )
@@ -41,6 +42,17 @@ type Options struct {
 	// DryRun forwards --dry-run to rclone. No bytes are transferred and no
 	// runs row is written (the prerequisite check still happens).
 	DryRun bool
+	// OnRunID, if non-nil, is invoked once the runs row has been
+	// allocated. Desktop callers use it to bridge the
+	// "started a goroutine, want a runID" gap without polling. Not
+	// invoked in DryRun mode (no row is written).
+	OnRunID func(runID int64)
+	// Progress, if non-nil, receives in-flight progress events derived
+	// from rclone's periodic stats output. The callback is invoked
+	// synchronously from rclone's stderr-reader goroutine; callers
+	// must keep it cheap (non-blocking channel send is the canonical
+	// shape). nil means no-op.
+	Progress func(runevents.Progress)
 }
 
 // Report is the outcome of one Sync invocation. Volume and Destination
@@ -145,8 +157,11 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 	if err != nil {
 		return rep, err
 	}
+	if opts.OnRunID != nil && runID != 0 {
+		opts.OnRunID(runID)
+	}
 
-	err = runRcloneOperation(ctx, s, rcl, opts.DryRun, runID, &rep,
+	err = runRcloneOperation(ctx, s, rcl, opts.DryRun, runID, &rep, opts.Progress,
 		func(runID int64) []string {
 			return buildRcloneArgs(vol, dest, runID, opts)
 		})
@@ -186,6 +201,7 @@ func runRcloneOperation(
 	dryRun bool,
 	runID int64,
 	rep *Report,
+	progress func(runevents.Progress),
 	buildArgs func(runID int64) []string,
 ) (err error) {
 	rep.RunID = runID
@@ -193,7 +209,7 @@ func runRcloneOperation(
 		finishRun(ctx, s, dryRun, runID, rep)
 	}()
 
-	rep.RcloneResult, err = rcl.Run(ctx, buildArgs(runID)...)
+	rep.RcloneResult, err = rcl.RunWithProgress(ctx, progress, buildArgs(runID)...)
 	if err != nil && rep.RcloneResult.Errors == 0 && !rep.RcloneResult.FatalError {
 		// Invocation failed without a parseable error count: treat as fatal.
 		rep.RcloneResult.FatalError = true
@@ -491,7 +507,7 @@ func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volum
 		return rep, err
 	}
 
-	err = runRcloneOperation(ctx, s, rcl, opts.DryRun, runID, &rep,
+	err = runRcloneOperation(ctx, s, rcl, opts.DryRun, runID, &rep, nil,
 		func(_ int64) []string {
 			return buildRestoreArgs(vol, dest, opts)
 		})

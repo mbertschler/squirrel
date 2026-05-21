@@ -55,7 +55,7 @@ func TestParseJSONLogCapturesObjectlessErrors(t *testing.T) {
 		`{"stats":{"errors":1,"fatalError":true,"totalTransfers":0,"totalChecks":0,"bytes":0}}`,
 	}, "\n")
 	var r RunResult
-	parseJSONLog(strings.NewReader(stream), &r)
+	parseJSONLog(strings.NewReader(stream), &r, nil)
 
 	if len(r.FailedFiles) != 2 {
 		t.Fatalf("FailedFiles = %+v, want 2 (auth + reading; retry summaries dropped)", r.FailedFiles)
