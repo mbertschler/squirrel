@@ -48,11 +48,14 @@ templ VolumesPage(rows []VolumeRow, dests map[string]*config.Destination) {
 								<td class="px-4 py-2 text-right tabular-nums text-muted-foreground">{ humanBytes(r.CumulativeSize) }</td>
 								<td class="px-4 py-2 text-muted-foreground">{ joinStrings(r.SyncTo, ", ") }</td>
 								<td class="px-4 py-2 text-right">
-									if r.Indexed {
-										<a class="btn btn-sm btn-outline" href={ templ.URL("/volumes/" + r.Name + "/browse") }>Browse</a>
-									} else {
-										<span class="text-xs text-muted-foreground">not yet indexed</span>
-									}
+									<div class="flex justify-end gap-2">
+										if r.Indexed {
+											<a class="btn btn-sm btn-outline" href={ templ.URL("/volumes/" + r.Name + "/browse") }>Browse</a>
+										}
+										<form method="post" action={ templ.URL("/volumes/" + r.Name + "/index") } class="inline">
+											<button type="submit" class="btn btn-sm btn-primary">Index</button>
+										</form>
+									</div>
 								</td>
 							</tr>
 						}

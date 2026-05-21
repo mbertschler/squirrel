@@ -1,0 +1,117 @@
+package templates
+
+import (
+	"fmt"
+
+	"github.com/mbertschler/squirrel/store"
+)
+
+// RunRow bundles a run with the volume name resolved (so the template
+// doesn't reach into the store layer).
+type RunRow struct {
+	Run        store.Run
+	VolumeName string
+}
+
+templ RunsPage(rows []RunRow) {
+	@PageHeader("Runs", "Recent index, sync, restore, and audit runs.")
+	<section class="p-6">
+		<div class="card overflow-hidden">
+			<table class="w-full text-sm">
+				<thead class="text-left text-xs uppercase tracking-wide text-muted-foreground bg-muted/30">
+					<tr>
+						<th class="px-4 py-2 font-medium">#</th>
+						<th class="px-4 py-2 font-medium">Kind</th>
+						<th class="px-4 py-2 font-medium">Volume</th>
+						<th class="px-4 py-2 font-medium">Destination</th>
+						<th class="px-4 py-2 font-medium">Started</th>
+						<th class="px-4 py-2 font-medium">Ended</th>
+						<th class="px-4 py-2 font-medium">Status</th>
+						<th class="px-4 py-2 font-medium text-right">Files</th>
+					</tr>
+				</thead>
+				<tbody>
+					if len(rows) == 0 {
+						<tr><td colspan="8" class="px-4 py-6 text-center text-muted-foreground">no runs yet</td></tr>
+					}
+					for _, r := range rows {
+						<tr class="border-t border-border">
+							<td class="px-4 py-1.5 tabular-nums">
+								<a class="hover:underline" href={ templ.URL("/runs/" + fmt.Sprintf("%d", r.Run.ID)) }>{ fmt.Sprintf("%d", r.Run.ID) }</a>
+							</td>
+							<td class="px-4 py-1.5">{ r.Run.Kind }</td>
+							<td class="px-4 py-1.5">{ r.VolumeName }</td>
+							<td class="px-4 py-1.5 text-muted-foreground">
+								if r.Run.Destination.Valid {
+									{ r.Run.Destination.String }
+								} else {
+									—
+								}
+							</td>
+							<td class="px-4 py-1.5 text-muted-foreground tabular-nums">{ fmtTime(r.Run.StartedAtNs) }</td>
+							<td class="px-4 py-1.5 text-muted-foreground tabular-nums">
+								if r.Run.EndedAtNs.Valid {
+									{ fmtTime(r.Run.EndedAtNs.Int64) }
+								} else {
+									—
+								}
+							</td>
+							<td class="px-4 py-1.5">@runStatusBadge(r.Run.Status)</td>
+							<td class="px-4 py-1.5 text-right tabular-nums">{ fmt.Sprintf("%d", r.Run.FileCount) }</td>
+						</tr>
+					}
+				</tbody>
+			</table>
+		</div>
+	</section>
+}
+
+templ runStatusBadge(s string) {
+	switch s {
+	case "running":
+		<span class="rounded-md px-2 py-0.5 text-xs bg-primary/15 text-primary">running</span>
+	case "success":
+		<span class="rounded-md px-2 py-0.5 text-xs bg-emerald-500/15 text-emerald-700 dark:text-emerald-400">success</span>
+	case "failed":
+		<span class="rounded-md px-2 py-0.5 text-xs bg-destructive/15 text-destructive">failed</span>
+	case "partial":
+		<span class="rounded-md px-2 py-0.5 text-xs bg-amber-500/15 text-amber-700 dark:text-amber-400">partial</span>
+	default:
+		<span class="rounded-md px-2 py-0.5 text-xs bg-muted text-muted-foreground">{ s }</span>
+	}
+}
+
+templ RunDetailPage(row RunRow, errMsg string) {
+	@PageHeader(fmt.Sprintf("Run #%d", row.Run.ID), row.Run.Kind+" · "+row.VolumeName)
+	<section class="p-6 space-y-4">
+		<turbo-frame id="run-detail" data-controller="autorefresh" data-autorefresh-interval-value="2000" data-autorefresh-done-value={ runDone(row.Run.Status) }>
+			<div class="card p-4 grid grid-cols-2 gap-x-8 gap-y-3 text-sm">
+				<dt class="text-muted-foreground">Status</dt><dd>@runStatusBadge(row.Run.Status)</dd>
+				<dt class="text-muted-foreground">Started</dt><dd class="tabular-nums">{ fmtTime(row.Run.StartedAtNs) }</dd>
+				<dt class="text-muted-foreground">Ended</dt>
+				<dd class="tabular-nums">
+					if row.Run.EndedAtNs.Valid {
+						{ fmtTime(row.Run.EndedAtNs.Int64) }
+					} else {
+						—
+					}
+				</dd>
+				<dt class="text-muted-foreground">Files</dt><dd class="tabular-nums">{ fmt.Sprintf("%d", row.Run.FileCount) }</dd>
+				if errMsg != "" {
+					<dt class="text-muted-foreground">Error</dt><dd class="text-destructive">{ errMsg }</dd>
+				}
+			</div>
+		</turbo-frame>
+		<a class="btn btn-outline btn-sm" href="/runs">All runs</a>
+	</section>
+}
+
+// runDone returns "true" if the run has reached a terminal status, used
+// to stop the auto-refresh Stimulus controller from polling further.
+func runDone(status string) string {
+	switch status {
+	case "success", "failed", "partial":
+		return "true"
+	}
+	return "false"
+}

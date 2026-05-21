@@ -43,10 +43,18 @@ func New(deps Deps) (http.Handler, error) {
 
 	vh := handlers.NewVolumes(deps.Config, deps.Store)
 	bh := handlers.NewBrowse(deps.Config, deps.Store)
+	qh := handlers.NewQuery(deps.Config, deps.Store)
+	rh := handlers.NewRuns(deps.Config, deps.Store)
 
 	mux.HandleFunc("GET /{$}", vh.ServeIndex)
 	mux.HandleFunc("GET /volumes", vh.ServeIndex)
 	mux.HandleFunc("GET /volumes/{name}/browse", bh.Serve)
+	mux.HandleFunc("POST /volumes/{name}/index", rh.StartIndex)
+	mux.HandleFunc("GET /query", qh.Serve)
+	mux.HandleFunc("GET /query/duplicates", qh.ServeDuplicates)
+	mux.HandleFunc("GET /query/missing", qh.ServeMissing)
+	mux.HandleFunc("GET /runs", rh.ServeIndex)
+	mux.HandleFunc("GET /runs/{id}", rh.ServeDetail)
 
 	return logRequests(mux), nil
 }

@@ -76,6 +76,8 @@ func (h *Volumes) rows(ctx context.Context) []templates.VolumeRow {
 func buildNav(active string) []templates.NavItem {
 	items := []templates.NavItem{
 		{Label: "Volumes", Href: "/volumes"},
+		{Label: "Query", Href: "/query"},
+		{Label: "Runs", Href: "/runs"},
 	}
 	for i := range items {
 		if items[i].Href == active {
