@@ -72,19 +72,15 @@ issue we should open for that item.
    on-disk content drifted out-of-band between those steps, the
    `.squirrel-history/run-N/` payload no longer matches the recorded
    blake3.
-9. [#H5](#h5-no-soft-delete-or-decommission-flow-for-volumes-or-nodes)
-   — removing a volume or node from config silently leaves orphan rows;
-   there's no `archive` / `decommission` workflow with the required
-   multi-step confirmation the project's philosophy calls for.
-10. [#H6](#h6-no-pre-migration-snapshot-of-the-index) — schema
+9. [#H5](#h5-no-pre-migration-snapshot-of-the-index) — schema
     migrations run in a transaction (good) but there is no on-disk
     snapshot taken before the migration starts. A corruption or
     in-flight crash leaves no point-in-time backup to fall back to.
-11. [#H7](#h7-the-watermark-and-correlated-run-id-are-overwrite-in-place)
+10. [#H6](#h6-the-watermark-and-correlated-run-id-are-overwrite-in-place)
     — `UpsertPeerSyncState` and `SetCorrelatedRunID` rewrite values
     with no audit row. If a bug or hostile peer pushes a bad
     watermark, the prior watermark is lost.
-12. [#H8](#h8-destination-root-and-restore-target-are-not-marker-guarded)
+11. [#H7](#h7-destination-root-and-restore-target-are-not-marker-guarded)
     — sync writes into `<dest.root>/<volume>/` and restore writes into
     `vol.Path`; nothing validates that those locations are the squirrel-
     owned tree we think they are.
@@ -567,60 +563,7 @@ recorded blake3.
 
 ---
 
-### H5: No soft-delete or decommission flow for volumes or nodes
-
-**Severity:** High (philosophical) • **Likelihood:** Every config
-cleanup.
-
-**Where**
-
-- `store/volumes.go` — no soft-delete column, no delete API.
-- `store/nodes.go` — same.
-- `cmd/squirrel/root.go:127-140` — `warnOrphanVolumes` only warns.
-
-**What can go wrong**
-
-A user who removes `[volumes.pictures]` from config gets a single-line
-stderr warning. The volume row stays, the file rows stay, run rows
-stay. That's correct from a "never forget metadata" angle, BUT:
-
-- There's no positive confirmation that the operator intended the
-  removal. The warning is easy to miss in a noisy terminal.
-- There's no way to formally retire a volume (or peer node) without
-  hand-editing the DB. Retirement should be a multi-step intentional
-  flow per the CLAUDE.md philosophy.
-- A removed-and-re-added volume with a different path collides on
-  name and confuses re-indexing (the existing `resolveNamedVolume`
-  refuses the mismatch — good — but doesn't offer a retirement
-  command to resolve it).
-
-**Proposed mitigation**
-
-- Add a `deactivated_at_ns` column (nullable) to `volumes` and
-  `nodes`. `NULL` means active; non-NULL means archived.
-- Add `squirrel volumes archive <name>` and `squirrel volumes
-  unarchive <name>` commands. Archived volumes are skipped by
-  index/sync but their rows stay queryable via `--include-archived`.
-- Archiving requires two steps:
-  1. `squirrel volumes archive <name>` — flips the column, writes a
-     `runs_audit` entry, refuses if any volume is currently being
-     indexed/synced.
-  2. (Optional, much later, very deliberate) `squirrel volumes purge
-     <name> --confirm-name <name> --i-understand-this-is-irreversible`
-     — only after archive, and only after a configurable cooldown.
-- Same shape for nodes.
-
-**Acceptance**
-
-- A volume archive workflow exists and is documented.
-- Archived volumes don't appear in `squirrel volumes` by default.
-- Archived volumes are not auto-purged.
-
-**Issue:** `store, cli: add archive / unarchive workflow for volumes and nodes`
-
----
-
-### H6: No pre-migration snapshot of the index
+### H5: No pre-migration snapshot of the index
 
 **Severity:** High • **Likelihood:** Every binary upgrade.
 
@@ -660,7 +603,7 @@ mid-migration rolls back). But:
 
 ---
 
-### H7: The watermark and correlated_run_id are overwrite-in-place
+### H6: The watermark and correlated_run_id are overwrite-in-place
 
 **Severity:** High (forensic) • **Likelihood:** Low today, but the
 record loss is permanent.
@@ -700,7 +643,7 @@ exactly.
 
 ---
 
-### H8: Destination root and restore target are not marker-guarded
+### H7: Destination root and restore target are not marker-guarded
 
 **Severity:** High • **Likelihood:** Low (requires misconfiguration),
 but blast radius is very high.
