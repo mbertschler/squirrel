@@ -1,0 +1,20 @@
+{
+  "name": "squirrel-desktop-assets",
+  "private": true,
+  "type": "module",
+  "description": "Frontend assets for the squirrel-desktop Wails app. Built via bun + Tailwind CLI + esbuild Go API; never executed at runtime — the Go binary embeds the built output.",
+  "scripts": {
+    "build:css": "tailwindcss -i ./app/static/src/app.css -o ./app/static/dist/app.css --minify",
+    "watch:css": "tailwindcss -i ./app/static/src/app.css -o ./app/static/dist/app.css --watch"
+  },
+  "dependencies": {
+    "@hotwired/turbo": "^8.0.13",
+    "@hotwired/stimulus": "^3.2.2",
+    "basecoat-css": "^0.3.11",
+    "lucide": "^0.469.0"
+  },
+  "devDependencies": {
+    "tailwindcss": "^4.1.4",
+    "@tailwindcss/cli": "^4.1.4"
+  }
+}

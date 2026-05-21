@@ -1,0 +1,11 @@
+# bun resolves JS deps into node_modules; the lockfile (bun.lock) is
+# checked in so versions are reproducible without having node_modules
+# committed. The Tailwind CLI binary, Lucide icons, Turbo, Stimulus
+# and Basecoat all live here at install time and are pulled in via
+# `bun install`.
+node_modules/
+
+# Sourcemap is only useful in dev and inflates the binary; the
+# corresponding app.js comment points at a file that won't exist in
+# production. Generated bundle stays committed.
+app/static/dist/*.map

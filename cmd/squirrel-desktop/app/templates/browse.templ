@@ -1,0 +1,105 @@
+package templates
+
+import "fmt"
+
+// BrowseEntry is one row in the ncdu-style listing — either a direct
+// subfolder (Dir == true; Size/Count are the cumulative subtree totals)
+// or a direct file (Size is its own size_bytes, Count is always zero).
+type BrowseEntry struct {
+	Name  string
+	Dir   bool
+	Size  int64
+	Count int64
+	// Href is the URL the row links to. Folders link to the next
+	// listing; files link to a per-file detail (not yet implemented).
+	Href string
+	// Hash is the file's content blake3, hex-encoded. Empty for folders.
+	Hash string
+}
+
+// BrowsePage is the ncdu-style directory listing. Crumbs is the path
+// trail from the volume root to the current folder. Total is the
+// cumulative_size of the current folder, used to size the proportional
+// bar next to each row.
+templ BrowsePage(volumeName, currentPath string, crumbs []NavItem, entries []BrowseEntry, total int64, upHref string) {
+	@PageHeader("Browse · "+volumeName, currentPath)
+	<section class="p-6">
+		@browseFrame(volumeName, currentPath, crumbs, entries, total, upHref)
+	</section>
+}
+
+// browseFrame is the Turbo Frame body. The page wraps it once on initial
+// load; subsequent navigations swap only this frame, preserving the
+// outer layout + Stimulus mount on `data-controller="ncdu"`.
+templ browseFrame(volumeName, currentPath string, crumbs []NavItem, entries []BrowseEntry, total int64, upHref string) {
+	<turbo-frame id="browse" data-controller="ncdu" data-action="keydown@window->ncdu#handleKey">
+		<nav class="text-sm text-muted-foreground mb-3 flex items-center gap-1 flex-wrap">
+			for i, c := range crumbs {
+				if i > 0 {
+					<span class="opacity-50">/</span>
+				}
+				if c.Active {
+					<span class="font-medium text-foreground">{ c.Label }</span>
+				} else {
+					<a class="hover:underline" href={ templ.URL(c.Href) } data-turbo-frame="browse">{ c.Label }</a>
+				}
+			}
+		</nav>
+		if upHref != "" {
+			<a class="btn btn-sm btn-ghost mb-2" href={ templ.URL(upHref) } data-turbo-frame="browse" data-ncdu-target="up">../</a>
+		}
+		<div class="card overflow-hidden">
+			<table class="w-full text-sm">
+				<thead class="text-left text-xs uppercase tracking-wide text-muted-foreground bg-muted/30">
+					<tr>
+						<th class="px-4 py-2 font-medium w-1/2">Name</th>
+						<th class="px-4 py-2 font-medium text-right">Size</th>
+						<th class="px-4 py-2 font-medium text-right">Files</th>
+						<th class="px-4 py-2 font-medium">Share</th>
+					</tr>
+				</thead>
+				<tbody>
+					if len(entries) == 0 {
+						<tr><td colspan="4" class="px-4 py-6 text-center text-muted-foreground">empty</td></tr>
+					}
+					for _, e := range entries {
+						<tr class="border-t border-border">
+							<td class="px-4 py-1.5">
+								<a href={ templ.URL(e.Href) } data-turbo-frame="browse" data-ncdu-target="row"
+									class="block w-full focus:outline-none focus:bg-accent focus:text-accent-foreground rounded px-1 -mx-1">
+									if e.Dir {
+										<span class="text-primary font-medium">{ e.Name + "/" }</span>
+									} else {
+										<span>{ e.Name }</span>
+										if e.Hash != "" {
+											<span class="ml-2 text-xs text-muted-foreground tabular-nums">{ shortHash(e.Hash) }</span>
+										}
+									}
+								</a>
+							</td>
+							<td class="px-4 py-1.5 text-right tabular-nums">{ humanBytes(e.Size) }</td>
+							<td class="px-4 py-1.5 text-right tabular-nums text-muted-foreground">
+								if e.Dir {
+									{ fmt.Sprintf("%d", e.Count) }
+								}
+							</td>
+							<td class="px-4 py-1.5 w-40">
+								@shareBar(e.Size, total)
+							</td>
+						</tr>
+					}
+				</tbody>
+			</table>
+		</div>
+		<p class="text-xs text-muted-foreground mt-3">↑/↓ or j/k to focus rows, Enter or → to open, ← or Backspace to go up.</p>
+	</turbo-frame>
+}
+
+// shareBar renders a horizontal progress-style bar sized to size/total
+// (clamped 0..100). Used to give the directory listing a quick visual
+// of which children dominate the parent.
+templ shareBar(size, total int64) {
+	<div class="h-1.5 rounded bg-muted overflow-hidden">
+		<div class="h-full bg-primary" style={ "width: " + barWidth(size, total) }></div>
+	</div>
+}
