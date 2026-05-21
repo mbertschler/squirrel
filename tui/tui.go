@@ -157,9 +157,16 @@ func (m *rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.browse.Init()
 
 	case tea.KeyMsg:
-		// Global keys first. Screens never see q/?/Tab/1-3.
+		// Global keys first. Modal screens get a chance to consume them via
+		// modalConsumesKey so e.g. "esc" closes a Browse file-detail panel
+		// before it would back out to the Volumes screen.
+		if m.modalConsumesKey(msg.String()) {
+			break // fall through to the per-screen delegation below
+		}
 		switch msg.String() {
-		case "ctrl+c", "q":
+		case "ctrl+c":
+			return m, tea.Quit
+		case "q":
 			if m.active == screenBrowse {
 				// In Browse, q backs out to the Volumes list instead of quitting.
 				m.active = screenVolumes
@@ -240,6 +247,26 @@ func (m *rootModel) View() string {
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
 }
 
+// modalConsumesKey reports whether the active screen has a modal context
+// (file-detail panel, run-detail panel) for which the given key should be
+// delivered to the screen rather than handled globally. Without this,
+// pressing esc inside a Browse file-detail panel would back the user out
+// to the Volumes list instead of closing the panel.
+func (m *rootModel) modalConsumesKey(key string) bool {
+	switch key {
+	case "esc", "q", "enter", "backspace":
+	default:
+		return false
+	}
+	switch m.active {
+	case screenBrowse:
+		return m.browse.fileDetail != nil
+	case screenRuns:
+		return m.runs.selectedDetail != nil
+	}
+	return false
+}
+
 func (m *rootModel) cycleTab(delta int) {
 	// Tabs cycle through Dashboard / Runs / Volumes only — Browse is reached
 	// from Volumes, not from the tab bar.
@@ -280,9 +307,9 @@ func (m *rootModel) renderTabs() string {
 }
 
 func (m *rootModel) renderStatusBar() string {
-	left := "q quit · tab switch · ? help"
+	left := "q quit · tab / shift-tab switch · 1-3 jump"
 	if m.active == screenBrowse {
-		left = "↑↓ navigate · enter descend · backspace ascend · esc back · q back"
+		left = "↑↓ navigate · enter descend · backspace ascend · esc / q back"
 	}
 	var right string
 	if m.status != "" {
