@@ -6,7 +6,6 @@ package handlers
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"sort"
 
@@ -64,8 +63,6 @@ func (h *Volumes) rows(ctx context.Context) []templates.VolumeRow {
 					row.Indexed = true
 					row.FileCount = root.FileCount
 					row.CumulativeSize = root.CumulativeSize
-				} else if !errors.Is(ferr, context.Canceled) {
-					// no folder yet — leave defaults (not indexed)
 				}
 				h.fillRunning(ctx, &row, v.ID)
 			}
