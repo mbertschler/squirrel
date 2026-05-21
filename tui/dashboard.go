@@ -246,24 +246,27 @@ func (m *dashboardModel) probeAgent() tea.Cmd {
 	}
 }
 
-// loadDashboardData runs the SQL queries that back the dashboard in one
-// shot. Returns a populated dashboardData with .now set to the
-// observation time so render functions agree on "now".
+// loadDashboardData runs the SQL queries that back the dashboard. The
+// recent-runs bucket comes from a bounded ListRuns scan (200 is plenty
+// for "what happened today"); the per-(volume,kind) "last successful"
+// table comes from its own helper that scans every run, so volumes
+// whose last index sits beyond the recent window still surface
+// correctly.
 func loadDashboardData(ctx context.Context, s *store.Store) (dashboardData, error) {
 	now := time.Now()
 	vols, err := s.ListVolumes(ctx)
 	if err != nil {
 		return dashboardData{}, fmt.Errorf("list volumes: %w", err)
 	}
-	// Pull recent runs descending and partition into active vs. terminal
-	// without a second query. 200 is well above what a healthy install
-	// generates in a day and bounds the work cheaply.
 	runs, err := s.ListRuns(ctx, store.ListRunsOpts{Limit: 200, Descending: true})
 	if err != nil {
 		return dashboardData{}, fmt.Errorf("list runs: %w", err)
 	}
+	latestByVol, err := s.LatestSuccessfulRunsByVolumeAndKind(ctx)
+	if err != nil {
+		return dashboardData{}, fmt.Errorf("latest by volume: %w", err)
+	}
 	var active, recent []store.Run
-	latestByVol := map[int64]map[string]store.Run{}
 	for _, r := range runs {
 		if r.Status == store.RunStatusRunning {
 			active = append(active, r)
@@ -271,23 +274,6 @@ func loadDashboardData(ctx context.Context, s *store.Store) (dashboardData, erro
 		}
 		if len(recent) < 10 {
 			recent = append(recent, r)
-		}
-		// Track latest terminal-success run per (volume, kind) for the
-		// "last index"/"last sync" columns. Only success / partial count —
-		// a failed run does not mean the volume has been re-indexed.
-		if r.Status != store.RunStatusSuccess && r.Status != store.RunStatusPartial {
-			continue
-		}
-		if !r.VolumeID.Valid {
-			continue
-		}
-		byKind := latestByVol[r.VolumeID.Int64]
-		if byKind == nil {
-			byKind = map[string]store.Run{}
-			latestByVol[r.VolumeID.Int64] = byKind
-		}
-		if existing, ok := byKind[r.Kind]; !ok || r.ID > existing.ID {
-			byKind[r.Kind] = r
 		}
 	}
 	return dashboardData{

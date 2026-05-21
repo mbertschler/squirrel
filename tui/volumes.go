@@ -187,26 +187,13 @@ func (m *volumesModel) fetch() tea.Cmd {
 		if err != nil {
 			return volumesDataMsg{err: err}
 		}
-		runs, err := m.store.ListRuns(ctx, store.ListRunsOpts{Limit: 200, Descending: true})
+		// Direct per-(volume, kind) query rather than a bounded ListRuns
+		// scan — see store.LatestSuccessfulRunsByVolumeAndKind for the
+		// reasoning. Volumes whose last index sits outside the recent
+		// window still get an accurate "last index" cell.
+		latestByVol, err := m.store.LatestSuccessfulRunsByVolumeAndKind(ctx)
 		if err != nil {
 			return volumesDataMsg{err: err}
-		}
-		latestByVol := map[int64]map[string]store.Run{}
-		for _, r := range runs {
-			if r.Status != store.RunStatusSuccess && r.Status != store.RunStatusPartial {
-				continue
-			}
-			if !r.VolumeID.Valid {
-				continue
-			}
-			byKind := latestByVol[r.VolumeID.Int64]
-			if byKind == nil {
-				byKind = map[string]store.Run{}
-				latestByVol[r.VolumeID.Int64] = byKind
-			}
-			if existing, ok := byKind[r.Kind]; !ok || r.ID > existing.ID {
-				byKind[r.Kind] = r
-			}
 		}
 		return volumesDataMsg{volumes: vols, latestByVol: latestByVol}
 	}
