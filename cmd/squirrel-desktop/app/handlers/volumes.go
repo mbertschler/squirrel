@@ -39,7 +39,11 @@ func (h *Volumes) ServeIndex(w http.ResponseWriter, r *http.Request) {
 // rows materialises one VolumeRow per configured volume. Aggregates
 // come from the volume's root folder; a volume that has never been
 // indexed (no volumes row, or volumes row but no root folder) reports
-// Indexed = false and zero counts.
+// Indexed = false and zero counts. For indexed volumes we additionally
+// look up any in-flight 'running' index/sync runs so the page can
+// render disabled "Indexing…" / "Syncing → ⟨dest⟩…" affordances —
+// non-indexed volumes can't have running runs against a non-existent
+// volume_id, so we skip the query.
 func (h *Volumes) rows(ctx context.Context) []templates.VolumeRow {
 	names := make([]string, 0, len(h.Config.Volumes))
 	for k := range h.Config.Volumes {
@@ -63,12 +67,57 @@ func (h *Volumes) rows(ctx context.Context) []templates.VolumeRow {
 				} else if !errors.Is(ferr, context.Canceled) {
 					// no folder yet — leave defaults (not indexed)
 				}
+				h.fillRunning(ctx, &row, v.ID)
 			}
 		}
 		out = append(out, row)
 	}
 	return out
 }
+
+// fillRunning populates RunningIndexRunID and RunningSyncRunIDs from
+// the runs table. One ListRuns call per volume (descending, capped at
+// runningRunsScanLimit) is enough: there's at most one 'running' row
+// per (kind, volume, destination) tuple in normal operation, and a
+// stale-row backlog would still surface within the cap. Errors are
+// swallowed — the action stays safe (store-side guards still refuse
+// duplicates); the UI just falls back to enabled buttons.
+func (h *Volumes) fillRunning(ctx context.Context, row *templates.VolumeRow, volumeID int64) {
+	runs, err := h.Store.ListRuns(ctx, store.ListRunsOpts{
+		VolumeID: &volumeID, Descending: true, Limit: runningRunsScanLimit,
+	})
+	if err != nil {
+		return
+	}
+	for _, r := range runs {
+		if r.Status != store.RunStatusRunning {
+			continue
+		}
+		switch r.Kind {
+		case store.RunKindIndex:
+			if row.RunningIndexRunID == 0 {
+				row.RunningIndexRunID = r.ID
+			}
+		case store.RunKindSync:
+			if !r.Destination.Valid {
+				continue
+			}
+			dest := r.Destination.String
+			if row.RunningSyncRunIDs == nil {
+				row.RunningSyncRunIDs = make(map[string]int64, len(row.SyncTo))
+			}
+			if _, seen := row.RunningSyncRunIDs[dest]; !seen {
+				row.RunningSyncRunIDs[dest] = r.ID
+			}
+		}
+	}
+}
+
+// runningRunsScanLimit caps the per-volume runs scan used to derive
+// the running-state map. A handful of in-flight runs is the realistic
+// upper bound; the cap guards against a pathological backlog of stale
+// 'running' rows dominating the listing render.
+const runningRunsScanLimit = 20
 
 // buildNav returns the shared sidebar entries with the currently
 // active path marked. Kept in handlers (rather than templates) because

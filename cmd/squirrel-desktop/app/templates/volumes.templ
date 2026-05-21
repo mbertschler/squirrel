@@ -10,13 +10,21 @@ import (
 // page can render counts without re-issuing per-volume queries from the
 // template layer. Aggregates come from the volume root folder
 // (file_count, cumulative_size).
+//
+// RunningIndexRunID and RunningSyncRunIDs carry the in-flight 'running'
+// run ids that gate the action buttons: zero means "no run in flight,
+// render the active form"; non-zero means "render a disabled
+// progress affordance linking to /runs/<id>". The truth lives in the
+// runs table — the handler queries it per render, no push channel.
 type VolumeRow struct {
-	Name           string
-	Path           string
-	SyncTo         []string
-	FileCount      int64
-	CumulativeSize int64
-	Indexed        bool
+	Name              string
+	Path              string
+	SyncTo            []string
+	FileCount         int64
+	CumulativeSize    int64
+	Indexed           bool
+	RunningIndexRunID int64
+	RunningSyncRunIDs map[string]int64
 }
 
 templ VolumesPage(rows []VolumeRow, dests map[string]*config.Destination) {
@@ -52,13 +60,21 @@ templ VolumesPage(rows []VolumeRow, dests map[string]*config.Destination) {
 										if r.Indexed {
 											<a class="btn btn-sm btn-outline" href={ templ.URL("/volumes/" + r.Name + "/browse") }>Browse</a>
 										}
-										<form method="post" action={ templ.URL("/volumes/" + r.Name + "/index") } class="inline">
-											<button type="submit" class="btn btn-sm btn-primary">Index</button>
-										</form>
-										for _, dest := range r.SyncTo {
-											<form method="post" action={ templ.URL("/volumes/" + r.Name + "/sync/" + dest) } class="inline">
-												<button type="submit" class="btn btn-sm btn-outline">{ "Sync → " + dest }</button>
+										if r.RunningIndexRunID != 0 {
+											<a class="btn btn-sm btn-primary opacity-60 cursor-not-allowed" href={ templ.URL(fmt.Sprintf("/runs/%d", r.RunningIndexRunID)) } aria-disabled="true" title="Index run in progress">Indexing…</a>
+										} else {
+											<form method="post" action={ templ.URL("/volumes/" + r.Name + "/index") } class="inline">
+												<button type="submit" class="btn btn-sm btn-primary">Index</button>
 											</form>
+										}
+										for _, dest := range r.SyncTo {
+											if id := r.RunningSyncRunIDs[dest]; id != 0 {
+												<a class="btn btn-sm btn-outline opacity-60 cursor-not-allowed" href={ templ.URL(fmt.Sprintf("/runs/%d", id)) } aria-disabled="true" title={ "Sync to " + dest + " in progress" }>{ "Syncing → " + dest + "…" }</a>
+											} else {
+												<form method="post" action={ templ.URL("/volumes/" + r.Name + "/sync/" + dest) } class="inline">
+													<button type="submit" class="btn btn-sm btn-outline">{ "Sync → " + dest }</button>
+												</form>
+											}
 										}
 									</div>
 								</td>
