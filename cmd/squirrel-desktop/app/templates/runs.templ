@@ -3,6 +3,7 @@ package templates
 import (
 	"fmt"
 
+	"github.com/mbertschler/squirrel/runevents"
 	"github.com/mbertschler/squirrel/store"
 )
 
@@ -84,34 +85,72 @@ templ runStatusBadge(s string) {
 templ RunDetailPage(row RunRow, errMsg string) {
 	@PageHeader(fmt.Sprintf("Run #%d", row.Run.ID), row.Run.Kind+" · "+row.VolumeName)
 	<section class="p-6 space-y-4">
-		<turbo-frame id="run-detail" data-controller="autorefresh" data-autorefresh-interval-value="2000" data-autorefresh-done-value={ runDone(row.Run.Status) }>
-			<div class="card p-4 grid grid-cols-2 gap-x-8 gap-y-3 text-sm">
-				<dt class="text-muted-foreground">Status</dt><dd>@runStatusBadge(row.Run.Status)</dd>
-				<dt class="text-muted-foreground">Started</dt><dd class="tabular-nums">{ fmtTime(row.Run.StartedAtNs) }</dd>
-				<dt class="text-muted-foreground">Ended</dt>
-				<dd class="tabular-nums">
-					if row.Run.EndedAtNs.Valid {
-						{ fmtTime(row.Run.EndedAtNs.Int64) }
-					} else {
-						—
-					}
-				</dd>
-				<dt class="text-muted-foreground">Files</dt><dd class="tabular-nums">{ fmt.Sprintf("%d", row.Run.FileCount) }</dd>
-				if errMsg != "" {
-					<dt class="text-muted-foreground">Error</dt><dd class="text-destructive">{ errMsg }</dd>
-				}
+		// The SSE controller below opens an EventSource against
+		// /runs/{id}/events; each event payload is one turbo-stream
+		// frame targeting #run-status, so progress lands by mutating
+		// just the panel below without unmounting the controller (which
+		// would tear down the live channel). The status panel renders
+		// the latest stored row inline so initial page load is useful
+		// even before the first SSE frame arrives.
+		<div data-controller="sse" data-sse-url-value={ fmt.Sprintf("/runs/%d/events", row.Run.ID) }>
+			@RunStatusFrame(row, runevents.Progress{})
+		</div>
+		if errMsg != "" {
+			<div class="card p-4 text-sm">
+				<div class="text-muted-foreground mb-1">Error</div>
+				<div class="text-destructive">{ errMsg }</div>
 			</div>
-		</turbo-frame>
+		}
 		<a class="btn btn-outline btn-sm" href="/runs">All runs</a>
 	</section>
 }
 
-// runDone returns "true" if the run has reached a terminal status, used
-// to stop the auto-refresh Stimulus controller from polling further.
-func runDone(status string) string {
-	switch status {
-	case "success", "failed", "partial":
-		return "true"
+// RunStatusFrame is the per-event payload of the SSE stream and the
+// initial inline render inside RunDetailPage. Wrapping in a turbo-stream
+// makes the client-side swap automatic: the SSE controller just shoves
+// each event into Turbo.renderStreamMessage and Turbo finds the
+// matching #run-status target itself.
+templ RunStatusFrame(row RunRow, p runevents.Progress) {
+	<turbo-stream action="replace" target="run-status">
+		<template>
+			@runStatusPanel(row, p)
+		</template>
+	</turbo-stream>
+}
+
+templ runStatusPanel(row RunRow, p runevents.Progress) {
+	<div id="run-status" class="card p-4 grid grid-cols-2 gap-x-8 gap-y-3 text-sm">
+		<dt class="text-muted-foreground">Status</dt><dd>@runStatusBadge(row.Run.Status)</dd>
+		<dt class="text-muted-foreground">Started</dt><dd class="tabular-nums">{ fmtTime(row.Run.StartedAtNs) }</dd>
+		<dt class="text-muted-foreground">Ended</dt>
+		<dd class="tabular-nums">
+			if row.Run.EndedAtNs.Valid {
+				{ fmtTime(row.Run.EndedAtNs.Int64) }
+			} else {
+				—
+			}
+		</dd>
+		<dt class="text-muted-foreground">Files</dt><dd class="tabular-nums">{ fmt.Sprintf("%d", row.Run.FileCount) }</dd>
+		if p.Stage != "" && p.Stage != runevents.StageDone {
+			<dt class="text-muted-foreground">Progress</dt>
+			<dd class="tabular-nums">{ progressText(p) }</dd>
+		}
+	</div>
+}
+
+// progressText renders one progress datapoint inline. Kept template-side
+// because the formatting differs per stage (file-count for index, bytes
+// for sync) and tying it to the wire shape keeps the SSE pipe straight.
+func progressText(p runevents.Progress) string {
+	switch {
+	case p.BytesTotal > 0:
+		return fmt.Sprintf("%s · %s / %s", p.Stage, humanBytes(p.BytesDone), humanBytes(p.BytesTotal))
+	case p.BytesDone > 0:
+		return fmt.Sprintf("%s · %s", p.Stage, humanBytes(p.BytesDone))
+	case p.Total > 0:
+		return fmt.Sprintf("%s · %d / %d", p.Stage, p.Done, p.Total)
+	case p.Done > 0:
+		return fmt.Sprintf("%s · %d", p.Stage, p.Done)
 	}
-	return "false"
+	return p.Stage
 }

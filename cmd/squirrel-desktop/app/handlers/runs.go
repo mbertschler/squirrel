@@ -15,6 +15,7 @@ import (
 	"github.com/mbertschler/squirrel/cmd/squirrel-desktop/app/templates"
 	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/index"
+	"github.com/mbertschler/squirrel/runevents"
 	"github.com/mbertschler/squirrel/store"
 	syncpkg "github.com/mbertschler/squirrel/sync"
 )
@@ -36,10 +37,16 @@ type Runs struct {
 	// concurrency is already gated by store.BeginSyncRunIfClear inside
 	// sync.RunPair.
 	rcloneMu gosync.Mutex
+
+	// hub fans Progress events from in-flight index/sync goroutines
+	// out to any SSE subscribers. Shared across the lifetime of the
+	// handler so a tab opened after the run starts still receives
+	// live frames.
+	hub *progressHub
 }
 
 func NewRuns(c *config.Config, s *store.Store) *Runs {
-	return &Runs{Config: c, Store: s}
+	return &Runs{Config: c, Store: s, hub: newProgressHub()}
 }
 
 func (h *Runs) ServeIndex(w http.ResponseWriter, r *http.Request) {
@@ -111,11 +118,10 @@ func (h *Runs) StartIndex(w http.ResponseWriter, r *http.Request) {
 
 	// Background context, not r.Context(): outliving the request is
 	// the whole point. The goroutine writes the run row + per-file
-	// changes via the existing index package.
-	go func() {
-		ctx := context.Background()
-		_, _ = index.Index(ctx, h.Store, vc.Path, index.Options{Name: name})
-	}()
+	// changes via the existing index package. OnRunID is the bridge
+	// that lets us publish progress events under the right key even
+	// though the runs row is allocated inside index.Index.
+	go h.runIndexGoroutine(vc.Path, name)
 
 	if volumeID == 0 {
 		// Volume row will be created by the indexer; we can't query
@@ -189,6 +195,35 @@ func (h *Runs) StartSync(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, fmt.Sprintf("/runs/%d", newID), http.StatusSeeOther)
 }
 
+// runIndexGoroutine is the body of the background index goroutine.
+// Fresh context.Background() so the index outlives the HTTP request;
+// hub.Close runs in a defer so subscribers see a clean end-of-stream
+// regardless of whether index.Index returned cleanly or panicked. The
+// runID-aware closures route Progress events to the hub keyed by the
+// allocated runs row.
+func (h *Runs) runIndexGoroutine(path, name string) {
+	ctx := context.Background()
+	var runID int64
+	opts := index.Options{
+		Name: name,
+		OnRunID: func(id int64) {
+			runID = id
+		},
+		Progress: func(p runevents.Progress) {
+			if runID != 0 {
+				h.hub.Publish(runID, p)
+			}
+		},
+	}
+	defer func() {
+		if runID != 0 {
+			h.hub.Publish(runID, runevents.Progress{Stage: runevents.StageDone})
+			h.hub.Close(runID)
+		}
+	}()
+	_, _ = index.Index(ctx, h.Store, path, opts)
+}
+
 // resolveSyncTarget converts the validated (name, dest) into the
 // concrete sync.Pair plus a configured Rclone, isolating the
 // fail-fast surface that should redirect to /runs from the
@@ -211,7 +246,24 @@ func (h *Runs) resolveSyncTarget(ctx context.Context, name, dest string) (syncpk
 // via the request log — the runs table carries the durable state.
 func (h *Runs) runSyncGoroutine(name, dest string, pair syncpkg.Pair, rcl *syncpkg.Rclone) {
 	ctx := context.Background()
-	rep, err := syncpkg.RunPair(ctx, h.Store, rcl, pair, syncpkg.Options{})
+	var runID int64
+	opts := syncpkg.Options{
+		OnRunID: func(id int64) {
+			runID = id
+		},
+		Progress: func(p runevents.Progress) {
+			if runID != 0 {
+				h.hub.Publish(runID, p)
+			}
+		},
+	}
+	defer func() {
+		if runID != 0 {
+			h.hub.Publish(runID, runevents.Progress{Stage: runevents.StageDone})
+			h.hub.Close(runID)
+		}
+	}()
+	rep, err := syncpkg.RunPair(ctx, h.Store, rcl, pair, opts)
 	switch {
 	case err != nil:
 		log.Printf("desktop: sync %s → %s: %v", name, dest, err)
