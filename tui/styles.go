@@ -7,13 +7,12 @@ import "github.com/charmbracelet/lipgloss"
 // individual screen files. The TUI assumes a 256-colour terminal; on a 16-
 // colour terminal lipgloss degrades gracefully.
 var (
-	colourAccent    = lipgloss.Color("39")  // cyan-ish
-	colourMuted     = lipgloss.Color("244") // grey
-	colourSuccess   = lipgloss.Color("42")  // green
-	colourWarning   = lipgloss.Color("214") // amber
-	colourFailure   = lipgloss.Color("196") // red
-	colourRunning   = lipgloss.Color("39")  // cyan-ish, same as accent
-	colourSelection = lipgloss.Color("236")
+	colourAccent  = lipgloss.Color("39")  // cyan-ish
+	colourMuted   = lipgloss.Color("244") // grey
+	colourSuccess = lipgloss.Color("42")  // green
+	colourWarning = lipgloss.Color("214") // amber
+	colourFailure = lipgloss.Color("196") // red
+	colourRunning = lipgloss.Color("39")  // cyan-ish, same as accent
 
 	styleTitle = lipgloss.NewStyle().Bold(true).Foreground(colourAccent)
 	styleMuted = lipgloss.NewStyle().Foreground(colourMuted)
@@ -30,8 +29,6 @@ var (
 	styleStatusBar = lipgloss.NewStyle().
 			Foreground(colourMuted).
 			Padding(0, 1)
-
-	styleSelected = lipgloss.NewStyle().Background(colourSelection)
 
 	styleHeader = lipgloss.NewStyle().Bold(true).Underline(true)
 )

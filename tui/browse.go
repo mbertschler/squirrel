@@ -35,12 +35,12 @@ type browseModel struct {
 	volumeID   int64
 	volumeName string
 
-	current     store.Folder // the folder currently displayed
-	atRoot      bool
-	entries     []browseEntry
-	loaded      bool
-	loadErr     error
-	fileDetail  *store.FileRow // when non-nil, the file-detail panel is open
+	current    store.Folder // the folder currently displayed
+	atRoot     bool
+	entries    []browseEntry
+	loaded     bool
+	loadErr    error
+	fileDetail *store.FileRow // when non-nil, the file-detail panel is open
 
 	table table.Model
 }
