@@ -90,12 +90,14 @@ type rootModel struct {
 
 func newRootModel(s *store.Store, cfg *config.Config) *rootModel {
 	client := newAgentClient(cfg)
+	dash := newDashboardModel(s)
+	dash.attachClient(client)
 	return &rootModel{
 		store:     s,
 		cfg:       cfg,
 		client:    client,
 		active:    screenDashboard,
-		dashboard: newDashboardModel(s),
+		dashboard: dash,
 		runs:      newRunsModel(s),
 		volumes:   newVolumesModel(s),
 		browse:    newBrowseModel(s),
