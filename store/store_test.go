@@ -3272,3 +3272,175 @@ func TestBeginIndexRunIfClearRejectsWrongKind(t *testing.T) {
 		}
 	}
 }
+
+// TestBackupVacuumIntoProducesValidSnapshot exercises Backup against
+// a populated store, then opens the snapshot as a regular DB and
+// verifies it carries the same volume row. Cheapest reliable check
+// that VACUUM INTO actually wrote a usable copy.
+func TestBackupVacuumIntoProducesValidSnapshot(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+
+	snap := filepath.Join(t.TempDir(), "snap.db")
+	if err := s.Backup(ctx, snap); err != nil {
+		t.Fatalf("Backup: %v", err)
+	}
+	if _, err := os.Stat(snap); err != nil {
+		t.Fatalf("snapshot missing: %v", err)
+	}
+	s2, err := OpenWithOptions(snap, OpenOptions{DisablePreMigrationBackup: true})
+	if err != nil {
+		t.Fatalf("Open snapshot: %v", err)
+	}
+	defer s2.Close()
+	v, err := s2.GetVolumeByID(ctx, vID)
+	if err != nil {
+		t.Fatalf("snapshot missing volume row: %v", err)
+	}
+	if v.Path != "/v" {
+		t.Fatalf("snapshot volume path = %q, want /v", v.Path)
+	}
+}
+
+// TestBackupRefusesExistingPath: callers should not silently overwrite
+// an existing snapshot — every backup should be a fresh file with a
+// unique timestamp.
+func TestBackupRefusesExistingPath(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	snap := filepath.Join(t.TempDir(), "snap.db")
+	if err := os.WriteFile(snap, []byte("preexisting"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Backup(context.Background(), snap); err == nil {
+		t.Fatalf("Backup over an existing file should refuse")
+	}
+}
+
+// TestIntegrityCheckCleanDB returns ["ok"] on a fresh DB.
+func TestIntegrityCheckCleanDB(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	rows, err := s.IntegrityCheck(context.Background())
+	if err != nil {
+		t.Fatalf("IntegrityCheck: %v", err)
+	}
+	if !IsIntegrityClean(rows) {
+		t.Fatalf("rows = %v, want [ok]", rows)
+	}
+}
+
+// TestPreflightCheckSnapshotRoundTrip: Backup + PreflightCheckSnapshot
+// must read back the schema version that's currently in the live DB.
+func TestPreflightCheckSnapshotRoundTrip(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	snap := filepath.Join(t.TempDir(), "snap.db")
+	if err := s.Backup(context.Background(), snap); err != nil {
+		t.Fatalf("Backup: %v", err)
+	}
+	v, err := PreflightCheckSnapshot(context.Background(), snap)
+	if err != nil {
+		t.Fatalf("PreflightCheckSnapshot: %v", err)
+	}
+	if v != SchemaVersion {
+		t.Fatalf("snapshot version = %d, want %d", v, SchemaVersion)
+	}
+}
+
+// TestProbeLiveDBExclusiveDetectsActiveAgent: while a Store holds the
+// DB open, ProbeLiveDBExclusive must refuse to acquire the exclusive
+// lock. After the Store closes, the probe succeeds.
+func TestProbeLiveDBExclusiveDetectsActiveAgent(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	ctx := context.Background()
+	// Hold a real write open to be sure we're holding the lock.
+	if _, err := s.db.ExecContext(ctx, `CREATE TABLE probe (x INTEGER)`); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("seed tx: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO probe VALUES (1)`); err != nil {
+		t.Fatalf("seed insert: %v", err)
+	}
+	defer tx.Rollback()
+
+	if err := ProbeLiveDBExclusive(ctx, dsn); err == nil {
+		t.Fatalf("probe should refuse while a writer is active")
+	}
+
+	// Release the in-flight tx and close the store, then probe again.
+	_ = tx.Rollback()
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := ProbeLiveDBExclusive(ctx, dsn); err != nil {
+		t.Fatalf("probe on closed db: %v", err)
+	}
+}
+
+// TestMigratePreFlight verifies that opening an existing DB at an
+// older schema version produces a snapshot in the configured
+// backup directory before migrating forward.
+func TestMigratePreMigrationBackup(t *testing.T) {
+	dir := t.TempDir()
+	dsn := filepath.Join(dir, "test.db")
+	// Step 1: create a DB at v5 by hand. We use applyV5 directly to
+	// stop the chain at the baseline; the next OpenWithOptions will
+	// see current=5 and migrate forward.
+	{
+		db, err := openSQLite(buildDSN(dsn))
+		if err != nil {
+			t.Fatalf("openSQLite: %v", err)
+		}
+		if _, err := db.ExecContext(context.Background(), `CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL PRIMARY KEY)`); err != nil {
+			t.Fatalf("create schema_version: %v", err)
+		}
+		if err := applyV5(context.Background(), db); err != nil {
+			t.Fatalf("applyV5: %v", err)
+		}
+		_ = db.Close()
+	}
+
+	backupDir := filepath.Join(dir, "snapshots")
+	s, err := OpenWithOptions(dsn, OpenOptions{BackupDir: backupDir})
+	if err != nil {
+		t.Fatalf("OpenWithOptions: %v", err)
+	}
+	defer s.Close()
+
+	entries, err := os.ReadDir(backupDir)
+	if err != nil {
+		t.Fatalf("read backup dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("backup dir entries = %d, want 1: %+v", len(entries), entries)
+	}
+	if !strings.HasPrefix(entries[0].Name(), "pre-migration-v5-to-v") {
+		t.Fatalf("backup name = %q, want pre-migration-v5-to-v*", entries[0].Name())
+	}
+}

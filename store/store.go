@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -18,7 +19,19 @@ import (
 // and migrations.go.
 type Store struct {
 	db *sql.DB
+	// path is the absolute filesystem path of the live DB. Normalised
+	// via filepath.Abs at Open time; falls back to the caller-supplied
+	// value if Abs returns an error (typically a cwd-resolution issue
+	// on an exotic platform), so callers using Path() in production
+	// can safely treat it as absolute.
+	path string
 }
+
+// Path returns the absolute filesystem path of the live database file
+// as normalised at Open time. Used by the CLI's `db backup` subcommand
+// to derive a default backup directory next to the live DB, and by
+// tests that need to inspect the file directly.
+func (s *Store) Path() string { return s.path }
 
 // OpenOptions tunes Store.Open. NodeName is the identity recorded as the
 // self row in the nodes table on first migration to v6 (or beyond). An
@@ -26,6 +39,17 @@ type Store struct {
 // a config-derived name still produce a self row.
 type OpenOptions struct {
 	NodeName string
+	// BackupDir is where pre-migration snapshots land. Empty means
+	// "<dirname(path)>/backups". Tests use a custom value to keep
+	// snapshots inside t.TempDir(); production callers leave it
+	// empty so backups sit next to the live DB.
+	BackupDir string
+	// DisablePreMigrationBackup turns off the snapshot taken before
+	// each schema-advancing migration. Useful for tests that drive
+	// runMigrations directly with a fixture and don't want backup
+	// files cluttering the fixture directory; production callers
+	// should leave it false.
+	DisablePreMigrationBackup bool
 }
 
 // Open opens (or creates) the SQLite database at the given filesystem path
@@ -56,8 +80,16 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{db: db}
-	if err := s.migrate(context.Background(), nodeName); err != nil {
+	absPath, absErr := filepath.Abs(path)
+	if absErr != nil {
+		// Fall back to the verbatim path: filepath.Abs only fails when
+		// it can't resolve the cwd, which is an environmental issue,
+		// not a reason to refuse Open. The Path() accessor's doc warns
+		// the field may be relative on such platforms.
+		absPath = path
+	}
+	s := &Store{db: db, path: absPath}
+	if err := s.migrate(context.Background(), nodeName, opts); err != nil {
 		db.Close()
 		return nil, err
 	}
