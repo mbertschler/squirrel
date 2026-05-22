@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -82,6 +83,11 @@ func (s *Server) scanOneVolume(ctx context.Context, logger io.Writer, name strin
 		Kind:    store.RunKindAudit,
 		Shallow: s.cfg.ScanStrategy != ScanStrategyDeep,
 	})
+	if inFlight, ok := errors.AsType[*index.ErrAlreadyRunning](err); ok {
+		fmt.Fprintf(logger, "audit %s: skipped — %s in flight (run=%d)\n",
+			name, inFlight.Blocker.Kind, inFlight.Blocker.ID)
+		return
+	}
 	if err != nil {
 		fmt.Fprintf(logger, "audit %s: %v\n", name, err)
 		return
