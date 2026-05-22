@@ -60,13 +60,18 @@ type Run struct {
 	Shallow sql.NullBool
 }
 
-// BeginRun records the start of a run and returns its id. Callers must pair
-// it with FinishRun (typically via defer with an error pointer or an explicit
-// terminal call). volumeID must reference an existing volume. destination
-// must be a non-empty name for kind='sync' or 'restore' and the empty string
-// for kind='index' — the schema-level CHECK rejects mismatches, which
-// surfaces here as an Exec error.
+// BeginRun records the start of a sync or restore run and returns its
+// id. Callers must pair it with FinishRun (typically via defer with an
+// error pointer or an explicit terminal call). volumeID must reference
+// an existing volume; destination must be non-empty (sync/restore must
+// name an rclone target). Index and audit kinds belong on BeginIndexRun
+// — they record the shallow flag, which this entry point can't carry,
+// and the call is rejected here to keep the signal from being silently
+// dropped.
 func (s *Store) BeginRun(ctx context.Context, kind string, volumeID int64, destination string) (int64, error) {
+	if kind == RunKindIndex || kind == RunKindAudit {
+		return 0, fmt.Errorf("BeginRun: kind %q must go through BeginIndexRun so runs.shallow is recorded", kind)
+	}
 	var destVal sql.NullString
 	if destination != "" {
 		destVal = sql.NullString{String: destination, Valid: true}

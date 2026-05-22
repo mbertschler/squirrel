@@ -291,7 +291,7 @@ func TestNodeSyncResolvesConflictOnLocalWriteOnReceiver(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed receiver volume: %v", err)
 	}
-	runID, err := f.recvStore.BeginRun(ctx, store.RunKindIndex, v.ID, "")
+	runID, err := f.recvStore.BeginIndexRun(ctx, store.RunKindIndex, v.ID, false)
 	if err != nil {
 		t.Fatalf("BeginRun on receiver: %v", err)
 	}
@@ -920,7 +920,7 @@ func TestCollectIndexEntriesSkipsReservedDirs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
-	runID, err := f.initStore.BeginRun(ctx, store.RunKindIndex, v.ID, "")
+	runID, err := f.initStore.BeginIndexRun(ctx, store.RunKindIndex, v.ID, false)
 	if err != nil {
 		t.Fatalf("BeginRun: %v", err)
 	}
@@ -1349,7 +1349,7 @@ func TestPlanCopyFromExistingDirectAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetOrCreateVolume: %v", err)
 	}
-	runID, err := f.recvStore.BeginRun(ctx, store.RunKindIndex, v.ID, "")
+	runID, err := f.recvStore.BeginIndexRun(ctx, store.RunKindIndex, v.ID, false)
 	if err != nil {
 		t.Fatalf("BeginRun: %v", err)
 	}
@@ -1447,7 +1447,7 @@ func TestPlanDedupStrategyOff(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetOrCreateVolume: %v", err)
 	}
-	runID, err := f.recvStore.BeginRun(ctx, store.RunKindIndex, v.ID, "")
+	runID, err := f.recvStore.BeginIndexRun(ctx, store.RunKindIndex, v.ID, false)
 	if err != nil {
 		t.Fatalf("BeginRun: %v", err)
 	}

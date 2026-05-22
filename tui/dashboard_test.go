@@ -38,17 +38,17 @@ func TestLoadDashboardDataPartitionsRuns(t *testing.T) {
 	//   - recentRuns: every terminal run, newest first, capped at 10
 	//   - latestByVol[vol.ID]: index = most recent success, sync = the
 	//     successful one (failed audit doesn't establish "last audit")
-	finishedIdx1, _ := s.BeginRun(ctx, store.RunKindIndex, vol.ID, "")
+	finishedIdx1, _ := s.BeginIndexRun(ctx, store.RunKindIndex, vol.ID, false)
 	if err := s.FinishRun(ctx, finishedIdx1, store.RunStatusSuccess, "", 100); err != nil {
 		t.Fatalf("FinishRun: %v", err)
 	}
-	finishedIdx2, _ := s.BeginRun(ctx, store.RunKindIndex, vol.ID, "")
+	finishedIdx2, _ := s.BeginIndexRun(ctx, store.RunKindIndex, vol.ID, false)
 	if err := s.FinishRun(ctx, finishedIdx2, store.RunStatusPartial, "", 105); err != nil {
 		t.Fatalf("FinishRun: %v", err)
 	}
 	activeSync, _ := s.BeginRun(ctx, store.RunKindSync, vol.ID, "backup")
 	// leave running
-	failedAudit, _ := s.BeginRun(ctx, store.RunKindAudit, vol.ID, "")
+	failedAudit, _ := s.BeginIndexRun(ctx, store.RunKindAudit, vol.ID, false)
 	if err := s.FinishRun(ctx, failedAudit, store.RunStatusFailed, "boom", 0); err != nil {
 		t.Fatalf("FinishRun: %v", err)
 	}

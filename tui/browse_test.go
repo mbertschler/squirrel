@@ -36,7 +36,7 @@ func TestBrowseLoadPathRootListsChildrenAndFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetOrCreateVolume: %v", err)
 	}
-	run, err := s.BeginRun(ctx, store.RunKindIndex, vol.ID, "")
+	run, err := s.BeginIndexRun(ctx, store.RunKindIndex, vol.ID, false)
 	if err != nil {
 		t.Fatalf("BeginRun: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestBrowseLoadPathDescend(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 	vol, _ := s.GetOrCreateVolume(ctx, "/srv/photos")
-	run, _ := s.BeginRun(ctx, store.RunKindIndex, vol.ID, "")
+	run, _ := s.BeginIndexRun(ctx, store.RunKindIndex, vol.ID, false)
 	upsertFile(t, s, vol.ID, run, "albums/a.jpg", 0x02, 1024)
 	upsertFile(t, s, vol.ID, run, "albums/b.jpg", 0x03, 2048)
 

@@ -185,9 +185,7 @@ func (m *runsModel) renderDetail(r store.Run) string {
 		)
 	}
 	lines = append(lines, [2]string{"Files", fmt.Sprintf("%d", r.FileCount)})
-	if r.Shallow.Valid {
-		lines = append(lines, [2]string{"Shallow", shallowLabel(r.Shallow.Bool)})
-	}
+	lines = append(lines, [2]string{"Mode", shallowLabel(r.Shallow)})
 	if r.PeerNodeID.Valid {
 		lines = append(lines, [2]string{"Peer node", fmt.Sprintf("#%d", r.PeerNodeID.Int64)})
 	}
@@ -290,12 +288,16 @@ func (m *runsModel) resizeColumns() {
 }
 
 // shallowLabel renders the runs.shallow flag for the detail view as a
-// full word — the column rendering uses shallowGlyph instead.
-func shallowLabel(shallow bool) string {
-	if shallow {
-		return "yes (skipped rehash when size/mtime matched)"
+// full word. NULL stays "—" (with context) because pre-v10 history and
+// sync/restore runs have nothing honest to say about the hashing mode.
+func shallowLabel(s sql.NullBool) string {
+	if !s.Valid {
+		return styleMuted.Render("— (not recorded)")
 	}
-	return "no (rehashed every file)"
+	if s.Bool {
+		return "shallow (skipped rehash when size/mtime matched)"
+	}
+	return "full (rehashed every file)"
 }
 
 // shallowGlyph renders runs.shallow compactly for the table column.

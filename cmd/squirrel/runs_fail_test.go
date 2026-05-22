@@ -27,7 +27,7 @@ func beginRunningRun(t *testing.T, dbPath, volumeName string) int64 {
 	if err != nil {
 		t.Fatalf("GetVolumeByName %q: %v", volumeName, err)
 	}
-	runID, err := s.BeginRun(ctx, store.RunKindIndex, vol.ID, "")
+	runID, err := s.BeginIndexRun(ctx, store.RunKindIndex, vol.ID, false)
 	if err != nil {
 		t.Fatalf("BeginRun: %v", err)
 	}

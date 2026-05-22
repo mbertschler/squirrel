@@ -41,7 +41,7 @@ func makeVolume(t *testing.T, s *Store, path string) int64 {
 // when constructing FileRow literals directly.
 func makeRun(t *testing.T, s *Store, volumeID int64) int64 {
 	t.Helper()
-	id, err := s.BeginRun(context.Background(), RunKindIndex, volumeID, "")
+	id, err := s.BeginIndexRun(context.Background(), RunKindIndex, volumeID, false)
 	if err != nil {
 		t.Fatalf("BeginRun: %v", err)
 	}
@@ -561,7 +561,7 @@ func TestRunLifecycleTracks(t *testing.T) {
 	ctx := context.Background()
 
 	vID := makeVolume(t, s, "/v")
-	runID, err := s.BeginRun(ctx, RunKindIndex, vID, "")
+	runID, err := s.BeginIndexRun(ctx, RunKindIndex, vID, false)
 	if err != nil {
 		t.Fatalf("BeginRun: %v", err)
 	}
@@ -677,7 +677,7 @@ func TestFinishRunPropagatesErrorMessage(t *testing.T) {
 	ctx := context.Background()
 
 	vID := makeVolume(t, s, "/v")
-	runID, err := s.BeginRun(ctx, RunKindIndex, vID, "")
+	runID, err := s.BeginIndexRun(ctx, RunKindIndex, vID, false)
 	if err != nil {
 		t.Fatalf("BeginRun: %v", err)
 	}
@@ -1387,7 +1387,7 @@ func TestBeginRunDestinationRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	vID := makeVolume(t, s, "/v")
 
-	indexID, err := s.BeginRun(ctx, RunKindIndex, vID, "")
+	indexID, err := s.BeginIndexRun(ctx, RunKindIndex, vID, false)
 	if err != nil {
 		t.Fatalf("BeginRun index: %v", err)
 	}
@@ -1484,6 +1484,26 @@ func TestBeginIndexRunRejectsWrongKind(t *testing.T) {
 	}
 }
 
+// TestBeginRunRejectsIndexAuditKind pins the inverse: BeginRun refuses
+// index and audit so callers can't accidentally insert a row with NULL
+// shallow when the run did make a hashing-mode choice.
+func TestBeginRunRejectsIndexAuditKind(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+
+	for _, kind := range []string{RunKindIndex, RunKindAudit} {
+		if _, err := s.BeginRun(ctx, kind, vID, ""); err == nil {
+			t.Fatalf("BeginRun(%q) accepted, want error directing to BeginIndexRun", kind)
+		}
+	}
+}
+
 // TestLatestSuccessfulIndexRun confirms the prerequisite-check helper used
 // by sync: it returns the most recent success/partial index run for a
 // volume, ignoring failed runs and other kinds.
@@ -1501,10 +1521,10 @@ func TestLatestSuccessfulIndexRun(t *testing.T) {
 		t.Fatalf("expected ErrNoRows on fresh volume, got %v", err)
 	}
 
-	failID, _ := s.BeginRun(ctx, RunKindIndex, vID, "")
+	failID, _ := s.BeginIndexRun(ctx, RunKindIndex, vID, false)
 	_ = s.FinishRun(ctx, failID, RunStatusFailed, "walk: nope", 0)
 
-	okID, _ := s.BeginRun(ctx, RunKindIndex, vID, "")
+	okID, _ := s.BeginIndexRun(ctx, RunKindIndex, vID, false)
 	_ = s.FinishRun(ctx, okID, RunStatusSuccess, "", 3)
 
 	syncID, _ := s.BeginRun(ctx, RunKindSync, vID, "nas")
@@ -1539,9 +1559,9 @@ func TestLatestSuccessfulRunsByVolumeAndKind(t *testing.T) {
 	// ignored), a partial sync to one destination, and a successful sync
 	// to a different destination — the latest sync, across destinations,
 	// is what the helper should return.
-	oldIdx, _ := s.BeginRun(ctx, RunKindIndex, volA, "")
+	oldIdx, _ := s.BeginIndexRun(ctx, RunKindIndex, volA, false)
 	_ = s.FinishRun(ctx, oldIdx, RunStatusSuccess, "", 10)
-	failIdx, _ := s.BeginRun(ctx, RunKindIndex, volA, "")
+	failIdx, _ := s.BeginIndexRun(ctx, RunKindIndex, volA, false)
 	_ = s.FinishRun(ctx, failIdx, RunStatusFailed, "boom", 0)
 	syncNas, _ := s.BeginRun(ctx, RunKindSync, volA, "nas")
 	_ = s.FinishRun(ctx, syncNas, RunStatusPartial, "", 5)
@@ -1550,7 +1570,7 @@ func TestLatestSuccessfulRunsByVolumeAndKind(t *testing.T) {
 
 	// volB: only a single successful index, no sync. The map should
 	// contain the index entry but no sync entry.
-	bIdx, _ := s.BeginRun(ctx, RunKindIndex, volB, "")
+	bIdx, _ := s.BeginIndexRun(ctx, RunKindIndex, volB, false)
 	_ = s.FinishRun(ctx, bIdx, RunStatusSuccess, "", 1)
 
 	got, err := s.LatestSuccessfulRunsByVolumeAndKind(ctx)
@@ -2700,7 +2720,7 @@ func TestMigrateV6ToV7AddsAuditKind(t *testing.T) {
 	}
 
 	// New 'audit' kind inserts cleanly via BeginRun, with destination NULL.
-	auditID, err := s.BeginRun(ctx, RunKindAudit, 1, "")
+	auditID, err := s.BeginIndexRun(ctx, RunKindAudit, 1, false)
 	if err != nil {
 		t.Fatalf("BeginRun audit: %v", err)
 	}
@@ -2738,7 +2758,7 @@ func TestAuditRunWidensKindCheckOnFreshDB(t *testing.T) {
 	defer s.Close()
 	ctx := context.Background()
 	vID := makeVolume(t, s, "/v")
-	if _, err := s.BeginRun(ctx, RunKindAudit, vID, ""); err != nil {
+	if _, err := s.BeginIndexRun(ctx, RunKindAudit, vID, false); err != nil {
 		t.Fatalf("BeginRun audit on fresh DB: %v", err)
 	}
 }
@@ -2758,15 +2778,15 @@ func TestListAuditRunsSince(t *testing.T) {
 	vID := makeVolume(t, s, "/v")
 	otherID := makeVolume(t, s, "/other")
 	// A regular index run (excluded by kind).
-	_, _ = s.BeginRun(ctx, RunKindIndex, vID, "")
+	_, _ = s.BeginIndexRun(ctx, RunKindIndex, vID, false)
 	// Three audit runs on vID. Their started_at_ns is set by BeginRun
 	// to time.Now().UnixNano(); we read it back rather than synthesise.
-	r1, _ := s.BeginRun(ctx, RunKindAudit, vID, "")
+	r1, _ := s.BeginIndexRun(ctx, RunKindAudit, vID, false)
 	row1, _ := s.GetRun(ctx, r1)
-	r2, _ := s.BeginRun(ctx, RunKindAudit, vID, "")
-	r3, _ := s.BeginRun(ctx, RunKindAudit, vID, "")
+	r2, _ := s.BeginIndexRun(ctx, RunKindAudit, vID, false)
+	r3, _ := s.BeginIndexRun(ctx, RunKindAudit, vID, false)
 	// An audit run on a different volume — must not appear.
-	_, _ = s.BeginRun(ctx, RunKindAudit, otherID, "")
+	_, _ = s.BeginIndexRun(ctx, RunKindAudit, otherID, false)
 
 	got, err := s.ListAuditRunsSince(ctx, vID, 0)
 	if err != nil {
@@ -2828,7 +2848,7 @@ func TestCountModifiedFilesByRun(t *testing.T) {
 		t.Fatalf("upsert b.txt: %v", err)
 	}
 
-	auditRun, err := s.BeginRun(ctx, RunKindAudit, vID, "")
+	auditRun, err := s.BeginIndexRun(ctx, RunKindAudit, vID, false)
 	if err != nil {
 		t.Fatalf("BeginRun audit: %v", err)
 	}
@@ -2856,7 +2876,7 @@ func TestCountModifiedFilesByRun(t *testing.T) {
 	}
 
 	// A clean run (no modifications) returns zero.
-	cleanRun, _ := s.BeginRun(ctx, RunKindAudit, vID, "")
+	cleanRun, _ := s.BeginIndexRun(ctx, RunKindAudit, vID, false)
 	got, err = s.CountModifiedFilesByRun(ctx, cleanRun)
 	if err != nil {
 		t.Fatalf("CountModifiedFilesByRun clean: %v", err)
@@ -2892,7 +2912,7 @@ func TestMarkMissingStampsRunIDAndCount(t *testing.T) {
 		}
 	}
 
-	auditRun, err := s.BeginRun(ctx, RunKindAudit, vID, "")
+	auditRun, err := s.BeginIndexRun(ctx, RunKindAudit, vID, false)
 	if err != nil {
 		t.Fatalf("BeginRun audit: %v", err)
 	}
@@ -2936,7 +2956,7 @@ func TestMarkMissingStampsRunIDAndCount(t *testing.T) {
 	// (TouchSeen advances last_seen to laterRun) and re-MarkMissings
 	// the volume yields zero newly-missing rows: b.txt and c.txt are
 	// already missing, and a.txt is present.
-	laterRun, _ := s.BeginRun(ctx, RunKindAudit, vID, "")
+	laterRun, _ := s.BeginIndexRun(ctx, RunKindAudit, vID, false)
 	if err := s.TouchSeen(ctx, vID, "a.txt", laterRun); err != nil {
 		t.Fatalf("TouchSeen later: %v", err)
 	}

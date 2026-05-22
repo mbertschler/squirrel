@@ -147,9 +147,7 @@ templ runStatusPanel(row RunRow, p runevents.Progress) {
 			}
 		</dd>
 		<dt class="text-muted-foreground">Files</dt><dd class="tabular-nums">{ fmt.Sprintf("%d", row.Run.FileCount) }</dd>
-		if row.Run.Shallow.Valid {
-			<dt class="text-muted-foreground">Mode</dt><dd>@shallowBadge(row.Run.Shallow)</dd>
-		}
+		<dt class="text-muted-foreground">Mode</dt><dd>@shallowBadge(row.Run.Shallow)</dd>
 		if p.Stage != "" && p.Stage != runevents.StageDone {
 			<dt class="text-muted-foreground">Progress</dt>
 			<dd class="tabular-nums">{ progressText(p) }</dd>
