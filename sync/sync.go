@@ -162,7 +162,7 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 	}
 
 	err = runRcloneOperation(ctx, s, rcl, opts.DryRun, runID, &rep, opts.Progress,
-		func(runID int64) []string {
+		func(runID int64) ([]string, error) {
 			return buildRcloneArgs(vol, dest, runID, opts)
 		})
 	return rep, err
@@ -202,14 +202,24 @@ func runRcloneOperation(
 	runID int64,
 	rep *Report,
 	progress func(runevents.Progress),
-	buildArgs func(runID int64) []string,
+	buildArgs func(runID int64) ([]string, error),
 ) (err error) {
 	rep.RunID = runID
 	defer func() {
 		finishRun(ctx, s, dryRun, runID, rep)
 	}()
 
-	rep.RcloneResult, err = rcl.RunWithProgress(ctx, progress, buildArgs(runID)...)
+	args, err := buildArgs(runID)
+	if err != nil {
+		// Synthesise a FailedFile entry so the deferred finishRun
+		// writes a meaningful err message into the runs row — otherwise
+		// `squirrel runs` shows "failed" with no reason, hiding the
+		// (e.g.) runID=0 guard from forensic readers.
+		rep.RcloneResult.FatalError = true
+		rep.RcloneResult.FailedFiles = []FailedFile{{Message: err.Error()}}
+		return err
+	}
+	rep.RcloneResult, err = rcl.RunWithProgress(ctx, progress, args...)
 	if err != nil && rep.RcloneResult.Errors == 0 && !rep.RcloneResult.FatalError {
 		// Invocation failed without a parseable error count: treat as fatal.
 		rep.RcloneResult.FatalError = true
@@ -304,7 +314,16 @@ func deriveStatus(r RunResult) string {
 // Layout reminder: the source is the absolute volume path; the destination
 // is <dest>:<root>/<volume>/, with .squirrel-history living *inside* that
 // per-volume subtree so the destination is fully self-describing.
-func buildRcloneArgs(vol *config.Volume, dest *config.Destination, runID int64, opts Options) []string {
+//
+// A real (non-dry-run) sync must carry a non-zero runID — the backup-dir
+// uses it to bucket overwritten files into run-<id>/, and runID=0 would
+// collide every overwrite into the run-dry-run/ placeholder bucket. The
+// allocator guarantees this today, but we refuse here as a defensive
+// guard against any future regression that bypasses the allocator.
+func buildRcloneArgs(vol *config.Volume, dest *config.Destination, runID int64, opts Options) ([]string, error) {
+	if !opts.DryRun && runID == 0 {
+		return nil, fmt.Errorf("sync: refusing to build rclone args with runID=0 outside dry-run mode")
+	}
 	srcArg := withTrailingSlash(vol.Path)
 	dstArg := destinationVolumeURI(dest, vol.Name)
 	backupDir := backupDirURI(dest, vol.Name, runID, opts.DryRun)
@@ -326,7 +345,7 @@ func buildRcloneArgs(vol *config.Volume, dest *config.Destination, runID int64, 
 		args = append(args, "--dry-run")
 	}
 	args = append(args, srcArg, dstArg)
-	return args
+	return args, nil
 }
 
 // withTrailingSlash ensures the path ends in '/'. rclone treats
@@ -508,8 +527,8 @@ func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volum
 	}
 
 	err = runRcloneOperation(ctx, s, rcl, opts.DryRun, runID, &rep, nil,
-		func(_ int64) []string {
-			return buildRestoreArgs(vol, dest, opts)
+		func(_ int64) ([]string, error) {
+			return buildRestoreArgs(vol, dest, opts), nil
 		})
 	return rep, err
 }
