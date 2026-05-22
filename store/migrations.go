@@ -120,9 +120,13 @@ func (s *Store) preMigrationBackup(ctx context.Context, fromVersion int, backupD
 	if backupDir == "" {
 		backupDir = defaultBackupDir(s.path)
 	}
+	// Millisecond precision so two processes (e.g. CLI + agent) that
+	// race through Open in the same second can't collide on the same
+	// snapshot filename — Backup refuses to overwrite, and a collision
+	// would make Open fail in a confusing way.
 	name := fmt.Sprintf("pre-migration-v%d-to-v%d-%s.db",
 		fromVersion, SchemaVersion,
-		time.Now().UTC().Format("20060102T150405Z"))
+		time.Now().UTC().Format("20060102T150405.000Z"))
 	return s.Backup(ctx, filepath.Join(backupDir, name))
 }
 

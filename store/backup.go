@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -72,14 +73,16 @@ func IsIntegrityClean(rows []string) bool {
 }
 
 // ProbeLiveDBExclusive opens livePath without running migrations and
-// attempts to start an EXCLUSIVE transaction. The transaction is
-// immediately rolled back; the only point is to detect whether
-// another process holds the DB open. SQLite's POSIX advisory locking
-// handles this without needing flock or pidfiles.
+// attempts to acquire the SQLite write lock via `BEGIN IMMEDIATE`. The
+// transaction is rolled back immediately; the only point is to detect
+// whether another process holds the DB open. SQLite's POSIX advisory
+// locking handles this without needing flock or pidfiles.
 //
 // A nil return means the lock was obtained (and released) — nobody
-// else has the DB open. A non-nil return means someone does
-// (typically the running agent). The check is racy with respect to a
+// else has the DB open. ErrLiveDBInUse wraps the underlying SQLite
+// error (typically SQLITE_BUSY) so callers can distinguish a real
+// lock contention from a non-lock failure (corruption, permission,
+// invalid DB) via errors.Is. The check is racy with respect to a
 // process that opens the DB right after the lock is released; the
 // caller should follow up with the file-system swap quickly.
 func ProbeLiveDBExclusive(ctx context.Context, livePath string) error {
@@ -97,13 +100,12 @@ func ProbeLiveDBExclusive(ctx context.Context, livePath string) error {
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(1)
-	// BEGIN IMMEDIATE acquires the SQLite write lock without
-	// requiring an open transaction first. In WAL mode this succeeds
-	// only if no other process holds the write lock. The short
-	// busy_timeout above keeps us from blocking on a contended live
-	// agent.
+	// BEGIN IMMEDIATE acquires the SQLite write lock without requiring
+	// an open transaction first. In WAL mode this succeeds only if no
+	// other process holds the write lock. The short busy_timeout above
+	// keeps us from blocking on a contended live agent.
 	if _, err := db.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
-		return fmt.Errorf("live db is in use by another process")
+		return fmt.Errorf("%w: %w", ErrLiveDBInUse, err)
 	}
 	if _, err := db.ExecContext(ctx, `ROLLBACK`); err != nil {
 		// Best-effort cleanup — the probe is read-only so leaving the
@@ -113,12 +115,20 @@ func ProbeLiveDBExclusive(ctx context.Context, livePath string) error {
 	return nil
 }
 
-// PreflightCheckSnapshot reads dstPath as a candidate snapshot
-// (a SQLite database) and verifies it is openable, syntactically a
-// valid squirrel database, and at the same schema version as the
-// running binary. Returns the snapshot's schema version on success;
-// the caller is responsible for any further compatibility decisions.
-// Does not modify the live DB or the snapshot.
+// ErrLiveDBInUse is the sentinel ProbeLiveDBExclusive wraps when the
+// SQLite write lock is held by another process. Callers can errors.Is
+// against this to keep the friendly "in use" diagnostic for lock
+// contention while preserving the underlying error for everything
+// else.
+var ErrLiveDBInUse = errors.New("live db is in use by another process")
+
+// PreflightCheckSnapshot reads snapshotPath as a candidate snapshot
+// (a SQLite database) and verifies it is openable and syntactically a
+// squirrel database — i.e. it has a non-empty schema_version table.
+// Returns the snapshot's schema version on success; the caller is
+// responsible for comparing it against store.SchemaVersion and
+// deciding whether to refuse a restore. Does not modify the live DB
+// or the snapshot.
 func PreflightCheckSnapshot(ctx context.Context, snapshotPath string) (int, error) {
 	if _, err := os.Stat(snapshotPath); err != nil {
 		return 0, fmt.Errorf("snapshot %s: %w", snapshotPath, err)

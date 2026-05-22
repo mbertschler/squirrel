@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -155,9 +156,15 @@ func runDBRestore(cmd *cobra.Command, snapshotPath string, force bool) error {
 		// Try to open the live DB exclusively to detect a running
 		// agent / concurrent CLI. Skipped under --force so a stuck
 		// lockfile (or a deliberately overridden constraint) can
-		// be worked around.
-		if err := store.ProbeLiveDBExclusive(cmd.Context(), liveAbs); err != nil {
+		// be worked around. We split lock-contention from other
+		// errors (corruption, permission, invalid DB) so the
+		// "in use" hint isn't slapped on diagnostics it doesn't fit.
+		err := store.ProbeLiveDBExclusive(cmd.Context(), liveAbs)
+		if errors.Is(err, store.ErrLiveDBInUse) {
 			return fmt.Errorf("%w (pass --force to skip this check after confirming nothing else holds the DB open)", err)
+		}
+		if err != nil {
+			return fmt.Errorf("probe live db: %w", err)
 		}
 	}
 
