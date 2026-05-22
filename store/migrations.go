@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"time"
 )
@@ -57,7 +58,16 @@ type migrationCtx struct {
 // migrate brings the database from whatever version it is at up to
 // SchemaVersion. Refuses futures and the obsolete v1 schema. A fresh
 // database (current == 0) jumps to the baseline then steps forward.
-func (s *Store) migrate(ctx context.Context, nodeName string) error {
+//
+// Before any schema-advancing migration runs against an existing
+// database, migrate takes an online snapshot via VACUUM INTO and lands
+// it under opts.BackupDir (or "<dirname(s.path)>/backups" by default).
+// The snapshot is the rollback surface if a migration commits bad
+// state or walks over pre-existing corruption — the SQLite transaction
+// would only roll back failed migrations, not buggy-but-successful
+// ones. Fresh databases (current == 0) skip the snapshot because
+// there's nothing to lose.
+func (s *Store) migrate(ctx context.Context, nodeName string, opts OpenOptions) error {
 	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL PRIMARY KEY)`); err != nil {
 		return fmt.Errorf("create schema_version: %w", err)
 	}
@@ -73,15 +83,54 @@ func (s *Store) migrate(ctx context.Context, nodeName string) error {
 	if current == 1 {
 		return fmt.Errorf("database schema version 1 is no longer supported (binary expects v%d); delete the database and re-index", SchemaVersion)
 	}
-	if current == 0 {
+	freshDB := current == 0
+	if freshDB {
 		if err := applyV5(ctx, s.db); err != nil {
 			return fmt.Errorf("apply schema v%d: %w", freshSchemaBaseline, err)
 		}
 		current = freshSchemaBaseline
 	}
 
+	// Take a pre-migration snapshot only when an *existing* database is
+	// about to step forward. A fresh DB has nothing worth snapshotting
+	// (the applyV5 baseline plus the chain to SchemaVersion produces a
+	// completely synthetic DB), and avoiding the snapshot keeps the
+	// "open a temp DB for a test" path free of side files.
+	if !freshDB && current < SchemaVersion && !opts.DisablePreMigrationBackup {
+		if err := s.preMigrationBackup(ctx, current, opts.BackupDir); err != nil {
+			return fmt.Errorf("pre-migration snapshot: %w", err)
+		}
+	}
+
 	_, err = runMigrations(ctx, s.db, current, buildMigrations(migrationCtx{nodeName: nodeName}))
 	return err
+}
+
+// preMigrationBackup writes a snapshot of the current DB to
+// backupDir before the schema is advanced. The filename encodes the
+// from/to versions and an ISO8601 timestamp so a backups/ directory
+// can carry multiple snapshots (different upgrade points) without
+// collisions.
+func (s *Store) preMigrationBackup(ctx context.Context, fromVersion int, backupDir string) error {
+	if s.path == "" {
+		// migrate() was invoked without a path — e.g. in-memory test;
+		// nothing to snapshot to.
+		return nil
+	}
+	if backupDir == "" {
+		backupDir = defaultBackupDir(s.path)
+	}
+	name := fmt.Sprintf("pre-migration-v%d-to-v%d-%s.db",
+		fromVersion, SchemaVersion,
+		time.Now().UTC().Format("20060102T150405Z"))
+	return s.Backup(ctx, filepath.Join(backupDir, name))
+}
+
+// defaultBackupDir returns "<dirname(dbPath)>/backups", the sibling
+// directory the CLI uses for both pre-migration snapshots and manual
+// `db backup` snapshots when --to is unset.
+func defaultBackupDir(dbPath string) string {
+	return filepath.Join(filepath.Dir(dbPath), "backups")
 }
 
 // runMigrations applies every migration whose version > current in order,

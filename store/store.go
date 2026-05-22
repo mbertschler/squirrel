@@ -17,8 +17,15 @@ import (
 // hangs off it; per-domain methods live in volumes.go, files.go, runs.go,
 // and migrations.go.
 type Store struct {
-	db *sql.DB
+	db   *sql.DB
+	path string // absolute path of the live DB file (post-validateDBPath)
 }
+
+// Path returns the absolute filesystem path of the live database
+// file. Used by the CLI's `db backup` subcommand to derive a default
+// backup directory next to the live DB, and by tests that need to
+// inspect the file directly.
+func (s *Store) Path() string { return s.path }
 
 // OpenOptions tunes Store.Open. NodeName is the identity recorded as the
 // self row in the nodes table on first migration to v6 (or beyond). An
@@ -26,6 +33,17 @@ type Store struct {
 // a config-derived name still produce a self row.
 type OpenOptions struct {
 	NodeName string
+	// BackupDir is where pre-migration snapshots land. Empty means
+	// "<dirname(path)>/backups". Tests use a custom value to keep
+	// snapshots inside t.TempDir(); production callers leave it
+	// empty so backups sit next to the live DB.
+	BackupDir string
+	// DisablePreMigrationBackup turns off the snapshot taken before
+	// each schema-advancing migration. Useful for tests that drive
+	// runMigrations directly with a fixture and don't want backup
+	// files cluttering the fixture directory; production callers
+	// should leave it false.
+	DisablePreMigrationBackup bool
 }
 
 // Open opens (or creates) the SQLite database at the given filesystem path
@@ -56,8 +74,8 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{db: db}
-	if err := s.migrate(context.Background(), nodeName); err != nil {
+	s := &Store{db: db, path: path}
+	if err := s.migrate(context.Background(), nodeName, opts); err != nil {
 		db.Close()
 		return nil, err
 	}
