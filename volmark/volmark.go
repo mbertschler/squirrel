@@ -24,13 +24,18 @@ import (
 const MarkerName = ".squirrel-volume"
 
 // Marker is the parsed contents of a .squirrel-volume file. Volume
-// is the only field consulted for validation; Node, Version, and
-// CreatedAt are forensic metadata so an operator inspecting the
-// marker later can answer "who initialised this directory and when?"
+// is the only field consulted for validation; Node and CreatedAt are
+// forensic metadata so an operator inspecting the marker later can
+// answer "who initialised this directory and when?"
+//
+// A binary-version field was considered but dropped: squirrel doesn't
+// plumb a build-time version string today, and an always-empty field
+// on every marker would be misleading documentation. If/when a real
+// version is available, add it back here and stamp it at every Write
+// call site.
 type Marker struct {
 	Volume    string `json:"volume"`
 	Node      string `json:"node,omitempty"`
-	Version   string `json:"version,omitempty"`
 	CreatedAt string `json:"created_at,omitempty"`
 }
 

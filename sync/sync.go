@@ -333,7 +333,7 @@ func validateLocalVolumeMarker(vol *config.Volume) error {
 		return nil
 	}
 	if errors.Is(err, volmark.ErrMissing) {
-		return fmt.Errorf("volume %q at %s has no .squirrel-volume marker — refusing to restore (run `squirrel index %s` first or use `--to <scratch>` to restore elsewhere)", vol.Name, vol.Path, vol.Name)
+		return fmt.Errorf("volume %q at %s has no %s marker — refusing to restore (run `squirrel index %s` first or use `--to <scratch>` to restore elsewhere)", vol.Name, vol.Path, volmark.MarkerName, vol.Name)
 	}
 	if _, ok := errors.AsType[*volmark.ErrMismatch](err); ok {
 		return fmt.Errorf("volume %q: %w (refusing to restore over a different volume's tree)", vol.Name, err)
@@ -366,7 +366,7 @@ func ensureDestinationMarker(ctx context.Context, s *store.Store, dest *config.D
 		return fmt.Errorf("destination %q marker check: %w", dest.Name, err)
 	}
 	if !init {
-		return fmt.Errorf("destination %q at %s has no .squirrel-volume marker — re-run with --init to bootstrap (refusing in case the root is a typo)", dest.Name, root)
+		return fmt.Errorf("destination %q at %s has no %s marker — re-run with --init to bootstrap (refusing in case the root is a typo)", dest.Name, root, volmark.MarkerName)
 	}
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return fmt.Errorf("destination %q: mkdir %s: %w", dest.Name, root, err)

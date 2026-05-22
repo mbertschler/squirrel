@@ -18,7 +18,7 @@ func TestReadMissingReturnsSentinel(t *testing.T) {
 
 func TestWriteThenReadRoundTrip(t *testing.T) {
 	root := t.TempDir()
-	want := Marker{Volume: "pics", Node: "laptop", Version: "v8", CreatedAt: "2026-05-22T15:00:00Z"}
+	want := Marker{Volume: "pics", Node: "laptop", CreatedAt: "2026-05-22T15:00:00Z"}
 	if err := Write(root, want); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
@@ -26,7 +26,7 @@ func TestWriteThenReadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
-	if got.Volume != want.Volume || got.Node != want.Node || got.Version != want.Version || got.CreatedAt != want.CreatedAt {
+	if got.Volume != want.Volume || got.Node != want.Node || got.CreatedAt != want.CreatedAt {
 		t.Fatalf("round-trip mismatch: got %+v, want %+v", got, want)
 	}
 }
