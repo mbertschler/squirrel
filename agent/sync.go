@@ -779,10 +779,20 @@ func (r *peerSyncRouter) preStageCopyFromExisting(sess *peerSession) error {
 				return fmt.Errorf("mkdir history for %s: %w", relPath, err)
 			}
 			if err := os.Rename(dstAbs, histDst); err != nil {
-				rollback()
-				return fmt.Errorf("preserve out-of-band %s → %s: %w", relPath, histDst, err)
+				// Tolerate a concurrent unlink of dstAbs between Lstat
+				// and Rename: the file we wanted to preserve is gone,
+				// so the copy-from-existing path can proceed against
+				// the (now empty) destination as if no out-of-band
+				// file had ever been there. Mirrors preMoveSupersedes,
+				// which silently continues on ErrNotExist for the
+				// same reason.
+				if !errors.Is(err, os.ErrNotExist) {
+					rollback()
+					return fmt.Errorf("preserve out-of-band %s → %s: %w", relPath, histDst, err)
+				}
+			} else {
+				preserved = append(preserved, preservedMove{histAbs: histDst, dstAbs: dstAbs})
 			}
-			preserved = append(preserved, preservedMove{histAbs: histDst, dstAbs: dstAbs})
 		} else if !errors.Is(err, os.ErrNotExist) {
 			rollback()
 			return fmt.Errorf("stat dst %s: %w", relPath, err)

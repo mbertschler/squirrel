@@ -1711,8 +1711,8 @@ func TestNodeSyncCopyFromExistingPreservesOutOfBandFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("glob history: %v", err)
 	}
-	if len(matches) == 0 {
-		t.Fatalf("no history copy of pets/a.jpg under %s", histRoot)
+	if len(matches) != 1 {
+		t.Fatalf("history glob = %d match(es) under %s, want exactly 1: %+v", len(matches), histRoot, matches)
 	}
 	preserved, err := os.ReadFile(matches[0])
 	if err != nil {
