@@ -1,0 +1,61 @@
+package templates
+
+// NavItem is one entry in the sidebar nav. Kept on the layout package so
+// every page can render the same nav element without redeclaring the type.
+type NavItem struct {
+	Label  string
+	Href   string
+	Active bool
+}
+
+// Layout renders the application shell shared by every full-page response.
+// Frame-only responses (Turbo navigations within a frame) bypass it and
+// render only the targeted partial.
+templ Layout(title string, nav []NavItem) {
+	<!DOCTYPE html>
+	<html lang="en">
+		<head>
+			<meta charset="utf-8"/>
+			<meta name="viewport" content="width=device-width, initial-scale=1"/>
+			<title>{ title } · Squirrel</title>
+			<link rel="stylesheet" href="/static/app.css"/>
+			<script src="/static/app.js" defer></script>
+		</head>
+		<body class="min-h-screen bg-background text-foreground antialiased">
+			<div class="flex min-h-screen">
+				@sidebar(nav)
+				<main class="flex-1 overflow-auto">
+					{ children... }
+				</main>
+			</div>
+		</body>
+	</html>
+}
+
+templ sidebar(items []NavItem) {
+	<aside class="w-56 shrink-0 border-r border-border bg-sidebar text-sidebar-foreground">
+		<div class="flex h-14 items-center gap-2 border-b border-border px-4 font-semibold">
+			<span class="text-base">Squirrel</span>
+		</div>
+		<nav class="flex flex-col gap-1 p-2">
+			for _, it := range items {
+				if it.Active {
+					<a href={ templ.URL(it.Href) } class="rounded-md px-3 py-2 text-sm font-medium bg-sidebar-accent text-sidebar-accent-foreground">{ it.Label }</a>
+				} else {
+					<a href={ templ.URL(it.Href) } class="rounded-md px-3 py-2 text-sm font-medium hover:bg-sidebar-accent/50">{ it.Label }</a>
+				}
+			}
+		</nav>
+	</aside>
+}
+
+// PageHeader is the standard top-of-page banner with a title and an
+// optional subtitle. Pages put their own content below it.
+templ PageHeader(title, subtitle string) {
+	<header class="border-b border-border bg-background/95 px-6 py-4 backdrop-blur sticky top-0 z-10">
+		<h1 class="text-xl font-semibold leading-tight">{ title }</h1>
+		if subtitle != "" {
+			<p class="text-sm text-muted-foreground mt-0.5">{ subtitle }</p>
+		}
+	</header>
+}

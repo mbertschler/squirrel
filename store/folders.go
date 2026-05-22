@@ -34,6 +34,11 @@ func init() {
 // nullable in storage so the migration can seed rows in two passes, but in
 // steady state on a fully-seeded volume they are always non-NULL — the empty
 // folder hash is well-defined (keyed hash of the empty input).
+//
+// FileCount and CumulativeSize are aggregates over the live (status='present')
+// file set within this folder and all of its descendants. They are maintained
+// in the same closure walk that updates the Merkle hashes; on a fully-seeded
+// volume they are always non-negative and consistent with the files table.
 type Folder struct {
 	ID               int64
 	VolumeID         int64
@@ -41,6 +46,8 @@ type Folder struct {
 	Path             string
 	ShallowBlake3    []byte
 	DeepBlake3       []byte
+	FileCount        int64
+	CumulativeSize   int64
 	LastChangedRunID sql.NullInt64
 }
 
@@ -156,12 +163,16 @@ func getOrCreateFolderTx(ctx context.Context, tx *sql.Tx, volumeID int64, path s
 	return id, nil
 }
 
+// folderSelectColumns is the projection used by every folders read. Pair
+// every new SELECT with this list and scanFolderInto below so the column
+// order stays in lockstep across single-row and multi-row reads.
+const folderSelectColumns = `id, volume_id, parent_id, path, shallow_blake3, deep_blake3, file_count, cumulative_size, last_changed_run_id`
+
 // GetFolderByPath returns the folder row at (volumeID, path). Returns
 // sql.ErrNoRows when no such folder exists.
 func (s *Store) GetFolderByPath(ctx context.Context, volumeID int64, path string) (Folder, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, volume_id, parent_id, path, shallow_blake3, deep_blake3, last_changed_run_id
-		 FROM folders WHERE volume_id = ? AND path = ?`,
+		`SELECT `+folderSelectColumns+` FROM folders WHERE volume_id = ? AND path = ?`,
 		volumeID, path)
 	return scanFolder(row)
 }
@@ -174,8 +185,7 @@ func (s *Store) GetFolderByPath(ctx context.Context, volumeID int64, path string
 // the empty slice when parentID has no children.
 func (s *Store) ListChildFolders(ctx context.Context, parentID int64) ([]Folder, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, volume_id, parent_id, path, shallow_blake3, deep_blake3, last_changed_run_id
-		 FROM folders WHERE parent_id = ?
+		`SELECT `+folderSelectColumns+` FROM folders WHERE parent_id = ?
 		 ORDER BY path`,
 		parentID)
 	if err != nil {
@@ -185,7 +195,7 @@ func (s *Store) ListChildFolders(ctx context.Context, parentID int64) ([]Folder,
 	var out []Folder
 	for rows.Next() {
 		var f Folder
-		if err := rows.Scan(&f.ID, &f.VolumeID, &f.ParentID, &f.Path, &f.ShallowBlake3, &f.DeepBlake3, &f.LastChangedRunID); err != nil {
+		if err := scanFolderInto(rows, &f); err != nil {
 			return nil, fmt.Errorf("scan child folder: %w", err)
 		}
 		out = append(out, f)
@@ -196,16 +206,20 @@ func (s *Store) ListChildFolders(ctx context.Context, parentID int64) ([]Folder,
 // GetFolderByID returns the folder row by primary key.
 func (s *Store) GetFolderByID(ctx context.Context, id int64) (Folder, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, volume_id, parent_id, path, shallow_blake3, deep_blake3, last_changed_run_id
-		 FROM folders WHERE id = ?`,
-		id)
+		`SELECT `+folderSelectColumns+` FROM folders WHERE id = ?`, id)
 	return scanFolder(row)
 }
 
 func scanFolder(row *sql.Row) (Folder, error) {
 	var f Folder
-	err := row.Scan(&f.ID, &f.VolumeID, &f.ParentID, &f.Path, &f.ShallowBlake3, &f.DeepBlake3, &f.LastChangedRunID)
+	err := scanFolderInto(row, &f)
 	return f, err
+}
+
+func scanFolderInto(s rowScanner, f *Folder) error {
+	return s.Scan(&f.ID, &f.VolumeID, &f.ParentID, &f.Path,
+		&f.ShallowBlake3, &f.DeepBlake3, &f.FileCount, &f.CumulativeSize,
+		&f.LastChangedRunID)
 }
 
 // ComputeShallowHash is the canonical shallow_blake3 over the live direct
@@ -328,19 +342,30 @@ func recomputeFoldersClosure(ctx context.Context, tx *sql.Tx, leafIDs map[int64]
 	sort.Slice(order, func(i, j int) bool { return depthOf(order[i]) > depthOf(order[j]) })
 
 	for _, id := range order {
-		shallow, err := computeShallowForFolderTx(ctx, tx, id)
-		if err != nil {
-			return err
-		}
-		deep, err := computeDeepForFolderTx(ctx, tx, id, shallow)
-		if err != nil {
-			return err
-		}
-		if err := writeFolderHashesTx(ctx, tx, id, shallow, deep, runID); err != nil {
+		if err := recomputeOneFolder(ctx, tx, id, runID); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// recomputeOneFolder reads the current live state of one folder (direct
+// files and direct child folders), derives every aggregate (shallow +
+// deep Merkle hashes, file_count, cumulative_size), and writes them in
+// one UPDATE. The caller is responsible for visiting descendants before
+// their parents so a folder's `child` aggregates (deep hash, counts)
+// are already current when this runs.
+func recomputeOneFolder(ctx context.Context, tx *sql.Tx, folderID, runID int64) error {
+	shallow, directFiles, directSize, err := computeShallowAndDirectAggregatesTx(ctx, tx, folderID)
+	if err != nil {
+		return err
+	}
+	deep, childFiles, childSize, err := computeDeepAndChildAggregatesTx(ctx, tx, folderID, shallow)
+	if err != nil {
+		return err
+	}
+	return writeFolderStateTx(ctx, tx, folderID, shallow, deep,
+		directFiles+childFiles, directSize+childSize, runID)
 }
 
 // recomputeFolderAndAncestors recomputes shallow and deep hashes for the
@@ -359,15 +384,7 @@ func recomputeFolderAndAncestors(ctx context.Context, tx *sql.Tx, folderID int64
 			`SELECT parent_id FROM folders WHERE id = ?`, folderID).Scan(&parentID); err != nil {
 			return fmt.Errorf("lookup folder %d: %w", folderID, err)
 		}
-		shallow, err := computeShallowForFolderTx(ctx, tx, folderID)
-		if err != nil {
-			return err
-		}
-		deep, err := computeDeepForFolderTx(ctx, tx, folderID, shallow)
-		if err != nil {
-			return err
-		}
-		if err := writeFolderHashesTx(ctx, tx, folderID, shallow, deep, runID); err != nil {
+		if err := recomputeOneFolder(ctx, tx, folderID, runID); err != nil {
 			return err
 		}
 		if !parentID.Valid {
@@ -378,70 +395,81 @@ func recomputeFolderAndAncestors(ctx context.Context, tx *sql.Tx, folderID int64
 	return nil
 }
 
-// computeShallowForFolderTx reads the live direct file children of one
-// folder inside the open transaction and returns the canonical shallow
-// digest. An empty folder yields the keyed hash of the empty input — a
-// well-defined value, never NULL.
-func computeShallowForFolderTx(ctx context.Context, tx *sql.Tx, folderID int64) ([]byte, error) {
+// computeShallowAndDirectAggregatesTx reads the live direct file children
+// of one folder inside the open transaction and returns the canonical
+// shallow digest along with (count, sumSize) over the same rows. An
+// empty folder yields the keyed hash of the empty input — a well-defined
+// value, never NULL — and zero aggregates.
+func computeShallowAndDirectAggregatesTx(ctx context.Context, tx *sql.Tx, folderID int64) ([]byte, int64, int64, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT name, blake3 FROM files
+		`SELECT name, blake3, size_bytes FROM files
 		 WHERE folder_id = ? AND status = 'present'
 		 ORDER BY name`,
 		folderID)
 	if err != nil {
-		return nil, fmt.Errorf("read folder %d files: %w", folderID, err)
+		return nil, 0, 0, fmt.Errorf("read folder %d files: %w", folderID, err)
 	}
 	defer rows.Close()
 	var entries []ShallowEntry
+	var count, sumSize int64
 	for rows.Next() {
 		var e ShallowEntry
-		if err := rows.Scan(&e.Name, &e.Blake3); err != nil {
-			return nil, fmt.Errorf("scan folder %d files: %w", folderID, err)
+		var size int64
+		if err := rows.Scan(&e.Name, &e.Blake3, &size); err != nil {
+			return nil, 0, 0, fmt.Errorf("scan folder %d files: %w", folderID, err)
 		}
 		entries = append(entries, e)
+		count++
+		sumSize += size
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, 0, 0, err
 	}
-	return ComputeShallowHash(entries), nil
+	return ComputeShallowHash(entries), count, sumSize, nil
 }
 
-// computeDeepForFolderTx folds shallow with the deep hashes of direct
-// child folders inside the open transaction. Children that still carry a
-// NULL deep_blake3 (uninitialised on this volume — e.g. a fresh ancestor
-// row whose subtree has no files yet) are folded with the empty-input
-// keyed hash so the input is always 32 bytes and the parent hash stays
-// stable.
-func computeDeepForFolderTx(ctx context.Context, tx *sql.Tx, folderID int64, shallow []byte) ([]byte, error) {
+// computeDeepAndChildAggregatesTx folds the shallow hash with the deep
+// hashes of direct child folders, and sums each child's already-stored
+// (file_count, cumulative_size). Children that still carry a NULL
+// deep_blake3 (uninitialised — e.g. a fresh ancestor row whose subtree
+// has no files yet) are folded with the empty-input keyed hash so the
+// hash input is always 32 bytes and the parent hash stays stable. The
+// child aggregates default to zero in the same case (NULLs cannot happen
+// after migration because the columns are NOT NULL DEFAULT 0).
+func computeDeepAndChildAggregatesTx(ctx context.Context, tx *sql.Tx, folderID int64, shallow []byte) ([]byte, int64, int64, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT path, deep_blake3 FROM folders
+		`SELECT path, deep_blake3, file_count, cumulative_size FROM folders
 		 WHERE parent_id = ?
 		 ORDER BY path`,
 		folderID)
 	if err != nil {
-		return nil, fmt.Errorf("read child folders of %d: %w", folderID, err)
+		return nil, 0, 0, fmt.Errorf("read child folders of %d: %w", folderID, err)
 	}
 	defer rows.Close()
 	var children []ChildFolder
+	var childFiles, childSize int64
 	emptyDeep := ComputeShallowHash(nil)
 	for rows.Next() {
 		var path string
 		var deep []byte
-		if err := rows.Scan(&path, &deep); err != nil {
-			return nil, fmt.Errorf("scan child folders of %d: %w", folderID, err)
+		var fileCount, cumSize int64
+		if err := rows.Scan(&path, &deep, &fileCount, &cumSize); err != nil {
+			return nil, 0, 0, fmt.Errorf("scan child folders of %d: %w", folderID, err)
 		}
 		if deep == nil {
 			deep = emptyDeep
 		}
 		children = append(children, ChildFolder{Name: folderName(path), DeepBlake3: deep})
+		childFiles += fileCount
+		childSize += cumSize
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, 0, 0, err
 	}
-	return ComputeDeepHash(shallow, children), nil
+	return ComputeDeepHash(shallow, children), childFiles, childSize, nil
 }
 
-func writeFolderHashesTx(ctx context.Context, tx *sql.Tx, folderID int64, shallow, deep []byte, runID int64) error {
+func writeFolderStateTx(ctx context.Context, tx *sql.Tx, folderID int64, shallow, deep []byte, fileCount, cumulativeSize int64, runID int64) error {
 	var runIDArg any
 	if runID > 0 {
 		runIDArg = runID
@@ -449,11 +477,12 @@ func writeFolderHashesTx(ctx context.Context, tx *sql.Tx, folderID int64, shallo
 		runIDArg = nil
 	}
 	_, err := tx.ExecContext(ctx,
-		`UPDATE folders SET shallow_blake3 = ?, deep_blake3 = ?, last_changed_run_id = ?
+		`UPDATE folders SET shallow_blake3 = ?, deep_blake3 = ?,
+		   file_count = ?, cumulative_size = ?, last_changed_run_id = ?
 		 WHERE id = ?`,
-		shallow, deep, runIDArg, folderID)
+		shallow, deep, fileCount, cumulativeSize, runIDArg, folderID)
 	if err != nil {
-		return fmt.Errorf("update folder %d hashes: %w", folderID, err)
+		return fmt.Errorf("update folder %d state: %w", folderID, err)
 	}
 	return nil
 }

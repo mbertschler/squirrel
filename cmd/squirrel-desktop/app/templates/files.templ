@@ -1,0 +1,67 @@
+package templates
+
+import (
+	"fmt"
+
+	"github.com/mbertschler/squirrel/store"
+)
+
+// FileDetail collects everything the per-hash view needs. Live and
+// History are partitioned subsets of the same GetByBlake3 result so the
+// template doesn't have to filter inline.
+type FileDetail struct {
+	Hash    string
+	Live    []store.FileWithVolume
+	History []store.FileWithVolume
+	BackTo  string
+}
+
+templ FileDetailPage(d FileDetail) {
+	@PageHeader("File", shortHash(d.Hash))
+	<section class="p-6 space-y-6">
+		<div class="card p-4">
+			<div class="text-xs uppercase tracking-wide text-muted-foreground">BLAKE3</div>
+			<code class="text-xs break-all">{ d.Hash }</code>
+		</div>
+		@fileLocations("Live locations", "Paths where this content is currently tracked.", d.Live)
+		@fileLocations("History", "Superseded rows that once held this content.", d.History)
+		<a class="btn btn-outline btn-sm" href={ templ.URL(d.BackTo) }>Back</a>
+	</section>
+}
+
+templ fileLocations(title, subtitle string, files []store.FileWithVolume) {
+	<div class="card overflow-hidden">
+		<header class="card-header">
+			<h2 class="text-base font-semibold">{ title }</h2>
+			<p class="text-sm text-muted-foreground">{ subtitle }</p>
+		</header>
+		if len(files) == 0 {
+			<p class="px-4 py-6 text-center text-muted-foreground">None.</p>
+		} else {
+			<table class="w-full text-sm">
+				<thead class="text-left text-xs uppercase tracking-wide text-muted-foreground bg-muted/30">
+					<tr>
+						<th class="px-4 py-2 font-medium">Volume</th>
+						<th class="px-4 py-2 font-medium">Path</th>
+						<th class="px-4 py-2 font-medium">Status</th>
+						<th class="px-4 py-2 font-medium text-right">Size</th>
+						<th class="px-4 py-2 font-medium text-right">First run</th>
+						<th class="px-4 py-2 font-medium text-right">Last run</th>
+					</tr>
+				</thead>
+				<tbody>
+					for _, f := range files {
+						<tr class="border-t border-border">
+							<td class="px-4 py-1.5 font-medium">{ f.Volume.Name }</td>
+							<td class="px-4 py-1.5 text-muted-foreground"><code class="text-xs">{ f.File.Path }</code></td>
+							<td class="px-4 py-1.5">@statusBadge(f.File.Status)</td>
+							<td class="px-4 py-1.5 text-right tabular-nums">{ humanBytes(f.File.SizeBytes) }</td>
+							<td class="px-4 py-1.5 text-right tabular-nums text-muted-foreground">{ fmt.Sprintf("%d", f.File.FirstSeenRunID) }</td>
+							<td class="px-4 py-1.5 text-right tabular-nums text-muted-foreground">{ fmt.Sprintf("%d", f.File.LastSeenRunID) }</td>
+						</tr>
+					}
+				</tbody>
+			</table>
+		}
+	</div>
+}

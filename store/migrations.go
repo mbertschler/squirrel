@@ -9,7 +9,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 8
+const SchemaVersion = 9
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -43,6 +43,7 @@ func buildMigrations(mctx migrationCtx) []migration {
 		}},
 		{version: 7, up: migrateV6ToV7},
 		{version: 8, up: migrateV7ToV8},
+		{version: 9, up: migrateV8ToV9},
 	}
 }
 
@@ -933,6 +934,10 @@ func finishFilesV8Rebuild(ctx context.Context, tx *sql.Tx) error {
 // populated, so the deep computation is a single pass with no recursion.
 // last_changed_run_id stays NULL — there is no run that "caused" the
 // migration's content, so claiming one would falsify the audit log.
+//
+// The compute and write happen via v8-local helpers (computeShallowV8 /
+// computeDeepV8 / writeFolderHashesV8) so the migration doesn't read or
+// write columns that only exist from v9 onwards.
 func backfillFolderHashesV8(ctx context.Context, tx *sql.Tx) error {
 	rows, err := tx.QueryContext(ctx, `SELECT id FROM folders ORDER BY length(path) DESC, path DESC`)
 	if err != nil {
@@ -954,16 +959,174 @@ func backfillFolderHashesV8(ctx context.Context, tx *sql.Tx) error {
 	rows.Close()
 
 	for _, id := range ids {
-		shallow, err := computeShallowForFolderTx(ctx, tx, id)
+		shallow, err := computeShallowV8(ctx, tx, id)
 		if err != nil {
 			return err
 		}
-		deep, err := computeDeepForFolderTx(ctx, tx, id, shallow)
+		deep, err := computeDeepV8(ctx, tx, id, shallow)
 		if err != nil {
 			return err
 		}
-		if err := writeFolderHashesTx(ctx, tx, id, shallow, deep, 0); err != nil {
+		if err := writeFolderHashesV8(ctx, tx, id, shallow, deep); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// computeShallowV8 mirrors computeShallowAndDirectAggregatesTx but reads
+// only the columns that exist in v8 (no file_count / cumulative_size on
+// folders, no aggregate return values). Lives inside the migration file
+// so v8 backfill doesn't depend on post-v8 helper signatures.
+func computeShallowV8(ctx context.Context, tx *sql.Tx, folderID int64) ([]byte, error) {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT name, blake3 FROM files
+		 WHERE folder_id = ? AND status = 'present'
+		 ORDER BY name`,
+		folderID)
+	if err != nil {
+		return nil, fmt.Errorf("read folder %d files: %w", folderID, err)
+	}
+	defer rows.Close()
+	var entries []ShallowEntry
+	for rows.Next() {
+		var e ShallowEntry
+		if err := rows.Scan(&e.Name, &e.Blake3); err != nil {
+			return nil, fmt.Errorf("scan folder %d files: %w", folderID, err)
+		}
+		entries = append(entries, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ComputeShallowHash(entries), nil
+}
+
+func computeDeepV8(ctx context.Context, tx *sql.Tx, folderID int64, shallow []byte) ([]byte, error) {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT path, deep_blake3 FROM folders
+		 WHERE parent_id = ?
+		 ORDER BY path`,
+		folderID)
+	if err != nil {
+		return nil, fmt.Errorf("read child folders of %d: %w", folderID, err)
+	}
+	defer rows.Close()
+	var children []ChildFolder
+	emptyDeep := ComputeShallowHash(nil)
+	for rows.Next() {
+		var path string
+		var deep []byte
+		if err := rows.Scan(&path, &deep); err != nil {
+			return nil, fmt.Errorf("scan child folders of %d: %w", folderID, err)
+		}
+		if deep == nil {
+			deep = emptyDeep
+		}
+		children = append(children, ChildFolder{Name: folderName(path), DeepBlake3: deep})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ComputeDeepHash(shallow, children), nil
+}
+
+func writeFolderHashesV8(ctx context.Context, tx *sql.Tx, folderID int64, shallow, deep []byte) error {
+	_, err := tx.ExecContext(ctx,
+		`UPDATE folders SET shallow_blake3 = ?, deep_blake3 = ?, last_changed_run_id = NULL
+		 WHERE id = ?`,
+		shallow, deep, folderID)
+	if err != nil {
+		return fmt.Errorf("update folder %d hashes: %w", folderID, err)
+	}
+	return nil
+}
+
+// migrateV8ToV9 adds two cumulative aggregates to the folders table —
+// file_count and cumulative_size — over the live (status='present') file
+// set within the folder and all of its descendants. They power the
+// ncdu-style desktop browser without re-summing the files table on
+// every navigation; they are maintained in steady state by the same
+// closure walk that re-folds the Merkle hashes (see
+// recomputeOneFolder in folders.go).
+//
+// The migration is additive: two NOT NULL DEFAULT 0 columns, then a
+// single leaves-first backfill pass that mirrors the v8 hash backfill.
+// last_changed_run_id is left untouched — the aggregates were always
+// "the same content" the v8 folder row already described, just
+// uncounted, so no run id can honestly take credit.
+func migrateV8ToV9(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`ALTER TABLE folders ADD COLUMN file_count      INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE folders ADD COLUMN cumulative_size INTEGER NOT NULL DEFAULT 0`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("v8→v9 add column: %w", err)
+		}
+	}
+	if err := backfillFolderAggregatesV9(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (9)`); err != nil {
+		return fmt.Errorf("record schema v9: %w", err)
+	}
+	return tx.Commit()
+}
+
+// backfillFolderAggregatesV9 walks every folder in leaves-first order
+// and writes its (file_count, cumulative_size) as
+// direct-present-files-in-folder + sum-of-children's-aggregates. The
+// ordering is identical to backfillFolderHashesV8 so each parent's
+// children are already populated when it runs.
+func backfillFolderAggregatesV9(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM folders ORDER BY length(path) DESC, path DESC`)
+	if err != nil {
+		return fmt.Errorf("list folders for aggregate backfill: %w", err)
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan folder id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	for _, id := range ids {
+		var directCount, directSize int64
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*), COALESCE(SUM(size_bytes), 0) FROM files
+			 WHERE folder_id = ? AND status = 'present'`,
+			id,
+		).Scan(&directCount, &directSize); err != nil {
+			return fmt.Errorf("aggregate folder %d files: %w", id, err)
+		}
+		var childCount, childSize int64
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COALESCE(SUM(file_count), 0), COALESCE(SUM(cumulative_size), 0)
+			 FROM folders WHERE parent_id = ?`,
+			id,
+		).Scan(&childCount, &childSize); err != nil {
+			return fmt.Errorf("aggregate folder %d children: %w", id, err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE folders SET file_count = ?, cumulative_size = ? WHERE id = ?`,
+			directCount+childCount, directSize+childSize, id,
+		); err != nil {
+			return fmt.Errorf("update folder %d aggregates: %w", id, err)
 		}
 	}
 	return nil

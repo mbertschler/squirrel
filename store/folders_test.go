@@ -268,6 +268,155 @@ func TestEmptyFolderHasWellDefinedHash(t *testing.T) {
 	}
 }
 
+// TestUpsertMaintainsFolderAggregates exercises the v9 closure-walk
+// invariant: every folder's (file_count, cumulative_size) reflects the
+// present file set in the folder and all of its descendants, kept
+// current by recomputeOneFolder on every Upsert and MarkMissing.
+func TestUpsertMaintainsFolderAggregates(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+	run1 := makeRun(t, s, vID)
+
+	// Seed: three files at varying depths so root, a, a/b, and x/y all
+	// have predictable counts and sums.
+	seed := []struct {
+		path string
+		size int64
+	}{
+		{"top.txt", 10},
+		{"a/b/inner.txt", 100},
+		{"x/y/leaf.txt", 1000},
+	}
+	for i, e := range seed {
+		if err := s.Upsert(ctx, FileRow{
+			VolumeID: vID, Path: e.path, Blake3: digest(byte(0x10 + i)),
+			SizeBytes: e.size, MtimeNs: 1, Status: StatusPresent,
+			FirstSeenRunID: run1, LastSeenRunID: run1, IndexedAtNs: 1,
+		}, nil); err != nil {
+			t.Fatalf("seed %s: %v", e.path, err)
+		}
+	}
+
+	wantAfterSeed := map[string]struct {
+		count int64
+		size  int64
+	}{
+		"":    {3, 1110},
+		"a":   {1, 100},
+		"a/b": {1, 100},
+		"x":   {1, 1000},
+		"x/y": {1, 1000},
+	}
+	for p, want := range wantAfterSeed {
+		f, err := s.GetFolderByPath(ctx, vID, p)
+		if err != nil {
+			t.Fatalf("GetFolderByPath %q: %v", p, err)
+		}
+		if f.FileCount != want.count || f.CumulativeSize != want.size {
+			t.Errorf("folder %q after seed: got (%d, %d), want (%d, %d)",
+				p, f.FileCount, f.CumulativeSize, want.count, want.size)
+		}
+	}
+
+	// Mark the deep file missing — its size should drop out of every
+	// ancestor's cumulative_size, and the count should fall too.
+	if err := upsertMissing(ctx, s, vID, "x/y/leaf.txt", run1); err != nil {
+		t.Fatalf("mark missing: %v", err)
+	}
+	wantAfterMissing := map[string]struct {
+		count int64
+		size  int64
+	}{
+		"":    {2, 110},
+		"x":   {0, 0},
+		"x/y": {0, 0},
+	}
+	for p, want := range wantAfterMissing {
+		f, err := s.GetFolderByPath(ctx, vID, p)
+		if err != nil {
+			t.Fatalf("GetFolderByPath %q: %v", p, err)
+		}
+		if f.FileCount != want.count || f.CumulativeSize != want.size {
+			t.Errorf("folder %q after missing: got (%d, %d), want (%d, %d)",
+				p, f.FileCount, f.CumulativeSize, want.count, want.size)
+		}
+	}
+}
+
+// TestMigrateV8ToV9BackfillsAggregates seeds a v7 fixture, drives the
+// full migration chain forward, and asserts every folder ends at v9 with
+// (file_count, cumulative_size) matching an independent re-aggregation
+// from the files table. Because v8→v9 is additive (no row rewrites), a
+// drift here would be a backfill bug.
+func TestMigrateV8ToV9BackfillsAggregates(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	rawDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("raw sql.Open: %v", err)
+	}
+	for _, q := range v7Fixture() {
+		if _, err := rawDB.Exec(q); err != nil {
+			rawDB.Close()
+			t.Fatalf("v7 DDL %q: %v", q, err)
+		}
+	}
+	seed := []struct {
+		path string
+		hash byte
+		size int64
+	}{
+		{"top.txt", 0x10, 7},
+		{"a/file1.txt", 0x11, 11},
+		{"a/file2.txt", 0x12, 13},
+		{"a/b/inner.txt", 0x13, 17},
+		{"x/y/z/deep.txt", 0x14, 19},
+	}
+	for _, f := range seed {
+		if _, err := rawDB.Exec(
+			`INSERT INTO files (volume_id, path, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
+			 VALUES (1, ?, ?, ?, 1, 'present', 1, 1, 1)`, f.path, digest(f.hash), f.size,
+		); err != nil {
+			rawDB.Close()
+			t.Fatalf("seed %s: %v", f.path, err)
+		}
+	}
+	rawDB.Close()
+
+	s, err := OpenWithOptions(dsn, OpenOptions{NodeName: "nas"})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	if v, _ := s.CurrentSchemaVersion(ctx); v != SchemaVersion {
+		t.Fatalf("schema version = %d, want %d", v, SchemaVersion)
+	}
+
+	want := map[string]struct {
+		count int64
+		size  int64
+	}{
+		"":      {5, 7 + 11 + 13 + 17 + 19},
+		"a":     {3, 11 + 13 + 17},
+		"a/b":   {1, 17},
+		"x":     {1, 19},
+		"x/y":   {1, 19},
+		"x/y/z": {1, 19},
+	}
+	for p, w := range want {
+		f, err := s.GetFolderByPath(ctx, 1, p)
+		if err != nil {
+			t.Fatalf("GetFolderByPath %q: %v", p, err)
+		}
+		if f.FileCount != w.count || f.CumulativeSize != w.size {
+			t.Errorf("folder %q: got (%d, %d), want (%d, %d)",
+				p, f.FileCount, f.CumulativeSize, w.count, w.size)
+		}
+	}
+}
+
 // TestDriftDetectionFoundation simulates corruption on the receiver:
 // directly poking one file row's content shows up as a deep_blake3 mismatch
 // against an independent recomputation. This is the cheap full-volume

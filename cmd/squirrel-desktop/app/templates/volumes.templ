@@ -1,0 +1,100 @@
+package templates
+
+import (
+	"fmt"
+
+	"github.com/mbertschler/squirrel/config"
+)
+
+// VolumeRow bundles a configured volume with its index-side stats so the
+// page can render counts without re-issuing per-volume queries from the
+// template layer. Aggregates come from the volume root folder
+// (file_count, cumulative_size).
+type VolumeRow struct {
+	Name           string
+	Path           string
+	SyncTo         []string
+	FileCount      int64
+	CumulativeSize int64
+	Indexed        bool
+}
+
+templ VolumesPage(rows []VolumeRow, dests map[string]*config.Destination) {
+	@PageHeader("Volumes", "Configured volumes and where each one syncs to.")
+	<section class="p-6 space-y-6">
+		<div class="card">
+			<header class="card-header">
+				<h2 class="text-base font-semibold">Volumes</h2>
+				<p class="text-sm text-muted-foreground">From <code class="text-xs">~/.squirrel/config.toml</code>.</p>
+			</header>
+			<div class="overflow-x-auto">
+				<table class="w-full text-sm">
+					<thead class="text-left text-xs uppercase tracking-wide text-muted-foreground">
+						<tr>
+							<th class="px-4 py-2 font-medium">Name</th>
+							<th class="px-4 py-2 font-medium">Path</th>
+							<th class="px-4 py-2 font-medium text-right">Files</th>
+							<th class="px-4 py-2 font-medium text-right">Size</th>
+							<th class="px-4 py-2 font-medium">Sync to</th>
+							<th class="px-4 py-2 font-medium"></th>
+						</tr>
+					</thead>
+					<tbody>
+						for _, r := range rows {
+							<tr class="border-t border-border">
+								<td class="px-4 py-2 font-medium">{ r.Name }</td>
+								<td class="px-4 py-2 text-muted-foreground"><code class="text-xs">{ r.Path }</code></td>
+								<td class="px-4 py-2 text-right tabular-nums">{ fmt.Sprintf("%d", r.FileCount) }</td>
+								<td class="px-4 py-2 text-right tabular-nums text-muted-foreground">{ humanBytes(r.CumulativeSize) }</td>
+								<td class="px-4 py-2 text-muted-foreground">{ joinStrings(r.SyncTo, ", ") }</td>
+								<td class="px-4 py-2 text-right">
+									<div class="flex flex-wrap justify-end gap-2">
+										if r.Indexed {
+											<a class="btn btn-sm btn-outline" href={ templ.URL("/volumes/" + r.Name + "/browse") }>Browse</a>
+										}
+										<form method="post" action={ templ.URL("/volumes/" + r.Name + "/index") } class="inline">
+											<button type="submit" class="btn btn-sm btn-primary">Index</button>
+										</form>
+										for _, dest := range r.SyncTo {
+											<form method="post" action={ templ.URL("/volumes/" + r.Name + "/sync/" + dest) } class="inline">
+												<button type="submit" class="btn btn-sm btn-outline">{ "Sync → " + dest }</button>
+											</form>
+										}
+									</div>
+								</td>
+							</tr>
+						}
+					</tbody>
+				</table>
+			</div>
+		</div>
+		<div class="card">
+			<header class="card-header">
+				<h2 class="text-base font-semibold">Destinations</h2>
+				<p class="text-sm text-muted-foreground">Configured rclone targets used by <code class="text-xs">sync</code>.</p>
+			</header>
+			<div class="overflow-x-auto">
+				<table class="w-full text-sm">
+					<thead class="text-left text-xs uppercase tracking-wide text-muted-foreground">
+						<tr>
+							<th class="px-4 py-2 font-medium">Name</th>
+							<th class="px-4 py-2 font-medium">Type</th>
+							<th class="px-4 py-2 font-medium">Endpoint</th>
+							<th class="px-4 py-2 font-medium">Root</th>
+						</tr>
+					</thead>
+					<tbody>
+						for _, name := range sortedDestinationNames(dests) {
+							<tr class="border-t border-border">
+								<td class="px-4 py-2 font-medium">{ name }</td>
+								<td class="px-4 py-2 text-muted-foreground">{ dests[name].Type }</td>
+								<td class="px-4 py-2 text-muted-foreground"><code class="text-xs">{ destEndpoint(dests[name]) }</code></td>
+								<td class="px-4 py-2 text-muted-foreground"><code class="text-xs">{ dests[name].Root }</code></td>
+							</tr>
+						}
+					</tbody>
+				</table>
+			</div>
+		</div>
+	</section>
+}

@@ -1,0 +1,160 @@
+package templates
+
+import (
+	"encoding/hex"
+	"fmt"
+	"time"
+
+	"github.com/mbertschler/squirrel/store"
+)
+
+// QueryResult bundles the variants returned by a query lookup. Only one
+// shape is populated per request, dictated by Mode.
+type QueryResult struct {
+	Mode       string // "", "hash", "path", "duplicates", "missing"
+	Query      string
+	Files      []store.FileWithVolume
+	History    []store.FileRow // populated when Mode == "path"
+	PathVolume string          // volume the path belongs to (for the history view)
+}
+
+templ QueryPage(res QueryResult) {
+	@PageHeader("Query", "Look up a hash, path, or list duplicates and missing files.")
+	<section class="p-6 space-y-6">
+		<form action="/query" method="get" class="card p-4 flex gap-3 items-end">
+			<div class="flex-1">
+				<label class="text-xs uppercase tracking-wide text-muted-foreground" for="q">Hash or path</label>
+				<input id="q" name="q" type="text" class="input w-full mt-1" placeholder="BLAKE3 hex digest, or absolute path" value={ res.Query } autocomplete="off"/>
+			</div>
+			<button type="submit" class="btn btn-primary">Look up</button>
+			<a href="/query/duplicates" class="btn btn-outline">Duplicates</a>
+			<a href="/query/missing" class="btn btn-outline">Missing</a>
+		</form>
+		switch res.Mode {
+		case "hash":
+			@queryHashResults(res)
+		case "path":
+			@queryPathResults(res)
+		case "duplicates":
+			@queryListResults("Duplicate hashes (live rows that share content across paths)", res.Files)
+		case "missing":
+			@queryListResults("Missing files (live row, no longer on disk)", res.Files)
+		default:
+			<p class="text-sm text-muted-foreground">Enter a 64-character hex digest, an absolute path, or use one of the buttons above.</p>
+		}
+	</section>
+}
+
+templ queryHashResults(res QueryResult) {
+	<div class="card overflow-hidden">
+		<header class="card-header">
+			<h2 class="text-base font-semibold">Files matching this hash</h2>
+			<p class="text-sm text-muted-foreground"><code class="text-xs">{ res.Query }</code></p>
+		</header>
+		if len(res.Files) == 0 {
+			<p class="px-4 py-6 text-center text-muted-foreground">No file rows have ever held this content.</p>
+		} else {
+			@fileTable(res.Files, true)
+		}
+	</div>
+}
+
+templ queryPathResults(res QueryResult) {
+	<div class="card overflow-hidden">
+		<header class="card-header">
+			<h2 class="text-base font-semibold">History for this path</h2>
+			<p class="text-sm text-muted-foreground"><code class="text-xs">{ res.PathVolume }: { res.Query }</code></p>
+		</header>
+		if len(res.History) == 0 {
+			<p class="px-4 py-6 text-center text-muted-foreground">No row at this path.</p>
+		} else {
+			<table class="w-full text-sm">
+				<thead class="text-left text-xs uppercase tracking-wide text-muted-foreground bg-muted/30">
+					<tr>
+						<th class="px-4 py-2 font-medium">Hash</th>
+						<th class="px-4 py-2 font-medium">Status</th>
+						<th class="px-4 py-2 font-medium text-right">Size</th>
+						<th class="px-4 py-2 font-medium">First seen run</th>
+						<th class="px-4 py-2 font-medium">Last seen run</th>
+					</tr>
+				</thead>
+				<tbody>
+					for _, r := range res.History {
+						<tr class="border-t border-border">
+							<td class="px-4 py-1.5"><code class="text-xs">{ shortHash(hex.EncodeToString(r.Blake3)) }</code></td>
+							<td class="px-4 py-1.5">@statusBadge(r.Status)</td>
+							<td class="px-4 py-1.5 text-right tabular-nums">{ humanBytes(r.SizeBytes) }</td>
+							<td class="px-4 py-1.5 text-muted-foreground tabular-nums">{ fmt.Sprintf("%d", r.FirstSeenRunID) }</td>
+							<td class="px-4 py-1.5 text-muted-foreground tabular-nums">{ fmt.Sprintf("%d", r.LastSeenRunID) }</td>
+						</tr>
+					}
+				</tbody>
+			</table>
+		}
+	</div>
+}
+
+templ queryListResults(title string, files []store.FileWithVolume) {
+	<div class="card overflow-hidden">
+		<header class="card-header">
+			<h2 class="text-base font-semibold">{ title }</h2>
+			<p class="text-sm text-muted-foreground">{ fmt.Sprintf("%d row(s)", len(files)) }</p>
+		</header>
+		if len(files) == 0 {
+			<p class="px-4 py-6 text-center text-muted-foreground">No matches.</p>
+		} else {
+			@fileTable(files, false)
+		}
+	</div>
+}
+
+templ fileTable(files []store.FileWithVolume, withHash bool) {
+	<table class="w-full text-sm">
+		<thead class="text-left text-xs uppercase tracking-wide text-muted-foreground bg-muted/30">
+			<tr>
+				<th class="px-4 py-2 font-medium">Volume</th>
+				<th class="px-4 py-2 font-medium">Path</th>
+				if !withHash {
+					<th class="px-4 py-2 font-medium">Hash</th>
+				}
+				<th class="px-4 py-2 font-medium">Status</th>
+				<th class="px-4 py-2 font-medium text-right">Size</th>
+			</tr>
+		</thead>
+		<tbody>
+			for _, f := range files {
+				<tr class="border-t border-border">
+					<td class="px-4 py-1.5 font-medium">{ f.Volume.Name }</td>
+					<td class="px-4 py-1.5 text-muted-foreground"><code class="text-xs">{ f.File.Path }</code></td>
+					if !withHash {
+						<td class="px-4 py-1.5"><code class="text-xs">{ shortHash(hex.EncodeToString(f.File.Blake3)) }</code></td>
+					}
+					<td class="px-4 py-1.5">@statusBadge(f.File.Status)</td>
+					<td class="px-4 py-1.5 text-right tabular-nums">{ humanBytes(f.File.SizeBytes) }</td>
+				</tr>
+			}
+		</tbody>
+	</table>
+}
+
+templ statusBadge(status string) {
+	switch status {
+	case "present":
+		<span class="rounded-md px-2 py-0.5 text-xs bg-primary/15 text-primary">present</span>
+	case "missing":
+		<span class="rounded-md px-2 py-0.5 text-xs bg-destructive/15 text-destructive">missing</span>
+	case "superseded":
+		<span class="rounded-md px-2 py-0.5 text-xs bg-muted text-muted-foreground">superseded</span>
+	default:
+		<span class="rounded-md px-2 py-0.5 text-xs bg-muted text-muted-foreground">{ status }</span>
+	}
+}
+
+// fmtTime formats a ns-since-epoch timestamp as a short, human-readable
+// string. Used by the runs view.
+func fmtTime(ns int64) string {
+	if ns <= 0 {
+		return "—"
+	}
+	return time.Unix(0, ns).Format("2006-01-02 15:04:05")
+}
