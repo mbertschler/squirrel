@@ -12,6 +12,7 @@ import (
 	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/index"
 	"github.com/mbertschler/squirrel/store"
+	"github.com/mbertschler/squirrel/volmark"
 )
 
 // syncFixture holds the bits each end-to-end test sets up: a store, a
@@ -38,6 +39,17 @@ func setupFixture(t *testing.T) *syncFixture {
 	destPath := filepath.Join(root, "dst")
 	if err := os.MkdirAll(destPath, 0o755); err != nil {
 		t.Fatalf("mkdir dst: %v", err)
+	}
+	// Pre-bootstrap the destination's per-volume marker so tests can
+	// call Sync without each one passing Init: true. The init flow is
+	// exercised separately by TestSyncRefusesUninitialisedDestination
+	// and TestSyncInitWritesMarker.
+	destVolRoot := filepath.Join(destPath, "pics")
+	if err := os.MkdirAll(destVolRoot, 0o755); err != nil {
+		t.Fatalf("mkdir dst volume: %v", err)
+	}
+	if err := volmark.Write(destVolRoot, volmark.Marker{Volume: "pics"}); err != nil {
+		t.Fatalf("seed destination marker: %v", err)
 	}
 
 	dbPath := filepath.Join(root, "test.db")
@@ -512,6 +524,12 @@ func TestRestoreRefusesOnVolumePathMismatch(t *testing.T) {
 	if _, err := f.store.CreateVolume(context.Background(), f.vol.Name, staleDir); err != nil {
 		t.Fatalf("seed stale volume row: %v", err)
 	}
+	// Seed the marker at f.vol.Path so the marker gate passes; the
+	// failure under test is the volume-row/config path mismatch, not
+	// the marker check (which is exercised separately).
+	if err := volmark.Write(f.vol.Path, volmark.Marker{Volume: f.vol.Name}); err != nil {
+		t.Fatal(err)
+	}
 	_, err := Restore(context.Background(), f.store, f.rcl, f.vol, f.dest, RestoreOptions{})
 	if err == nil || !strings.Contains(err.Error(), "resolve the conflict") {
 		t.Fatalf("expected path-mismatch error, got %v", err)
@@ -597,5 +615,109 @@ func TestBuildRcloneArgsRefusesZeroRunIDOutsideDryRun(t *testing.T) {
 	// A real runID must always succeed regardless of dry-run.
 	if _, err := buildRcloneArgs(vol, dest, 17, Options{DryRun: false}); err != nil {
 		t.Fatalf("non-zero runID outside dry-run should be allowed, got %v", err)
+	}
+}
+
+// TestSyncRefusesUninitialisedDestination removes the bootstrap
+// marker that setupFixture seeded and confirms Sync refuses to run
+// without --init. This is the threat model: a typo in dest.Root
+// points us at an unrelated directory and we have no way to know
+// that without the marker.
+func TestSyncRefusesUninitialisedDestination(t *testing.T) {
+	f := setupFixture(t)
+	if err := os.WriteFile(filepath.Join(f.vol.Path, "a.txt"), []byte("alpha"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.runIndex(t)
+	// Remove the seeded marker — simulate "this directory was not
+	// claimed by squirrel."
+	if err := os.Remove(filepath.Join(f.dest.Root, f.vol.Name, volmark.MarkerName)); err != nil {
+		t.Fatalf("remove seeded marker: %v", err)
+	}
+
+	_, err := Sync(context.Background(), f.store, f.rcl, f.vol, f.dest, Options{})
+	if err == nil || !strings.Contains(err.Error(), "--init") {
+		t.Fatalf("expected --init hint, got %v", err)
+	}
+}
+
+// TestSyncInitWritesMarker confirms that passing Init: true creates
+// the destination per-volume directory + marker and proceeds with
+// the sync.
+func TestSyncInitWritesMarker(t *testing.T) {
+	f := setupFixture(t)
+	if err := os.WriteFile(filepath.Join(f.vol.Path, "a.txt"), []byte("alpha"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.runIndex(t)
+	// Tear down the entire per-volume destination subtree (incl.
+	// marker) so Init must (re-)create both.
+	if err := os.RemoveAll(filepath.Join(f.dest.Root, f.vol.Name)); err != nil {
+		t.Fatalf("clear dst volume: %v", err)
+	}
+
+	rep, err := Sync(context.Background(), f.store, f.rcl, f.vol, f.dest, Options{Init: true})
+	if err != nil {
+		t.Fatalf("Sync with Init: %v", err)
+	}
+	if rep.Status != store.RunStatusSuccess {
+		t.Fatalf("Status = %q, want success", rep.Status)
+	}
+	m, err := volmark.Read(filepath.Join(f.dest.Root, f.vol.Name))
+	if err != nil {
+		t.Fatalf("marker not written: %v", err)
+	}
+	if m.Volume != f.vol.Name {
+		t.Fatalf("marker volume = %q, want %q", m.Volume, f.vol.Name)
+	}
+}
+
+// TestSyncRefusesMismatchedDestinationMarker covers the "different
+// volume's tree" case: a marker exists but names something else.
+// Init is irrelevant here — we must always refuse rather than
+// overwrite another volume's identity.
+func TestSyncRefusesMismatchedDestinationMarker(t *testing.T) {
+	f := setupFixture(t)
+	if err := os.WriteFile(filepath.Join(f.vol.Path, "a.txt"), []byte("alpha"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.runIndex(t)
+	if err := volmark.Write(filepath.Join(f.dest.Root, f.vol.Name), volmark.Marker{Volume: "video"}); err != nil {
+		t.Fatalf("seed wrong-volume marker: %v", err)
+	}
+
+	for _, init := range []bool{false, true} {
+		_, err := Sync(context.Background(), f.store, f.rcl, f.vol, f.dest, Options{Init: init})
+		if err == nil || !strings.Contains(err.Error(), `names "video"`) {
+			t.Fatalf("Init=%v: expected mismatch error, got %v", init, err)
+		}
+	}
+}
+
+// TestRestoreRefusesMissingLocalMarker exercises the source-side
+// guard: restore writes into the local vol.Path and must refuse if
+// the marker doesn't name this volume.
+func TestRestoreRefusesMissingLocalMarker(t *testing.T) {
+	f := setupFixture(t)
+	if err := os.Remove(filepath.Join(f.vol.Path, volmark.MarkerName)); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("clear source marker: %v", err)
+	}
+	_, err := Restore(context.Background(), f.store, f.rcl, f.vol, f.dest, RestoreOptions{})
+	if err == nil || !strings.Contains(err.Error(), "no .squirrel-volume marker") {
+		t.Fatalf("expected missing-marker refusal, got %v", err)
+	}
+}
+
+// TestRestoreToPathSkipsMarkerCheck confirms the scratch-target
+// override bypasses the marker requirement.
+func TestRestoreToPathSkipsMarkerCheck(t *testing.T) {
+	f := setupFixture(t)
+	if err := os.Remove(filepath.Join(f.vol.Path, volmark.MarkerName)); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("clear source marker: %v", err)
+	}
+	scratch := t.TempDir()
+	rep, err := Restore(context.Background(), f.store, f.rcl, f.vol, f.dest, RestoreOptions{ToPath: scratch})
+	if err != nil {
+		t.Fatalf("Restore --to scratch: %v (rep=%+v)", err, rep)
 	}
 }

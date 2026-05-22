@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/mbertschler/squirrel/store"
+	"github.com/mbertschler/squirrel/volmark"
 )
 
 func setupStore(t *testing.T) *store.Store {
@@ -915,5 +916,71 @@ func TestIndexBlocksConcurrentAudit(t *testing.T) {
 	}
 	if sentinel.Kind != store.RunKindAudit {
 		t.Fatalf("err.Kind = %q, want %q (the kind that was refused)", sentinel.Kind, store.RunKindAudit)
+	}
+}
+
+// TestIndexWritesVolumeMarker confirms the first non-dry-run Index
+// against a named volume drops a .squirrel-volume marker at the
+// volume root, and that a subsequent run with the same name leaves
+// it intact (the marker is metadata, not a per-run write target).
+func TestIndexWritesVolumeMarker(t *testing.T) {
+	s := setupStore(t)
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), "alpha")
+
+	if _, err := Index(context.Background(), s, root, Options{Name: "pics", Workers: 2}); err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	m, err := volmark.Read(root)
+	if err != nil {
+		t.Fatalf("marker not written: %v", err)
+	}
+	if m.Volume != "pics" {
+		t.Fatalf("marker volume = %q, want %q", m.Volume, "pics")
+	}
+	if m.CreatedAt == "" {
+		t.Fatalf("marker created_at empty; want timestamp")
+	}
+
+	// Second run leaves the marker untouched. Read again and confirm
+	// timestamps match — a rewrite would bump CreatedAt.
+	if _, err := Index(context.Background(), s, root, Options{Name: "pics", Workers: 2}); err != nil {
+		t.Fatalf("second Index: %v", err)
+	}
+	m2, err := volmark.Read(root)
+	if err != nil {
+		t.Fatalf("marker missing after second run: %v", err)
+	}
+	if m2.CreatedAt != m.CreatedAt {
+		t.Fatalf("marker rewritten by second run: %q → %q", m.CreatedAt, m2.CreatedAt)
+	}
+
+	// The marker file is not in the index (walker filters it).
+	v, _ := s.GetVolumeByPath(context.Background(), root)
+	if _, err := s.GetByPath(context.Background(), v.ID, volmark.MarkerName); err == nil {
+		t.Fatalf("walker indexed %s; want skipped", volmark.MarkerName)
+	}
+}
+
+// TestIndexRefusesMismatchedVolumeMarker covers the "wrong volume"
+// case: a marker at the root names a different volume than the one
+// the indexer was asked to populate. The fix prevents accidentally
+// repurposing one volume's tree as a new one — that would invent
+// two volume identities for the same byte tree.
+func TestIndexRefusesMismatchedVolumeMarker(t *testing.T) {
+	s := setupStore(t)
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), "alpha")
+	if err := volmark.Write(root, volmark.Marker{Volume: "video"}); err != nil {
+		t.Fatalf("seed wrong-volume marker: %v", err)
+	}
+
+	_, err := Index(context.Background(), s, root, Options{Name: "pics", Workers: 2})
+	if err == nil {
+		t.Fatalf("Index against mismatched marker should refuse")
+	}
+	var mismatch *volmark.ErrMismatch
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("err type = %T (%v), want *volmark.ErrMismatch", err, err)
 	}
 }

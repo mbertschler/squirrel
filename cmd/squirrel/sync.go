@@ -20,6 +20,7 @@ func newSyncCmd() *cobra.Command {
 		to      string
 		shallow bool
 		dryRun  bool
+		initDst bool
 	)
 	cmd := &cobra.Command{
 		Use:   "sync [<volume>]",
@@ -33,12 +34,14 @@ func newSyncCmd() *cobra.Command {
 			return runSync(cmd, volumeName, to, sync.Options{
 				Shallow: shallow,
 				DryRun:  dryRun,
+				Init:    initDst,
 			})
 		},
 	}
 	cmd.Flags().StringVar(&to, "to", "", "limit to this destination name (default: every destination declared on the volume)")
 	cmd.Flags().BoolVar(&shallow, "shallow", false, "skip BLAKE3 verification; trust rclone's default size+mtime comparison")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview rclone actions without transferring; no runs row is written")
+	cmd.Flags().BoolVar(&initDst, "init", false, "bootstrap a .squirrel-volume marker at the destination on first sync (refused subsequently if the marker mismatches)")
 	return cmd
 }
 

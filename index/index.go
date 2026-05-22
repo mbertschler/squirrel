@@ -3,6 +3,7 @@ package index
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/mbertschler/squirrel/runevents"
 	"github.com/mbertschler/squirrel/store"
+	"github.com/mbertschler/squirrel/volmark"
 )
 
 type Options struct {
@@ -208,6 +210,23 @@ func newIndexer(ctx context.Context, s *store.Store, root string, opts Options) 
 		return nil, err
 	}
 
+	// Volume marker: identifies absRoot as the squirrel volume named
+	// opts.Name. Index transparently writes it on first contact and
+	// refuses on mismatch — that's the safety property for any future
+	// command (notably restore) that consults the marker to verify it
+	// hasn't been pointed at the wrong directory. Skipped for dry-run
+	// (no disk writes) and for unnamed legacy callers (no expected
+	// volume to validate against).
+	if !opts.DryRun && opts.Name != "" {
+		self, err := s.GetSelfNode(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("resolve self node for marker: %w", err)
+		}
+		if err := ensureVolumeMarker(absRoot, opts.Name, self.Name); err != nil {
+			return nil, err
+		}
+	}
+
 	idx := &indexer{
 		ctx:          ctx,
 		store:        s,
@@ -334,6 +353,14 @@ func (i *indexer) visit(path string, d os.DirEntry, walkErr error) error {
 	}
 	if err := i.ctx.Err(); err != nil {
 		return err
+	}
+	// The .squirrel-volume marker at the volume root is metadata, not
+	// payload — indexing it would add a row to every volume, churn its
+	// mtime on each ensureVolumeMarker rewrite, and silently propagate
+	// the source's marker to destinations on sync. Skip it at walk
+	// time so the index stays purely a record of user content.
+	if !d.IsDir() && d.Name() == volmark.MarkerName && filepath.Dir(path) == i.absRoot {
+		return nil
 	}
 	if !shouldIndex(d) {
 		return nil
@@ -564,6 +591,27 @@ func (i *indexer) rowFor(w workItem, digest []byte) store.FileRow {
 		LastSeenRunID:  i.runID,
 		IndexedAtNs:    store.NowNs(),
 	}
+}
+
+// ensureVolumeMarker reads the .squirrel-volume marker at absRoot and
+// writes a fresh one when missing. A mismatch (the marker names a
+// different volume) is refused so a typo'd vol.Path can't silently
+// repurpose another squirrel volume's tree as a new one. The write
+// path stamps node attribution for forensic value; subsequent runs
+// leave the existing marker untouched.
+func ensureVolumeMarker(absRoot, volumeName, nodeName string) error {
+	err := volmark.Validate(absRoot, volumeName)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, volmark.ErrMissing) {
+		return volmark.Write(absRoot, volmark.Marker{
+			Volume:    volumeName,
+			Node:      nodeName,
+			CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		})
+	}
+	return err
 }
 
 // resolveVolume returns the volume for absRoot and whether it already exists

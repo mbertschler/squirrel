@@ -15,6 +15,7 @@ import (
 	"github.com/mbertschler/squirrel/runevents"
 	"github.com/mbertschler/squirrel/store"
 	"github.com/mbertschler/squirrel/syncproto"
+	"github.com/mbertschler/squirrel/volmark"
 )
 
 // HistoryDirName is the directory at the destination, per volume, where
@@ -42,6 +43,13 @@ type Options struct {
 	// DryRun forwards --dry-run to rclone. No bytes are transferred and no
 	// runs row is written (the prerequisite check still happens).
 	DryRun bool
+	// Init authorises the writing of a fresh .squirrel-volume marker
+	// when the destination's per-volume directory does not yet carry
+	// one. Without Init, a missing marker is refused — the directory
+	// might be a typo or an unrelated tree, and squirrel insists on
+	// explicit consent before claiming it. Mismatching markers are
+	// always refused regardless of Init.
+	Init bool
 	// OnRunID, if non-nil, is invoked once the runs row has been
 	// allocated. Desktop callers use it to bridge the
 	// "started a goroutine, want a runID" gap without polling. Not
@@ -148,6 +156,19 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 	volID, err := requireIndexedVolume(ctx, s, vol)
 	if err != nil {
 		return rep, err
+	}
+
+	// Marker gate for local destinations. Remote destinations skip
+	// this check for now — reading/writing a marker through rclone
+	// adds out-of-band exec invocations that aren't worth the
+	// complexity until we hit a real misconfiguration on a remote.
+	// The dry-run path also skips: it never writes, and refusing a
+	// dry-run on an uninitialised destination would prevent the
+	// "preview what would happen" workflow.
+	if !opts.DryRun && dest.Type == "local" {
+		if err := ensureDestinationMarker(ctx, s, dest, vol.Name, opts.Init); err != nil {
+			return rep, err
+		}
 	}
 
 	runID, err := beginSyncRunGuarded(ctx, s, opts.DryRun, store.SyncRunSpec{
@@ -300,6 +321,70 @@ func historyDirInSourceWarning(vol *config.Volume) string {
 		vol.Name, HistoryDirName)
 }
 
+// validateLocalVolumeMarker is the restore-time guard against
+// pointing the operation at the wrong local directory. Unlike sync's
+// --init flag, restore deliberately offers no bootstrap: the safety
+// property is "refuse to overwrite a tree we haven't previously
+// claimed." A fresh local volume must run `squirrel index <vol>`
+// first (which writes the marker) before restoring into it.
+func validateLocalVolumeMarker(vol *config.Volume) error {
+	err := volmark.Validate(vol.Path, vol.Name)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, volmark.ErrMissing) {
+		return fmt.Errorf("volume %q at %s has no .squirrel-volume marker — refusing to restore (run `squirrel index %s` first or use `--to <scratch>` to restore elsewhere)", vol.Name, vol.Path, vol.Name)
+	}
+	if _, ok := errors.AsType[*volmark.ErrMismatch](err); ok {
+		return fmt.Errorf("volume %q: %w (refusing to restore over a different volume's tree)", vol.Name, err)
+	}
+	return fmt.Errorf("volume %q marker check: %w", vol.Name, err)
+}
+
+// ensureDestinationMarker validates (or, with Init, writes) the
+// .squirrel-volume marker at <dest.Root>/<vol.Name>/. The directory
+// is created on first --init so the marker can land even when the
+// destination tree is empty; on every subsequent sync the marker must
+// already match the volume name. A mismatched marker is always
+// refused, regardless of Init: that path almost certainly points at a
+// different squirrel volume, and overwriting its marker would erase
+// the trail that distinguishes the two.
+//
+// Restricted to dest.Type=="local" for now; remote destinations need
+// a separate rclone-mediated read/write path and are tracked as a
+// follow-up.
+func ensureDestinationMarker(ctx context.Context, s *store.Store, dest *config.Destination, volumeName string, init bool) error {
+	root := filepath.Join(dest.Root, volumeName)
+	err := volmark.Validate(root, volumeName)
+	if err == nil {
+		return nil
+	}
+	if _, ok := errors.AsType[*volmark.ErrMismatch](err); ok {
+		return fmt.Errorf("destination %q: %w (refuse to init over a different volume's tree)", dest.Name, err)
+	}
+	if !errors.Is(err, volmark.ErrMissing) {
+		return fmt.Errorf("destination %q marker check: %w", dest.Name, err)
+	}
+	if !init {
+		return fmt.Errorf("destination %q at %s has no .squirrel-volume marker — re-run with --init to bootstrap (refusing in case the root is a typo)", dest.Name, root)
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return fmt.Errorf("destination %q: mkdir %s: %w", dest.Name, root, err)
+	}
+	self, err := s.GetSelfNode(ctx)
+	if err != nil {
+		return fmt.Errorf("destination %q: resolve self node: %w", dest.Name, err)
+	}
+	if err := volmark.Write(root, volmark.Marker{
+		Volume:    volumeName,
+		Node:      self.Name,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	}); err != nil {
+		return fmt.Errorf("destination %q: %w", dest.Name, err)
+	}
+	return nil
+}
+
 func deriveStatus(r RunResult) string {
 	if r.FatalError {
 		return store.RunStatusFailed
@@ -337,6 +422,11 @@ func buildRcloneArgs(vol *config.Volume, dest *config.Destination, runID int64, 
 		// directory is silently excluded rather than uploaded. (We also
 		// warn at index time so the user isn't surprised.)
 		"--filter", "- /" + HistoryDirName + "/**",
+		// The .squirrel-volume marker is per-side metadata: source and
+		// destination each carry their own to identify the tree as
+		// squirrel-owned. Filtering it out of comparison ensures the
+		// source's marker doesn't propagate over the destination's.
+		"--filter", "- /" + volmark.MarkerName,
 	}
 	if !opts.Shallow {
 		args = append(args, "--checksum", "--hash", "blake3")
@@ -512,6 +602,20 @@ type RestoreOptions struct {
 func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, dest *config.Destination, opts RestoreOptions) (rep Report, err error) {
 	rep = Report{Volume: vol.Name, Destination: dest.Name}
 
+	// Local target marker check: when restoring into the live volume
+	// path (the dangerous, in-place direction), insist on a marker
+	// that names this volume. A missing or mismatched marker is the
+	// strongest signal we have that vol.Path is a typo or unrelated
+	// tree, and overwriting it via rclone would be irreversible. The
+	// --to override skips this check because the operator is
+	// explicitly redirecting to a scratch directory and accepts
+	// responsibility for the target.
+	if !opts.DryRun && opts.ToPath == "" {
+		if err := validateLocalVolumeMarker(vol); err != nil {
+			return rep, err
+		}
+	}
+
 	// We deliberately don't require an existing index for restore: the
 	// destination is the source of truth in this direction, and a fresh
 	// laptop may have no DB rows yet. We still create a volumes row so
@@ -580,6 +684,7 @@ func buildRestoreArgs(vol *config.Volume, dest *config.Destination, opts Restore
 		args = append(args, "--files-from-raw", opts.IncludeFromFile)
 	} else {
 		args = append(args, "--filter", "- /"+HistoryDirName+"/**")
+		args = append(args, "--filter", "- /"+volmark.MarkerName)
 	}
 	if !opts.Shallow {
 		args = append(args, "--checksum", "--hash", "blake3")
