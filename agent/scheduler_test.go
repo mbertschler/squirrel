@@ -394,7 +394,7 @@ func TestSchedulerSkipsWhenInFlightIndexRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
-	if _, err := f.store.BeginRun(context.Background(), store.RunKindIndex, v.ID, ""); err != nil {
+	if _, err := f.store.BeginIndexRun(context.Background(), store.RunKindIndex, v.ID, false); err != nil {
 		t.Fatalf("BeginRun: %v", err)
 	}
 

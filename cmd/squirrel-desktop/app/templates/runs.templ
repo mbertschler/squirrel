@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"database/sql"
 	"fmt"
 
 	"github.com/mbertschler/squirrel/runevents"
@@ -23,6 +24,7 @@ templ RunsPage(rows []RunRow) {
 					<tr>
 						<th class="px-4 py-2 font-medium">#</th>
 						<th class="px-4 py-2 font-medium">Kind</th>
+						<th class="px-4 py-2 font-medium">Mode</th>
 						<th class="px-4 py-2 font-medium">Volume</th>
 						<th class="px-4 py-2 font-medium">Destination</th>
 						<th class="px-4 py-2 font-medium">Started</th>
@@ -33,7 +35,7 @@ templ RunsPage(rows []RunRow) {
 				</thead>
 				<tbody>
 					if len(rows) == 0 {
-						<tr><td colspan="8" class="px-4 py-6 text-center text-muted-foreground">no runs yet</td></tr>
+						<tr><td colspan="9" class="px-4 py-6 text-center text-muted-foreground">no runs yet</td></tr>
 					}
 					for _, r := range rows {
 						<tr class="border-t border-border">
@@ -41,6 +43,7 @@ templ RunsPage(rows []RunRow) {
 								<a class="hover:underline" href={ templ.URL("/runs/" + fmt.Sprintf("%d", r.Run.ID)) }>{ fmt.Sprintf("%d", r.Run.ID) }</a>
 							</td>
 							<td class="px-4 py-1.5">{ r.Run.Kind }</td>
+							<td class="px-4 py-1.5">@shallowBadge(r.Run.Shallow)</td>
 							<td class="px-4 py-1.5">{ r.VolumeName }</td>
 							<td class="px-4 py-1.5 text-muted-foreground">
 								if r.Run.Destination.Valid {
@@ -65,6 +68,19 @@ templ RunsPage(rows []RunRow) {
 			</table>
 		</div>
 	</section>
+}
+
+// shallowBadge renders runs.shallow as a compact mode badge. NULL —
+// the pre-v10 / sync-restore case — stays muted because we have nothing
+// honest to claim about the run's hashing strategy.
+templ shallowBadge(s sql.NullBool) {
+	if !s.Valid {
+		<span class="text-muted-foreground">—</span>
+	} else if s.Bool {
+		<span class="rounded-md px-2 py-0.5 text-xs bg-amber-500/15 text-amber-700 dark:text-amber-400" title="skipped rehash when size and mtime matched">shallow</span>
+	} else {
+		<span class="rounded-md px-2 py-0.5 text-xs bg-muted text-muted-foreground" title="rehashed every file">full</span>
+	}
 }
 
 templ runStatusBadge(s string) {
@@ -131,6 +147,7 @@ templ runStatusPanel(row RunRow, p runevents.Progress) {
 			}
 		</dd>
 		<dt class="text-muted-foreground">Files</dt><dd class="tabular-nums">{ fmt.Sprintf("%d", row.Run.FileCount) }</dd>
+		<dt class="text-muted-foreground">Mode</dt><dd>@shallowBadge(row.Run.Shallow)</dd>
 		if p.Stage != "" && p.Stage != runevents.StageDone {
 			<dt class="text-muted-foreground">Progress</dt>
 			<dd class="tabular-nums">{ progressText(p) }</dd>

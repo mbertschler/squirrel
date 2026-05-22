@@ -488,6 +488,41 @@ func TestIndexRecordsRuns(t *testing.T) {
 	}
 }
 
+// TestIndexRecordsShallowFlag pins that the runs row carries the
+// Options.Shallow value the call was made with: shallow=true for the
+// fast (size, mtime) path and shallow=false for the rehash-everything
+// path. The flag is what the UIs render to tell users whether the
+// run's "unchanged" counts were verified by hash or trusted by stat.
+func TestIndexRecordsShallowFlag(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), "hello")
+
+	s := setupStore(t)
+	ctx := context.Background()
+	rep1, err := Index(ctx, s, root, Options{Shallow: false})
+	if err != nil {
+		t.Fatalf("first Index: %v", err)
+	}
+	rep2, err := Index(ctx, s, root, Options{Shallow: true})
+	if err != nil {
+		t.Fatalf("second Index: %v", err)
+	}
+	first, err := s.GetRun(ctx, rep1.RunID)
+	if err != nil {
+		t.Fatalf("GetRun first: %v", err)
+	}
+	if !first.Shallow.Valid || first.Shallow.Bool {
+		t.Fatalf("first run shallow = %+v, want valid=true bool=false", first.Shallow)
+	}
+	second, err := s.GetRun(ctx, rep2.RunID)
+	if err != nil {
+		t.Fatalf("GetRun second: %v", err)
+	}
+	if !second.Shallow.Valid || !second.Shallow.Bool {
+		t.Fatalf("second run shallow = %+v, want valid=true bool=true", second.Shallow)
+	}
+}
+
 func TestIndexPartialRunOnPerFileError(t *testing.T) {
 	skipIfRoot(t)
 	root := t.TempDir()

@@ -185,6 +185,7 @@ func (m *runsModel) renderDetail(r store.Run) string {
 		)
 	}
 	lines = append(lines, [2]string{"Files", fmt.Sprintf("%d", r.FileCount)})
+	lines = append(lines, [2]string{"Mode", shallowLabel(r.Shallow)})
 	if r.PeerNodeID.Valid {
 		lines = append(lines, [2]string{"Peer node", fmt.Sprintf("#%d", r.PeerNodeID.Int64)})
 	}
@@ -247,6 +248,7 @@ func (m *runsModel) applyFilter() {
 			whenAgo(r.EndedAtNs, now),
 			runDuration(r),
 			fmt.Sprintf("%d", r.FileCount),
+			shallowGlyph(r.Shallow),
 		})
 	}
 	m.table.SetRows(rows)
@@ -263,6 +265,7 @@ func (m *runsModel) resizeColumns() {
 		{Title: "WHEN", Width: 12},
 		{Title: "DURATION", Width: 10},
 		{Title: "FILES", Width: 8},
+		{Title: "MODE", Width: 8},
 	}
 	// If we know the terminal width, give the surplus to the variable-width
 	// columns (volume, destination) — those are the ones that benefit most
@@ -282,6 +285,32 @@ func (m *runsModel) resizeColumns() {
 		}
 	}
 	m.table.SetColumns(cols)
+}
+
+// shallowLabel renders the runs.shallow flag for the detail view as a
+// full word. NULL stays "—" (with context) because pre-v10 history and
+// sync/restore runs have nothing honest to say about the hashing mode.
+func shallowLabel(s sql.NullBool) string {
+	if !s.Valid {
+		return styleMuted.Render("— (not recorded)")
+	}
+	if s.Bool {
+		return "shallow (skipped rehash when size/mtime matched)"
+	}
+	return "full (rehashed every file)"
+}
+
+// shallowGlyph renders runs.shallow compactly for the table column.
+// NULL stays "—" because the flag wasn't recorded (pre-v10 history) or
+// doesn't apply (sync/restore runs).
+func shallowGlyph(s sql.NullBool) string {
+	if !s.Valid {
+		return styleMuted.Render("—")
+	}
+	if s.Bool {
+		return "shallow"
+	}
+	return "full"
 }
 
 func (m *runsModel) volumeName(id sql.NullInt64) string {
