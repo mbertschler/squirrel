@@ -646,35 +646,44 @@ type RestoreOptions struct {
 func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, dest *config.Destination, opts RestoreOptions) (rep Report, err error) {
 	rep = Report{Volume: vol.Name, Destination: dest.Name}
 
+	// "In-place" is the dangerous direction: writing into the live
+	// volume path. Unsetting ToPath is the canonical request, but a
+	// caller who explicitly passes ToPath == vol.Path is asking for
+	// the same thing and must go through the same gates — otherwise
+	// `--to <vol.Path>` would silently bypass the marker check, the
+	// non-empty refusal, AND --backup-dir, reintroducing exactly the
+	// data-loss path this PR is trying to close.
+	targetInPlace, err := isInPlaceRestore(vol, opts.ToPath)
+	if err != nil {
+		return rep, err
+	}
+
 	// Local target marker check: when restoring into the live volume
-	// path (the dangerous, in-place direction), insist on a marker
-	// that names this volume. A missing or mismatched marker is the
-	// strongest signal we have that vol.Path is a typo or unrelated
-	// tree, and overwriting it via rclone would be irreversible. The
-	// --to override skips this check because the operator is
-	// explicitly redirecting to a scratch directory and accepts
-	// responsibility for the target.
-	if !opts.DryRun && opts.ToPath == "" {
+	// path, insist on a marker that names this volume. A missing or
+	// mismatched marker is the strongest signal we have that vol.Path
+	// is a typo or unrelated tree, and overwriting it via rclone
+	// would be irreversible. A genuine scratch --to bypasses the
+	// check because the operator is explicitly redirecting to an
+	// unrelated directory.
+	if !opts.DryRun && targetInPlace {
 		if err := validateLocalVolumeMarker(vol); err != nil {
 			return rep, err
 		}
 	}
 
-	// Default-target overwrite gate: a non-empty live vol.Path is the
+	// In-place overwrite gate: a non-empty live vol.Path is the
 	// most likely realistic data-loss path in squirrel today (user
 	// runs `restore` to recover what they think is missing, rclone
 	// happily replaces local edits with the destination's view). When
 	// InPlace is unset and the directory carries anything beyond the
-	// marker/history subtree, refuse with the --in-place hint. The
-	// --to override skips this entirely — scratch targets are the
-	// operator's responsibility.
-	if !opts.DryRun && opts.ToPath == "" && !opts.InPlace {
+	// marker/history subtree, refuse with the --in-place hint.
+	if !opts.DryRun && targetInPlace && !opts.InPlace {
 		hasContent, err := localVolumeHasContent(vol.Path)
 		if err != nil {
 			return rep, err
 		}
 		if hasContent {
-			return rep, fmt.Errorf("volume %q at %s is not empty — pass --in-place to overwrite (a per-run history of replaced files lands under %s/run-<id>/) or --to <path> to restore into a scratch directory", vol.Name, vol.Path, RestoreHistoryDirName)
+			return rep, fmt.Errorf("volume %q at %s is not empty — pass --in-place to overwrite (a per-run history of replaced files lands under %s/run-<id>/) or --to <scratch-path> to restore into a different directory", vol.Name, vol.Path, RestoreHistoryDirName)
 		}
 	}
 
@@ -697,6 +706,26 @@ func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volum
 			return buildRestoreArgs(vol, dest, runID, opts), nil
 		})
 	return rep, err
+}
+
+// isInPlaceRestore reports whether the restore target equals
+// vol.Path. The CLI's --to flag is for "restore into a scratch
+// directory" — when the operator points it at the live volume itself
+// (or leaves it unset), the safety gates that apply to the default
+// path must still fire.
+func isInPlaceRestore(vol *config.Volume, toPath string) (bool, error) {
+	if toPath == "" {
+		return true, nil
+	}
+	absTo, err := filepath.Abs(toPath)
+	if err != nil {
+		return false, fmt.Errorf("resolve --to path %s: %w", toPath, err)
+	}
+	absVol, err := filepath.Abs(vol.Path)
+	if err != nil {
+		return false, fmt.Errorf("resolve vol.Path %s: %w", vol.Path, err)
+	}
+	return filepath.Clean(absTo) == filepath.Clean(absVol), nil
 }
 
 func getOrCreateVolumeForRestore(ctx context.Context, s *store.Store, vol *config.Volume) (store.Volume, error) {
@@ -731,9 +760,12 @@ func getOrCreateVolumeForRestore(ctx context.Context, s *store.Store, vol *confi
 //
 // Restore's in-place mode preserves local overwrites under
 // .squirrel-restore-history/run-<id>/ via --backup-dir, mirroring the
-// destination-side history that sync writes. When ToPath is set (a
-// scratch target), no backup-dir is added — the override is the
-// operator's explicit "I have a fresh directory, just copy" path.
+// destination-side history that sync writes. When ToPath is set to a
+// genuine scratch target (a path other than vol.Path), no backup-dir
+// is added — the override is the operator's explicit "I have a fresh
+// directory, just copy" path. When --to points back at vol.Path the
+// flag is treated as in-place: same backup-dir contract as ToPath
+// unset.
 func buildRestoreArgs(vol *config.Volume, dest *config.Destination, runID int64, opts RestoreOptions) []string {
 	srcArg := destinationVolumeURI(dest, vol.Name)
 	target := vol.Path
@@ -743,7 +775,12 @@ func buildRestoreArgs(vol *config.Volume, dest *config.Destination, runID int64,
 	dstArg := withTrailingSlash(target)
 
 	args := []string{"copy"}
-	if opts.ToPath == "" && opts.InPlace && runID != 0 {
+	// inPlace mirrors Restore's isInPlaceRestore check. Errors here
+	// would have already surfaced in Restore() before buildRestoreArgs
+	// is called, so we treat the helper's err as "fall back to the
+	// safer literal compare" rather than propagate.
+	inPlace, _ := isInPlaceRestore(vol, opts.ToPath)
+	if inPlace && opts.InPlace && runID != 0 {
 		backupDir := filepath.Join(target, RestoreHistoryDirName, "run-"+strconv.FormatInt(runID, 10))
 		args = append(args, "--backup-dir", backupDir)
 	}

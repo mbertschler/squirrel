@@ -419,9 +419,14 @@ func (d *nodeSyncDriver) collectIndexEntries() ([]syncproto.IndexEntry, error) {
 // store because the reserved-ness is a sync-layer concern: the DB
 // happily stores rows under any path. Matches *files* under those
 // subtrees — a file at the bare reserved-dir name is impossible.
+// .squirrel-restore-history is local-side only (created by
+// `restore --in-place`); the receiver doesn't write into it but a
+// peer's index can contain rows pointing there, and those must not
+// propagate via node sync.
 func isReservedSyncPath(p string) bool {
 	return strings.HasPrefix(p, HistoryDirName+"/") ||
-		strings.HasPrefix(p, ConflictsDirName+"/")
+		strings.HasPrefix(p, ConflictsDirName+"/") ||
+		strings.HasPrefix(p, RestoreHistoryDirName+"/")
 }
 
 // isReservedFolderPath is the folder-path variant of
@@ -432,7 +437,8 @@ func isReservedSyncPath(p string) bool {
 // the Merkle walk — which the receiver's validateFolderPath then
 // rejects, aborting the whole walk.
 func isReservedFolderPath(p string) bool {
-	return p == HistoryDirName || p == ConflictsDirName || isReservedSyncPath(p)
+	return p == HistoryDirName || p == ConflictsDirName || p == RestoreHistoryDirName ||
+		isReservedSyncPath(p)
 }
 
 // phaseTransfer invokes rclone exactly once over the transfer +

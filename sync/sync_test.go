@@ -812,3 +812,23 @@ func TestRestoreToPathSkipsInPlaceCheck(t *testing.T) {
 		t.Fatalf("Status = %q, want success", rep.Status)
 	}
 }
+
+// TestRestoreToPathEqualVolPathTreatedAsInPlace confirms that passing
+// --to <vol.Path> goes through the same safety gates as the default
+// in-place restore (marker check + non-empty refusal). Without this
+// equivalence, `--to <vol.Path>` would silently bypass the very
+// protections #61 is meant to enforce.
+func TestRestoreToPathEqualVolPathTreatedAsInPlace(t *testing.T) {
+	f := setupFixture(t)
+	if err := volmark.Write(f.vol.Path, volmark.Marker{Volume: f.vol.Name}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(f.vol.Path, "local-edit.txt"), []byte("user wrote this"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Restore(context.Background(), f.store, f.rcl, f.vol, f.dest, RestoreOptions{ToPath: f.vol.Path})
+	if err == nil || !strings.Contains(err.Error(), "--in-place") {
+		t.Fatalf("expected --in-place refusal when --to equals vol.Path, got %v", err)
+	}
+}
