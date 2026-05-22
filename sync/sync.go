@@ -211,7 +211,12 @@ func runRcloneOperation(
 
 	args, err := buildArgs(runID)
 	if err != nil {
+		// Synthesise a FailedFile entry so the deferred finishRun
+		// writes a meaningful err message into the runs row — otherwise
+		// `squirrel runs` shows "failed" with no reason, hiding the
+		// (e.g.) runID=0 guard from forensic readers.
 		rep.RcloneResult.FatalError = true
+		rep.RcloneResult.FailedFiles = []FailedFile{{Message: err.Error()}}
 		return err
 	}
 	rep.RcloneResult, err = rcl.RunWithProgress(ctx, progress, args...)

@@ -798,9 +798,19 @@ func copyFileToPath(srcAbs, dstAbs string, mtimeNs int64) error {
 		cleanup()
 		return fmt.Errorf("copy bytes: %w", err)
 	}
+	// Apply mode bits on the open fd before fsync so the inode-metadata
+	// flush picks them up. chmod-after-close would persist a value the
+	// fsync didn't cover; a crash after rename could then leave the
+	// destination at CreateTemp's 0o600 instead of the source's mode.
+	if err := tmp.Chmod(srcInfo.Mode().Perm()); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return fmt.Errorf("chmod temp: %w", err)
+	}
 	// fsync before close+rename: a crash between os.Rename and the
-	// kernel flushing the data pages would otherwise leave a zero-byte
-	// file at dstAbs even though the rename succeeded.
+	// kernel flushing data and inode pages would otherwise leave a
+	// zero-byte file (or one with default metadata) at dstAbs even
+	// though the rename succeeded.
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		cleanup()
@@ -810,10 +820,10 @@ func copyFileToPath(srcAbs, dstAbs string, mtimeNs int64) error {
 		cleanup()
 		return fmt.Errorf("close temp: %w", err)
 	}
-	if err := os.Chmod(tmpPath, srcInfo.Mode().Perm()); err != nil {
-		cleanup()
-		return fmt.Errorf("chmod temp: %w", err)
-	}
+	// mtime is set after close because stdlib has no Chtimes on an open
+	// *os.File. A crash before the kernel persists the timestamp leaves
+	// the file with the default mtime — the next `squirrel index` rehashes
+	// it (acceptable cost), so we treat mtime as soft metadata here.
 	if mtimeNs != 0 {
 		t := time.Unix(0, mtimeNs)
 		if err := os.Chtimes(tmpPath, t, t); err != nil {
