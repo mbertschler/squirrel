@@ -94,15 +94,13 @@ func (h *Browse) collectEntries(ctx context.Context, volumeName string, folder s
 		})
 	}
 	for _, f := range files {
+		hash := hex.EncodeToString(f.Blake3)
 		entries = append(entries, templates.BrowseEntry{
 			Name: fileName(f.Path),
 			Dir:  false,
 			Size: f.SizeBytes,
-			Hash: hex.EncodeToString(f.Blake3),
-			// File detail page is not implemented yet; "#" keeps the
-			// anchor focusable for keyboard nav without navigating
-			// the Turbo frame back to the current listing.
-			Href: "#",
+			Hash: hash,
+			Href: "/files/" + hash,
 		})
 	}
 	sort.SliceStable(entries, func(i, j int) bool { return entries[i].Size > entries[j].Size })

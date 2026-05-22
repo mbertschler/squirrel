@@ -1447,6 +1447,70 @@ func TestLatestSuccessfulIndexRun(t *testing.T) {
 	}
 }
 
+// TestLatestSuccessfulRunsByVolumeAndKind covers the dashboard helper:
+// one row per (volume, kind) with status in success/partial, ignoring
+// failed runs and runs from other (volume, kind) pairs, and reaching
+// past any bounded recent-runs window.
+func TestLatestSuccessfulRunsByVolumeAndKind(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	volA := makeVolume(t, s, "/a")
+	volB := makeVolume(t, s, "/b")
+
+	// volA: an old successful index, a newer failed index (must be
+	// ignored), a partial sync to one destination, and a successful sync
+	// to a different destination — the latest sync, across destinations,
+	// is what the helper should return.
+	oldIdx, _ := s.BeginRun(ctx, RunKindIndex, volA, "")
+	_ = s.FinishRun(ctx, oldIdx, RunStatusSuccess, "", 10)
+	failIdx, _ := s.BeginRun(ctx, RunKindIndex, volA, "")
+	_ = s.FinishRun(ctx, failIdx, RunStatusFailed, "boom", 0)
+	syncNas, _ := s.BeginRun(ctx, RunKindSync, volA, "nas")
+	_ = s.FinishRun(ctx, syncNas, RunStatusPartial, "", 5)
+	syncS3, _ := s.BeginRun(ctx, RunKindSync, volA, "s3")
+	_ = s.FinishRun(ctx, syncS3, RunStatusSuccess, "", 5)
+
+	// volB: only a single successful index, no sync. The map should
+	// contain the index entry but no sync entry.
+	bIdx, _ := s.BeginRun(ctx, RunKindIndex, volB, "")
+	_ = s.FinishRun(ctx, bIdx, RunStatusSuccess, "", 1)
+
+	got, err := s.LatestSuccessfulRunsByVolumeAndKind(ctx)
+	if err != nil {
+		t.Fatalf("LatestSuccessfulRunsByVolumeAndKind: %v", err)
+	}
+
+	aByKind := got[volA]
+	if aByKind == nil {
+		t.Fatalf("missing volA entry in result: %+v", got)
+	}
+	if aByKind[RunKindIndex].ID != oldIdx {
+		t.Errorf("volA latest index = %d, want %d (the failed one must be ignored)",
+			aByKind[RunKindIndex].ID, oldIdx)
+	}
+	if aByKind[RunKindSync].ID != syncS3 {
+		t.Errorf("volA latest sync = %d, want %d (latest across destinations)",
+			aByKind[RunKindSync].ID, syncS3)
+	}
+
+	bByKind := got[volB]
+	if bByKind == nil {
+		t.Fatalf("missing volB entry in result: %+v", got)
+	}
+	if bByKind[RunKindIndex].ID != bIdx {
+		t.Errorf("volB latest index = %d, want %d", bByKind[RunKindIndex].ID, bIdx)
+	}
+	if _, ok := bByKind[RunKindSync]; ok {
+		t.Errorf("volB should have no sync entry: got %+v", bByKind)
+	}
+}
+
 // TestFreshV6SelfNodeRow verifies the v6 acceptance contract: a fresh
 // database has exactly one row in the nodes table, and that row carries
 // the OpenOptions.NodeName the caller supplied (no synthetic peers).

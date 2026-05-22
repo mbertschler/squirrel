@@ -65,17 +65,20 @@ templ browseFrame(volumeName, currentPath string, crumbs []NavItem, entries []Br
 					for _, e := range entries {
 						<tr class="border-t border-border">
 							<td class="px-4 py-1.5">
-								<a href={ templ.URL(e.Href) } data-turbo-frame="browse" data-ncdu-target="row"
-									class="block w-full focus:outline-none focus:bg-accent focus:text-accent-foreground rounded px-1 -mx-1">
-									if e.Dir {
+								if e.Dir {
+									<a href={ templ.URL(e.Href) } data-turbo-frame="browse" data-ncdu-target="row"
+										class="block w-full focus:outline-none focus:bg-accent focus:text-accent-foreground rounded px-1 -mx-1">
 										<span class="text-primary font-medium">{ e.Name + "/" }</span>
-									} else {
+									</a>
+								} else {
+									<a href={ templ.URL(e.Href) } data-turbo-frame="_top" data-ncdu-target="row"
+										class="block w-full focus:outline-none focus:bg-accent focus:text-accent-foreground rounded px-1 -mx-1">
 										<span>{ e.Name }</span>
 										if e.Hash != "" {
 											<span class="ml-2 text-xs text-muted-foreground tabular-nums">{ shortHash(e.Hash) }</span>
 										}
-									}
-								</a>
+									</a>
+								}
 							</td>
 							<td class="px-4 py-1.5 text-right tabular-nums">{ humanBytes(e.Size) }</td>
 							<td class="px-4 py-1.5 text-right tabular-nums text-muted-foreground">
