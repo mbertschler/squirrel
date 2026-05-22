@@ -69,6 +69,13 @@ type Report struct {
 // flight against the same volume. Callers can errors.As against this type
 // to distinguish a polite refusal (the other run is still progressing —
 // don't log as error, don't synthesise a failed row) from a real failure.
+//
+// Kind is the kind we *tried* to start (the refused caller); Blocker.Kind
+// is the kind actually holding the gate (which may differ — index and
+// audit block each other). Diagnostic messages should name both so an
+// operator can tell "I tried to start an audit but an index is in
+// flight" from "I tried to start an index but another index is in
+// flight."
 type ErrAlreadyRunning struct {
 	Kind    string
 	Volume  string
@@ -76,8 +83,8 @@ type ErrAlreadyRunning struct {
 }
 
 func (e *ErrAlreadyRunning) Error() string {
-	return fmt.Sprintf("%s of %s already running (run=%d, started %s)",
-		e.Kind, e.Volume, e.Blocker.ID,
+	return fmt.Sprintf("%s of %s refused: %s already running (run=%d, started %s)",
+		e.Kind, e.Volume, e.Blocker.Kind, e.Blocker.ID,
 		time.Unix(0, e.Blocker.StartedAtNs).UTC().Format(time.RFC3339))
 }
 

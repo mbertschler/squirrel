@@ -85,7 +85,7 @@ func (s *Server) scanOneVolume(ctx context.Context, logger io.Writer, name strin
 	})
 	if inFlight, ok := errors.AsType[*index.ErrAlreadyRunning](err); ok {
 		fmt.Fprintf(logger, "audit %s: skipped — %s in flight (run=%d)\n",
-			name, inFlight.Kind, inFlight.Blocker.ID)
+			name, inFlight.Blocker.Kind, inFlight.Blocker.ID)
 		return
 	}
 	if err != nil {

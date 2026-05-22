@@ -306,8 +306,9 @@ func (s *scheduler) executeIndex(ctx context.Context, vol *config.Volume, volume
 	if inFlight, ok := errors.AsType[*index.ErrAlreadyRunning](err); ok {
 		s.logger.Info("scheduler.skipped",
 			"kind", "index", "volume", vol.Name,
-			"reason", "in-flight index run",
-			"blocker_run_id", inFlight.Blocker.ID)
+			"reason", fmt.Sprintf("in-flight %s run", inFlight.Blocker.Kind),
+			"blocker_run_id", inFlight.Blocker.ID,
+			"blocker_kind", inFlight.Blocker.Kind)
 		return false
 	}
 	duration := s.now().Sub(start)
