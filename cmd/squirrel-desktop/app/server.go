@@ -51,6 +51,7 @@ func New(deps Deps) (http.Handler, error) {
 	mux.HandleFunc("GET /volumes", vh.ServeIndex)
 	mux.HandleFunc("GET /volumes/{name}/browse", bh.Serve)
 	mux.HandleFunc("POST /volumes/{name}/index", rh.StartIndex)
+	mux.HandleFunc("POST /volumes/{name}/sync/{dest}", rh.StartSync)
 	mux.HandleFunc("GET /query", qh.Serve)
 	mux.HandleFunc("GET /query/duplicates", qh.ServeDuplicates)
 	mux.HandleFunc("GET /query/missing", qh.ServeMissing)
