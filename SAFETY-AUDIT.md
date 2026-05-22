@@ -41,13 +41,16 @@ issue we should open for that item.
 1. [#C1](#c1-restore-overwrites-the-local-volume-without-history) —
    `restore` overwrites the local volume in place with no
    `--backup-dir`, no confirmation, no marker check.
+   → tracked in [#61](https://github.com/mbertschler/squirrel/issues/61)
 2. [#C2](#c2-copy-from-existing-pre-stage-can-clobber-out-of-band-files)
    — receiver's CopyFromExisting pre-stage uses `os.Rename` over the
    destination path; an out-of-band file there is overwritten without
    being moved to history.
+   → tracked in [#62](https://github.com/mbertschler/squirrel/issues/62)
 3. [#C3](#c3-no-backup-of-the-sqlite-index) — there is no built-in
    backup, snapshot, or Litestream story for `~/.squirrel/index.db`. A
    single disk failure loses the entire index.
+   → tracked in [#65](https://github.com/mbertschler/squirrel/issues/65) (combined with H5 + M3)
 4. [#C4](#c4-sync-runid-fallback-collides-history-into-one-bucket) —
    `backupDirURI` falls back to `run-dry-run/` when `runID == 0` outside
    dry-run mode; any future bug that calls into that branch silently
@@ -59,6 +62,7 @@ issue we should open for that item.
    `index` has no atomic begin-if-clear gate; two concurrent indexers
    (CLI + agent scheduler) can both finish, and the loser's MarkMissing
    will flip the winner's freshly-touched rows to `missing`.
+   → tracked in [#63](https://github.com/mbertschler/squirrel/issues/63)
 6. [#H2](#h2-finishrun-blindly-overwrites-terminal-state) — `FinishRun`
    accepts a transition from any status, so a double-finish bug or a
    buggy retry overwrites the original terminal status, error message,
@@ -76,6 +80,7 @@ issue we should open for that item.
     migrations run in a transaction (good) but there is no on-disk
     snapshot taken before the migration starts. A corruption or
     in-flight crash leaves no point-in-time backup to fall back to.
+    → tracked in [#65](https://github.com/mbertschler/squirrel/issues/65) (combined with C3 + M3)
 10. [#H6](#h6-the-watermark-and-correlated-run-id-are-overwrite-in-place)
     — `UpsertPeerSyncState` and `SetCorrelatedRunID` rewrite values
     with no audit row. If a bug or hostile peer pushes a bad
@@ -84,6 +89,7 @@ issue we should open for that item.
     — sync writes into `<dest.root>/<volume>/` and restore writes into
     `vol.Path`; nothing validates that those locations are the squirrel-
     owned tree we think they are.
+    → tracked in [#64](https://github.com/mbertschler/squirrel/issues/64)
 
 ### Medium
 
@@ -97,6 +103,7 @@ issue we should open for that item.
 16. [#M3](#m3-no-pragma-integrity_check-anywhere) — the sqlite file is
     only verified lazily, page-by-page, when a row is read. A silent
     corruption can sit undetected for months.
+    → tracked in [#65](https://github.com/mbertschler/squirrel/issues/65) (combined with C3 + H5)
 17. [#M4](#m4-source_node_id-attribution-is-overwritten-on-touch) —
     when an unchanged-content row is touched on a different sync's
     closeSession or by the indexer, `updateLiveRow` rewrites
@@ -190,7 +197,7 @@ with whatever the remote holds.
   edit is moved into the local backup-dir, asserts the restored bytes
   land on the live path.
 
-**Issue:** `restore: gate in-place overwrites behind --in-place and write a local history dir`
+**Issue:** [#61 — restore: gate in-place overwrites behind --in-place and write a local history dir](https://github.com/mbertschler/squirrel/issues/61)
 
 ---
 
@@ -242,7 +249,7 @@ gate.
   CopyFromExisting, asserts the prior bytes are at
   `.squirrel-history/run-N/<path>` after the sync.
 
-**Issue:** `agent: CopyFromExisting pre-stage must preserve any out-of-band file at the destination path`
+**Issue:** [#62 — agent: CopyFromExisting pre-stage must preserve any out-of-band file at the destination path](https://github.com/mbertschler/squirrel/issues/62)
 
 ---
 
@@ -315,7 +322,7 @@ layers, each independently useful:
   `cp snapshot.db ~/.squirrel/index.db`) demonstrates the recovery
   path.
 
-**Issue:** `store: add db backup / restore / online snapshot and document Litestream integration`
+**Issue:** [#65 — store, cli: ship squirrel db {backup,check,restore} and snapshot before migrations](https://github.com/mbertschler/squirrel/issues/65) (combined with H5 + M3)
 
 ---
 
@@ -414,7 +421,7 @@ overwrite-on-supersede with an out-of-date watermark.
 - A regression test exercises the race directly via two goroutines
   hitting `Index` simultaneously.
 
-**Issue:** `store: add BeginIndexRunIfClear and wire it through index/audit paths`
+**Issue:** [#63 — store: add BeginIndexRunIfClear and wire it through index/audit paths](https://github.com/mbertschler/squirrel/issues/63)
 
 ---
 
@@ -599,7 +606,7 @@ mid-migration rolls back). But:
 - A test seeds a v7 DB, runs migrate to v8, asserts a backup file is
   present.
 
-**Issue:** `migrations: snapshot the index to ~/.squirrel/backups before each upgrade`
+**Issue:** [#65 — store, cli: ship squirrel db {backup,check,restore} and snapshot before migrations](https://github.com/mbertschler/squirrel/issues/65) (combined with C3 + M3)
 
 ---
 
@@ -689,7 +696,7 @@ rclone overwrites them.
   message and a `--init` workaround.
 - A regression test asserts the marker is created on first sync.
 
-**Issue:** `sync: require .squirrel-volume markers on destination and source to gate against misconfiguration`
+**Issue:** [#64 — sync: require .squirrel-volume markers on destination and source to gate against misconfiguration](https://github.com/mbertschler/squirrel/issues/64)
 
 ---
 
@@ -795,7 +802,7 @@ can be silently broken until a `query` happens to touch them.
 - `squirrel db check` exits 0 on a clean DB and non-zero on a corrupted
   one; tests both via a `.bak`-then-corrupt fixture.
 
-**Issue:** `cli, store: add db check command running PRAGMA integrity_check`
+**Issue:** [#65 — store, cli: ship squirrel db {backup,check,restore} and snapshot before migrations](https://github.com/mbertschler/squirrel/issues/65) (combined with C3 + H5)
 
 ---
 
