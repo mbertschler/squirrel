@@ -28,6 +28,7 @@ func newRestoreCmd() *cobra.Command {
 		to      string
 		shallow bool
 		dryRun  bool
+		inPlace bool
 	)
 	cmd := &cobra.Command{
 		Use:   "restore <volume>",
@@ -38,6 +39,7 @@ func newRestoreCmd() *cobra.Command {
 				ToPath:  to,
 				Shallow: shallow,
 				DryRun:  dryRun,
+				InPlace: inPlace,
 			})
 		},
 	}
@@ -45,6 +47,7 @@ func newRestoreCmd() *cobra.Command {
 	cmd.Flags().StringVar(&to, "to", "", "local target path (default: the volume's declared path)")
 	cmd.Flags().BoolVar(&shallow, "shallow", false, "skip BLAKE3 verification on the way down")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview rclone actions without transferring")
+	cmd.Flags().BoolVar(&inPlace, "in-place", false, "permit restore against a non-empty live vol.Path; overwritten files are moved to .squirrel-restore-history/run-<id>/")
 	return cmd
 }
 
