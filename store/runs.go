@@ -53,6 +53,11 @@ type Run struct {
 	FileCount       int64
 	PeerNodeID      sql.NullInt64
 	CorrelatedRunID sql.NullInt64
+	// Shallow is meaningful for index and audit runs: true when the
+	// run took the (size, mtime) shortcut instead of rehashing every
+	// file. NULL (Valid=false) for sync/restore runs and for the
+	// pre-v10 history that never recorded the choice.
+	Shallow sql.NullBool
 }
 
 // BeginRun records the start of a run and returns its id. Callers must pair
@@ -76,6 +81,31 @@ func (s *Store) BeginRun(ctx context.Context, kind string, volumeID int64, desti
 	id, err := res.LastInsertId()
 	if err != nil {
 		return 0, fmt.Errorf("run last insert id: %w", err)
+	}
+	return id, nil
+}
+
+// BeginIndexRun is BeginRun's sibling for kind='index' or kind='audit'
+// rows that additionally records whether the walk ran in shallow mode
+// (skip rehash when size/mtime match). Index and audit are the only run
+// kinds where the shortcut applies; sync/restore go through BeginRun and
+// leave runs.shallow NULL. The kind argument is validated to be one of
+// the two index-shaped kinds so this entry point can't silently widen
+// shallow's meaning later.
+func (s *Store) BeginIndexRun(ctx context.Context, kind string, volumeID int64, shallow bool) (int64, error) {
+	if kind != RunKindIndex && kind != RunKindAudit {
+		return 0, fmt.Errorf("BeginIndexRun: kind must be %q or %q, got %q", RunKindIndex, RunKindAudit, kind)
+	}
+	res, err := s.db.ExecContext(ctx, `
+		INSERT INTO runs (kind, volume_id, destination, started_at_ns, status, file_count, shallow)
+		VALUES (?, ?, NULL, ?, 'running', 0, ?)
+	`, kind, volumeID, NowNs(), shallow)
+	if err != nil {
+		return 0, fmt.Errorf("insert index run: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("index run last insert id: %w", err)
 	}
 	return id, nil
 }
@@ -173,12 +203,12 @@ type ListRunsOpts struct {
 // runColumns is the fixed projection for every read of a runs row. Keeps
 // the scan order in lockstep with the query order; adding a column means
 // editing one place.
-const runColumns = `id, kind, volume_id, destination, started_at_ns, ended_at_ns, status, error, file_count, peer_node_id, correlated_run_id`
+const runColumns = `id, kind, volume_id, destination, started_at_ns, ended_at_ns, status, error, file_count, peer_node_id, correlated_run_id, shallow`
 
 func scanRun(scan func(...any) error) (Run, error) {
 	var r Run
 	err := scan(&r.ID, &r.Kind, &r.VolumeID, &r.Destination, &r.StartedAtNs, &r.EndedAtNs,
-		&r.Status, &r.Error, &r.FileCount, &r.PeerNodeID, &r.CorrelatedRunID)
+		&r.Status, &r.Error, &r.FileCount, &r.PeerNodeID, &r.CorrelatedRunID, &r.Shallow)
 	return r, err
 }
 

@@ -1412,6 +1412,78 @@ func TestBeginRunDestinationRoundTrip(t *testing.T) {
 	}
 }
 
+// TestBeginIndexRunRecordsShallow verifies that BeginIndexRun stamps
+// the runs.shallow column with the value the caller passed and that
+// runs allocated via BeginRun (sync/restore) leave the column NULL.
+func TestBeginIndexRunRecordsShallow(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+
+	shallowID, err := s.BeginIndexRun(ctx, RunKindIndex, vID, true)
+	if err != nil {
+		t.Fatalf("BeginIndexRun shallow: %v", err)
+	}
+	fullID, err := s.BeginIndexRun(ctx, RunKindIndex, vID, false)
+	if err != nil {
+		t.Fatalf("BeginIndexRun full: %v", err)
+	}
+	auditID, err := s.BeginIndexRun(ctx, RunKindAudit, vID, true)
+	if err != nil {
+		t.Fatalf("BeginIndexRun audit: %v", err)
+	}
+	syncID, err := s.BeginRun(ctx, RunKindSync, vID, "nas")
+	if err != nil {
+		t.Fatalf("BeginRun sync: %v", err)
+	}
+
+	runs, err := s.ListRuns(ctx, ListRunsOpts{})
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	byID := map[int64]Run{}
+	for _, r := range runs {
+		byID[r.ID] = r
+	}
+	if got := byID[shallowID]; !got.Shallow.Valid || !got.Shallow.Bool {
+		t.Fatalf("shallow run: got %+v, want valid=true bool=true", got.Shallow)
+	}
+	if got := byID[fullID]; !got.Shallow.Valid || got.Shallow.Bool {
+		t.Fatalf("full run: got %+v, want valid=true bool=false", got.Shallow)
+	}
+	if got := byID[auditID]; !got.Shallow.Valid || !got.Shallow.Bool {
+		t.Fatalf("audit shallow run: got %+v, want valid=true bool=true", got.Shallow)
+	}
+	if got := byID[syncID]; got.Shallow.Valid {
+		t.Fatalf("sync run: got %+v, want NULL", got.Shallow)
+	}
+}
+
+// TestBeginIndexRunRejectsWrongKind pins the validation: only index and
+// audit kinds may go through BeginIndexRun. The shallow flag has no
+// meaning for sync/restore so the API refuses to record one.
+func TestBeginIndexRunRejectsWrongKind(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+
+	for _, kind := range []string{RunKindSync, RunKindRestore, "bogus"} {
+		if _, err := s.BeginIndexRun(ctx, kind, vID, true); err == nil {
+			t.Fatalf("BeginIndexRun(%q) accepted, want error", kind)
+		}
+	}
+}
+
 // TestLatestSuccessfulIndexRun confirms the prerequisite-check helper used
 // by sync: it returns the most recent success/partial index run for a
 // volume, ignoring failed runs and other kinds.

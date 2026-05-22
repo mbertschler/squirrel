@@ -335,7 +335,10 @@ func (s *scheduler) executeIndex(ctx context.Context, vol *config.Volume, volume
 // still returns the (best-effort) run id so the kicked/finished log
 // pair carries a non-zero correlation when possible.
 func (s *scheduler) recordFailedIndex(ctx context.Context, vol *config.Volume, volumeID int64, runErr error) int64 {
-	id, err := s.store.BeginRun(ctx, store.RunKindIndex, volumeID, "")
+	// Scheduler index runs are always shallow (see executeIndex); the
+	// synthesised failed row carries the same flag so cadence math
+	// and run history don't lie about the attempted mode.
+	id, err := s.store.BeginIndexRun(ctx, store.RunKindIndex, volumeID, true)
 	if err != nil {
 		s.logger.Error("scheduler.error",
 			"kind", "index", "volume", vol.Name,

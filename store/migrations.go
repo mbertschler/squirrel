@@ -9,7 +9,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 9
+const SchemaVersion = 10
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -44,6 +44,7 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 7, up: migrateV6ToV7},
 		{version: 8, up: migrateV7ToV8},
 		{version: 9, up: migrateV8ToV9},
+		{version: 10, up: migrateV9ToV10},
 	}
 }
 
@@ -1130,4 +1131,30 @@ func backfillFolderAggregatesV9(ctx context.Context, tx *sql.Tx) error {
 		}
 	}
 	return nil
+}
+
+// migrateV9ToV10 adds a nullable `shallow` flag to the runs table. The
+// flag is meaningful for index and audit runs — it records whether the
+// run took the (size, mtime) shortcut instead of rehashing every file —
+// and is left NULL for sync/restore (where the concept doesn't apply)
+// and for the history of pre-v10 rows (where the choice wasn't
+// recorded). A CHECK constraint keeps the column to 0/1/NULL so the
+// nullable bool semantics stay legible from raw SQL.
+func migrateV9ToV10(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`ALTER TABLE runs ADD COLUMN shallow INTEGER CHECK (shallow IS NULL OR shallow IN (0, 1))`,
+		`INSERT INTO schema_version (version) VALUES (10)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("v9→v10: %w", err)
+		}
+	}
+	return tx.Commit()
 }

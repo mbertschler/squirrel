@@ -221,7 +221,7 @@ func (i *indexer) beginRun() error {
 	if kind == "" {
 		kind = store.RunKindIndex
 	}
-	id, err := i.store.BeginRun(i.ctx, kind, i.volumeID, "")
+	id, err := i.store.BeginIndexRun(i.ctx, kind, i.volumeID, i.opts.Shallow)
 	if err != nil {
 		return fmt.Errorf("begin run: %w", err)
 	}
