@@ -785,30 +785,45 @@ func TestDryRunReportsMissingCount(t *testing.T) {
 	}
 }
 
-// TestConcurrentIndexRunsAreSerialized covers the TOCTOU race the new
-// BeginIndexRunIfClear gate closes: two goroutines invoking Index on
-// the same volume must produce exactly one success and one
-// ErrAlreadyRunning, with the loser's MarkMissing never firing
-// against the winner's run.
-func TestConcurrentIndexRunsAreSerialized(t *testing.T) {
+// TestConcurrentIndexCallsCannotOverlap covers the TOCTOU race the new
+// BeginIndexRunIfClear gate closes. Asserting "exactly one of N
+// parallel Index calls succeeds" is timing-dependent (a fast walk can
+// finish before the next goroutine reaches the gate), so we instead
+// park a running index row externally and confirm that *every*
+// concurrent Index call is refused with the sentinel pointing at the
+// parked blocker. The store-level race coverage lives in
+// TestBeginIndexRunIfClearAtomic.
+func TestConcurrentIndexCallsCannotOverlap(t *testing.T) {
 	s := setupStore(t)
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "a.txt"), "alpha")
 	writeFile(t, filepath.Join(root, "b.txt"), "beta")
 
-	// Seed the volume row up front so both goroutines hit the gate at
-	// roughly the same moment instead of one waiting on volume creation.
+	// Materialise the volume row via a real Index pass so the parked
+	// row can reference a valid volume_id.
 	if _, err := Index(context.Background(), s, root, Options{Name: "v", Workers: 2}); err != nil {
 		t.Fatalf("seed Index: %v", err)
 	}
+	v := volumeFor(t, s, root)
+
+	parkedID, blocker, err := s.BeginIndexRunIfClear(context.Background(), store.RunKindIndex, v.ID, false)
+	if err != nil {
+		t.Fatalf("park running row: %v", err)
+	}
+	if blocker != nil {
+		t.Fatalf("park gate unexpectedly blocked: blocker=%+v", blocker)
+	}
+	defer func() {
+		_ = s.FinishRun(context.Background(), parkedID, store.RunStatusSuccess, "", 0)
+	}()
 
 	const parallel = 4
 	var (
-		wg          sync.WaitGroup
-		mu          sync.Mutex
-		successes   int
-		inFlightErr int
-		other       []error
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		blocked  int
+		other    []error
+		surprise int
 	)
 	start := make(chan struct{})
 	for i := 0; i < parallel; i++ {
@@ -819,11 +834,16 @@ func TestConcurrentIndexRunsAreSerialized(t *testing.T) {
 			_, err := Index(context.Background(), s, root, Options{Name: "v", Workers: 2})
 			mu.Lock()
 			defer mu.Unlock()
+			var inFlight *ErrAlreadyRunning
 			switch {
 			case err == nil:
-				successes++
-			case errors.As(err, new(*ErrAlreadyRunning)):
-				inFlightErr++
+				surprise++
+			case errors.As(err, &inFlight):
+				if inFlight.Blocker.ID != parkedID {
+					other = append(other, fmt.Errorf("blocker id = %d, want %d", inFlight.Blocker.ID, parkedID))
+					return
+				}
+				blocked++
 			default:
 				other = append(other, err)
 			}
@@ -832,14 +852,22 @@ func TestConcurrentIndexRunsAreSerialized(t *testing.T) {
 	close(start)
 	wg.Wait()
 
+	if surprise > 0 {
+		t.Fatalf("%d concurrent Index() calls succeeded while a row was parked", surprise)
+	}
 	if len(other) > 0 {
 		t.Fatalf("unexpected errors: %v", other)
 	}
-	if successes != 1 {
-		t.Fatalf("successes = %d, want 1 (in-flight = %d)", successes, inFlightErr)
+	if blocked != parallel {
+		t.Fatalf("blocked = %d, want %d", blocked, parallel)
 	}
-	if inFlightErr != parallel-1 {
-		t.Fatalf("in-flight refusals = %d, want %d", inFlightErr, parallel-1)
+
+	// Releasing the parked row reopens the slot.
+	if err := s.FinishRun(context.Background(), parkedID, store.RunStatusSuccess, "", 0); err != nil {
+		t.Fatalf("FinishRun parked: %v", err)
+	}
+	if _, err := Index(context.Background(), s, root, Options{Name: "v", Workers: 2}); err != nil {
+		t.Fatalf("post-finish Index: %v", err)
 	}
 }
 
