@@ -19,6 +19,17 @@ func newRootCmd() *cobra.Command {
 		Use:          "squirrel",
 		Short:        "Local content-addressed file indexer",
 		SilenceUsage: true,
+		// Bare `squirrel` (no subcommand) opens the TUI when stdin and stdout
+		// are both attached to a terminal; otherwise it falls through to the
+		// usual cobra help output. This keeps `squirrel | grep ...` and
+		// scripts that invoke the binary unchanged while making the
+		// interactive entry point one keystroke shorter.
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 && stdinIsTTY() {
+				return runTUI(cmd)
+			}
+			return cmd.Help()
+		},
 	}
 
 	// --db default is left empty: the resolved value comes from (in order)
@@ -38,6 +49,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newRestoreCmd())
 	root.AddCommand(newAgentCmd())
 	root.AddCommand(newAuditCmd())
+	root.AddCommand(newTUICmd())
 	return root
 }
 

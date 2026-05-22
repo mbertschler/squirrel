@@ -106,6 +106,13 @@ squirrel runs
 squirrel runs --volume pictures --limit 5
 ```
 
+Open the interactive terminal UI to watch live runs, browse the index ncdu-style, and drill into individual run records:
+
+```
+squirrel tui
+squirrel        # bare invocation opens the TUI when stdin/stdout are a terminal
+```
+
 ## CLI reference
 
 ```
@@ -116,6 +123,7 @@ squirrel query   --duplicates
 squirrel query   --missing
 squirrel runs                        [--volume NAME] [--limit N]
 squirrel volumes
+squirrel tui
 ```
 
 | Flag        | Default                       | Meaning                                                          |
