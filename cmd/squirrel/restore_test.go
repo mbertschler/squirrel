@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/mbertschler/squirrel/store"
+	"github.com/mbertschler/squirrel/volmark"
 )
 
 // TestCLIRestoreRoundTrip is the end-to-end smoke test: sync a volume,
@@ -22,12 +23,18 @@ func TestCLIRestoreRoundTrip(t *testing.T) {
 	runCLI(t, "--config", f.configPath, "index", f.volumeName)
 	runCLI(t, "--config", f.configPath, "sync", "pics")
 
-	// Wipe the local volume so the restore has work to do.
+	// Wipe the local volume so the restore has work to do. The marker
+	// is re-written by hand: the documented recovery flow is "create
+	// the volume directory and put a marker in it" (or re-run index)
+	// before restore. Without it the marker check refuses.
 	if err := os.RemoveAll(f.volumeDir); err != nil {
 		t.Fatalf("remove volume: %v", err)
 	}
 	if err := os.MkdirAll(f.volumeDir, 0o755); err != nil {
 		t.Fatalf("recreate volume: %v", err)
+	}
+	if err := volmark.Write(f.volumeDir, volmark.Marker{Volume: f.volumeName}); err != nil {
+		t.Fatalf("re-seed source marker: %v", err)
 	}
 
 	out := runCLI(t, "--config", f.configPath, "restore", "pics")

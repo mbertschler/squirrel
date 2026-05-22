@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/mbertschler/squirrel/volmark"
 )
 
 // requireRcloneCLI mirrors sync.requireRclone but for the CLI tests in
@@ -49,6 +51,17 @@ func writeSyncFixture(t *testing.T) syncFixturePaths {
 	destDir := filepath.Join(root, "dst")
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		t.Fatalf("mkdir dest: %v", err)
+	}
+	// Pre-bootstrap the destination's per-volume marker so existing
+	// CLI tests don't have to pass --init on the first sync. A
+	// dedicated CLI test exercises the --init flow against a marker-less
+	// destination separately.
+	destVolDir := filepath.Join(destDir, "pics")
+	if err := os.MkdirAll(destVolDir, 0o755); err != nil {
+		t.Fatalf("mkdir dest volume: %v", err)
+	}
+	if err := volmark.Write(destVolDir, volmark.Marker{Volume: "pics"}); err != nil {
+		t.Fatalf("seed destination marker: %v", err)
 	}
 	dbPath := filepath.Join(root, "index.db")
 	configPath := filepath.Join(root, "config.toml")
