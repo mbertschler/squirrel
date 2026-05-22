@@ -1,0 +1,177 @@
+package templates
+
+import (
+	"fmt"
+	"time"
+)
+
+// MenubarSnapshot is one consistent read of the data shown in the
+// status-bar panel. Captured by the handler in a single pass so the
+// poll-driven refresh never renders a half-updated view.
+type MenubarSnapshot struct {
+	Volumes    []MenubarVolume
+	ActiveRuns []MenubarRun
+}
+
+// MenubarVolume is the compact per-volume row: name, cumulative
+// counts, and a "running" flag if any run for that volume is in
+// flight. Path is kept so the template can render a tooltip / second
+// line, not for any computation.
+type MenubarVolume struct {
+	Name           string
+	Path           string
+	FileCount      int64
+	CumulativeSize int64
+	Indexed        bool
+	Running        bool
+}
+
+// MenubarRun is one in-flight run as rendered in the active-runs
+// list. Started is a wall-clock ns timestamp so the template can
+// compute elapsed seconds against time.Now() on each render.
+type MenubarRun struct {
+	ID          int64
+	Kind        string
+	Volume      string
+	Destination string
+	StartedAtNs int64
+}
+
+// MenubarPage is the full HTML page served at GET /menubar. The
+// layout is intentionally sidebar-free: the panel is ~360px wide.
+// The wrapping Stimulus controller polls /menubar/frame every few
+// seconds so volume counts and running-run state stay live without
+// the user having to close+reopen the popover.
+templ MenubarPage(snap MenubarSnapshot) {
+	<!DOCTYPE html>
+	<html lang="en">
+		<head>
+			<meta charset="utf-8"/>
+			<meta name="viewport" content="width=device-width, initial-scale=1"/>
+			<title>Squirrel</title>
+			<link rel="stylesheet" href="/static/app.css"/>
+			<script src="/static/app.js" defer></script>
+		</head>
+		<body class="min-h-screen bg-background text-foreground antialiased">
+			<div
+				class="flex min-h-screen flex-col"
+				data-controller="menubar-refresh"
+				data-menubar-refresh-url-value="/menubar/frame"
+				data-menubar-refresh-interval-value="2500"
+			>
+				<header class="flex items-center justify-between border-b border-border px-4 py-3">
+					<div class="flex items-center gap-2">
+						<span class="inline-block h-2 w-2 rounded-full bg-primary"></span>
+						<span class="text-sm font-semibold">Squirrel</span>
+					</div>
+					<a class="btn btn-sm btn-ghost" href="/volumes" target="_blank" rel="noopener">Open</a>
+				</header>
+				<div id="menubar-body" class="flex-1 overflow-auto">
+					@MenubarFrame(snap)
+				</div>
+			</div>
+		</body>
+	</html>
+}
+
+// MenubarFrame is the refreshable body. Served standalone at
+// /menubar/frame so the Stimulus poller can swap it without rebuilding
+// the controller-owning wrapper.
+templ MenubarFrame(snap MenubarSnapshot) {
+	<div id="menubar-frame" class="space-y-3 p-3">
+		@menubarVolumes(snap.Volumes)
+		@menubarActiveRuns(snap.ActiveRuns)
+	</div>
+}
+
+templ menubarVolumes(rows []MenubarVolume) {
+	<section class="card">
+		<header class="card-header">
+			<h2 class="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Volumes</h2>
+		</header>
+		if len(rows) == 0 {
+			<div class="px-3 py-2 text-xs text-muted-foreground">No volumes configured.</div>
+		}
+		<ul class="divide-y divide-border">
+			for _, v := range rows {
+				<li class="flex items-center justify-between gap-2 px-3 py-2 text-sm">
+					<div class="min-w-0">
+						<div class="flex items-center gap-1.5">
+							<span class="truncate font-medium">{ v.Name }</span>
+							if v.Running {
+								<span class="rounded-md bg-primary/15 px-1.5 py-0.5 text-[10px] font-medium text-primary">running</span>
+							}
+						</div>
+						if v.Indexed {
+							<div class="text-xs text-muted-foreground tabular-nums">
+								{ fmt.Sprintf("%d files", v.FileCount) } · { humanBytes(v.CumulativeSize) }
+							</div>
+						} else {
+							<div class="text-xs text-muted-foreground">not indexed</div>
+						}
+					</div>
+				</li>
+			}
+		</ul>
+	</section>
+}
+
+templ menubarActiveRuns(rows []MenubarRun) {
+	<section class="card">
+		<header class="card-header">
+			<h2 class="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Active runs</h2>
+		</header>
+		if len(rows) == 0 {
+			<div class="px-3 py-2 text-xs text-muted-foreground">No active runs.</div>
+		} else {
+			<ul class="divide-y divide-border">
+				for _, r := range rows {
+					<li class="px-3 py-2 text-sm">
+						<div class="flex items-center justify-between gap-2">
+							<span class="font-medium">{ menubarRunLabel(r) }</span>
+							<span class="tabular-nums text-xs text-muted-foreground">{ menubarElapsed(r.StartedAtNs) }</span>
+						</div>
+						<div class="text-xs text-muted-foreground">
+							<a class="hover:underline" href={ templ.URL(fmt.Sprintf("/runs/%d", r.ID)) } target="_blank" rel="noopener">{ fmt.Sprintf("Run #%d", r.ID) }</a>
+						</div>
+					</li>
+				}
+			</ul>
+		}
+	</section>
+}
+
+// menubarRunLabel renders "<kind> <volume>" or "<kind> <volume> → <dest>"
+// depending on whether a destination is set. Kept here (not on the
+// MenubarRun struct) so the template's formatting decisions stay near
+// the markup that uses them.
+func menubarRunLabel(r MenubarRun) string {
+	label := r.Kind
+	if r.Volume != "" {
+		label += " " + r.Volume
+	}
+	if r.Destination != "" {
+		label += " → " + r.Destination
+	}
+	return label
+}
+
+// menubarElapsed returns a short elapsed string ("12s", "3m 04s") for
+// the menubar's active-runs list. Recomputed on every render — the
+// frame is re-fetched by the poller, so the value stays current
+// without any client-side ticking.
+func menubarElapsed(startedNs int64) string {
+	if startedNs <= 0 {
+		return ""
+	}
+	d := time.Since(time.Unix(0, startedNs))
+	if d < 0 {
+		return ""
+	}
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	m := int(d.Minutes())
+	s := int(d.Seconds()) - m*60
+	return fmt.Sprintf("%dm %02ds", m, s)
+}

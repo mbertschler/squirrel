@@ -45,10 +45,23 @@ func main() {
 	}
 }
 
+// desktopOptions captures the flag-driven form factor for the desktop
+// window. Defined here rather than in main_wailsdesktop.go so flag
+// parsing and dispatch stay free of build tags — runDesktop's serve-only
+// stub also accepts it without dragging in webview deps.
+type desktopOptions struct {
+	// Menubar selects the macOS status-bar attached panel: a small
+	// frameless on-top window pinned to the tray icon, accessory
+	// activation policy (no dock icon), starting hidden. The regular
+	// full window is used when this is false.
+	Menubar bool
+}
+
 func run() error {
 	cfgPath := flag.String("config", "", "TOML config path (default: $SQUIRREL_CONFIG or ~/.squirrel/config.toml)")
 	dbPath := flag.String("db", "", "SQLite index db path; overrides the value in config")
 	serveAddr := flag.String("serve", "", "Run as a stand-alone web server on the given address (e.g. :8080); when set, no desktop window is opened")
+	menubar := flag.Bool("menubar", false, "Use the macOS status-bar attached panel form factor (small frameless window pinned to the tray icon) instead of the regular full window")
 	flag.Parse()
 
 	cfg, err := config.Load(*cfgPath)
@@ -76,7 +89,7 @@ func run() error {
 	if *serveAddr != "" {
 		return runServe(*serveAddr, handler)
 	}
-	return runDesktop(handler)
+	return runDesktop(handler, desktopOptions{Menubar: *menubar})
 }
 
 func runServe(addr string, h http.Handler) error {
