@@ -322,7 +322,17 @@ layers, each independently useful:
   `cp snapshot.db ~/.squirrel/index.db`) demonstrates the recovery
   path.
 
-**Issue:** [#65 — store, cli: ship squirrel db {backup,check,restore} and snapshot before migrations](https://github.com/mbertschler/squirrel/issues/65) (combined with H5 + M3)
+**Scope of tracking issue #65**
+
+Issue #65 covers layer 1 (`squirrel db backup` via `VACUUM INTO`) plus
+the pre-migration snapshot from H5 and the `PRAGMA integrity_check`
+from M3 — i.e. the immediately shippable primitives. Layer 2
+(per-sync destination snapshots under
+`<dest>/<volume>/.squirrel-index/`) and layer 3 (documented Litestream
+wiring) are deferred follow-ups, listed as out-of-scope in #65 and
+worth re-opening as separate issues once the core primitives land.
+
+**Issue:** [#65 — store, cli: ship squirrel db {backup,check,restore} and snapshot before migrations](https://github.com/mbertschler/squirrel/issues/65) (covers layer 1 + H5 + M3; layers 2 and 3 deferred)
 
 ---
 
