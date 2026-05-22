@@ -64,6 +64,23 @@ type Report struct {
 	RunID int64
 }
 
+// ErrAlreadyRunning is returned from Index when store.BeginIndexRunIfClear
+// refuses to start because another index- or audit-kind run is already in
+// flight against the same volume. Callers can errors.As against this type
+// to distinguish a polite refusal (the other run is still progressing —
+// don't log as error, don't synthesise a failed row) from a real failure.
+type ErrAlreadyRunning struct {
+	Kind    string
+	Volume  string
+	Blocker store.Run
+}
+
+func (e *ErrAlreadyRunning) Error() string {
+	return fmt.Sprintf("%s of %s already running (run=%d, started %s)",
+		e.Kind, e.Volume, e.Blocker.ID,
+		time.Unix(0, e.Blocker.StartedAtNs).UTC().Format(time.RFC3339))
+}
+
 type changeKind int
 
 const (
@@ -213,6 +230,11 @@ func newIndexer(ctx context.Context, s *store.Store, root string, opts Options) 
 // beginRun records the start of this index run in the store, unless the
 // indexer is operating in DryRun mode (which never touches the database).
 // The resulting run id is what every per-row write is tagged with.
+//
+// Concurrency: BeginIndexRunIfClear is atomic — two concurrent indexers
+// against the same volume cannot both pass this gate. The loser sees a
+// non-nil blocker and returns ErrAlreadyRunning so callers can render a
+// polite skip (scheduler) or a clear error (CLI).
 func (i *indexer) beginRun() error {
 	if i.opts.DryRun {
 		return nil
@@ -221,9 +243,12 @@ func (i *indexer) beginRun() error {
 	if kind == "" {
 		kind = store.RunKindIndex
 	}
-	id, err := i.store.BeginIndexRun(i.ctx, kind, i.volumeID, i.opts.Shallow)
+	id, blocker, err := i.store.BeginIndexRunIfClear(i.ctx, kind, i.volumeID, i.opts.Shallow)
 	if err != nil {
 		return fmt.Errorf("begin run: %w", err)
+	}
+	if blocker != nil {
+		return &ErrAlreadyRunning{Kind: kind, Volume: i.opts.Name, Blocker: *blocker}
 	}
 	i.runID = id
 	return nil

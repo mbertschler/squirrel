@@ -484,6 +484,61 @@ func (s *Store) BeginSyncRunIfClear(ctx context.Context, spec SyncRunSpec) (int6
 	return id, nil, nil
 }
 
+// BeginIndexRunIfClear atomically inserts a 'running' kind='index' or
+// kind='audit' row for volumeID iff no other index- or audit-kind run
+// is currently in flight against the same volume. Symmetric to
+// BeginSyncRunIfClear (BEGIN IMMEDIATE + check + insert in one tx) so
+// two concurrent callers cannot both observe "no running run" and both
+// insert. Cross-kind: an in-flight 'index' blocks a new 'audit' and
+// vice versa because both walk the volume and call MarkMissing with
+// their own run-id — letting them overlap is exactly the bug this
+// guards against.
+//
+// Returns (newID, nil, nil) when the row was inserted; (0, &blocker,
+// nil) when refused. Stale rows from crashed runs keep blocking here
+// until cleared via `runs fail` (#37), same recovery story as sync.
+func (s *Store) BeginIndexRunIfClear(ctx context.Context, kind string, volumeID int64, shallow bool) (int64, *Run, error) {
+	if kind != RunKindIndex && kind != RunKindAudit {
+		return 0, nil, fmt.Errorf("BeginIndexRunIfClear: kind must be %q or %q, got %q", RunKindIndex, RunKindAudit, kind)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, nil, fmt.Errorf("begin index-run tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	row := tx.QueryRowContext(ctx, `
+		SELECT `+runColumns+`
+		FROM runs
+		WHERE kind IN ('index', 'audit') AND status = 'running'
+		  AND volume_id = ?
+		ORDER BY id LIMIT 1
+	`, volumeID)
+	blocker, scanErr := scanRun(row.Scan)
+	if scanErr == nil {
+		return 0, &blocker, nil
+	}
+	if !errors.Is(scanErr, sql.ErrNoRows) {
+		return 0, nil, fmt.Errorf("check running index/audit: %w", scanErr)
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		INSERT INTO runs (kind, volume_id, destination, started_at_ns, status, file_count, shallow)
+		VALUES (?, ?, NULL, ?, 'running', 0, ?)
+	`, kind, volumeID, NowNs(), shallow)
+	if err != nil {
+		return 0, nil, fmt.Errorf("insert index run: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, nil, fmt.Errorf("index run last insert id: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, nil, fmt.Errorf("commit index run: %w", err)
+	}
+	return id, nil, nil
+}
+
 // LatestSuccessfulIndexRun returns the most recent index run for the given
 // volume that finished in status 'success' or 'partial'. Used by the sync
 // command as a prerequisite check: refusing to sync a volume that has never

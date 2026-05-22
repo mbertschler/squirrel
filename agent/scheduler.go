@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -258,10 +259,12 @@ func (s *scheduler) maybeRunIndex(ctx context.Context, vol *config.Volume, volum
 	return s.executeIndex(ctx, vol, volumeID, reason)
 }
 
-// indexGatePassed runs the two pre-flight checks an index kick needs:
-// cadence (skips silently when not due) and in-flight detection
-// (logs scheduler.skipped). Returns true when the caller may proceed
-// to acquire the lock and run.
+// indexGatePassed evaluates the cadence pre-check for an index kick.
+// The in-flight check that used to live here was a TOCTOU pattern
+// (HasRunningRun + insert) — it has moved into index.Index's atomic
+// BeginIndexRunIfClear gate. A run that loses that gate surfaces here
+// as an index.ErrAlreadyRunning from executeIndex and is logged as
+// scheduler.skipped without going through indexGatePassed.
 func (s *scheduler) indexGatePassed(ctx context.Context, vol *config.Volume, volumeID int64, cadence time.Duration) bool {
 	if cadence > 0 {
 		due, err := s.indexDue(ctx, volumeID, cadence)
@@ -273,18 +276,6 @@ func (s *scheduler) indexGatePassed(ctx context.Context, vol *config.Volume, vol
 		if !due {
 			return false
 		}
-	}
-	running, err := s.store.HasRunningRun(ctx, store.RunKindIndex, volumeID, "")
-	if err != nil {
-		s.logger.Error("scheduler.error",
-			"kind", "index", "volume", vol.Name, "err", err.Error())
-		return false
-	}
-	if running {
-		s.logger.Info("scheduler.skipped",
-			"kind", "index", "volume", vol.Name,
-			"reason", "in-flight index run")
-		return false
 	}
 	return true
 }
@@ -308,6 +299,17 @@ func (s *scheduler) executeIndex(ctx context.Context, vol *config.Volume, volume
 		Kind:    store.RunKindIndex,
 		Shallow: true,
 	})
+	// A polite refusal from the new atomic gate (concurrent CLI invocation,
+	// stale 'running' row, audit in flight) is not an error worth recording
+	// as a failed run — the conflicting run is still progressing and the
+	// next tick re-evaluates fresh.
+	if inFlight, ok := errors.AsType[*index.ErrAlreadyRunning](err); ok {
+		s.logger.Info("scheduler.skipped",
+			"kind", "index", "volume", vol.Name,
+			"reason", "in-flight index run",
+			"blocker_run_id", inFlight.Blocker.ID)
+		return false
+	}
 	duration := s.now().Sub(start)
 	if err != nil && rep.RunID == 0 {
 		rep.RunID = s.recordFailedIndex(ctx, vol, volumeID, err)

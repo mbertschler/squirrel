@@ -3,10 +3,12 @@ package index
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -780,5 +782,110 @@ func TestDryRunReportsMissingCount(t *testing.T) {
 	}
 	if row.Status != store.StatusPresent {
 		t.Fatalf("dry-run mutated DB: status = %s, want present (untouched)", row.Status)
+	}
+}
+
+// TestConcurrentIndexRunsAreSerialized covers the TOCTOU race the new
+// BeginIndexRunIfClear gate closes: two goroutines invoking Index on
+// the same volume must produce exactly one success and one
+// ErrAlreadyRunning, with the loser's MarkMissing never firing
+// against the winner's run.
+func TestConcurrentIndexRunsAreSerialized(t *testing.T) {
+	s := setupStore(t)
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), "alpha")
+	writeFile(t, filepath.Join(root, "b.txt"), "beta")
+
+	// Seed the volume row up front so both goroutines hit the gate at
+	// roughly the same moment instead of one waiting on volume creation.
+	if _, err := Index(context.Background(), s, root, Options{Name: "v", Workers: 2}); err != nil {
+		t.Fatalf("seed Index: %v", err)
+	}
+
+	const parallel = 4
+	var (
+		wg          sync.WaitGroup
+		mu          sync.Mutex
+		successes   int
+		inFlightErr int
+		other       []error
+	)
+	start := make(chan struct{})
+	for i := 0; i < parallel; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := Index(context.Background(), s, root, Options{Name: "v", Workers: 2})
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				successes++
+			case errors.As(err, new(*ErrAlreadyRunning)):
+				inFlightErr++
+			default:
+				other = append(other, err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if len(other) > 0 {
+		t.Fatalf("unexpected errors: %v", other)
+	}
+	if successes != 1 {
+		t.Fatalf("successes = %d, want 1 (in-flight = %d)", successes, inFlightErr)
+	}
+	if inFlightErr != parallel-1 {
+		t.Fatalf("in-flight refusals = %d, want %d", inFlightErr, parallel-1)
+	}
+}
+
+// TestIndexBlocksConcurrentAudit confirms that an in-flight index run
+// also refuses a fresh audit-kind invocation (and vice versa) on the
+// same volume. Both walk the volume and call MarkMissing under their
+// own run-id, so letting them overlap is exactly the corruption mode
+// the gate guards against.
+func TestIndexBlocksConcurrentAudit(t *testing.T) {
+	s := setupStore(t)
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), "alpha")
+
+	// Materialise the volume row via a real Index pass so we can park a
+	// running row on it directly afterwards.
+	if _, err := Index(context.Background(), s, root, Options{Name: "v", Workers: 2}); err != nil {
+		t.Fatalf("seed Index: %v", err)
+	}
+	v := volumeFor(t, s, root)
+
+	// Manually park a running index row to simulate "another index is
+	// still in flight" without spinning up a second goroutine that
+	// races on completion timing.
+	idxID, blocker, err := s.BeginIndexRunIfClear(context.Background(), store.RunKindIndex, v.ID, false)
+	if err != nil {
+		t.Fatalf("seed running index row: %v", err)
+	}
+	if blocker != nil {
+		t.Fatalf("seed gate unexpectedly blocked: blocker=%+v", blocker)
+	}
+	defer func() {
+		_ = s.FinishRun(context.Background(), idxID, store.RunStatusSuccess, "", 0)
+	}()
+
+	_, err = Index(context.Background(), s, root, Options{Name: "v", Workers: 2, Kind: store.RunKindAudit})
+	if err == nil {
+		t.Fatalf("audit Index unexpectedly succeeded with an in-flight index")
+	}
+	var sentinel *ErrAlreadyRunning
+	if !errors.As(err, &sentinel) {
+		t.Fatalf("err = %v (%T), want *ErrAlreadyRunning", err, err)
+	}
+	if sentinel.Blocker.ID != idxID {
+		t.Fatalf("blocker id = %d, want %d (the seeded index)", sentinel.Blocker.ID, idxID)
+	}
+	if sentinel.Kind != store.RunKindAudit {
+		t.Fatalf("err.Kind = %q, want %q (the kind that was refused)", sentinel.Kind, store.RunKindAudit)
 	}
 }

@@ -3162,3 +3162,113 @@ func TestGetPresentByBlake3InVolume(t *testing.T) {
 		t.Fatalf("want ErrNoRows for unknown digest, got %v", err)
 	}
 }
+
+// TestBeginIndexRunIfClearAtomic is the index-side companion to
+// TestBeginSyncRunIfClearAtomic: many goroutines racing on the same
+// volume must serialise inside BEGIN IMMEDIATE so exactly one inserts
+// and the rest see the inserted row as the blocker. The gate covers
+// both 'index' and 'audit' kinds against each other on the same
+// volume since both walk the tree and call MarkMissing.
+func TestBeginIndexRunIfClearAtomic(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+
+	const parallel = 8
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		newIDs   []int64
+		blockers []*Run
+		execErrs []error
+	)
+	start := make(chan struct{})
+	for i := 0; i < parallel; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			id, blocker, err := s.BeginIndexRunIfClear(ctx, RunKindIndex, vID, false)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err != nil:
+				execErrs = append(execErrs, err)
+			case blocker != nil:
+				blockers = append(blockers, blocker)
+			default:
+				newIDs = append(newIDs, id)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if len(execErrs) > 0 {
+		t.Fatalf("unexpected errors: %v", execErrs)
+	}
+	if len(newIDs) != 1 {
+		t.Fatalf("inserts = %d, want exactly 1 (IDs=%v)", len(newIDs), newIDs)
+	}
+	if len(blockers) != parallel-1 {
+		t.Fatalf("blockers = %d, want %d", len(blockers), parallel-1)
+	}
+	for _, b := range blockers {
+		if b.ID != newIDs[0] {
+			t.Fatalf("blocker id = %d, want %d", b.ID, newIDs[0])
+		}
+	}
+
+	// Cross-kind: a running index also blocks a fresh audit on the
+	// same volume — they share the walk and MarkMissing surface.
+	id2, blocker2, err := s.BeginIndexRunIfClear(ctx, RunKindAudit, vID, true)
+	if err != nil {
+		t.Fatalf("audit gate err: %v", err)
+	}
+	if blocker2 == nil || blocker2.ID != newIDs[0] {
+		t.Fatalf("audit should have been blocked by the running index (got id=%d blocker=%+v)", id2, blocker2)
+	}
+
+	// A different volume is independent.
+	vB := makeVolume(t, s, "/w")
+	idB, blockerB, err := s.BeginIndexRunIfClear(ctx, RunKindIndex, vB, false)
+	if err != nil || blockerB != nil || idB == 0 {
+		t.Fatalf("independent volume blocked: id=%d blocker=%+v err=%v", idB, blockerB, err)
+	}
+
+	// Finishing the first run reopens the slot, and the next kind can
+	// be audit (or index) freely.
+	if err := s.FinishRun(ctx, newIDs[0], RunStatusSuccess, "", 0); err != nil {
+		t.Fatalf("FinishRun: %v", err)
+	}
+	id3, blocker3, err := s.BeginIndexRunIfClear(ctx, RunKindAudit, vID, true)
+	if err != nil || blocker3 != nil || id3 == 0 {
+		t.Fatalf("post-finish reuse blocked: id=%d blocker=%+v err=%v", id3, blocker3, err)
+	}
+}
+
+// TestBeginIndexRunIfClearRejectsWrongKind ensures the gate refuses
+// kinds that don't belong on its branch, so sync/restore callers get
+// a clear diagnostic instead of an INSERT that violates the schema
+// CHECK at commit time.
+func TestBeginIndexRunIfClearRejectsWrongKind(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	vID := makeVolume(t, s, "/v")
+
+	for _, k := range []string{RunKindSync, RunKindRestore, ""} {
+		_, _, err := s.BeginIndexRunIfClear(context.Background(), k, vID, false)
+		if err == nil || !strings.Contains(err.Error(), "kind must be") {
+			t.Fatalf("kind=%q: want kind-validation error, got %v", k, err)
+		}
+	}
+}
