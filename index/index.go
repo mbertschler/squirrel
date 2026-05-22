@@ -9,9 +9,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/zeebo/blake3"
 
+	"github.com/mbertschler/squirrel/runevents"
 	"github.com/mbertschler/squirrel/store"
 )
 
@@ -34,6 +36,16 @@ type Options struct {
 	// scheduler (#17) sets store.RunKindAudit so out-of-band re-walks
 	// are distinguishable from regular indexing in `squirrel runs`.
 	Kind string
+	// OnRunID, if non-nil, is invoked once the runs row has been
+	// allocated by BeginRun. Desktop callers use it to bridge the
+	// "started a goroutine, want a runID" gap without polling the
+	// runs table. Never invoked in DryRun mode (no row is written).
+	OnRunID func(runID int64)
+	// Progress, if non-nil, receives in-flight progress events from
+	// the collector. The callback is invoked synchronously from the
+	// collector goroutine; callers must keep it cheap (non-blocking
+	// send into a channel is the canonical shape). nil means no-op.
+	Progress func(runevents.Progress)
 }
 
 type Report struct {
@@ -85,6 +97,9 @@ func Index(ctx context.Context, s *store.Store, root string, opts Options) (repo
 	}
 	if err := idx.beginRun(); err != nil {
 		return Report{}, err
+	}
+	if opts.OnRunID != nil && idx.runID != 0 {
+		opts.OnRunID(idx.runID)
 	}
 	defer func() { idx.finishRun(&report, err) }()
 
@@ -361,6 +376,9 @@ func (i *indexer) collect() (Report, error) {
 		batch = batch[:0]
 		return nil
 	}
+	progress := runevents.NewThrottle(i.opts.Progress, 500*time.Millisecond, 100)
+	defer progress.Flush()
+	var done int64
 	for r := range i.results {
 		if r.err != nil {
 			report.Errors++
@@ -368,6 +386,8 @@ func (i *indexer) collect() (Report, error) {
 			continue
 		}
 		tally(&report, r.kind)
+		done++
+		progress.Emit(runevents.Progress{Stage: runevents.StageHashing, Done: done})
 		if i.opts.DryRun {
 			i.seen[r.row.Path] = struct{}{}
 			continue

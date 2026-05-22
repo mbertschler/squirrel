@@ -3,8 +3,10 @@ import { Application } from "@hotwired/stimulus";
 import "basecoat-css/all";
 
 import NcduController from "./controllers/ncdu_controller";
-import AutorefreshController from "./controllers/autorefresh_controller";
+import SseController from "./controllers/sse_controller";
+import ThemeController from "./controllers/theme_controller";
 
 const stim = Application.start();
 stim.register("ncdu", NcduController);
-stim.register("autorefresh", AutorefreshController);
+stim.register("sse", SseController);
+stim.register("theme", ThemeController);

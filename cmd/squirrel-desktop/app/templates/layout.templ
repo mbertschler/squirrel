@@ -8,6 +8,27 @@ type NavItem struct {
 	Active bool
 }
 
+// themeBootScript runs synchronously in <head> before <body> paints so
+// the `.dark` class is applied (or not) before any pixels are drawn —
+// no flash of light theme on dark-mode reload. It reads the persisted
+// preference from localStorage; absent or "auto" falls back to the OS
+// preference via prefers-color-scheme. Mirror this logic in the theme
+// Stimulus controller — both must agree on resolution.
+const themeBootScript = `(function(){try{var s=localStorage.getItem("squirrel-theme");` +
+	`var d=s==="dark"||((s!=="light")&&window.matchMedia("(prefers-color-scheme: dark)").matches);` +
+	`document.documentElement.classList.toggle("dark",d);}catch(e){}})();`
+
+// themeBoot emits the inline boot script as the first <script> in
+// <head>. It runs synchronously (no defer/async) so the resolved theme
+// class is on <html> before the renderer ever paints body content.
+// templ escapes content inside literal <script> tags, so the whole
+// element is emitted via templ.Raw — the body is a fixed string of
+// our own authoring, not user input, so the unsafe-injection caveat
+// does not apply here.
+templ themeBoot() {
+	@templ.Raw("<script>" + themeBootScript + "</script>")
+}
+
 // Layout renders the application shell shared by every full-page response.
 // Frame-only responses (Turbo navigations within a frame) bypass it and
 // render only the targeted partial.
@@ -18,6 +39,7 @@ templ Layout(title string, nav []NavItem) {
 			<meta charset="utf-8"/>
 			<meta name="viewport" content="width=device-width, initial-scale=1"/>
 			<title>{ title } · Squirrel</title>
+			@themeBoot()
 			<link rel="stylesheet" href="/static/app.css"/>
 			<script src="/static/app.js" defer></script>
 		</head>
@@ -33,11 +55,11 @@ templ Layout(title string, nav []NavItem) {
 }
 
 templ sidebar(items []NavItem) {
-	<aside class="w-56 shrink-0 border-r border-border bg-sidebar text-sidebar-foreground">
+	<aside class="w-56 shrink-0 border-r border-border bg-sidebar text-sidebar-foreground flex flex-col">
 		<div class="flex h-14 items-center gap-2 border-b border-border px-4 font-semibold">
 			<span class="text-base">Squirrel</span>
 		</div>
-		<nav class="flex flex-col gap-1 p-2">
+		<nav class="flex flex-col gap-1 p-2 flex-1">
 			for _, it := range items {
 				if it.Active {
 					<a href={ templ.URL(it.Href) } class="rounded-md px-3 py-2 text-sm font-medium bg-sidebar-accent text-sidebar-accent-foreground">{ it.Label }</a>
@@ -46,7 +68,66 @@ templ sidebar(items []NavItem) {
 				}
 			}
 		</nav>
+		@themeToggle()
 	</aside>
+}
+
+// themeToggle renders the sidebar's theme cycle button. The button is
+// controlled by the `theme` Stimulus controller, which writes the choice
+// to localStorage and re-applies the same resolution logic the boot
+// script uses. Three icons are inlined (sun = light, moon = dark,
+// monitor = auto/OS) and toggled via data-theme-mode-value; only the
+// matching icon is visible at any time.
+templ themeToggle() {
+	<div class="border-t border-border p-2" data-controller="theme" data-theme-mode-value="auto">
+		<button
+			type="button"
+			class="btn-ghost btn-sm w-full justify-start gap-2"
+			data-action="click->theme#cycle"
+			data-theme-target="button"
+			aria-label="Toggle theme"
+			title="Toggle theme"
+		>
+			<span data-theme-target="iconAuto" class="inline-flex">
+				@iconMonitor()
+			</span>
+			<span data-theme-target="iconLight" class="hidden">
+				@iconSun()
+			</span>
+			<span data-theme-target="iconDark" class="hidden">
+				@iconMoon()
+			</span>
+			<span data-theme-target="label" class="text-xs text-muted-foreground">Auto</span>
+		</button>
+	</div>
+}
+
+templ iconSun() {
+	<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+		<circle cx="12" cy="12" r="4"></circle>
+		<path d="M12 2v2"></path>
+		<path d="M12 20v2"></path>
+		<path d="m4.93 4.93 1.41 1.41"></path>
+		<path d="m17.66 17.66 1.41 1.41"></path>
+		<path d="M2 12h2"></path>
+		<path d="M20 12h2"></path>
+		<path d="m6.34 17.66-1.41 1.41"></path>
+		<path d="m19.07 4.93-1.41 1.41"></path>
+	</svg>
+}
+
+templ iconMoon() {
+	<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+		<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"></path>
+	</svg>
+}
+
+templ iconMonitor() {
+	<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+		<rect width="20" height="14" x="2" y="3" rx="2"></rect>
+		<line x1="8" x2="16" y1="21" y2="21"></line>
+		<line x1="12" x2="12" y1="17" y2="21"></line>
+	</svg>
 }
 
 // PageHeader is the standard top-of-page banner with a title and an

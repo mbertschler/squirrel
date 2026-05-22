@@ -57,6 +57,7 @@ func New(deps Deps) (http.Handler, error) {
 	mux.HandleFunc("GET /query/missing", qh.ServeMissing)
 	mux.HandleFunc("GET /runs", rh.ServeIndex)
 	mux.HandleFunc("GET /runs/{id}", rh.ServeDetail)
+	mux.HandleFunc("GET /runs/{id}/events", rh.ServeEvents)
 	mux.HandleFunc("GET /files/{hash}", fh.ServeDetail)
 
 	return logRequests(mux), nil
