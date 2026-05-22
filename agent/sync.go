@@ -798,6 +798,14 @@ func copyFileToPath(srcAbs, dstAbs string, mtimeNs int64) error {
 		cleanup()
 		return fmt.Errorf("copy bytes: %w", err)
 	}
+	// fsync before close+rename: a crash between os.Rename and the
+	// kernel flushing the data pages would otherwise leave a zero-byte
+	// file at dstAbs even though the rename succeeded.
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return fmt.Errorf("sync temp: %w", err)
+	}
 	if err := tmp.Close(); err != nil {
 		cleanup()
 		return fmt.Errorf("close temp: %w", err)

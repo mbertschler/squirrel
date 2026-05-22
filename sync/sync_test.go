@@ -576,3 +576,26 @@ sync_to = ["a"]
 		t.Fatalf("expected no-match error (volume 'two' doesn't sync to 'b')")
 	}
 }
+
+func TestBuildRcloneArgsRefusesZeroRunIDOutsideDryRun(t *testing.T) {
+	vol := &config.Volume{Name: "pics", Path: "/tmp/pics"}
+	dest := &config.Destination{Name: "scratch", Type: "local", Root: "/tmp/dst"}
+
+	// runID=0 outside dry-run is the bug shape #C4 guards against:
+	// backupDirURI would otherwise collide every overwrite into the
+	// run-dry-run/ placeholder bucket.
+	if _, err := buildRcloneArgs(vol, dest, 0, Options{DryRun: false}); err == nil {
+		t.Fatalf("expected refusal for runID=0 outside dry-run")
+	}
+
+	// runID=0 in dry-run is legitimate (the allocator returns 0 for
+	// dry-run by design) and must succeed.
+	if _, err := buildRcloneArgs(vol, dest, 0, Options{DryRun: true}); err != nil {
+		t.Fatalf("dry-run with runID=0 should be allowed, got %v", err)
+	}
+
+	// A real runID must always succeed regardless of dry-run.
+	if _, err := buildRcloneArgs(vol, dest, 17, Options{DryRun: false}); err != nil {
+		t.Fatalf("non-zero runID outside dry-run should be allowed, got %v", err)
+	}
+}
