@@ -721,3 +721,114 @@ func TestRestoreToPathSkipsMarkerCheck(t *testing.T) {
 		t.Fatalf("Restore --to scratch: %v (rep=%+v)", err, rep)
 	}
 }
+
+// TestRestoreRefusesPopulatedVolumeWithoutInPlace covers issue #61:
+// a default-target restore against a vol.Path that contains user
+// content must refuse unless --in-place is set. The marker alone
+// doesn't count as content, but any other file does.
+func TestRestoreRefusesPopulatedVolumeWithoutInPlace(t *testing.T) {
+	f := setupFixture(t)
+	// Bootstrap the local volume: write the marker and one user file.
+	if err := volmark.Write(f.vol.Path, volmark.Marker{Volume: f.vol.Name}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(f.vol.Path, "local-edit.txt"), []byte("user wrote this"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Restore(context.Background(), f.store, f.rcl, f.vol, f.dest, RestoreOptions{})
+	if err == nil || !strings.Contains(err.Error(), "--in-place") {
+		t.Fatalf("expected --in-place refusal, got %v", err)
+	}
+}
+
+// TestRestoreInPlacePreservesLocalEdits asserts the --backup-dir
+// contract end-to-end: an --in-place restore with a hash-mismatched
+// local file moves the prior bytes to
+// .squirrel-restore-history/run-<id>/<path>/ and lands the
+// destination's bytes at the live path.
+func TestRestoreInPlacePreservesLocalEdits(t *testing.T) {
+	f := setupFixture(t)
+	// Seed: a file synced upstream, then a local edit that diverges
+	// from the destination.
+	if err := os.WriteFile(filepath.Join(f.vol.Path, "a.txt"), []byte("upstream-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.runIndex(t)
+	if _, err := Sync(context.Background(), f.store, f.rcl, f.vol, f.dest, Options{}); err != nil {
+		t.Fatalf("seed Sync: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.vol.Path, "a.txt"), []byte("local-edit-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := Restore(context.Background(), f.store, f.rcl, f.vol, f.dest, RestoreOptions{InPlace: true})
+	if err != nil {
+		t.Fatalf("Restore --in-place: %v (rep=%+v)", err, rep)
+	}
+	if rep.Status != store.RunStatusSuccess {
+		t.Fatalf("Status = %q, want success", rep.Status)
+	}
+
+	// Live path holds the destination's bytes (upstream-bytes).
+	got, _ := os.ReadFile(filepath.Join(f.vol.Path, "a.txt"))
+	if string(got) != "upstream-bytes" {
+		t.Fatalf("a.txt = %q, want upstream-bytes", got)
+	}
+	// Prior local bytes preserved under run-<id>/.
+	histRoot := filepath.Join(f.vol.Path, RestoreHistoryDirName)
+	matches, _ := filepath.Glob(filepath.Join(histRoot, "run-*", "a.txt"))
+	if len(matches) == 0 {
+		t.Fatalf("no .squirrel-restore-history/run-*/a.txt under %s", histRoot)
+	}
+	preserved, _ := os.ReadFile(matches[0])
+	if string(preserved) != "local-edit-bytes" {
+		t.Fatalf("restore-history copy = %q, want local-edit-bytes", preserved)
+	}
+}
+
+// TestRestoreToPathSkipsInPlaceCheck confirms --to lets the operator
+// restore into any scratch directory without needing --in-place,
+// even when that directory is empty or populated.
+func TestRestoreToPathSkipsInPlaceCheck(t *testing.T) {
+	f := setupFixture(t)
+	if err := os.WriteFile(filepath.Join(f.vol.Path, "a.txt"), []byte("upstream-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.runIndex(t)
+	if _, err := Sync(context.Background(), f.store, f.rcl, f.vol, f.dest, Options{}); err != nil {
+		t.Fatalf("seed Sync: %v", err)
+	}
+
+	scratch := t.TempDir()
+	// Make scratch non-empty to confirm --to bypasses the gate.
+	if err := os.WriteFile(filepath.Join(scratch, "preexisting.txt"), []byte("scratch had this"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := Restore(context.Background(), f.store, f.rcl, f.vol, f.dest, RestoreOptions{ToPath: scratch})
+	if err != nil {
+		t.Fatalf("Restore --to populated scratch: %v (rep=%+v)", err, rep)
+	}
+	if rep.Status != store.RunStatusSuccess {
+		t.Fatalf("Status = %q, want success", rep.Status)
+	}
+}
+
+// TestRestoreToPathEqualVolPathTreatedAsInPlace confirms that passing
+// --to <vol.Path> goes through the same safety gates as the default
+// in-place restore (marker check + non-empty refusal). Without this
+// equivalence, `--to <vol.Path>` would silently bypass the very
+// protections #61 is meant to enforce.
+func TestRestoreToPathEqualVolPathTreatedAsInPlace(t *testing.T) {
+	f := setupFixture(t)
+	if err := volmark.Write(f.vol.Path, volmark.Marker{Volume: f.vol.Name}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(f.vol.Path, "local-edit.txt"), []byte("user wrote this"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Restore(context.Background(), f.store, f.rcl, f.vol, f.dest, RestoreOptions{ToPath: f.vol.Path})
+	if err == nil || !strings.Contains(err.Error(), "--in-place") {
+		t.Fatalf("expected --in-place refusal when --to equals vol.Path, got %v", err)
+	}
+}

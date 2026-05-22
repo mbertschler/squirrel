@@ -228,7 +228,8 @@ func relPathUnder(base, abs string) (string, bool) {
 // can be materialised locally instead of crossing the network.
 //
 // Rows under the receiver-owned reserved subtrees
-// (`.squirrel-history/`, `.squirrel-conflicts/`) are excluded: a
+// (`.squirrel-history/`, `.squirrel-conflicts/`,
+// `.squirrel-restore-history/`) are excluded: a
 // conflict-preservation row carrying a prior blake3 is reachable for
 // historical lookup but must not be elevated back into a live user
 // path via dedup. The store layer enforces this so every caller
@@ -243,6 +244,7 @@ func (s *Store) GetPresentByBlake3InVolume(ctx context.Context, volumeID int64, 
 		 WHERE f.blake3 = ? AND fo.volume_id = ? AND f.status = 'present'
 		   AND fo.path != '.squirrel-history'   AND fo.path NOT LIKE '.squirrel-history/%'
 		   AND fo.path != '.squirrel-conflicts' AND fo.path NOT LIKE '.squirrel-conflicts/%'
+		   AND fo.path != '.squirrel-restore-history' AND fo.path NOT LIKE '.squirrel-restore-history/%'
 		 ORDER BY `+pathFromFolderAndName+` LIMIT 1`,
 		digest, volumeID)
 	var r FileRow
