@@ -46,6 +46,7 @@ func New(deps Deps) (http.Handler, error) {
 	qh := handlers.NewQuery(deps.Config, deps.Store)
 	rh := handlers.NewRuns(deps.Config, deps.Store)
 	mh := handlers.NewMenubar(deps.Config, deps.Store)
+	fh := handlers.NewFiles(deps.Store)
 
 	mux.HandleFunc("GET /{$}", vh.ServeIndex)
 	mux.HandleFunc("GET /volumes", vh.ServeIndex)
@@ -60,6 +61,7 @@ func New(deps Deps) (http.Handler, error) {
 	mux.HandleFunc("GET /runs/{id}/events", rh.ServeEvents)
 	mux.HandleFunc("GET /menubar", mh.Serve)
 	mux.HandleFunc("GET /menubar/frame", mh.ServeFrame)
+	mux.HandleFunc("GET /files/{hash}", fh.ServeDetail)
 
 	return logRequests(mux), nil
 }

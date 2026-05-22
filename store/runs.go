@@ -499,6 +499,59 @@ func (s *Store) LatestFinishedRun(ctx context.Context, kind string, volumeID int
 	return scanRun(row.Scan)
 }
 
+// LatestSuccessfulRunsByVolumeAndKind returns the most recent success or
+// partial run for each (volume_id, kind) pair in one SQL pass, as a
+// nested map keyed first by volume id and then by run kind. Used by the
+// TUI's Dashboard and Volumes screens to compute "last index" / "last
+// sync" without scanning a bounded recent-runs window — that approach
+// silently returned "—" for volumes whose last successful run had fallen
+// out of the window on long-lived installs.
+//
+// Runs with NULL volume_id (today's cross-volume sync placeholder) are
+// excluded; cross-volume runs don't belong to any single volume row.
+// Sync runs are de-duplicated across destinations: a volume's "last sync"
+// is the latest successful sync to any of its destinations, which is
+// what dashboards generally mean by the term.
+func (s *Store) LatestSuccessfulRunsByVolumeAndKind(ctx context.Context) (map[int64]map[string]Run, error) {
+	// Correlated subquery picks the max id per (volume_id, kind) among
+	// success/partial rows. SQLite handles the NULL semantics correctly:
+	// rows with NULL volume_id never match the correlation predicate, so
+	// they are excluded from the outer result without an extra clause.
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+runColumns+`
+		FROM runs r1
+		WHERE r1.status IN ('success','partial')
+		  AND r1.volume_id IS NOT NULL
+		  AND r1.id = (
+		    SELECT MAX(r2.id) FROM runs r2
+		    WHERE r2.volume_id = r1.volume_id
+		      AND r2.kind = r1.kind
+		      AND r2.status IN ('success','partial')
+		  )
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("latest successful runs: %w", err)
+	}
+	defer rows.Close()
+	out := map[int64]map[string]Run{}
+	for rows.Next() {
+		r, err := scanRun(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		if !r.VolumeID.Valid {
+			continue
+		}
+		byKind, ok := out[r.VolumeID.Int64]
+		if !ok {
+			byKind = map[string]Run{}
+			out[r.VolumeID.Int64] = byKind
+		}
+		byKind[r.Kind] = r
+	}
+	return out, rows.Err()
+}
+
 // HasRunningRun reports whether any 'running' run of the given kind
 // exists for (volumeID, destination). destination "" matches the
 // SQL NULL column (the schema constraint for index/audit kinds); a
