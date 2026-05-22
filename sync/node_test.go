@@ -1633,3 +1633,92 @@ func hashFile(t *testing.T, abs string) []byte {
 	}
 	return h.Sum(nil)
 }
+
+// TestNodeSyncCopyFromExistingPreservesOutOfBandFile covers issue #62.
+// When classify decides CopyFromExisting based on the index alone, an
+// out-of-band file at the destination path on disk (no index row, so
+// classify can't see it) used to be silently overwritten by the
+// pre-stage's os.Rename. The pre-stage must now move the prior bytes
+// to .squirrel-history/run-<receiverRunID>/<path>/ before
+// materialising the dedup'd content, mirroring preMoveSupersedes.
+func TestNodeSyncCopyFromExistingPreservesOutOfBandFile(t *testing.T) {
+	f := setupNodeFixture(t)
+	ctx := context.Background()
+
+	// Step 1: round-trip a file so the receiver has an indexed
+	// `a.jpg` whose blake3 will satisfy the CopyFromExisting branch.
+	body := []byte("the dedup-source bytes")
+	original := filepath.Join(f.initVol.Path, "a.jpg")
+	if err := os.WriteFile(original, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.indexInitiator(t)
+	if _, err := SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true}); err != nil {
+		t.Fatalf("seed SyncNode: %v", err)
+	}
+
+	// Step 2: rename on the initiator and re-index, so round 2 will
+	// classify pets/a.jpg as CopyFromExisting on the receiver.
+	if err := os.Remove(original); err != nil {
+		t.Fatal(err)
+	}
+	renamed := filepath.Join(f.initVol.Path, "pets", "a.jpg")
+	if err := os.MkdirAll(filepath.Dir(renamed), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(renamed, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.indexInitiator(t)
+
+	// Step 3: plant an out-of-band file at the receiver's
+	// pets/a.jpg — exactly the bug scenario. No index row exists
+	// for it (we never indexed the receiver), so classify decides
+	// CopyFromExisting in good faith.
+	priorBytes := []byte("user wrote this directly via the NAS web UI")
+	recvNew := filepath.Join(f.recvVol.Path, "pets", "a.jpg")
+	if err := os.MkdirAll(filepath.Dir(recvNew), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(recvNew, priorBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	if err != nil {
+		t.Fatalf("dedup SyncNode: %v", err)
+	}
+	if rep.Status != store.RunStatusSuccess {
+		t.Fatalf("Status = %q, want success: %+v", rep.Status, rep)
+	}
+
+	// Initiator's dedup'd bytes are live at pets/a.jpg.
+	got, err := os.ReadFile(recvNew)
+	if err != nil {
+		t.Fatalf("read receiver pets/a.jpg: %v", err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("pets/a.jpg content = %q, want dedup-source bytes", got)
+	}
+
+	// The out-of-band bytes survive at
+	// .squirrel-history/run-<receiverRunID>/pets/a.jpg. The receiver
+	// run id isn't part of the report so glob the run-* directories
+	// and check there's exactly one history entry with our prior
+	// bytes.
+	histRoot := filepath.Join(f.recvVol.Path, ".squirrel-history")
+	matches, err := filepath.Glob(filepath.Join(histRoot, "run-*", "pets", "a.jpg"))
+	if err != nil {
+		t.Fatalf("glob history: %v", err)
+	}
+	if len(matches) == 0 {
+		t.Fatalf("no history copy of pets/a.jpg under %s", histRoot)
+	}
+	preserved, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatalf("read history copy %s: %v", matches[0], err)
+	}
+	if !bytes.Equal(preserved, priorBytes) {
+		t.Fatalf("history copy = %q, want %q", preserved, priorBytes)
+	}
+}
