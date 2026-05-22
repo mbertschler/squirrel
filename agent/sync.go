@@ -742,22 +742,73 @@ func (r *peerSyncRouter) dispositionForExisting(ctx context.Context, sess *peerS
 // than no mutation when /plan is going to fail, and rolling back
 // only the bytes this pre-stage actually wrote is bounded and safe.
 func (r *peerSyncRouter) preStageCopyFromExisting(sess *peerSession) error {
+	histRoot := filepath.Join(sess.volume.Path, HistoryDirName, "run-"+strconv.FormatInt(sess.receiverRunID, 10))
 	var materialised []string
+	// preserved tracks out-of-band files we moved to history so that a
+	// later rollback can restore them. The mapping is intentionally
+	// per-pre-stage: prior runs' history entries are not ours to touch.
+	type preservedMove struct{ histAbs, dstAbs string }
+	var preserved []preservedMove
+	rollback := func() {
+		for _, p := range materialised {
+			_ = os.Remove(p)
+		}
+		// Best-effort restore. If the rename back fails the bytes are
+		// still under .squirrel-history/run-<id>/ — the user can
+		// recover from there even if the live path stays empty.
+		for _, pm := range preserved {
+			_ = os.Rename(pm.histAbs, pm.dstAbs)
+		}
+	}
 	for relPath, entry := range sess.dispositions {
 		if entry.disposition != syncproto.DispositionCopyFromExisting {
 			continue
 		}
 		srcAbs := filepath.Join(sess.volume.Path, entry.copyFromPath)
 		dstAbs := filepath.Join(sess.volume.Path, relPath)
+		// If an out-of-band file exists at dstAbs (no index row, so
+		// classify decided CopyFromExisting in good faith), move it to
+		// history before copyFileToPath's atomic os.Rename overwrites
+		// the bytes silently. Mirrors preMoveSupersedes' contract: the
+		// receiver owns the history move when the bucket-side
+		// --backup-dir doesn't apply.
+		if _, err := os.Lstat(dstAbs); err == nil {
+			histDst := filepath.Join(histRoot, relPath)
+			if err := os.MkdirAll(filepath.Dir(histDst), 0o755); err != nil {
+				rollback()
+				return fmt.Errorf("mkdir history for %s: %w", relPath, err)
+			}
+			if err := os.Rename(dstAbs, histDst); err != nil {
+				// Tolerate a concurrent unlink of dstAbs between Lstat
+				// and Rename: the file we wanted to preserve is gone,
+				// so the copy-from-existing path can proceed against
+				// the (now empty) destination as if no out-of-band
+				// file had ever been there. Mirrors preMoveSupersedes,
+				// which silently continues on ErrNotExist for the
+				// same reason.
+				if !errors.Is(err, os.ErrNotExist) {
+					rollback()
+					return fmt.Errorf("preserve out-of-band %s → %s: %w", relPath, histDst, err)
+				}
+			} else {
+				preserved = append(preserved, preservedMove{histAbs: histDst, dstAbs: dstAbs})
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			rollback()
+			return fmt.Errorf("stat dst %s: %w", relPath, err)
+		}
 		if err := copyFileToPath(srcAbs, dstAbs, entry.mtimeNs); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				entry.disposition = syncproto.DispositionTransfer
 				entry.copyFromPath = ""
+				// Any out-of-band file we just moved to history stays
+				// there — the next pipeline phase (Transfer via rclone
+				// or the initiator's blob endpoint) writes a fresh
+				// dstAbs, and the user's prior bytes remain reachable
+				// under run-<id>/.
 				continue
 			}
-			for _, p := range materialised {
-				_ = os.Remove(p)
-			}
+			rollback()
 			return fmt.Errorf("copy %s → %s: %w", entry.copyFromPath, relPath, err)
 		}
 		materialised = append(materialised, dstAbs)
