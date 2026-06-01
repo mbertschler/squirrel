@@ -184,23 +184,10 @@ func (s *Store) GetFolderByPath(ctx context.Context, volumeID int64, path string
 // prefix, so sorting by path is identical to sorting by name). Returns
 // the empty slice when parentID has no children.
 func (s *Store) ListChildFolders(ctx context.Context, parentID int64) ([]Folder, error) {
-	rows, err := s.db.QueryContext(ctx,
+	return queryRows(ctx, s.db,
 		`SELECT `+folderSelectColumns+` FROM folders WHERE parent_id = ?
 		 ORDER BY path`,
-		parentID)
-	if err != nil {
-		return nil, fmt.Errorf("list child folders: %w", err)
-	}
-	defer rows.Close()
-	var out []Folder
-	for rows.Next() {
-		var f Folder
-		if err := scanFolderInto(rows, &f); err != nil {
-			return nil, fmt.Errorf("scan child folder: %w", err)
-		}
-		out = append(out, f)
-	}
-	return out, rows.Err()
+		scanFolderRow, parentID)
 }
 
 // GetFolderByID returns the folder row by primary key.
@@ -213,6 +200,15 @@ func (s *Store) GetFolderByID(ctx context.Context, id int64) (Folder, error) {
 func scanFolder(row *sql.Row) (Folder, error) {
 	var f Folder
 	err := scanFolderInto(row, &f)
+	return f, err
+}
+
+// scanFolderRow scans one row into a fresh Folder, adapting
+// scanFolderInto to the func(rowScanner) (T, error) shape queryRows
+// expects so folder list-reads share the collection loop.
+func scanFolderRow(s rowScanner) (Folder, error) {
+	var f Folder
+	err := scanFolderInto(s, &f)
 	return f, err
 }
 

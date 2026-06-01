@@ -217,6 +217,12 @@ func scanRun(scan func(...any) error) (Run, error) {
 	return r, err
 }
 
+// scanRunRow adapts scanRun to the func(rowScanner) (T, error) shape
+// queryRows expects, so the runs list-reads share one collection loop.
+func scanRunRow(s rowScanner) (Run, error) {
+	return scanRun(s.Scan)
+}
+
 // ListRuns returns runs matching opts. See ListRunsOpts for filter and
 // ordering semantics.
 func (s *Store) ListRuns(ctx context.Context, opts ListRunsOpts) ([]Run, error) {
@@ -235,20 +241,7 @@ func (s *Store) ListRuns(ctx context.Context, opts ListRunsOpts) ([]Run, error) 
 		query += ` LIMIT ?`
 		args = append(args, opts.Limit)
 	}
-	rows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("list runs: %w", err)
-	}
-	defer rows.Close()
-	var out []Run
-	for rows.Next() {
-		r, err := scanRun(rows.Scan)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
+	return queryRows(ctx, s.db, query, scanRunRow, args...)
 }
 
 // ListRunsByPeer returns kind='sync' runs whose peer_node_id matches
@@ -264,20 +257,7 @@ func (s *Store) ListRunsByPeer(ctx context.Context, peerNodeID int64, limit int)
 		query += ` LIMIT ?`
 		args = append(args, limit)
 	}
-	rows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("list runs by peer: %w", err)
-	}
-	defer rows.Close()
-	var out []Run
-	for rows.Next() {
-		r, err := scanRun(rows.Scan)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
+	return queryRows(ctx, s.db, query, scanRunRow, args...)
 }
 
 // GetRun returns the run with the given id, or sql.ErrNoRows.
@@ -352,24 +332,11 @@ func escapeLikePrefix(s string) string {
 // on the volume; a populated one narrows to the period since the
 // receiver and peer last agreed.
 func (s *Store) ListAuditRunsSince(ctx context.Context, volumeID int64, sinceNs int64) ([]Run, error) {
-	rows, err := s.db.QueryContext(ctx,
+	return queryRows(ctx, s.db,
 		`SELECT `+runColumns+` FROM runs
 		 WHERE kind = 'audit' AND volume_id = ? AND started_at_ns > ?
 		 ORDER BY id`,
-		volumeID, sinceNs)
-	if err != nil {
-		return nil, fmt.Errorf("list audit runs: %w", err)
-	}
-	defer rows.Close()
-	var out []Run
-	for rows.Next() {
-		r, err := scanRun(rows.Scan)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
+		scanRunRow, volumeID, sinceNs)
 }
 
 // CountModifiedFilesByRun returns the number of files rows whose

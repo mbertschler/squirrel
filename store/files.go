@@ -84,14 +84,47 @@ func (r *FileRow) scanFrom(s rowScanner) error {
 }
 
 // scanDests returns the per-column destination pointers in fileSelectColumns
-// order. scanFrom delegates here; collectJoined appends the volume pointers
-// on top so files-half scanning still has one source of truth.
+// order. scanFrom delegates here; scanFileWithVolume appends the volume
+// pointers on top so files-half scanning still has one source of truth.
 func (r *FileRow) scanDests() []any {
 	return []any{
 		&r.VolumeID, &r.Path, &r.Blake3, &r.SizeBytes, &r.MtimeNs,
 		&r.Status, &r.FirstSeenRunID, &r.LastSeenRunID, &r.IndexedAtNs,
 		&r.SourceNodeID, &r.SourceRunID,
 	}
+}
+
+// scanFileRow scans one row into a fresh FileRow in fileSelectColumns
+// order. It adapts FileRow.scanFrom to the func(rowScanner) (T, error)
+// shape queryRows expects so every files list-read shares one loop.
+func scanFileRow(s rowScanner) (FileRow, error) {
+	var r FileRow
+	err := r.scanFrom(s)
+	return r, err
+}
+
+// queryRows runs query with args and collects every row into a slice,
+// scanning each through scan. It centralises the
+// QueryContext/Next/Close/Err loop that every list-returning read would
+// otherwise repeat; scan receives the live *sql.Rows (as a rowScanner)
+// and returns one populated T. Errors are returned unwrapped — the SQL
+// error already names the failure, and callers that want more context
+// wrap the result.
+func queryRows[T any](ctx context.Context, db *sql.DB, query string, scan func(rowScanner) (T, error), args ...any) ([]T, error) {
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []T
+	for rows.Next() {
+		v, err := scan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
 }
 
 // GetByPath returns the currently-live row for (volumeID, relPath) — i.e.
@@ -122,24 +155,11 @@ func (s *Store) GetByPath(ctx context.Context, volumeID int64, relPath string) (
 // Filter on Status to find the live row, or use GetByPath.
 func (s *Store) ListHistoryByPath(ctx context.Context, volumeID int64, relPath string) ([]FileRow, error) {
 	folderPath, name := splitFilePath(relPath)
-	rows, err := s.db.QueryContext(ctx,
+	return queryRows(ctx, s.db,
 		`SELECT `+fileSelectColumns+` FROM `+fileFromJoin+`
 		 WHERE fo.volume_id = ? AND fo.path = ? AND f.name = ?
 		 ORDER BY f.first_seen_run_id`,
-		volumeID, folderPath, name)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []FileRow
-	for rows.Next() {
-		var r FileRow
-		if err := r.scanFrom(rows); err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
+		scanFileRow, volumeID, folderPath, name)
 }
 
 // LoadVolumeIndex returns every non-superseded row in the volume keyed by
@@ -255,17 +275,12 @@ func (s *Store) GetPresentByBlake3InVolume(ctx context.Context, volumeID int64, 
 // GetByBlake3 returns all rows matching the given BLAKE3 digest (raw 32 bytes),
 // joined with their volume.
 func (s *Store) GetByBlake3(ctx context.Context, digest []byte) ([]FileWithVolume, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	return queryRows(ctx, s.db, `
 		SELECT `+joinedColumns+`
 		FROM `+fileFromJoin+` JOIN volumes v ON v.id = fo.volume_id
 		WHERE f.blake3 = ?
 		ORDER BY v.name, `+pathFromFolderAndName+`
-	`, digest)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	return collectJoined(rows)
+	`, scanFileWithVolume, digest)
 }
 
 // Upsert records an observation of content at a path. It is the only
@@ -708,7 +723,7 @@ func (s *Store) MarkMissing(ctx context.Context, volumeID int64, currentRunID in
 // ListDuplicates returns rows whose blake3 digest appears at more than one
 // (volume_id, path), joined with their volume.
 func (s *Store) ListDuplicates(ctx context.Context) ([]FileWithVolume, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	return queryRows(ctx, s.db, `
 		SELECT `+joinedColumns+`
 		FROM `+fileFromJoin+` JOIN volumes v ON v.id = fo.volume_id
 		WHERE f.blake3 IN (
@@ -717,12 +732,7 @@ func (s *Store) ListDuplicates(ctx context.Context) ([]FileWithVolume, error) {
 		)
 		AND f.status = 'present'
 		ORDER BY f.blake3, v.name, `+pathFromFolderAndName+`
-	`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	return collectJoined(rows)
+	`, scanFileWithVolume)
 }
 
 // ListPresentPathsUnder returns the set of relative paths with status='present'
@@ -753,24 +763,11 @@ func (s *Store) ListPresentPathsUnder(ctx context.Context, volumeID int64) (map[
 // differing — orders of magnitude smaller than the full-volume
 // listing the flat protocol sends.
 func (s *Store) ListPresentFilesInFolder(ctx context.Context, folderID int64) ([]FileRow, error) {
-	rows, err := s.db.QueryContext(ctx,
+	return queryRows(ctx, s.db,
 		`SELECT `+fileSelectColumns+` FROM `+fileFromJoin+`
 		 WHERE f.folder_id = ? AND f.status = 'present'
 		 ORDER BY f.name`,
-		folderID)
-	if err != nil {
-		return nil, fmt.Errorf("list files in folder %d: %w", folderID, err)
-	}
-	defer rows.Close()
-	var out []FileRow
-	for rows.Next() {
-		var r FileRow
-		if err := r.scanFrom(rows); err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
+		scanFileRow, folderID)
 }
 
 // ListPresentBySource yields every present row in volumeID whose
@@ -827,32 +824,21 @@ func (s *Store) ListPresentBySource(ctx context.Context, volumeID int64, nodeID 
 
 // ListMissing returns all rows with status='missing', joined with their volume.
 func (s *Store) ListMissing(ctx context.Context) ([]FileWithVolume, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	return queryRows(ctx, s.db, `
 		SELECT `+joinedColumns+`
 		FROM `+fileFromJoin+` JOIN volumes v ON v.id = fo.volume_id
 		WHERE f.status = 'missing'
 		ORDER BY v.name, `+pathFromFolderAndName+`
-	`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	return collectJoined(rows)
+	`, scanFileWithVolume)
 }
 
-// collectJoined drains a SELECT that pulls joinedColumns into a slice of
-// FileWithVolume. The file half routes through FileRow.scanDests so the
-// file-column order stays defined in a single place; the volume pointers
-// are appended after.
-func collectJoined(rows *sql.Rows) ([]FileWithVolume, error) {
-	var out []FileWithVolume
-	for rows.Next() {
-		var fv FileWithVolume
-		dests := append(fv.File.scanDests(), &fv.Volume.ID, &fv.Volume.Name, &fv.Volume.Path)
-		if err := rows.Scan(dests...); err != nil {
-			return nil, err
-		}
-		out = append(out, fv)
-	}
-	return out, rows.Err()
+// scanFileWithVolume scans one joinedColumns row into a FileWithVolume.
+// The file half routes through FileRow.scanDests so the file-column
+// order stays defined in a single place; the volume pointers are
+// appended after. Pairs with queryRows for every joined list-read.
+func scanFileWithVolume(s rowScanner) (FileWithVolume, error) {
+	var fv FileWithVolume
+	dests := append(fv.File.scanDests(), &fv.Volume.ID, &fv.Volume.Name, &fv.Volume.Path)
+	err := s.Scan(dests...)
+	return fv, err
 }
