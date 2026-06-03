@@ -1276,11 +1276,11 @@ func migrateV10ToV11(ctx context.Context, db *sql.DB) error {
 // Columns mirror the upsert payload — (volume_id, peer_node_id,
 // last_shared_run_id, last_synced_at) — plus an at_ns insertion
 // timestamp distinct from last_synced_at so two history rows written in
-// the same NowNs() tick still order deterministically by id. last_shared
-// _run_id is nullable for the same reason it is on peer_sync_state: the
-// first contact carries no shared run id. Like runs_audit, rows are
-// never updated or deleted, keeping the table consistent with the
-// project's append-only-history principle.
+// the same NowNs() tick still order deterministically by id.
+// last_shared_run_id is nullable for the same reason it is on
+// peer_sync_state: the first contact carries no shared run id. Like
+// runs_audit, rows are never updated or deleted, keeping the table
+// consistent with the project's append-only-history principle.
 //
 // The index on (volume_id, peer_node_id) backs the per-pair history read
 // (ListPeerSyncStateHistory); the pair is high-cardinality across a fleet

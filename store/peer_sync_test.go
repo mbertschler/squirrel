@@ -180,9 +180,9 @@ func TestSetCorrelatedRunIDUnknownRun(t *testing.T) {
 	}
 }
 
-// TestMigrateV11ToV12CreatesPeerSyncHistory seeds a v11-shape database by
-// hand (the schema the v12 migration builds on: volumes, nodes,
-// peer_sync_state, runs_audit, schema_version=11), opens it to trigger
+// TestMigrateV11ToV12CreatesPeerSyncHistory seeds a minimal v11-shape
+// database by hand (only the tables the v12 migration reads or builds on:
+// schema_version=11, volumes, nodes, peer_sync_state), opens it to trigger
 // the v11→v12 step, and asserts the peer_sync_state_history table exists
 // and accepts an upsert-driven insert.
 func TestMigrateV11ToV12CreatesPeerSyncHistory(t *testing.T) {

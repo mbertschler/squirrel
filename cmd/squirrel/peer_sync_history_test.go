@@ -26,8 +26,19 @@ func TestCLIPeerSyncHistory(t *testing.T) {
 	if !strings.Contains(out, "LAST_SHARED_RUN_ID") {
 		t.Fatalf("history output missing header:\n%s", out)
 	}
-	if !strings.Contains(out, "7") || !strings.Contains(out, "42") {
-		t.Fatalf("history output missing watermark values:\n%s", out)
+	// The watermark is the last column; assert it per data row rather than
+	// a bare Contains, which would also match digits inside the RFC3339
+	// timestamps. History is listed oldest-first.
+	var watermarks []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] == "AT" {
+			continue // skip the header row
+		}
+		watermarks = append(watermarks, fields[len(fields)-1])
+	}
+	if len(watermarks) != 2 || watermarks[0] != "7" || watermarks[1] != "42" {
+		t.Fatalf("watermark column = %v, want [7 42] oldest-first:\n%s", watermarks, out)
 	}
 }
 
