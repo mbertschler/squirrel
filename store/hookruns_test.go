@@ -184,19 +184,25 @@ func TestLatestHookRun(t *testing.T) {
 		t.Fatalf("LatestHookRun on empty = %v, want sql.ErrNoRows", err)
 	}
 
-	// Two interval runs and a change run; LatestHookRun must return the
-	// newest of the requested trigger only.
-	mustBegin := func(trigger string) int64 {
+	// The change hook needs a real triggering run (the trigger↔run coupling
+	// is enforced); interval hooks carry none.
+	runID, err := s.BeginIndexRun(ctx, RunKindIndex, vol.ID, true)
+	if err != nil {
+		t.Fatalf("BeginIndexRun: %v", err)
+	}
+	mustBegin := func(spec HookRunSpec) int64 {
 		t.Helper()
-		id, err := s.BeginHookRun(ctx, HookRunSpec{VolumeID: vol.ID, Trigger: trigger})
+		id, err := s.BeginHookRun(ctx, spec)
 		if err != nil {
-			t.Fatalf("BeginHookRun(%s): %v", trigger, err)
+			t.Fatalf("BeginHookRun(%s): %v", spec.Trigger, err)
 		}
 		return id
 	}
-	mustBegin(HookTriggerInterval)
-	mustBegin(HookTriggerChange)
-	latestInterval := mustBegin(HookTriggerInterval)
+	// Two interval runs and a change run; LatestHookRun must return the
+	// newest of the requested trigger only.
+	mustBegin(HookRunSpec{VolumeID: vol.ID, Trigger: HookTriggerInterval})
+	mustBegin(HookRunSpec{VolumeID: vol.ID, Trigger: HookTriggerChange, TriggeringRunID: runID})
+	latestInterval := mustBegin(HookRunSpec{VolumeID: vol.ID, Trigger: HookTriggerInterval})
 
 	got, err := s.LatestHookRun(ctx, vol.ID, HookTriggerInterval)
 	if err != nil {
