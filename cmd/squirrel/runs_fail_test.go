@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -143,4 +144,84 @@ func TestCLIRunsFailRejectsBadID(t *testing.T) {
 	if !strings.Contains(err.Error(), `invalid run id "abc"`) {
 		t.Fatalf("error = %v, want invalid-run-id error", err)
 	}
+}
+
+// TestCLIRunsFailWritesManualAuditAndPreservesCount covers H3: a manual
+// `runs fail` records a 'manual-fail' runs_audit row (the source of
+// truth distinguishing operator recovery from real failure) and leaves
+// the running row's file_count intact rather than zeroing it. The
+// FinishRun-emitted 'finish' row is present too, carrying the resulting
+// status.
+func TestCLIRunsFailWritesManualAuditAndPreservesCount(t *testing.T) {
+	src := t.TempDir()
+	writeTestFile(t, filepath.Join(src, "a.txt"), "hello")
+	f := writeConfigFor(t, map[string]string{"src": src})
+	runCLI(t, "--config", f.configPath, "index", "src")
+	stuck := beginRunningRun(t, f.dbPath, "src")
+	// A crashed run typically carries a partial count; stamp one so the
+	// preservation assertion is meaningful (a fresh running row is 0).
+	setRunFileCount(t, f.dbPath, stuck, 42)
+
+	runCLI(t, "--config", f.configPath, "runs", "fail", fmt.Sprint(stuck))
+
+	got := getRun(t, f.dbPath, stuck)
+	if got.Status != store.RunStatusFailed {
+		t.Fatalf("status = %q, want failed", got.Status)
+	}
+	if got.FileCount != 42 {
+		t.Fatalf("file_count = %d, want 42 preserved (manual fail must not clobber)", got.FileCount)
+	}
+
+	audit := listRunAudit(t, f.dbPath, stuck)
+	var sawManual, sawFinish bool
+	for _, a := range audit {
+		switch a.Transition {
+		case store.TransitionManualFail:
+			sawManual = true
+			if !a.Operator.Valid || a.Operator.String == "" {
+				t.Fatalf("manual-fail audit operator = %+v, want a username", a.Operator)
+			}
+		case store.TransitionFinish:
+			sawFinish = true
+			if !a.Note.Valid || a.Note.String != store.RunStatusFailed {
+				t.Fatalf("finish audit note = %+v, want resulting status failed", a.Note)
+			}
+		}
+	}
+	if !sawManual {
+		t.Fatalf("no manual-fail audit row found in %+v", audit)
+	}
+	if !sawFinish {
+		t.Fatalf("no finish audit row found in %+v", audit)
+	}
+}
+
+// setRunFileCount stamps file_count on an existing run via a raw SQLite
+// connection, simulating a crashed run that had already counted some
+// files before dying. A raw connection (rather than a store method)
+// keeps this test-only mutation out of the production Store API.
+func setRunFileCount(t *testing.T, dbPath string, runID, count int64) {
+	t.Helper()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("raw sql.Open: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE runs SET file_count = ? WHERE id = ?`, count, runID); err != nil {
+		t.Fatalf("set file_count: %v", err)
+	}
+}
+
+func listRunAudit(t *testing.T, dbPath string, runID int64) []store.RunAudit {
+	t.Helper()
+	s, err := store.OpenWithOptions(dbPath, store.OpenOptions{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	audit, err := s.ListRunAudit(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ListRunAudit: %v", err)
+	}
+	return audit
 }
