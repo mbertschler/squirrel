@@ -20,6 +20,13 @@ const (
 	// written in addition to the FinishRun-emitted 'finish' row so the
 	// listing can distinguish a manual recovery from a real failure.
 	TransitionManualFail = "manual-fail"
+	// TransitionSetCorrelatedRunID records a SetCorrelatedRunID write: the
+	// initiator stamping the receiver's run id onto an already-open row
+	// once /v1/sync/begin returns. The note carries the old→new ids so a
+	// forensic reader can see a correlation being (re)written without
+	// trusting the live, overwrite-in-place runs.correlated_run_id column
+	// (SAFETY-AUDIT H6).
+	TransitionSetCorrelatedRunID = "set-correlated-run-id"
 )
 
 // RunAudit is one row of the insert-only runs_audit log: a single

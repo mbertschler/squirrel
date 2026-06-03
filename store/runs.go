@@ -166,22 +166,54 @@ func (s *Store) BeginPeerSyncRun(ctx context.Context, volumeID, peerNodeID, corr
 // SetCorrelatedRunID stamps the supplied correlated id onto an
 // already-open run row. Used by the initiator to record the receiver's
 // run id once /v1/sync/begin returns: at BeginRun time the receiver
-// hadn't yet allocated one. Returns sql.ErrNoRows if runID is invalid.
+// hadn't yet allocated one. Returns a "no such run" error if runID is
+// invalid.
+//
+// The update and a 'set-correlated-run-id' runs_audit row are written in
+// one transaction so the overwrite-in-place correlated_run_id column
+// gains an append-only trail of every value it ever held (SAFETY-AUDIT
+// H6). The audit note carries the old→new ids.
 func (s *Store) SetCorrelatedRunID(ctx context.Context, runID, correlatedRunID int64) error {
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE runs SET correlated_run_id = ? WHERE id = ?`,
-		correlatedRunID, runID)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return fmt.Errorf("begin set correlated run id %d: %w", runID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var prior sql.NullInt64
+	switch err := tx.QueryRowContext(ctx,
+		`SELECT correlated_run_id FROM runs WHERE id = ?`, runID).Scan(&prior); {
+	case errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("set correlated run id: no run with id %d", runID)
+	case err != nil:
+		return fmt.Errorf("set correlated run id read prior: %w", err)
+	}
+
+	atNs := NowNs()
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE runs SET correlated_run_id = ? WHERE id = ?`,
+		correlatedRunID, runID); err != nil {
 		return fmt.Errorf("set correlated run id: %w", err)
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("set correlated run id rows affected: %w", err)
+	note := fmt.Sprintf("%s->%d", nullInt64Label(prior), correlatedRunID)
+	if err := appendRunAuditTx(ctx, tx,
+		RunAuditEntry{RunID: runID, Transition: TransitionSetCorrelatedRunID, Note: note}, atNs); err != nil {
+		return err
 	}
-	if n == 0 {
-		return fmt.Errorf("set correlated run id: no run with id %d", runID)
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit set correlated run id %d: %w", runID, err)
 	}
 	return nil
+}
+
+// nullInt64Label renders a nullable int for an audit note: the decimal
+// value when set, or the literal "none" when NULL (the pre-correlation
+// state). Keeps the old→new note legible without a sql.NullInt64 dump.
+func nullInt64Label(v sql.NullInt64) string {
+	if !v.Valid {
+		return "none"
+	}
+	return fmt.Sprintf("%d", v.Int64)
 }
 
 // FinishRun records the terminal state of a run. errMsg is stored as NULL
