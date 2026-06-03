@@ -35,6 +35,10 @@ type scheduler struct {
 	locks     lockHolder
 	tickEvery time.Duration
 	now       func() time.Time
+	// hooks runs the per-volume external-tool hooks (#84). May be nil in
+	// tests that construct a bare scheduler; hookRunner methods tolerate a
+	// nil receiver so the firing sites need no extra guard.
+	hooks *hookRunner
 }
 
 // lockHolder is the subset of the peer-sync router the scheduler uses
@@ -61,6 +65,7 @@ func newScheduler(srv *Server, tickEvery time.Duration, now func() time.Time) *s
 		locks:     srv.router,
 		tickEvery: tickEvery,
 		now:       now,
+		hooks:     newHookRunner(srv.store, srv.cfg.Logger),
 	}
 }
 
@@ -87,6 +92,9 @@ func (s *scheduler) run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			// Drain in-flight hooks before returning so Serve's shutdown
+			// wait doesn't race a hook goroutine writing its outcome.
+			s.hooks.wait()
 			return
 		case <-t.C:
 			s.tick(ctx)
@@ -326,7 +334,27 @@ func (s *scheduler) executeIndex(ctx context.Context, vol *config.Volume, volume
 			"kind", "index", "volume", vol.Name,
 			"run_id", rep.RunID, "err", err.Error())
 	}
+	if ok {
+		s.fireChangeHook(ctx, vol, volumeID, rep)
+	}
 	return ok
+}
+
+// fireChangeHook nudges the volume's external-tool hook after a successful
+// index run (#85). Per the issue's lean default it fires on every
+// completed run (success or partial) and passes SQUIRREL_CHANGED so the
+// consumer can cheaply no-op when nothing moved — keying off "content
+// settled" rather than off a sync to a remote, since a volume need not
+// have any sync_to destination for the hook to be useful. The fire is
+// best-effort and asynchronous, so it never affects the run that
+// triggered it.
+//
+// "Changed" counts additions, modifications, and disappearances: a file
+// going missing is as much a content change the backup should capture as
+// a new or rewritten one.
+func (s *scheduler) fireChangeHook(ctx context.Context, vol *config.Volume, volumeID int64, rep index.Report) {
+	changed := rep.Added+rep.Modified+rep.Missing > 0
+	s.hooks.fire(ctx, vol, volumeID, store.HookTriggerChange, rep.RunID, changed)
 }
 
 // recordFailedIndex inserts and immediately finishes a failed

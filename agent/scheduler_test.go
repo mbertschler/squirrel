@@ -179,6 +179,7 @@ func (f *schedulerFixture) scheduler() *scheduler {
 		locks:     f.srv.router,
 		tickEvery: time.Second,
 		now:       f.clock.Now,
+		hooks:     newHookRunner(f.srv.store, f.srv.cfg.Logger),
 	}
 }
 

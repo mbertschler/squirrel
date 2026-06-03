@@ -10,7 +10,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 10
+const SchemaVersion = 11
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -46,6 +46,7 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 8, up: migrateV7ToV8},
 		{version: 9, up: migrateV8ToV9},
 		{version: 10, up: migrateV9ToV10},
+		{version: 11, up: migrateV10ToV11},
 	}
 }
 
@@ -1207,6 +1208,54 @@ func migrateV9ToV10(ctx context.Context, db *sql.DB) error {
 	for _, q := range stmts {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("v9→v10: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// migrateV10ToV11 adds the hook_runs table: the generic outcome record
+// for the per-volume external-tool hooks (#84). A hook run is squirrel
+// exec'ing a user-configured command on one of two triggers — 'change'
+// (after a successful index run that settled content) or 'interval' (on
+// a cadence, regardless of change) — and recording only the tool-agnostic
+// result (exit code, timestamps, the triggering run). squirrel never
+// parses what the command did, so the table carries no tool-specific
+// columns.
+//
+// The table is additive and references existing parents (volumes, runs);
+// no existing row is rewritten, so the content-immutability invariant on
+// `files` is untouched. triggering_run_id is a nullable FK to runs(id):
+// on-change hooks carry the index run that fired them; interval hooks
+// leave it NULL because no run triggered them.
+func migrateV10ToV11(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`CREATE TABLE hook_runs (
+			id                INTEGER PRIMARY KEY,
+			volume_id         INTEGER NOT NULL REFERENCES volumes(id),
+			trigger           TEXT NOT NULL CHECK (trigger IN ('change','interval')),
+			triggering_run_id INTEGER REFERENCES runs(id),
+			changed           INTEGER NOT NULL CHECK (changed IN (0, 1)),
+			started_at_ns     INTEGER NOT NULL,
+			ended_at_ns       INTEGER,
+			status            TEXT NOT NULL CHECK (status IN ('running','success','failed')),
+			exit_code         INTEGER,
+			error             TEXT
+		)`,
+		// The cadence math (interval-hook due check) and the status surface
+		// both read the latest hook run per (volume, trigger); index the
+		// pair the queries order by.
+		`CREATE INDEX idx_hook_runs_volume_trigger ON hook_runs(volume_id, trigger, started_at_ns)`,
+		`INSERT INTO schema_version (version) VALUES (11)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("v10→v11: %w", err)
 		}
 	}
 	return tx.Commit()
