@@ -31,6 +31,27 @@ const (
 	RunStatusPartial = "partial"
 )
 
+// ErrAlreadyFinished is returned by FinishRun when the target run is
+// already in a terminal status (success/partial/failed). The first
+// terminal write wins: its status, error, and ended_at_ns are the audit
+// record, and a second FinishRun would silently rewrite them. Callers
+// that may legitimately race a double-finish (e.g. agent/sync.go's
+// handleClose firing after closeSession already finalised) detect this
+// with errors.Is and fall back to a log-only path rather than treating
+// it as a hard error.
+var ErrAlreadyFinished = errors.New("run is already in a terminal status")
+
+// isTerminalStatus reports whether status is one of the three terminal
+// run states. A row in any of these must not be re-finalised by
+// FinishRun.
+func isTerminalStatus(status string) bool {
+	switch status {
+	case RunStatusSuccess, RunStatusPartial, RunStatusFailed:
+		return true
+	}
+	return false
+}
+
 // Run is one entry in the runs table. VolumeID uses sql.NullInt64 because the
 // column is nullable (cross-volume sync runs in the future); EndedAtNs and
 // Error are likewise nullable while a run is still in-flight or finished
@@ -166,26 +187,55 @@ func (s *Store) SetCorrelatedRunID(ctx context.Context, runID, correlatedRunID i
 // FinishRun records the terminal state of a run. errMsg is stored as NULL
 // when empty. fileCount should be the total number of files the run touched
 // (added + modified + unchanged) so the runs table doubles as a coarse audit
-// log without needing to scan files. Returns an error if the runID does not
-// match any row, which would otherwise leave a run stuck in status='running'.
+// log without needing to scan files.
+//
+// The transition is guarded: a row already in a terminal status
+// (success/partial/failed) is never re-finalised — the first terminal
+// write wins and FinishRun returns ErrAlreadyFinished (matchable via
+// errors.Is) without touching the row. This protects the audit trail
+// from a double-finish bug or a buggy retry silently rewriting the
+// original status, error, and ended-at timestamp. A runID matching no
+// row returns a plain "no such run" error so a stuck 'running' row is
+// never left behind silently.
+//
+// The status update and a 'finish' runs_audit row are written in one
+// transaction so the append-only transition log can't diverge from the
+// run row. The audit note carries the resulting status.
 func (s *Store) FinishRun(ctx context.Context, runID int64, status string, errMsg string, fileCount int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin finish run %d: %w", runID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var current string
+	switch err := tx.QueryRowContext(ctx, `SELECT status FROM runs WHERE id = ?`, runID).Scan(&current); {
+	case errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("finish run %d: no such run", runID)
+	case err != nil:
+		return fmt.Errorf("finish run %d read status: %w", runID, err)
+	}
+	if isTerminalStatus(current) {
+		return fmt.Errorf("finish run %d (status %s): %w", runID, current, ErrAlreadyFinished)
+	}
+
+	atNs := NowNs()
 	var errVal sql.NullString
 	if errMsg != "" {
 		errVal = sql.NullString{String: errMsg, Valid: true}
 	}
-	res, err := s.db.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, `
 		UPDATE runs SET ended_at_ns = ?, status = ?, error = ?, file_count = ?
 		WHERE id = ?
-	`, NowNs(), status, errVal, fileCount, runID)
-	if err != nil {
+	`, atNs, status, errVal, fileCount, runID); err != nil {
 		return fmt.Errorf("finish run %d: %w", runID, err)
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("finish run %d rows affected: %w", runID, err)
+	if err := appendRunAuditTx(ctx, tx,
+		RunAuditEntry{RunID: runID, Transition: TransitionFinish, Note: status}, atNs); err != nil {
+		return err
 	}
-	if n == 0 {
-		return fmt.Errorf("finish run %d: no such run", runID)
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit finish run %d: %w", runID, err)
 	}
 	return nil
 }
