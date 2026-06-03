@@ -644,22 +644,24 @@ func TestPlanResponseContainsAllDispositions(t *testing.T) {
 		}
 	}
 
-	// Materialise files on disk first. evolved.txt is a supersede, so
-	// its recorded digest must equal the hash of its on-disk bytes —
-	// otherwise the supersede pre-move's re-hash (#76) sees drift and
-	// downgrades it to a conflict. same.txt (already-correct) and
-	// local.txt (conflict) are never re-hashed for the supersede
-	// decision, so synthetic digests are fine there.
+	// Materialise files on disk first, then record their real on-disk
+	// hash for the paths the pre-stage re-hashes (#76): evolved.txt
+	// (supersede) and local.txt (conflict) both get re-hashed before
+	// their bytes are moved, so their recorded digests must match what's
+	// on disk — a real receiver indexes its own content; a synthetic
+	// digest would look like out-of-band drift. The three files share the
+	// same "seed" bytes, so one digest serves both. same.txt is
+	// already-correct and never re-hashed, so a synthetic digest is fine.
 	for _, p := range []string{"same.txt", "evolved.txt", "local.txt"} {
 		if err := os.WriteFile(filepath.Join(f.recvVol.Path, p), []byte("seed"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	evolvedDigest := hashFile(t, filepath.Join(f.recvVol.Path, "evolved.txt"))
+	seedDigest := hashFile(t, filepath.Join(f.recvVol.Path, "evolved.txt"))
 
 	mustUpsert("same.txt", bytesDigest(0xAA), nil)
-	mustUpsert("evolved.txt", evolvedDigest, &store.Provenance{NodeID: peer.ID, RunID: priorRun})
-	mustUpsert("local.txt", bytesDigest(0xCC), nil)
+	mustUpsert("evolved.txt", seedDigest, &store.Provenance{NodeID: peer.ID, RunID: priorRun})
+	mustUpsert("local.txt", seedDigest, nil)
 
 	// peer_sync_state watermark (in initiator-id space) high enough
 	// to cover the prior row's correlated id.
@@ -737,8 +739,8 @@ func TestPlanResponseContainsAllDispositions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetByPath %s: %v", plan.Conflicts[0].PreservedAtPath, err)
 	}
-	if hex.EncodeToString(conflictRow.Blake3) != hexDigest(0xCC) {
-		t.Fatalf("conflict-path row blake3 = %x, want prior digest (0xCC...)", conflictRow.Blake3)
+	if hex.EncodeToString(conflictRow.Blake3) != hex.EncodeToString(seedDigest) {
+		t.Fatalf("conflict-path row blake3 = %x, want the prior on-disk digest %x", conflictRow.Blake3, seedDigest)
 	}
 }
 
