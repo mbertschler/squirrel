@@ -50,7 +50,11 @@ func newHookRunner(s *store.Store, logger *slog.Logger) *hookRunner {
 //
 // A nil receiver is a no-op so tests can construct a bare scheduler
 // without wiring a runner.
-func (h *hookRunner) fire(ctx context.Context, vol *config.Volume, volumeID int64, trigger string, triggeringRunID int64, changed bool) {
+//
+// trigger is always "change" until the interval caller lands in #86;
+// keeping it a parameter keeps the foundation trigger-agnostic, hence the
+// nolint until the second caller exercises the other value.
+func (h *hookRunner) fire(ctx context.Context, vol *config.Volume, volumeID int64, trigger string, triggeringRunID int64, changed bool) { //nolint:unparam
 	if h == nil || vol.Hook == nil {
 		return
 	}
@@ -84,7 +88,7 @@ func (h *hookRunner) fire(ctx context.Context, vol *config.Volume, volumeID int6
 	go func() {
 		defer h.wg.Done()
 		defer h.done(volumeID)
-		h.execute(ctx, vol, volumeID, id, trigger, triggeringRunID, changed)
+		h.execute(ctx, vol, id, trigger, triggeringRunID, changed)
 	}()
 }
 
@@ -92,7 +96,7 @@ func (h *hookRunner) fire(ctx context.Context, vol *config.Volume, volumeID int6
 // the hook goroutine; the recording uses a detached context so the outcome
 // still lands even when ctx was cancelled by agent shutdown (which is what
 // killed the command in the first place).
-func (h *hookRunner) execute(ctx context.Context, vol *config.Volume, volumeID, hookRunID int64, trigger string, triggeringRunID int64, changed bool) {
+func (h *hookRunner) execute(ctx context.Context, vol *config.Volume, hookRunID int64, trigger string, triggeringRunID int64, changed bool) {
 	outcome := hook.Run(ctx, hook.Spec{
 		Command: vol.Hook.Command,
 		Volume:  vol.Name,
