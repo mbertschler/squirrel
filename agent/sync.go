@@ -1152,7 +1152,7 @@ func (r *peerSyncRouter) closeSession(ctx context.Context, sess *peerSession, st
 		committed++
 	}
 	if status == store.RunStatusSuccess {
-		if err := r.srv.store.UpsertPeerSyncState(ctx, sess.volumeID, sess.peerNodeID, sess.correlatedRunID); err != nil {
+		if err := r.srv.store.UpsertPeerSyncState(ctx, sess.volumeID, sess.peerNodeID, sess.correlatedRunID, false); err != nil {
 			return committed, fmt.Errorf("advance peer_sync_state: %w", err)
 		}
 	}
