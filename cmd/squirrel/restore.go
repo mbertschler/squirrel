@@ -89,10 +89,13 @@ func runRestore(cmd *cobra.Command, volumeName, fromName string, opts sync.Resto
 		return err
 	}
 	out := cmd.OutOrStdout()
+	if opts.Shallow {
+		fmt.Fprintln(out, shallowSyncWarning)
+	}
 	if err := sync.EnsureMinVersion(cmd.Context(), rcl, out, opts.Shallow); err != nil {
 		return err
 	}
-	if err := rcl.WriteRcloneConfig(rcloneConfigPathFor(cfg), cfg.Destinations); err != nil {
+	if err := writeRcloneConfigLogged(out, rcl, cfg); err != nil {
 		return err
 	}
 
