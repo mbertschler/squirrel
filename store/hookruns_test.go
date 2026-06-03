@@ -150,7 +150,10 @@ func TestListHookRuns(t *testing.T) {
 func TestLatestHookRun(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
-	vol, _ := s.CreateVolume(ctx, "v", "/tmp/v")
+	vol, err := s.CreateVolume(ctx, "v", "/tmp/v")
+	if err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
 
 	if _, err := s.LatestHookRun(ctx, vol.ID, HookTriggerInterval); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("LatestHookRun on empty = %v, want sql.ErrNoRows", err)
@@ -158,9 +161,17 @@ func TestLatestHookRun(t *testing.T) {
 
 	// Two interval runs and a change run; LatestHookRun must return the
 	// newest of the requested trigger only.
-	_, _ = s.BeginHookRun(ctx, HookRunSpec{VolumeID: vol.ID, Trigger: HookTriggerInterval})
-	_, _ = s.BeginHookRun(ctx, HookRunSpec{VolumeID: vol.ID, Trigger: HookTriggerChange})
-	latestInterval, _ := s.BeginHookRun(ctx, HookRunSpec{VolumeID: vol.ID, Trigger: HookTriggerInterval})
+	mustBegin := func(trigger string) int64 {
+		t.Helper()
+		id, err := s.BeginHookRun(ctx, HookRunSpec{VolumeID: vol.ID, Trigger: trigger})
+		if err != nil {
+			t.Fatalf("BeginHookRun(%s): %v", trigger, err)
+		}
+		return id
+	}
+	mustBegin(HookTriggerInterval)
+	mustBegin(HookTriggerChange)
+	latestInterval := mustBegin(HookTriggerInterval)
 
 	got, err := s.LatestHookRun(ctx, vol.ID, HookTriggerInterval)
 	if err != nil {

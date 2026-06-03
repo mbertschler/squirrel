@@ -230,12 +230,18 @@ func TestSchedulerFiresIntervalHook(t *testing.T) {
 	assertIntervalHookCount(t, f, 1)
 
 	// The interval hook fires independent of indexing — no runs row exists.
-	runs, _ := f.store.ListRuns(ctx, store.ListRunsOpts{})
+	runs, err := f.store.ListRuns(ctx, store.ListRunsOpts{})
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
 	if len(runs) != 0 {
 		t.Fatalf("interval hook created %d runs rows; want 0 (it never indexes)", len(runs))
 	}
 
-	hooks, _ := f.store.ListHookRuns(ctx, store.HookRunListOpts{Descending: true})
+	hooks, err := f.store.ListHookRuns(ctx, store.HookRunListOpts{Descending: true})
+	if err != nil {
+		t.Fatalf("ListHookRuns: %v", err)
+	}
 	hr := hooks[0]
 	if hr.Trigger != store.HookTriggerInterval {
 		t.Fatalf("trigger = %q, want interval", hr.Trigger)
