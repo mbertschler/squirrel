@@ -895,6 +895,14 @@ func copyFileToPath(srcAbs, dstAbs string, mtimeNs int64) error {
 // invariant: the receiver owns the move (since rclone drops the
 // flag for node syncs), and the move happens up front so verify
 // re-hashes a clean tree.
+//
+// classify chose Supersede by reading the index, so the bytes on disk
+// are re-hashed here before they are moved: if they drifted out-of-band
+// since the last index, moving them into history would mislabel content
+// history (the run-N file would carry bytes the index says are a
+// different blake3). On a drift the path is downgraded to Conflict so
+// the actual bytes are preserved under .squirrel-conflicts/ with a row
+// matching them, and the initiator's bytes still land live.
 func (r *peerSyncRouter) preMoveSupersedes(sess *peerSession) error {
 	histRoot := filepath.Join(sess.volume.Path, HistoryDirName, "run-"+strconv.FormatInt(sess.receiverRunID, 10))
 	for path, entry := range sess.dispositions {
@@ -902,21 +910,52 @@ func (r *peerSyncRouter) preMoveSupersedes(sess *peerSession) error {
 			continue
 		}
 		srcAbs := filepath.Join(sess.volume.Path, path)
+		state, err := rehashSource(srcAbs, entry.priorRow.Blake3)
+		if err != nil {
+			return fmt.Errorf("re-hash %s: %w", path, err)
+		}
+		if state.missing {
+			// Prior row claims a file that isn't on disk anymore. Treat
+			// as already moved (e.g. by a prior aborted sync); record
+			// and proceed.
+			continue
+		}
+		if state.drifted {
+			// Out-of-band write since the index observation. Hand the path
+			// to preStageConflicts (which runs after this pass and re-hashes
+			// again), preserving the bytes actually on disk under
+			// .squirrel-conflicts/. The live bytes stay put until then.
+			downgradeToConflict(sess, path, entry)
+			continue
+		}
 		dstAbs := filepath.Join(histRoot, path)
 		if err := os.MkdirAll(filepath.Dir(dstAbs), 0o755); err != nil {
 			return fmt.Errorf("mkdir history for %s: %w", path, err)
 		}
 		if err := os.Rename(srcAbs, dstAbs); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				// Prior row claims a file that isn't on disk anymore. Treat
-				// as already moved (e.g. by a prior aborted sync); record
-				// and proceed.
+				// Raced with a concurrent unlink between the re-hash and the
+				// rename; the bytes we meant to preserve are gone. Treat as
+				// already moved.
 				continue
 			}
 			return fmt.Errorf("rename %s → %s: %w", srcAbs, dstAbs, err)
 		}
 	}
 	return nil
+}
+
+// downgradeToConflict reclassifies a supersede path as a conflict after
+// preMoveSupersedes detects the on-disk bytes drifted from the index.
+// It only flips the verdict and enqueues the path: preStageConflicts
+// re-hashes the still-live bytes and stamps the preserved row with the
+// actual blake3, so there is one authoritative relabel point. The path
+// is appended to conflictOrder because that slice — not the
+// dispositions map — drives preStageConflicts and the /plan response.
+func downgradeToConflict(sess *peerSession, path string, entry *sessionEntry) {
+	entry.disposition = syncproto.DispositionConflict
+	entry.conflictReason = "on-disk drift during sync"
+	sess.conflictOrder = append(sess.conflictOrder, path)
 }
 
 // preStageConflicts handles every conflict-disposition path before
@@ -943,6 +982,14 @@ func (r *peerSyncRouter) preStageConflicts(ctx context.Context, sess *peerSessio
 		preservedRel := filepath.ToSlash(filepath.Join(confSubdir, path))
 		srcAbs := filepath.Join(sess.volume.Path, path)
 		dstAbs := filepath.Join(sess.volume.Path, preservedRel)
+		// Re-hash the still-live bytes before moving them. classify (or
+		// the supersede downgrade) recorded priorRow.Blake3 from the
+		// index; if the on-disk bytes drifted out-of-band the preserved
+		// row must describe what is actually moved, not the stale digest.
+		conflictRow, err := r.conflictRowForPreStage(sess, path, srcAbs, preservedRel, entry)
+		if err != nil {
+			return err
+		}
 		if err := os.MkdirAll(filepath.Dir(dstAbs), 0o755); err != nil {
 			return fmt.Errorf("mkdir conflicts for %s: %w", path, err)
 		}
@@ -954,23 +1001,44 @@ func (r *peerSyncRouter) preStageConflicts(ctx context.Context, sess *peerSessio
 			// receiver will mark it missing if no bytes materialise.
 			return fmt.Errorf("rename %s → %s: %w", srcAbs, dstAbs, err)
 		}
-		conflictRow := store.FileRow{
-			VolumeID:       sess.volumeID,
-			Path:           preservedRel,
-			Blake3:         entry.priorRow.Blake3,
-			SizeBytes:      entry.priorRow.SizeBytes,
-			MtimeNs:        entry.priorRow.MtimeNs,
-			Status:         store.StatusPresent,
-			FirstSeenRunID: sess.receiverRunID,
-			LastSeenRunID:  sess.receiverRunID,
-			IndexedAtNs:    store.NowNs(),
-		}
 		if err := r.srv.store.RecordConflictPreStage(ctx, sess.volumeID, path, conflictRow, priorProvenance(entry.priorRow)); err != nil {
 			return fmt.Errorf("record conflict pre-stage for %s: %w", path, err)
 		}
 		entry.preservedAtPath = preservedRel
 	}
 	return nil
+}
+
+// conflictRowForPreStage builds the loser's preserved-path row for one
+// conflict. It re-hashes srcAbs and, when the bytes drifted from the
+// index-recorded blake3, relabels entry.priorRow (the single source of
+// truth the wire response also reads) to the digest/size actually on
+// disk so the preserved content is described truthfully everywhere.
+// When the file has already vanished the index values are used
+// unchanged: there is nothing to re-hash, and the row still records the
+// loser's identity so the prior blake3 stays queryable.
+func (r *peerSyncRouter) conflictRowForPreStage(sess *peerSession, path, srcAbs, preservedRel string, entry *sessionEntry) (store.FileRow, error) {
+	state, err := rehashSource(srcAbs, entry.priorRow.Blake3)
+	if err != nil {
+		return store.FileRow{}, fmt.Errorf("re-hash %s: %w", path, err)
+	}
+	if !state.missing && state.drifted {
+		relabelled := *entry.priorRow
+		relabelled.Blake3 = state.digest
+		relabelled.SizeBytes = state.size
+		entry.priorRow = &relabelled
+	}
+	return store.FileRow{
+		VolumeID:       sess.volumeID,
+		Path:           preservedRel,
+		Blake3:         entry.priorRow.Blake3,
+		SizeBytes:      entry.priorRow.SizeBytes,
+		MtimeNs:        entry.priorRow.MtimeNs,
+		Status:         store.StatusPresent,
+		FirstSeenRunID: sess.receiverRunID,
+		LastSeenRunID:  sess.receiverRunID,
+		IndexedAtNs:    store.NowNs(),
+	}, nil
 }
 
 // priorProvenance lifts the prior row's (source_node_id, source_run_id)
@@ -1053,16 +1121,63 @@ func (r *peerSyncRouter) verifySession(sess *peerSession, scope []string) (syncp
 // indexer uses. Streamed via io.Copy so files larger than memory work
 // transparently.
 func hashOnDisk(abs string) ([]byte, error) {
+	digest, _, err := rehashOnDisk(abs)
+	return digest, err
+}
+
+// rehashOnDisk opens abs once and returns its BLAKE3 digest and size.
+// It differs from hashOnDisk only in also reporting the size, which the
+// drift-downgrade path needs so a rewritten conflict row's (blake3,
+// size) pair stays consistent with the bytes actually on disk.
+// os.ErrNotExist propagates unchanged so callers can treat a vanished
+// file as "already moved".
+func rehashOnDisk(abs string) (digest []byte, size int64, err error) {
 	f, err := os.Open(abs)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, 0, fmt.Errorf("stat: %w", err)
+	}
 	h := blake3.New()
 	if _, err := io.Copy(h, f); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return h.Sum(nil), nil
+	return h.Sum(nil), info.Size(), nil
+}
+
+// onDiskState is the result of re-hashing a pre-stage source path just
+// before it is moved into a preservation bucket. It tells the caller
+// whether the file vanished (missing — treat as already moved) and
+// whether its bytes drifted out-of-band away from the blake3 the index
+// recorded (drifted). On a drift, digest/size carry the bytes actually
+// found on disk so the preserved row can be relabelled truthfully.
+type onDiskState struct {
+	digest  []byte
+	size    int64
+	missing bool
+	drifted bool
+}
+
+// rehashSource re-hashes srcAbs and compares the result against the
+// receiver index's recorded blake3 (expected). It is the single place
+// the supersede and conflict pre-stages re-derive on-disk content
+// before a rename, closing the classify→pre-stage TOCTOU window: the
+// index decided the disposition, but the bytes about to be moved are
+// what the preserved row must be labelled with. os.ErrNotExist is
+// folded into the missing flag rather than returned as an error so both
+// call sites share the "already moved" handling.
+func rehashSource(srcAbs string, expected []byte) (onDiskState, error) {
+	digest, size, err := rehashOnDisk(srcAbs)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return onDiskState{missing: true}, nil
+		}
+		return onDiskState{}, err
+	}
+	return onDiskState{digest: digest, size: size, drifted: !bytesEqual(digest, expected)}, nil
 }
 
 // handleClose implements POST /v1/sync/close.
