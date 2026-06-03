@@ -104,6 +104,16 @@ func Run(ctx context.Context, spec Spec) Outcome {
 		out.Err = errors.New("hook: empty command")
 		return out
 	}
+	// A non-positive timeout would make context.WithTimeout fire
+	// immediately, surfacing as a phantom "timed out" before the command
+	// ran. Callers are contractually required to pass a positive bound (the
+	// config layer defaults it), so treat a violation as a clear error
+	// rather than an instant, confusing timeout.
+	if spec.Timeout <= 0 {
+		out.EndedAtNs = time.Now().UnixNano()
+		out.Err = fmt.Errorf("hook: timeout must be positive, got %s", spec.Timeout)
+		return out
+	}
 
 	runCtx, cancel := context.WithTimeout(ctx, spec.Timeout)
 	defer cancel()
@@ -180,25 +190,41 @@ func (s Spec) env() []string {
 	}
 }
 
-// boundedBuffer is an io.Writer that keeps at most limit bytes, dropping
-// the overflow. It lets us capture a stderr tail for diagnostics without
-// risking unbounded memory from a misbehaving hook.
+// boundedBuffer is an io.Writer that keeps at most limit bytes — the LAST
+// limit bytes written (the tail), dropping older overflow. For a failing
+// command the most recent stderr is the part that explains the failure, so
+// keeping the tail (not the head) is what makes the recorded diagnostic
+// useful, while still bounding memory against a chatty hook.
 type boundedBuffer struct {
 	buf   bytes.Buffer
 	limit int
 }
 
 func (b *boundedBuffer) Write(p []byte) (int, error) {
-	if room := b.limit - b.buf.Len(); room > 0 {
-		if len(p) <= room {
-			b.buf.Write(p)
-		} else {
-			b.buf.Write(p[:room])
-		}
+	n := len(p)
+	if b.limit <= 0 {
+		return n, nil
 	}
-	// Report the full length as written: we are intentionally discarding
-	// the overflow, not failing the command's write.
-	return len(p), nil
+	// A single write larger than the limit: keep only its tail, discarding
+	// everything buffered before it (all of which is now older).
+	if len(p) >= b.limit {
+		b.buf.Reset()
+		b.buf.Write(p[len(p)-b.limit:])
+		return n, nil
+	}
+	// Otherwise make room by dropping the oldest buffered bytes so the
+	// running total stays within the limit, then append.
+	if over := b.buf.Len() + len(p) - b.limit; over > 0 {
+		rest := b.buf.Bytes()[over:]
+		kept := make([]byte, len(rest))
+		copy(kept, rest)
+		b.buf.Reset()
+		b.buf.Write(kept)
+	}
+	b.buf.Write(p)
+	// Report the full length as written: we intentionally discard older
+	// overflow rather than failing the command's write.
+	return n, nil
 }
 
 func (b *boundedBuffer) String() string { return b.buf.String() }

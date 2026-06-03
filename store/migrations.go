@@ -1235,6 +1235,12 @@ func migrateV10ToV11(ctx context.Context, db *sql.DB) error {
 	defer tx.Rollback()
 
 	stmts := []string{
+		// The trigger↔triggering_run_id coupling mirrors the runs table's
+		// kind↔destination CHECK: a 'change' hook is always fired by an index
+		// run (so it carries that run id), while an 'interval' hook fires on
+		// the clock with no run behind it (so the id is NULL). Encoding it in
+		// the schema keeps the RUN column in `squirrel hooks`/TUI honest and
+		// turns a wiring bug into a loud failure instead of a NULL.
 		`CREATE TABLE hook_runs (
 			id                INTEGER PRIMARY KEY,
 			volume_id         INTEGER NOT NULL REFERENCES volumes(id),
@@ -1245,7 +1251,11 @@ func migrateV10ToV11(ctx context.Context, db *sql.DB) error {
 			ended_at_ns       INTEGER,
 			status            TEXT NOT NULL CHECK (status IN ('running','success','failed')),
 			exit_code         INTEGER,
-			error             TEXT
+			error             TEXT,
+			CHECK (
+				(trigger = 'change'   AND triggering_run_id IS NOT NULL) OR
+				(trigger = 'interval' AND triggering_run_id IS NULL)
+			)
 		)`,
 		// The cadence math (interval-hook due check) and the status surface
 		// both read the latest hook run per (volume, trigger); index the
