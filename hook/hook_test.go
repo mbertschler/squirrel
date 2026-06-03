@@ -159,8 +159,12 @@ func TestBoundedBufferKeepsTail(t *testing.T) {
 	// Tail is maintained across multiple writes.
 	var b2 boundedBuffer
 	b2.limit = 4
-	b2.Write([]byte("ab"))
-	b2.Write([]byte("cdef"))
+	if _, err := b2.Write([]byte("ab")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if _, err := b2.Write([]byte("cdef")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
 	if b2.String() != "cdef" {
 		t.Fatalf("buffer = %q, want %q (last 4 bytes across writes)", b2.String(), "cdef")
 	}
