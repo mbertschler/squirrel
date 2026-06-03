@@ -100,6 +100,14 @@ type VolumeHook struct {
 	// Timeout bounds one invocation so a hung hook can't wedge the agent's
 	// scheduler. Zero is replaced with DefaultHookTimeout at load time.
 	Timeout time.Duration
+	// Interval is the cadence for the interval ("check") trigger: the
+	// agent fires the same command on this period regardless of whether
+	// content changed (the motivating use is periodic backup
+	// verification, where bitrot happens to static data and so must be
+	// re-checked on a clock, not on an event). Zero means "no interval
+	// firing" — the hook then fires only on-change. The command tells the
+	// two triggers apart via SQUIRREL_TRIGGER (change vs interval).
+	Interval time.Duration
 }
 
 // DefaultHookTimeout is the per-invocation timeout applied when a hook
@@ -193,8 +201,9 @@ type rawVolume struct {
 }
 
 type rawVolumeHook struct {
-	Command []string `toml:"command"`
-	Timeout string   `toml:"timeout"`
+	Command  []string `toml:"command"`
+	Timeout  string   `toml:"timeout"`
+	Interval string   `toml:"interval"`
 }
 
 func (r *rawConfig) resolve(path string) (*Config, error) {
@@ -328,9 +337,14 @@ func resolveVolumeHook(raw *rawVolumeHook) (*VolumeHook, error) {
 		}
 		timeout = dur
 	}
+	interval, err := parseVolumeCadence("hook.interval", raw.Interval)
+	if err != nil {
+		return nil, err
+	}
 	return &VolumeHook{
-		Command: append([]string(nil), raw.Command...),
-		Timeout: timeout,
+		Command:  append([]string(nil), raw.Command...),
+		Timeout:  timeout,
+		Interval: interval,
 	}, nil
 }
 

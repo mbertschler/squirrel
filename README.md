@@ -65,21 +65,29 @@ A volume can declare a per-volume **hook** — a command the agent runs to nudge
 
 ```toml
 [volumes.pictures.hook]
-command = ["kopia", "snapshot", "create", "."]
-timeout = "30m"   # optional, defaults to 1h
+command  = ["kopia", "snapshot", "create", "."]
+timeout  = "30m"   # optional, defaults to 1h
+interval = "24h"   # optional — also fire on this cadence (see below)
 ```
 
-The hook fires after a successful index run on the volume (which the agent runs on the `index_every` / `sync_every` cadence). It is **best-effort**: a hook failure or timeout never fails or blocks the run that triggered it, and overlapping invocations for the same volume are skipped rather than stacked. The command receives:
+A hook fires on two triggers, both reusing the same command:
+
+- **on change** — after every successful index run on the volume (which the agent runs on the `index_every` / `sync_every` cadence). This answers *"is the latest content backed up?"*. It keys off content settling, not off a sync to a remote, so a volume needs no `sync_to` destination for the hook to be useful.
+- **on interval** — every `interval`, *regardless of whether anything changed*. This answers *"is the existing backup still intact?"*. Verification is orthogonal to change — bitrot happens to static data — so re-checks have to run on a clock. Omit `interval` to fire on-change only.
+
+The command tells the two apart via `SQUIRREL_TRIGGER` (so a single command can back up on change and verify on interval). It is **best-effort**: a hook failure or timeout never fails or blocks the run that triggered it, and overlapping invocations for the same volume are skipped rather than stacked. The command receives:
 
 | Variable | Meaning |
 |---|---|
 | `SQUIRREL_VOLUME` | volume name |
 | `SQUIRREL_PATH` | absolute volume path |
-| `SQUIRREL_RUN_ID` | the index run that triggered the hook |
-| `SQUIRREL_CHANGED` | `true`/`false` — whether the run observed changes (so the command can cheaply no-op) |
-| `SQUIRREL_TRIGGER` | `change` |
+| `SQUIRREL_RUN_ID` | the index run that triggered the hook (empty on the interval trigger) |
+| `SQUIRREL_CHANGED` | `true`/`false` — whether the run observed changes (so the command can cheaply no-op); always `false` on the interval trigger |
+| `SQUIRREL_TRIGGER` | `change` or `interval` |
 
 Because the command is exec'd without a shell, the volume path is never string-concatenated into a command line. If you want shell features, make the command `["sh", "-c", "…"]` yourself. Recorded outcomes are visible via `squirrel hooks` and the TUI's Hooks tab.
+
+> **Don't double-schedule verification.** If your external tool already runs its own verify on a timer (e.g. a cron/systemd job), don't *also* set `interval` for a verify command — two heavy passes will step on each other. Pick one driver: let squirrel schedule it (so the result lands in `squirrel hooks` / the TUI) **or** let the tool schedule it (maximum independence — verification keeps happening even when the agent is down), not both.
 
 ## Quickstart
 

@@ -75,11 +75,22 @@ func newScheduler(srv *Server, tickEvery time.Duration, now func() time.Time) *s
 // when nothing is scheduled.
 func (s *scheduler) anyScheduledVolume() bool {
 	for _, v := range s.volumes {
-		if v.SyncEvery > 0 || v.IndexEvery > 0 {
+		if volumeHasCadence(v) {
 			return true
 		}
 	}
 	return false
+}
+
+// volumeHasCadence reports whether a volume opts into any scheduler-driven
+// cadence: a sync, a standalone index, or an interval hook. The interval
+// hook counts on its own — a volume can want periodic verification of its
+// external backup without any squirrel index/sync schedule.
+func volumeHasCadence(v *config.Volume) bool {
+	if v.SyncEvery > 0 || v.IndexEvery > 0 {
+		return true
+	}
+	return v.Hook != nil && v.Hook.Interval > 0
 }
 
 // run is the scheduler's main loop. Returns on ctx cancellation. One
@@ -112,7 +123,7 @@ func (s *scheduler) tick(ctx context.Context) {
 			return
 		}
 		v := s.volumes[name]
-		if v.SyncEvery == 0 && v.IndexEvery == 0 {
+		if !volumeHasCadence(v) {
 			continue
 		}
 		s.evaluateVolume(ctx, v)
@@ -133,6 +144,13 @@ func sortedVolumeNames(m map[string]*config.Volume) []string {
 // indexes immediately before pushing; if that pre-sync index ran, it
 // satisfies the standalone-index cadence too (both write kind='index'
 // rows the same way) and the standalone branch naturally skips.
+//
+// The interval hook is evaluated last, after any index/sync this tick.
+// That ordering means a tick that re-indexed the source (verifying HDD1)
+// also fires the external check (verifying HDD2) right after — verify the
+// source, then verify the backup — without coupling the two cadences:
+// each runs on its own clock and the interval hook fires regardless of
+// whether an index ran.
 func (s *scheduler) evaluateVolume(ctx context.Context, vol *config.Volume) {
 	v, err := s.resolveVolume(ctx, vol.Name, vol.Path)
 	if err != nil {
@@ -144,6 +162,50 @@ func (s *scheduler) evaluateVolume(ctx context.Context, vol *config.Volume) {
 	if !syncFired && vol.IndexEvery > 0 {
 		s.maybeRunIndex(ctx, vol, v.ID, "standalone", vol.IndexEvery)
 	}
+	s.maybeFireIntervalHook(ctx, vol, v.ID)
+}
+
+// maybeFireIntervalHook fires the volume's hook on its interval cadence
+// (#86), independent of any change. It is the time-driven counterpart to
+// the on-change fire in executeIndex: verification is orthogonal to change
+// (bitrot hits static data), so it must run on a clock. The fire reuses
+// the foundation's exec/env/best-effort/don't-stack/timeout path with the
+// trigger set to interval; SQUIRREL_CHANGED is always false here (no run
+// observed anything) and there is no triggering run.
+func (s *scheduler) maybeFireIntervalHook(ctx context.Context, vol *config.Volume, volumeID int64) {
+	if vol.Hook == nil || vol.Hook.Interval <= 0 {
+		return
+	}
+	due, err := s.intervalHookDue(ctx, volumeID, vol.Hook.Interval)
+	if err != nil {
+		s.logger.Error("scheduler.error",
+			"kind", "hook", "volume", vol.Name, "err", err.Error())
+		return
+	}
+	if !due {
+		return
+	}
+	s.hooks.fire(ctx, vol, volumeID, store.HookTriggerInterval, 0, false)
+}
+
+// intervalHookDue reports whether `now - last_interval_hook >= cadence`
+// for the volume. A volume with no interval hook run yet is always due.
+// The last run's end timestamp anchors the cadence (falling back to its
+// start, mirroring elapsedSince); a still-running hook is handled by the
+// don't-stack guard inside fire, not here.
+func (s *scheduler) intervalHookDue(ctx context.Context, volumeID int64, cadence time.Duration) (bool, error) {
+	r, err := s.store.LatestHookRun(ctx, volumeID, store.HookTriggerInterval)
+	if err != nil {
+		if store.IsNotFound(err) {
+			return true, nil
+		}
+		return false, fmt.Errorf("lookup last interval hook: %w", err)
+	}
+	ts := r.StartedAtNs
+	if r.EndedAtNs.Valid {
+		ts = r.EndedAtNs.Int64
+	}
+	return s.now().Sub(time.Unix(0, ts)) >= cadence, nil
 }
 
 // resolveVolume looks up (or creates) the volume row by name. Mirrors

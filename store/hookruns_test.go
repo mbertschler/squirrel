@@ -147,6 +147,33 @@ func TestListHookRuns(t *testing.T) {
 	_ = id2
 }
 
+func TestLatestHookRun(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	vol, _ := s.CreateVolume(ctx, "v", "/tmp/v")
+
+	if _, err := s.LatestHookRun(ctx, vol.ID, HookTriggerInterval); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("LatestHookRun on empty = %v, want sql.ErrNoRows", err)
+	}
+
+	// Two interval runs and a change run; LatestHookRun must return the
+	// newest of the requested trigger only.
+	_, _ = s.BeginHookRun(ctx, HookRunSpec{VolumeID: vol.ID, Trigger: HookTriggerInterval})
+	_, _ = s.BeginHookRun(ctx, HookRunSpec{VolumeID: vol.ID, Trigger: HookTriggerChange})
+	latestInterval, _ := s.BeginHookRun(ctx, HookRunSpec{VolumeID: vol.ID, Trigger: HookTriggerInterval})
+
+	got, err := s.LatestHookRun(ctx, vol.ID, HookTriggerInterval)
+	if err != nil {
+		t.Fatalf("LatestHookRun: %v", err)
+	}
+	if got.ID != latestInterval {
+		t.Fatalf("latest interval id = %d, want %d", got.ID, latestInterval)
+	}
+	if got.Trigger != HookTriggerInterval {
+		t.Fatalf("trigger = %q, want interval", got.Trigger)
+	}
+}
+
 // hookRunByID reads a single hook run by id. It lives in the test
 // file (not the package surface) because production code never fetches a
 // hook run by primary key — it lists or, in the follow-up interval work,
