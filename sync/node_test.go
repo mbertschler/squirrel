@@ -296,16 +296,22 @@ func TestNodeSyncResolvesConflictOnLocalWriteOnReceiver(t *testing.T) {
 		t.Fatalf("BeginRun on receiver: %v", err)
 	}
 	_ = f.recvStore.FinishRun(ctx, runID, store.RunStatusSuccess, "", 1)
-	receiverDigest := bytesDigest(0x88)
+	// Write the receiver's local file first, then record its real
+	// on-disk hash. A real receiver indexes its own bytes, so the
+	// recorded digest matches what's on disk; otherwise the pre-stage
+	// re-hash would (correctly) relabel the preserved row to the actual
+	// content. The drift case itself is covered in the agent package by
+	// TestPreStageReHashRelabelsConflictDrift.
+	if err := os.WriteFile(filepath.Join(f.recvVol.Path, "doc.md"), []byte("recvr"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	receiverDigest := hashFile(t, filepath.Join(f.recvVol.Path, "doc.md"))
 	if err := f.recvStore.Upsert(ctx, store.FileRow{
 		VolumeID: v.ID, Path: "doc.md", Blake3: receiverDigest,
 		SizeBytes: 5, MtimeNs: 50, Status: store.StatusPresent,
 		FirstSeenRunID: runID, LastSeenRunID: runID, IndexedAtNs: 50,
 	}, nil); err != nil {
 		t.Fatalf("seed receiver file row: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(f.recvVol.Path, "doc.md"), []byte("recvr"), 0o644); err != nil {
-		t.Fatal(err)
 	}
 
 	// Initiator writes a *different* blake3 at the same path.
@@ -627,27 +633,33 @@ func TestPlanResponseContainsAllDispositions(t *testing.T) {
 	}
 	_ = f.recvStore.FinishRun(ctx, priorRun, store.RunStatusSuccess, "", 1)
 
-	mustUpsert := func(path string, b3 byte, prov *store.Provenance) {
+	mustUpsert := func(path string, digest []byte, prov *store.Provenance) {
 		t.Helper()
 		if err := f.recvStore.Upsert(ctx, store.FileRow{
-			VolumeID: v.ID, Path: path, Blake3: bytesDigest(b3),
+			VolumeID: v.ID, Path: path, Blake3: digest,
 			SizeBytes: 1, MtimeNs: 1, Status: store.StatusPresent,
 			FirstSeenRunID: priorRun, LastSeenRunID: priorRun, IndexedAtNs: 1,
 		}, prov); err != nil {
 			t.Fatalf("upsert receiver %s: %v", path, err)
 		}
 	}
-	mustUpsert("same.txt", 0xAA, nil)
-	mustUpsert("evolved.txt", 0xBB, &store.Provenance{NodeID: peer.ID, RunID: priorRun})
-	mustUpsert("local.txt", 0xCC, nil)
 
-	// Materialise files on disk so the supersede pre-move has
-	// something to rename.
+	// Materialise files on disk first. evolved.txt is a supersede, so
+	// its recorded digest must equal the hash of its on-disk bytes —
+	// otherwise the supersede pre-move's re-hash (#76) sees drift and
+	// downgrades it to a conflict. same.txt (already-correct) and
+	// local.txt (conflict) are never re-hashed for the supersede
+	// decision, so synthetic digests are fine there.
 	for _, p := range []string{"same.txt", "evolved.txt", "local.txt"} {
 		if err := os.WriteFile(filepath.Join(f.recvVol.Path, p), []byte("seed"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
+	evolvedDigest := hashFile(t, filepath.Join(f.recvVol.Path, "evolved.txt"))
+
+	mustUpsert("same.txt", bytesDigest(0xAA), nil)
+	mustUpsert("evolved.txt", evolvedDigest, &store.Provenance{NodeID: peer.ID, RunID: priorRun})
+	mustUpsert("local.txt", bytesDigest(0xCC), nil)
 
 	// peer_sync_state watermark (in initiator-id space) high enough
 	// to cover the prior row's correlated id.
