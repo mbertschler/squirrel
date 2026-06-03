@@ -156,3 +156,4 @@ Each destination is a tree shaped like the local volumes:
 - Storage: SQLite via the pure-Go `modernc.org/sqlite`. WAL mode is enabled at open. Schema version 6; older databases auto-migrate forward on first open.
 - Symlinks are skipped during indexing.
 - Sync runs do not pass `--delete-*` to rclone. Files removed locally remain at the destination.
+- The `runs` table is never auto-pruned; the run history is an audit trail and any retention is explicit and operator-driven only.
