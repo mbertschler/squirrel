@@ -128,14 +128,40 @@ func TestRunEmptyCommand(t *testing.T) {
 	}
 }
 
-func TestBoundedBuffer(t *testing.T) {
+func TestRunNonPositiveTimeout(t *testing.T) {
+	out := Run(context.Background(), Spec{
+		Command: []string{"sh", "-c", "exit 0"},
+		Timeout: 0,
+	})
+	if out.Succeeded() {
+		t.Fatalf("Succeeded = true, want failure for a non-positive timeout")
+	}
+	if out.TimedOut {
+		t.Fatalf("TimedOut = true, want a clear config error, not a phantom timeout")
+	}
+	if !strings.Contains(out.Err.Error(), "timeout must be positive") {
+		t.Fatalf("Err = %v, want a 'timeout must be positive' error", out.Err)
+	}
+}
+
+func TestBoundedBufferKeepsTail(t *testing.T) {
+	// Single oversized write keeps the tail.
 	var b boundedBuffer
 	b.limit = 4
 	n, err := b.Write([]byte("hello"))
 	if err != nil || n != 5 {
 		t.Fatalf("Write = (%d, %v), want (5, nil) — overflow is reported as written, not failed", n, err)
 	}
-	if b.String() != "hell" {
-		t.Fatalf("buffer = %q, want %q (capped at limit)", b.String(), "hell")
+	if b.String() != "ello" {
+		t.Fatalf("buffer = %q, want %q (the tail, not the head)", b.String(), "ello")
+	}
+
+	// Tail is maintained across multiple writes.
+	var b2 boundedBuffer
+	b2.limit = 4
+	b2.Write([]byte("ab"))
+	b2.Write([]byte("cdef"))
+	if b2.String() != "cdef" {
+		t.Fatalf("buffer = %q, want %q (last 4 bytes across writes)", b2.String(), "cdef")
 	}
 }

@@ -163,8 +163,11 @@ func TestSchedulerFiresChangeHook(t *testing.T) {
 		Name:       "v",
 		IndexEvery: time.Minute,
 		Hook: &config.VolumeHook{
-			// Touch a marker so we can prove the command actually ran.
-			Command: []string{"sh", "-c", "echo x > " + marker},
+			// Touch a marker so we can prove the command actually ran. The
+			// marker path is passed as an argument ($1), not concatenated
+			// into the script, so a temp dir with spaces/metacharacters
+			// can't break the command.
+			Command: []string{"sh", "-c", `echo x > "$1"`, "sh", marker},
 			Timeout: 5 * time.Second,
 		},
 	}

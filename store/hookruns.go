@@ -74,10 +74,24 @@ func scanHookRunRow(s rowScanner) (HookRun, error) {
 
 // BeginHookRun records the start of a hook invocation and returns its id.
 // The trigger must be one of the HookTrigger* constants. The row begins
-// in status 'running'; FinishHookRun moves it to a terminal state. A
-// non-zero spec.TriggeringRunID is stored as the FK; zero stores NULL.
+// in status 'running'; FinishHookRun moves it to a terminal state.
+//
+// The trigger and triggering run must agree (the schema enforces the same
+// coupling): a 'change' hook is fired by an index run and must carry a
+// non-zero TriggeringRunID; an 'interval' hook fires on the clock and must
+// leave it zero (stored as NULL). Rejecting the mismatch here turns a
+// wiring bug into a clear error rather than a CHECK-constraint failure.
 func (s *Store) BeginHookRun(ctx context.Context, spec HookRunSpec) (int64, error) {
-	if spec.Trigger != HookTriggerChange && spec.Trigger != HookTriggerInterval {
+	switch spec.Trigger {
+	case HookTriggerChange:
+		if spec.TriggeringRunID == 0 {
+			return 0, fmt.Errorf("BeginHookRun: a %q hook requires a triggering run id", HookTriggerChange)
+		}
+	case HookTriggerInterval:
+		if spec.TriggeringRunID != 0 {
+			return 0, fmt.Errorf("BeginHookRun: an %q hook must not carry a triggering run id (got %d)", HookTriggerInterval, spec.TriggeringRunID)
+		}
+	default:
 		return 0, fmt.Errorf("BeginHookRun: trigger must be %q or %q, got %q", HookTriggerChange, HookTriggerInterval, spec.Trigger)
 	}
 	var triggeringRun sql.NullInt64

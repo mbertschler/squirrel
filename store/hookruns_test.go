@@ -99,9 +99,28 @@ func TestFinishHookRunRejectsBadStatus(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 	vol, _ := s.CreateVolume(ctx, "v", "/tmp/v")
-	id, _ := s.BeginHookRun(ctx, HookRunSpec{VolumeID: vol.ID, Trigger: HookTriggerChange})
+	// Interval trigger needs no triggering run, keeping this focused on the
+	// FinishHookRun status validation.
+	id, err := s.BeginHookRun(ctx, HookRunSpec{VolumeID: vol.ID, Trigger: HookTriggerInterval})
+	if err != nil {
+		t.Fatalf("BeginHookRun: %v", err)
+	}
 	if err := s.FinishHookRun(ctx, id, HookStatusRunning, sql.NullInt64{}, ""); err == nil {
 		t.Fatalf("expected error finishing with non-terminal status, got nil")
+	}
+}
+
+func TestBeginHookRunRejectsTriggerRunMismatch(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	vol, _ := s.CreateVolume(ctx, "v", "/tmp/v")
+	// change without a triggering run is rejected.
+	if _, err := s.BeginHookRun(ctx, HookRunSpec{VolumeID: vol.ID, Trigger: HookTriggerChange}); err == nil {
+		t.Fatalf("expected error: change hook with no triggering run")
+	}
+	// interval with a triggering run is rejected.
+	if _, err := s.BeginHookRun(ctx, HookRunSpec{VolumeID: vol.ID, Trigger: HookTriggerInterval, TriggeringRunID: 1}); err == nil {
+		t.Fatalf("expected error: interval hook carrying a triggering run")
 	}
 }
 
@@ -117,7 +136,13 @@ func TestListHookRuns(t *testing.T) {
 	ctx := context.Background()
 	va, _ := s.CreateVolume(ctx, "a", "/tmp/a")
 	vb, _ := s.CreateVolume(ctx, "b", "/tmp/b")
-	id1, _ := s.BeginHookRun(ctx, HookRunSpec{VolumeID: va.ID, Trigger: HookTriggerChange})
+	// The change hook needs a real triggering run (the column is an FK and
+	// the trigger↔run coupling is enforced).
+	runID, err := s.BeginIndexRun(ctx, RunKindIndex, va.ID, true)
+	if err != nil {
+		t.Fatalf("BeginIndexRun: %v", err)
+	}
+	id1, _ := s.BeginHookRun(ctx, HookRunSpec{VolumeID: va.ID, Trigger: HookTriggerChange, TriggeringRunID: runID})
 	id2, _ := s.BeginHookRun(ctx, HookRunSpec{VolumeID: vb.ID, Trigger: HookTriggerInterval})
 	id3, _ := s.BeginHookRun(ctx, HookRunSpec{VolumeID: va.ID, Trigger: HookTriggerInterval})
 
