@@ -182,6 +182,7 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 	runID, err := beginSyncRunGuarded(ctx, s, opts.DryRun, store.SyncRunSpec{
 		VolumeID:    volID,
 		Destination: dest.Name,
+		Shallow:     opts.Shallow,
 	}, vol.Name)
 	if err != nil {
 		return rep, err
@@ -281,15 +282,17 @@ func requireIndexedVolume(ctx context.Context, s *store.Store, vol *config.Volum
 }
 
 // beginRestoreRun inserts a kind='restore' runs row, unless dryRun is
-// set in which case it returns (0, nil) and no row is written. Restore
-// is not gated against concurrency the way sync is — the destination is
-// the read side here, and parallel restores into separate ToPath
-// targets are a legitimate workflow.
-func beginRestoreRun(ctx context.Context, s *store.Store, dryRun bool, volID int64, destName string) (int64, error) {
+// set in which case it returns (0, nil) and no row is written. shallow
+// records whether the restore skipped BLAKE3 verification so the runs
+// row says which pulls were content-verified. Restore is not gated
+// against concurrency the way sync is — the destination is the read side
+// here, and parallel restores into separate ToPath targets are a
+// legitimate workflow.
+func beginRestoreRun(ctx context.Context, s *store.Store, dryRun bool, volID int64, destName string, shallow bool) (int64, error) {
 	if dryRun {
 		return 0, nil
 	}
-	id, err := s.BeginRun(ctx, store.RunKindRestore, volID, destName)
+	id, err := s.BeginRun(ctx, store.RunKindRestore, volID, destName, shallow)
 	if err != nil {
 		return 0, fmt.Errorf("begin restore run: %w", err)
 	}
@@ -696,7 +699,7 @@ func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volum
 		return rep, err
 	}
 
-	runID, err := beginRestoreRun(ctx, s, opts.DryRun, v.ID, dest.Name)
+	runID, err := beginRestoreRun(ctx, s, opts.DryRun, v.ID, dest.Name, opts.Shallow)
 	if err != nil {
 		return rep, err
 	}

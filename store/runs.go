@@ -53,10 +53,12 @@ type Run struct {
 	FileCount       int64
 	PeerNodeID      sql.NullInt64
 	CorrelatedRunID sql.NullInt64
-	// Shallow is meaningful for index and audit runs: true when the
-	// run took the (size, mtime) shortcut instead of rehashing every
-	// file. NULL (Valid=false) for sync/restore runs and for the
-	// pre-v10 history that never recorded the choice.
+	// Shallow is true when the run skipped BLAKE3 verification in
+	// favour of the (size, mtime) shortcut: a skipped rehash for index
+	// and audit runs, an rclone copy without --checksum --hash blake3
+	// for initiator-side sync and restore runs. NULL (Valid=false) for
+	// the receiver side of a node sync (which makes no such choice) and
+	// for the pre-v10 history that never recorded it.
 	Shallow sql.NullBool
 }
 
@@ -64,11 +66,11 @@ type Run struct {
 // id. Callers must pair it with FinishRun (typically via defer with an
 // error pointer or an explicit terminal call). volumeID must reference
 // an existing volume; destination must be non-empty (sync/restore must
-// name an rclone target). Index and audit kinds belong on BeginIndexRun
-// — they record the shallow flag, which this entry point can't carry,
-// and the call is rejected here to keep the signal from being silently
-// dropped.
-func (s *Store) BeginRun(ctx context.Context, kind string, volumeID int64, destination string) (int64, error) {
+// name an rclone target). shallow records whether the transfer skipped
+// BLAKE3 verification (rclone's size+mtime shortcut) so forensic readers
+// can tell which restores were content-verified. Index and audit kinds
+// belong on BeginIndexRun and are rejected here.
+func (s *Store) BeginRun(ctx context.Context, kind string, volumeID int64, destination string, shallow bool) (int64, error) {
 	if kind == RunKindIndex || kind == RunKindAudit {
 		return 0, fmt.Errorf("BeginRun: kind %q must go through BeginIndexRun so runs.shallow is recorded", kind)
 	}
@@ -77,9 +79,9 @@ func (s *Store) BeginRun(ctx context.Context, kind string, volumeID int64, desti
 		destVal = sql.NullString{String: destination, Valid: true}
 	}
 	res, err := s.db.ExecContext(ctx, `
-		INSERT INTO runs (kind, volume_id, destination, started_at_ns, status, file_count)
-		VALUES (?, ?, ?, ?, 'running', 0)
-	`, kind, volumeID, destVal, NowNs())
+		INSERT INTO runs (kind, volume_id, destination, started_at_ns, status, file_count, shallow)
+		VALUES (?, ?, ?, ?, 'running', 0, ?)
+	`, kind, volumeID, destVal, NowNs(), shallow)
 	if err != nil {
 		return 0, fmt.Errorf("insert run: %w", err)
 	}
@@ -385,12 +387,15 @@ func (s *Store) CountMissingFilesByRun(ctx context.Context, runID int64) (int, e
 // (sql.NullInt64{Valid: false}) for bucket syncs and carry the peer
 // linkage for node syncs. Destination is exact-match against the same
 // string the guard query checks (bucket destination name, or peer node
-// name from the initiator's config).
+// name from the initiator's config). Shallow records whether the
+// transfer skipped BLAKE3 verification (rclone's size+mtime shortcut)
+// so forensic readers can tell which syncs were content-verified.
 type SyncRunSpec struct {
 	VolumeID        int64
 	Destination     string
 	PeerNodeID      sql.NullInt64
 	CorrelatedRunID sql.NullInt64
+	Shallow         bool
 }
 
 // BeginSyncRunIfClear atomically inserts a 'running' kind='sync' row for
@@ -435,9 +440,9 @@ func (s *Store) BeginSyncRunIfClear(ctx context.Context, spec SyncRunSpec) (int6
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO runs (
 			kind, volume_id, destination, started_at_ns, status, file_count,
-			peer_node_id, correlated_run_id
-		) VALUES ('sync', ?, ?, ?, 'running', 0, ?, ?)
-	`, spec.VolumeID, spec.Destination, NowNs(), spec.PeerNodeID, spec.CorrelatedRunID)
+			peer_node_id, correlated_run_id, shallow
+		) VALUES ('sync', ?, ?, ?, 'running', 0, ?, ?, ?)
+	`, spec.VolumeID, spec.Destination, NowNs(), spec.PeerNodeID, spec.CorrelatedRunID, spec.Shallow)
 	if err != nil {
 		return 0, nil, fmt.Errorf("insert sync run: %w", err)
 	}
