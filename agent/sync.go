@@ -417,15 +417,22 @@ func (r *peerSyncRouter) planSession(ctx context.Context, sess *peerSession, ent
 		}
 		entry.disposition = disp
 		sess.dispositions[e.Path] = entry
-		if disp == syncproto.DispositionConflict {
-			sess.conflictOrder = append(sess.conflictOrder, e.Path)
-		}
 	}
 	if err := r.preStageCopyFromExisting(sess); err != nil {
 		return syncproto.PlanResponse{}, fmt.Errorf("pre-stage copy-from-existing: %w", err)
 	}
 	if err := r.preMoveSupersedes(sess); err != nil {
 		return syncproto.PlanResponse{}, fmt.Errorf("pre-move supersedes: %w", err)
+	}
+	// Build conflictOrder after the supersede pre-move so it captures
+	// both plan-time conflicts and supersedes the drift check downgraded
+	// to conflicts, in the order the initiator sent them. Ranging entries
+	// (a slice) rather than appending during the map-ranging pre-move
+	// keeps the /plan Conflicts list deterministic across runs.
+	for _, e := range entries {
+		if sess.dispositions[e.Path].disposition == syncproto.DispositionConflict {
+			sess.conflictOrder = append(sess.conflictOrder, e.Path)
+		}
 	}
 	if err := r.preStageConflicts(ctx, sess); err != nil {
 		return syncproto.PlanResponse{}, fmt.Errorf("pre-stage conflicts: %w", err)
@@ -925,7 +932,7 @@ func (r *peerSyncRouter) preMoveSupersedes(sess *peerSession) error {
 			// to preStageConflicts (which runs after this pass and re-hashes
 			// again), preserving the bytes actually on disk under
 			// .squirrel-conflicts/. The live bytes stay put until then.
-			downgradeToConflict(sess, path, entry)
+			downgradeToConflict(entry)
 			continue
 		}
 		dstAbs := filepath.Join(histRoot, path)
@@ -947,15 +954,14 @@ func (r *peerSyncRouter) preMoveSupersedes(sess *peerSession) error {
 
 // downgradeToConflict reclassifies a supersede path as a conflict after
 // preMoveSupersedes detects the on-disk bytes drifted from the index.
-// It only flips the verdict and enqueues the path: preStageConflicts
-// re-hashes the still-live bytes and stamps the preserved row with the
-// actual blake3, so there is one authoritative relabel point. The path
-// is appended to conflictOrder because that slice — not the
-// dispositions map — drives preStageConflicts and the /plan response.
-func downgradeToConflict(sess *peerSession, path string, entry *sessionEntry) {
+// It only flips the verdict and the reason; planSession rebuilds
+// conflictOrder from the initiator's entries after the pre-move, so the
+// downgrade lands in the /plan Conflicts list in initiator-sent order.
+// preStageConflicts then re-hashes the still-live bytes and stamps the
+// preserved row with the actual blake3 (one authoritative relabel point).
+func downgradeToConflict(entry *sessionEntry) {
 	entry.disposition = syncproto.DispositionConflict
 	entry.conflictReason = "on-disk drift during sync"
-	sess.conflictOrder = append(sess.conflictOrder, path)
 }
 
 // preStageConflicts handles every conflict-disposition path before
@@ -1137,15 +1143,16 @@ func rehashOnDisk(abs string) (digest []byte, size int64, err error) {
 		return nil, 0, err
 	}
 	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return nil, 0, fmt.Errorf("stat: %w", err)
-	}
 	h := blake3.New()
-	if _, err := io.Copy(h, f); err != nil {
+	// Size comes from the bytes actually hashed, not a prior f.Stat():
+	// in the drift scenario the file may be changing under us, and a
+	// Stat size that disagreed with the digest would make the relabelled
+	// (blake3, size) pair internally inconsistent.
+	n, err := io.Copy(h, f)
+	if err != nil {
 		return nil, 0, err
 	}
-	return h.Sum(nil), info.Size(), nil
+	return h.Sum(nil), n, nil
 }
 
 // onDiskState is the result of re-hashing a pre-stage source path just
