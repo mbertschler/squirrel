@@ -10,7 +10,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 11
+const SchemaVersion = 12
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -47,6 +47,7 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 9, up: migrateV8ToV9},
 		{version: 10, up: migrateV9ToV10},
 		{version: 11, up: migrateV10ToV11},
+		{version: 12, up: migrateV11ToV12},
 	}
 }
 
@@ -1259,6 +1260,55 @@ func migrateV10ToV11(ctx context.Context, db *sql.DB) error {
 	for _, q := range stmts {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("v10→v11: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// migrateV11ToV12 adds the insert-only `peer_sync_state_history` table:
+// an append-only log of every watermark advance written to
+// peer_sync_state. peer_sync_state itself is overwrite-in-place by
+// design (UpsertPeerSyncState does an upsert), so the live row only
+// ever shows the *current* watermark; this table preserves the prior
+// values so a bad or hostile watermark move can be detected and the
+// drift anchor can be reconstructed (SAFETY-AUDIT H6).
+//
+// Columns mirror the upsert payload — (volume_id, peer_node_id,
+// last_shared_run_id, last_synced_at) — plus an at_ns insertion
+// timestamp distinct from last_synced_at so two history rows written in
+// the same NowNs() tick still order deterministically by id. last_shared
+// _run_id is nullable for the same reason it is on peer_sync_state: the
+// first contact carries no shared run id. Like runs_audit, rows are
+// never updated or deleted, keeping the table consistent with the
+// project's append-only-history principle.
+//
+// The index on (volume_id, peer_node_id) backs the per-pair history read
+// (ListPeerSyncStateHistory); the pair is high-cardinality across a fleet
+// of volumes and peers so a plain composite index is appropriate rather
+// than a partial one.
+func migrateV11ToV12(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`CREATE TABLE peer_sync_state_history (
+			id                 INTEGER PRIMARY KEY,
+			volume_id          INTEGER NOT NULL REFERENCES volumes(id),
+			peer_node_id       INTEGER NOT NULL REFERENCES nodes(id),
+			last_shared_run_id INTEGER,
+			last_synced_at     INTEGER NOT NULL,
+			at_ns              INTEGER NOT NULL
+		)`,
+		`CREATE INDEX idx_peer_sync_history_pair
+		 ON peer_sync_state_history(volume_id, peer_node_id)`,
+		`INSERT INTO schema_version (version) VALUES (12)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("v11→v12: %w", err)
 		}
 	}
 	return tx.Commit()
