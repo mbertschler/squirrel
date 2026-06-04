@@ -49,6 +49,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newRestoreCmd())
 	root.AddCommand(newAgentCmd())
 	root.AddCommand(newAuditCmd())
+	root.AddCommand(newPeerSyncCmd())
 	root.AddCommand(newTUICmd())
 	root.AddCommand(newDBCmd())
 	return root

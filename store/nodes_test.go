@@ -109,7 +109,7 @@ func TestPeerSyncStateUpsertRoundtrip(t *testing.T) {
 	vID := makeVolume(t, s, "/v")
 	peer, _ := s.GetOrCreatePeerNode(ctx, "nas", "http://nas.example")
 
-	if err := s.UpsertPeerSyncState(ctx, vID, peer.ID, 7); err != nil {
+	if err := s.UpsertPeerSyncState(ctx, vID, peer.ID, 7, false); err != nil {
 		t.Fatalf("first upsert: %v", err)
 	}
 	state, err := s.GetPeerSyncState(ctx, vID, peer.ID)
@@ -120,7 +120,7 @@ func TestPeerSyncStateUpsertRoundtrip(t *testing.T) {
 		t.Fatalf("watermark = %+v, want 7", state.LastSharedRunID)
 	}
 
-	if err := s.UpsertPeerSyncState(ctx, vID, peer.ID, 42); err != nil {
+	if err := s.UpsertPeerSyncState(ctx, vID, peer.ID, 42, false); err != nil {
 		t.Fatalf("second upsert: %v", err)
 	}
 	state, _ = s.GetPeerSyncState(ctx, vID, peer.ID)

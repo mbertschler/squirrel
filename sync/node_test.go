@@ -665,7 +665,7 @@ func TestPlanResponseContainsAllDispositions(t *testing.T) {
 
 	// peer_sync_state watermark (in initiator-id space) high enough
 	// to cover the prior row's correlated id.
-	if err := f.recvStore.UpsertPeerSyncState(ctx, v.ID, peer.ID, priorInitiatorRunID+10); err != nil {
+	if err := f.recvStore.UpsertPeerSyncState(ctx, v.ID, peer.ID, priorInitiatorRunID+10, false); err != nil {
 		t.Fatalf("UpsertPeerSyncState: %v", err)
 	}
 
@@ -1015,7 +1015,7 @@ func TestBeginPendingWarningsSurfaceAuditDrift(t *testing.T) {
 	}
 	// peer_sync_state must exist so the audit-since watermark is set;
 	// it doesn't matter what the last_shared_run_id is here.
-	if err := f.recvStore.UpsertPeerSyncState(ctx, v.ID, peer.ID, 5); err != nil {
+	if err := f.recvStore.UpsertPeerSyncState(ctx, v.ID, peer.ID, 5, false); err != nil {
 		t.Fatalf("UpsertPeerSyncState: %v", err)
 	}
 
@@ -1106,7 +1106,7 @@ func TestBeginPendingWarningsSurfaceMissing(t *testing.T) {
 	}, &store.Provenance{NodeID: peer.ID, RunID: priorRun}); err != nil {
 		t.Fatalf("seed receiver row: %v", err)
 	}
-	if err := f.recvStore.UpsertPeerSyncState(ctx, v.ID, peer.ID, 5); err != nil {
+	if err := f.recvStore.UpsertPeerSyncState(ctx, v.ID, peer.ID, 5, false); err != nil {
 		t.Fatalf("UpsertPeerSyncState: %v", err)
 	}
 	if err := os.Remove(doc); err != nil {
@@ -1192,7 +1192,7 @@ func TestBeginPendingWarningsEmptyAfterWatermark(t *testing.T) {
 	// Advance the watermark past the audit timestamp so the
 	// post-watermark /begin sees no drift to surface. The audit row's
 	// started_at_ns is the truth; we use NowNs() which is >= it.
-	if err := f.recvStore.UpsertPeerSyncState(ctx, v.ID, peer.ID, 99); err != nil {
+	if err := f.recvStore.UpsertPeerSyncState(ctx, v.ID, peer.ID, 99, false); err != nil {
 		t.Fatalf("UpsertPeerSyncState: %v", err)
 	}
 
@@ -1572,7 +1572,7 @@ func TestPlanSupersedeWinsOverDedup(t *testing.T) {
 	}, &store.Provenance{NodeID: peer.ID, RunID: priorRunID}); err != nil {
 		t.Fatalf("seed source row: %v", err)
 	}
-	if err := f.recvStore.UpsertPeerSyncState(ctx, v.ID, peer.ID, 1); err != nil {
+	if err := f.recvStore.UpsertPeerSyncState(ctx, v.ID, peer.ID, 1, false); err != nil {
 		t.Fatalf("UpsertPeerSyncState: %v", err)
 	}
 	if err := f.recvStore.FinishRun(ctx, priorRunID, store.RunStatusSuccess, "", 2); err != nil {
