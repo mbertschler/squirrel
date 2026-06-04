@@ -64,7 +64,7 @@ func newPreStageFixture(t *testing.T) *preStageFixture {
 	}
 	// Watermark at/above the prior run's correlated id so the supersede
 	// branch of dispositionForExisting fires for peer-sourced rows.
-	if err := srv.store.UpsertPeerSyncState(ctx, v.ID, peer.ID, correlated); err != nil {
+	if err := srv.store.UpsertPeerSyncState(ctx, v.ID, peer.ID, correlated, false); err != nil {
 		t.Fatalf("UpsertPeerSyncState: %v", err)
 	}
 	recvRun, err := srv.store.BeginPeerSyncRun(ctx, v.ID, peer.ID, correlated+1, "peerA")
