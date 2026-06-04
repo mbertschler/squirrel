@@ -10,7 +10,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 10
+const SchemaVersion = 11
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -46,6 +46,7 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 8, up: migrateV7ToV8},
 		{version: 9, up: migrateV8ToV9},
 		{version: 10, up: migrateV9ToV10},
+		{version: 11, up: migrateV10ToV11},
 	}
 }
 
@@ -1207,6 +1208,57 @@ func migrateV9ToV10(ctx context.Context, db *sql.DB) error {
 	for _, q := range stmts {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("v9→v10: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// migrateV10ToV11 adds the insert-only `runs_audit` table: an
+// append-only log of run-lifecycle transitions. It exists so the runs
+// table — which is overwrite-in-place by design (FinishRun updates a
+// single row in place) — gains a forensic trail that distinguishes,
+// e.g., an operator's manual `runs fail` from a real process failure,
+// without mutating the run row's read shape.
+//
+// The schema is deliberately generic: `transition` is free text rather
+// than a CHECK-constrained enum so future call sites can record their
+// own transition kinds without a schema change. Today's writers tag
+// rows 'finish' (every FinishRun) and 'manual-fail' (the `runs fail`
+// CLI); the peer-sync correlation work (#77) will write
+// 'set-correlated-run-id' rows against the same table. `operator` and
+// `note` are nullable: machine-driven transitions leave operator NULL,
+// and note carries an optional human-readable detail (the resulting
+// status, a timestamp, etc.).
+//
+// run_id is a real FK to runs(id) — every audited transition concerns
+// an existing run. Rows are never updated or deleted (no code path
+// does so), keeping the table consistent with the project's
+// append-only-history principle. The idx_runs_audit_run index backs
+// the per-run read (ListRunAudit); run_id is high-cardinality (one
+// distinct value per run) so a plain index is appropriate here rather
+// than a partial one.
+func migrateV10ToV11(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`CREATE TABLE runs_audit (
+			id         INTEGER PRIMARY KEY,
+			run_id     INTEGER NOT NULL REFERENCES runs(id),
+			transition TEXT NOT NULL,
+			operator   TEXT,
+			at_ns      INTEGER NOT NULL,
+			note       TEXT
+		)`,
+		`CREATE INDEX idx_runs_audit_run ON runs_audit(run_id)`,
+		`INSERT INTO schema_version (version) VALUES (11)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("v10→v11: %w", err)
 		}
 	}
 	return tx.Commit()

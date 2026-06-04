@@ -1203,7 +1203,7 @@ func (r *peerSyncRouter) handleClose(w http.ResponseWriter, req *http.Request) {
 
 	committed, err := r.closeSession(req.Context(), sess, body.Status, body.FailedPaths)
 	if err != nil {
-		_ = r.srv.store.FinishRun(req.Context(), sess.receiverRunID, store.RunStatusFailed, err.Error(), int64(committed))
+		r.finalizeFailedClose(req.Context(), sess.receiverRunID, committed, err)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -1211,6 +1211,29 @@ func (r *peerSyncRouter) handleClose(w http.ResponseWriter, req *http.Request) {
 		ReceiverRunID: sess.receiverRunID,
 		Committed:     committed,
 	})
+}
+
+// finalizeFailedClose records the receiver-side failure when
+// closeSession returns an error. closeSession may have already moved
+// the run row to a terminal status before failing on a later step (its
+// FinishRun commits, then peer_sync_state advance fails); in that case
+// FinishRun here returns ErrAlreadyFinished and we log only, leaving the
+// first terminal write — the true audit record — intact rather than
+// rewriting it. Any other FinishRun error is logged too: the close is
+// already failing, and the run row's stuck-'running' state is the worse
+// outcome the caller surfaces, so there's nothing to return through.
+func (r *peerSyncRouter) finalizeFailedClose(ctx context.Context, runID int64, committed int, cause error) {
+	err := r.srv.store.FinishRun(ctx, runID, store.RunStatusFailed, cause.Error(), int64(committed))
+	if err == nil {
+		return
+	}
+	if errors.Is(err, store.ErrAlreadyFinished) {
+		r.srv.cfg.Logger.Info("sync.close.already_finished",
+			"run_id", runID, "cause", cause.Error())
+		return
+	}
+	r.srv.cfg.Logger.Error("sync.close.finish_failed",
+		"run_id", runID, "err", err.Error(), "cause", cause.Error())
 }
 
 // closeSession persists the new file rows for every path the receiver
