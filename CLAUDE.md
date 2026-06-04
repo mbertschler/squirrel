@@ -4,6 +4,8 @@ Squirrel indexes **content** (BLAKE3 hashes), not paths. A hash that has ever be
 
 The v4 schema enforces this: the `files` PK is `(volume_id, path, blake3)`, status is one of `present`/`missing`/`superseded`, and per `(volume_id, path)` at most one row is non-superseded. When content at a path changes, `Upsert` flips the prior row to `superseded` and inserts a new row — `blake3` is never rewritten in place. Any new feature (sync, pruning, dedup, GC) must preserve this rule: don't delete or overwrite historical rows without an explicit, opt-in retention policy.
 
+The same applies to the `runs` table: squirrel never auto-prunes runs — the run history is an audit trail, and any retention is explicit and operator-driven only.
+
 # Code quality reminders
 
 Don't:

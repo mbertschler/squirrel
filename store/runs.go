@@ -31,6 +31,27 @@ const (
 	RunStatusPartial = "partial"
 )
 
+// ErrAlreadyFinished is returned by FinishRun when the target run is
+// already in a terminal status (success/partial/failed). The first
+// terminal write wins: its status, error, and ended_at_ns are the audit
+// record, and a second FinishRun would silently rewrite them. Callers
+// that may legitimately race a double-finish (e.g. agent/sync.go's
+// handleClose firing after closeSession already finalised) detect this
+// with errors.Is and fall back to a log-only path rather than treating
+// it as a hard error.
+var ErrAlreadyFinished = errors.New("run is already in a terminal status")
+
+// isTerminalStatus reports whether status is one of the three terminal
+// run states. A row in any of these must not be re-finalised by
+// FinishRun.
+func isTerminalStatus(status string) bool {
+	switch status {
+	case RunStatusSuccess, RunStatusPartial, RunStatusFailed:
+		return true
+	}
+	return false
+}
+
 // Run is one entry in the runs table. VolumeID uses sql.NullInt64 because the
 // column is nullable (cross-volume sync runs in the future); EndedAtNs and
 // Error are likewise nullable while a run is still in-flight or finished
@@ -53,10 +74,12 @@ type Run struct {
 	FileCount       int64
 	PeerNodeID      sql.NullInt64
 	CorrelatedRunID sql.NullInt64
-	// Shallow is meaningful for index and audit runs: true when the
-	// run took the (size, mtime) shortcut instead of rehashing every
-	// file. NULL (Valid=false) for sync/restore runs and for the
-	// pre-v10 history that never recorded the choice.
+	// Shallow is true when the run skipped BLAKE3 verification in
+	// favour of the (size, mtime) shortcut: a skipped rehash for index
+	// and audit runs, an rclone copy without --checksum --hash blake3
+	// for initiator-side sync and restore runs. NULL (Valid=false) for
+	// the receiver side of a node sync (which makes no such choice) and
+	// for the pre-v10 history that never recorded it.
 	Shallow sql.NullBool
 }
 
@@ -64,11 +87,11 @@ type Run struct {
 // id. Callers must pair it with FinishRun (typically via defer with an
 // error pointer or an explicit terminal call). volumeID must reference
 // an existing volume; destination must be non-empty (sync/restore must
-// name an rclone target). Index and audit kinds belong on BeginIndexRun
-// — they record the shallow flag, which this entry point can't carry,
-// and the call is rejected here to keep the signal from being silently
-// dropped.
-func (s *Store) BeginRun(ctx context.Context, kind string, volumeID int64, destination string) (int64, error) {
+// name an rclone target). shallow records whether the transfer skipped
+// BLAKE3 verification (rclone's size+mtime shortcut) so forensic readers
+// can tell which restores were content-verified. Index and audit kinds
+// belong on BeginIndexRun and are rejected here.
+func (s *Store) BeginRun(ctx context.Context, kind string, volumeID int64, destination string, shallow bool) (int64, error) {
 	if kind == RunKindIndex || kind == RunKindAudit {
 		return 0, fmt.Errorf("BeginRun: kind %q must go through BeginIndexRun so runs.shallow is recorded", kind)
 	}
@@ -77,9 +100,9 @@ func (s *Store) BeginRun(ctx context.Context, kind string, volumeID int64, desti
 		destVal = sql.NullString{String: destination, Valid: true}
 	}
 	res, err := s.db.ExecContext(ctx, `
-		INSERT INTO runs (kind, volume_id, destination, started_at_ns, status, file_count)
-		VALUES (?, ?, ?, ?, 'running', 0)
-	`, kind, volumeID, destVal, NowNs())
+		INSERT INTO runs (kind, volume_id, destination, started_at_ns, status, file_count, shallow)
+		VALUES (?, ?, ?, ?, 'running', 0, ?)
+	`, kind, volumeID, destVal, NowNs(), shallow)
 	if err != nil {
 		return 0, fmt.Errorf("insert run: %w", err)
 	}
@@ -145,47 +168,108 @@ func (s *Store) BeginPeerSyncRun(ctx context.Context, volumeID, peerNodeID, corr
 // SetCorrelatedRunID stamps the supplied correlated id onto an
 // already-open run row. Used by the initiator to record the receiver's
 // run id once /v1/sync/begin returns: at BeginRun time the receiver
-// hadn't yet allocated one. Returns sql.ErrNoRows if runID is invalid.
+// hadn't yet allocated one. Returns a "no such run" error if runID is
+// invalid.
+//
+// The update and a 'set-correlated-run-id' runs_audit row are written in
+// one transaction so the overwrite-in-place correlated_run_id column
+// gains an append-only trail of every value it ever held (SAFETY-AUDIT
+// H6). The audit note carries the old→new ids.
 func (s *Store) SetCorrelatedRunID(ctx context.Context, runID, correlatedRunID int64) error {
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE runs SET correlated_run_id = ? WHERE id = ?`,
-		correlatedRunID, runID)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return fmt.Errorf("begin set correlated run id %d: %w", runID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var prior sql.NullInt64
+	switch err := tx.QueryRowContext(ctx,
+		`SELECT correlated_run_id FROM runs WHERE id = ?`, runID).Scan(&prior); {
+	case errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("set correlated run id: no run with id %d", runID)
+	case err != nil:
+		return fmt.Errorf("set correlated run id read prior: %w", err)
+	}
+
+	atNs := NowNs()
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE runs SET correlated_run_id = ? WHERE id = ?`,
+		correlatedRunID, runID); err != nil {
 		return fmt.Errorf("set correlated run id: %w", err)
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("set correlated run id rows affected: %w", err)
+	note := fmt.Sprintf("%s->%d", nullInt64Label(prior), correlatedRunID)
+	if err := appendRunAuditTx(ctx, tx,
+		RunAuditEntry{RunID: runID, Transition: TransitionSetCorrelatedRunID, Note: note}, atNs); err != nil {
+		return err
 	}
-	if n == 0 {
-		return fmt.Errorf("set correlated run id: no run with id %d", runID)
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit set correlated run id %d: %w", runID, err)
 	}
 	return nil
+}
+
+// nullInt64Label renders a nullable int for an audit note: the decimal
+// value when set, or the literal "none" when NULL (the pre-correlation
+// state). Keeps the old→new note legible without a sql.NullInt64 dump.
+func nullInt64Label(v sql.NullInt64) string {
+	if !v.Valid {
+		return "none"
+	}
+	return fmt.Sprintf("%d", v.Int64)
 }
 
 // FinishRun records the terminal state of a run. errMsg is stored as NULL
 // when empty. fileCount should be the total number of files the run touched
 // (added + modified + unchanged) so the runs table doubles as a coarse audit
-// log without needing to scan files. Returns an error if the runID does not
-// match any row, which would otherwise leave a run stuck in status='running'.
+// log without needing to scan files.
+//
+// The transition is guarded: a row already in a terminal status
+// (success/partial/failed) is never re-finalised — the first terminal
+// write wins and FinishRun returns ErrAlreadyFinished (matchable via
+// errors.Is) without touching the row. This protects the audit trail
+// from a double-finish bug or a buggy retry silently rewriting the
+// original status, error, and ended-at timestamp. A runID matching no
+// row returns a plain "no such run" error so a stuck 'running' row is
+// never left behind silently.
+//
+// The status update and a 'finish' runs_audit row are written in one
+// transaction so the append-only transition log can't diverge from the
+// run row. The audit note carries the resulting status.
 func (s *Store) FinishRun(ctx context.Context, runID int64, status string, errMsg string, fileCount int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin finish run %d: %w", runID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var current string
+	switch err := tx.QueryRowContext(ctx, `SELECT status FROM runs WHERE id = ?`, runID).Scan(&current); {
+	case errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("finish run %d: no such run", runID)
+	case err != nil:
+		return fmt.Errorf("finish run %d read status: %w", runID, err)
+	}
+	if isTerminalStatus(current) {
+		return fmt.Errorf("finish run %d (status %s): %w", runID, current, ErrAlreadyFinished)
+	}
+
+	atNs := NowNs()
 	var errVal sql.NullString
 	if errMsg != "" {
 		errVal = sql.NullString{String: errMsg, Valid: true}
 	}
-	res, err := s.db.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, `
 		UPDATE runs SET ended_at_ns = ?, status = ?, error = ?, file_count = ?
 		WHERE id = ?
-	`, NowNs(), status, errVal, fileCount, runID)
-	if err != nil {
+	`, atNs, status, errVal, fileCount, runID); err != nil {
 		return fmt.Errorf("finish run %d: %w", runID, err)
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("finish run %d rows affected: %w", runID, err)
+	if err := appendRunAuditTx(ctx, tx,
+		RunAuditEntry{RunID: runID, Transition: TransitionFinish, Note: status}, atNs); err != nil {
+		return err
 	}
-	if n == 0 {
-		return fmt.Errorf("finish run %d: no such run", runID)
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit finish run %d: %w", runID, err)
 	}
 	return nil
 }
@@ -385,12 +469,15 @@ func (s *Store) CountMissingFilesByRun(ctx context.Context, runID int64) (int, e
 // (sql.NullInt64{Valid: false}) for bucket syncs and carry the peer
 // linkage for node syncs. Destination is exact-match against the same
 // string the guard query checks (bucket destination name, or peer node
-// name from the initiator's config).
+// name from the initiator's config). Shallow records whether the
+// transfer skipped BLAKE3 verification (rclone's size+mtime shortcut)
+// so forensic readers can tell which syncs were content-verified.
 type SyncRunSpec struct {
 	VolumeID        int64
 	Destination     string
 	PeerNodeID      sql.NullInt64
 	CorrelatedRunID sql.NullInt64
+	Shallow         bool
 }
 
 // BeginSyncRunIfClear atomically inserts a 'running' kind='sync' row for
@@ -435,9 +522,9 @@ func (s *Store) BeginSyncRunIfClear(ctx context.Context, spec SyncRunSpec) (int6
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO runs (
 			kind, volume_id, destination, started_at_ns, status, file_count,
-			peer_node_id, correlated_run_id
-		) VALUES ('sync', ?, ?, ?, 'running', 0, ?, ?)
-	`, spec.VolumeID, spec.Destination, NowNs(), spec.PeerNodeID, spec.CorrelatedRunID)
+			peer_node_id, correlated_run_id, shallow
+		) VALUES ('sync', ?, ?, ?, 'running', 0, ?, ?, ?)
+	`, spec.VolumeID, spec.Destination, NowNs(), spec.PeerNodeID, spec.CorrelatedRunID, spec.Shallow)
 	if err != nil {
 		return 0, nil, fmt.Errorf("insert sync run: %w", err)
 	}
