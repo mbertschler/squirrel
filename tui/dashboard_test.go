@@ -46,13 +46,13 @@ func TestLoadDashboardDataPartitionsRuns(t *testing.T) {
 	if err := s.FinishRun(ctx, finishedIdx2, store.RunStatusPartial, "", 105); err != nil {
 		t.Fatalf("FinishRun: %v", err)
 	}
-	activeSync, _ := s.BeginRun(ctx, store.RunKindSync, vol.ID, "backup")
+	activeSync, _ := s.BeginRun(ctx, store.RunKindSync, vol.ID, "backup", false)
 	// leave running
 	failedAudit, _ := s.BeginIndexRun(ctx, store.RunKindAudit, vol.ID, false)
 	if err := s.FinishRun(ctx, failedAudit, store.RunStatusFailed, "boom", 0); err != nil {
 		t.Fatalf("FinishRun: %v", err)
 	}
-	successSync, _ := s.BeginRun(ctx, store.RunKindSync, vol.ID, "backup")
+	successSync, _ := s.BeginRun(ctx, store.RunKindSync, vol.ID, "backup", false)
 	if err := s.FinishRun(ctx, successSync, store.RunStatusSuccess, "", 50); err != nil {
 		t.Fatalf("FinishRun: %v", err)
 	}

@@ -1188,12 +1188,14 @@ func backfillFolderAggregatesV9(ctx context.Context, tx *sql.Tx) error {
 }
 
 // migrateV9ToV10 adds a nullable `shallow` flag to the runs table. The
-// flag is meaningful for index and audit runs — it records whether the
-// run took the (size, mtime) shortcut instead of rehashing every file —
-// and is left NULL for sync/restore (where the concept doesn't apply)
-// and for the history of pre-v10 rows (where the choice wasn't
-// recorded). A CHECK constraint keeps the column to 0/1/NULL so the
-// nullable bool semantics stay legible from raw SQL.
+// flag records whether the run skipped BLAKE3 verification in favour of
+// the (size, mtime) shortcut: for index and audit runs that means the
+// rehash was skipped, and for initiator-side sync/restore runs it means
+// rclone ran without --checksum --hash blake3. It stays NULL for the
+// receiver side of a node sync (which never makes the choice — it
+// pre-stages and verifies) and for the history of pre-v10 rows (where
+// the choice wasn't recorded). A CHECK constraint keeps the column to
+// 0/1/NULL so the nullable bool semantics stay legible from raw SQL.
 func migrateV9ToV10(ctx context.Context, db *sql.DB) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {

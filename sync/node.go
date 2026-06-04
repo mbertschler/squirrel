@@ -150,6 +150,7 @@ func (d *nodeSyncDriver) phaseBegin() error {
 		VolumeID:    d.volID,
 		Destination: d.node.Name,
 		PeerNodeID:  sql.NullInt64{Int64: peer.ID, Valid: true},
+		Shallow:     d.opts.Shallow,
 	})
 	if err != nil {
 		return fmt.Errorf("begin local run: %w", err)

@@ -293,7 +293,7 @@ func (h *Runs) prepareRclone(ctx context.Context) (*syncpkg.Rclone, error) {
 		return nil, err
 	}
 	confPath := filepath.Join(filepath.Dir(h.Config.Path), "rclone.conf")
-	if err := rcl.WriteRcloneConfig(confPath, h.Config.Destinations); err != nil {
+	if _, err := rcl.WriteRcloneConfig(confPath, h.Config.Destinations); err != nil {
 		return nil, err
 	}
 	return rcl, nil

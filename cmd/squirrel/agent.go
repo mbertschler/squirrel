@@ -149,7 +149,7 @@ func resolveSchedulerRclone(cmd *cobra.Command, cfg *config.Config) (*sync.Rclon
 	if err := sync.EnsureMinVersion(cmd.Context(), rcl, cmd.ErrOrStderr(), false); err != nil {
 		return nil, fmt.Errorf("scheduler rclone preflight: %w", err)
 	}
-	if err := rcl.WriteRcloneConfig(rcloneConfigPathFor(cfg), cfg.Destinations); err != nil {
+	if _, err := rcl.WriteRcloneConfig(rcloneConfigPathFor(cfg), cfg.Destinations); err != nil {
 		return nil, fmt.Errorf("write rclone config: %w", err)
 	}
 	return rcl, nil

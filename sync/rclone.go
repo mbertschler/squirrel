@@ -7,6 +7,7 @@ package sync
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/mbertschler/squirrel/config"
@@ -112,52 +114,107 @@ func lineSplit(data []byte) (line string, rest []byte, ok bool) {
 }
 
 // WriteRcloneConfig renders the destinations into an rclone INI config at
-// path with mode 0600 and returns it set on r.Config. The file is fully
-// rewritten on every call so that squirrel's config remains the single
-// source of truth for destinations.
-func (r *Rclone) WriteRcloneConfig(path string, dests map[string]*config.Destination) error {
+// path with mode 0600 and sets it on r.Config. squirrel's config is the
+// single source of truth for destinations, but the file is rewritten only
+// when its content actually changes: the rendered bytes are compared
+// against the file already on disk, and an identical render is left
+// untouched (no truncate, no mtime bump). This both avoids needless churn
+// and turns an unexpected rewrite into a signal — a caller can log the one
+// line so a buggy resolver silently regressing credentials is visible.
+//
+// wrote reports whether the file was (re)written: false means the existing
+// content already matched. A genuine rewrite is atomic — the bytes land in
+// a sibling temp file that is fsync'd and renamed over path — so a crash
+// mid-write can never leave a partially-rendered config with live secrets.
+func (r *Rclone) WriteRcloneConfig(path string, dests map[string]*config.Destination) (wrote bool, err error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("create rclone config dir: %w", err)
+		return false, fmt.Errorf("create rclone config dir: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return fmt.Errorf("open rclone config for write: %w", err)
+	rendered := renderRcloneConfig(dests)
+	if rcloneConfigUnchanged(path, rendered) {
+		// Defend the 0600 invariant even on the skip path: a pre-existing
+		// file from an older squirrel (which used 0644) must still be
+		// tightened, since it holds resolved secrets.
+		if err := os.Chmod(path, 0o600); err != nil {
+			return false, fmt.Errorf("chmod rclone config: %w", err)
+		}
+		r.Config = path
+		return false, nil
 	}
-	defer f.Close()
-	// OpenFile's perm only applies on create; if the file already exists
-	// (e.g., created by a previous version that used 0644) the existing
-	// mode is preserved. Force 0600 unconditionally — this file contains
-	// resolved secrets.
-	if err := f.Chmod(0o600); err != nil {
-		return fmt.Errorf("chmod rclone config: %w", err)
+	if err := writeRcloneConfigAtomic(path, rendered); err != nil {
+		return false, err
 	}
+	r.Config = path
+	return true, nil
+}
 
-	// Stable section order so repeat writes produce identical bytes.
+// renderRcloneConfig produces the INI body for the given destinations in a
+// stable section order so identical inputs render byte-for-byte identically
+// (the content-comparison in WriteRcloneConfig relies on this). type=local
+// destinations contribute no section — rclone addresses local paths
+// directly.
+func renderRcloneConfig(dests map[string]*config.Destination) []byte {
 	names := make([]string, 0, len(dests))
 	for name := range dests {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	var b strings.Builder
 	first := true
 	for _, name := range names {
 		section := dests[name].RcloneSection()
 		if section == "" {
-			continue // type=local — no rclone remote needed
+			continue
 		}
 		if !first {
-			if _, err := io.WriteString(f, "\n"); err != nil {
-				return err
-			}
+			b.WriteString("\n")
 		}
 		first = false
-		if _, err := io.WriteString(f, section); err != nil {
-			return fmt.Errorf("write section %s: %w", name, err)
-		}
+		b.WriteString(section)
+	}
+	return []byte(b.String())
+}
+
+// rcloneConfigUnchanged reports whether the file at path already holds
+// exactly want. A read error (missing file, unreadable) is treated as
+// "changed" so the caller falls through to a write.
+func rcloneConfigUnchanged(path string, want []byte) bool {
+	existing, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(existing, want)
+}
+
+// writeRcloneConfigAtomic writes data to a temp file in path's directory,
+// fsyncs it, and renames it over path so a reader never observes a
+// half-written config. The temp file is created at 0600 (the config holds
+// resolved secrets) and removed on any error before the rename succeeds.
+func writeRcloneConfigAtomic(path string, data []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), ".rclone.conf-*")
+	if err != nil {
+		return fmt.Errorf("create temp rclone config: %w", err)
+	}
+	tmp := f.Name()
+	defer func() { _ = os.Remove(tmp) }() // no-op once renamed
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("chmod temp rclone config: %w", err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write temp rclone config: %w", err)
 	}
 	if err := f.Sync(); err != nil {
-		return fmt.Errorf("fsync rclone config: %w", err)
+		_ = f.Close()
+		return fmt.Errorf("fsync temp rclone config: %w", err)
 	}
-	r.Config = path
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close temp rclone config: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("rename rclone config into place: %w", err)
+	}
 	return nil
 }
 

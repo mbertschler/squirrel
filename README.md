@@ -153,6 +153,7 @@ Each destination is a tree shaped like the local volumes:
 ## Notes
 
 - Hash: BLAKE3-256 via `github.com/zeebo/blake3`. Stored as a 32-byte `BLOB` in the `blake3` column. The CLI accepts and prints hex.
-- Storage: SQLite via the pure-Go `modernc.org/sqlite`. WAL mode is enabled at open. Schema version 6; older databases auto-migrate forward on first open.
+- Storage: SQLite via the pure-Go `modernc.org/sqlite`. WAL mode is enabled at open. Schema version 10; older databases auto-migrate forward on first open.
 - Symlinks are skipped during indexing.
 - Sync runs do not pass `--delete-*` to rclone. Files removed locally remain at the destination.
+- The `runs` table is never auto-pruned; the run history is an audit trail and any retention is explicit and operator-driven only.
