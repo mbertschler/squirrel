@@ -59,6 +59,28 @@ Supported destination types: `local`, `sftp`, `s3`, `b2`, `gcs`. Secrets accept 
 
 Squirrel writes its own `rclone.conf` next to the config (`~/.squirrel/rclone.conf`, mode 0600) on every sync invocation. You do not run `rclone config` and you should not edit `rclone.conf` by hand.
 
+### Hooks
+
+A volume can declare a per-volume **hook** — a command the agent runs to nudge an external tool when the volume's content changes. squirrel stays tool-agnostic: it never learns what the command does (a backup with kopia/restic, an `rclone copy`, a shell script — all the same to squirrel). It exec's the command **without a shell**, passes context through environment variables, and records only the generic outcome (exit code, timestamps).
+
+```toml
+[volumes.pictures.hook]
+command = ["kopia", "snapshot", "create", "."]
+timeout = "30m"   # optional, defaults to 1h
+```
+
+The hook fires after a successful index run on the volume (which the agent runs on the `index_every` / `sync_every` cadence). It is **best-effort**: a hook failure or timeout never fails or blocks the run that triggered it, and overlapping invocations for the same volume are skipped rather than stacked. The command receives:
+
+| Variable | Meaning |
+|---|---|
+| `SQUIRREL_VOLUME` | volume name |
+| `SQUIRREL_PATH` | absolute volume path |
+| `SQUIRREL_RUN_ID` | the index run that triggered the hook |
+| `SQUIRREL_CHANGED` | `true`/`false` — whether the run observed changes (so the command can cheaply no-op) |
+| `SQUIRREL_TRIGGER` | `change` |
+
+Because the command is exec'd without a shell, the volume path is never string-concatenated into a command line. If you want shell features, make the command `["sh", "-c", "…"]` yourself. Recorded outcomes are visible via `squirrel hooks` and the TUI's Hooks tab.
+
 ## Quickstart
 
 Index a configured volume:

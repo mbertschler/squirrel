@@ -77,7 +77,39 @@ type Volume struct {
 	// must be strictly shorter — equal or longer adds nothing on top
 	// of the pre-sync indexing the scheduler already runs.
 	IndexEvery time.Duration
+	// Hook is the per-volume external-tool hook, or nil when the volume
+	// declares no `[volumes.X.hook]` block. The agent exec's its command
+	// (without a shell) on a trigger and records only the generic outcome
+	// — squirrel never learns what the command does. See VolumeHook.
+	Hook *VolumeHook
 }
+
+// VolumeHook is a per-volume, best-effort command squirrel runs to nudge
+// an external tool when content settles or on a cadence (#84). squirrel
+// stays tool-agnostic: it exec's Command without a shell, passes context
+// via SQUIRREL_* environment variables, and records only the exit
+// code/timestamps. There is intentionally no rules engine — a single
+// command, distinguished across triggers by the SQUIRREL_TRIGGER env var
+// the agent sets, not by separate config.
+type VolumeHook struct {
+	// Command is the argv exec'd without a shell — Command[0] is the
+	// program, the rest its arguments. Users wanting shell features write
+	// `sh -c '…'` themselves; squirrel never string-concatenates the
+	// volume path into a command line.
+	Command []string
+	// Timeout bounds one invocation so a hung hook can't wedge the agent's
+	// scheduler. Zero is replaced with DefaultHookTimeout at load time.
+	Timeout time.Duration
+}
+
+// DefaultHookTimeout is the per-invocation timeout applied when a hook
+// block omits `timeout`. Generous because the motivating consumer (a
+// backup tool snapshotting a large volume) can legitimately run for a
+// while; the bound exists to reap a truly wedged process, not to cap
+// normal work. Overlap between invocations is handled separately by the
+// agent's don't-stack guard, so a hook that outlives its own cadence is
+// skipped rather than stacked.
+const DefaultHookTimeout = time.Hour
 
 // Destination is one rclone-backed remote. Type drives which Params are
 // required and how the destination is rendered into rclone.conf.
@@ -153,10 +185,16 @@ type rawConfig struct {
 }
 
 type rawVolume struct {
-	Path       string   `toml:"path"`
-	SyncTo     []string `toml:"sync_to"`
-	SyncEvery  string   `toml:"sync_every"`
-	IndexEvery string   `toml:"index_every"`
+	Path       string         `toml:"path"`
+	SyncTo     []string       `toml:"sync_to"`
+	SyncEvery  string         `toml:"sync_every"`
+	IndexEvery string         `toml:"index_every"`
+	Hook       *rawVolumeHook `toml:"hook"`
+}
+
+type rawVolumeHook struct {
+	Command []string `toml:"command"`
+	Timeout string   `toml:"timeout"`
 }
 
 func (r *rawConfig) resolve(path string) (*Config, error) {
@@ -248,12 +286,51 @@ func resolveVolume(name string, raw rawVolume, dests map[string]*Destination, no
 	if syncEvery > 0 && indexEvery > 0 && indexEvery >= syncEvery {
 		return nil, errors.New("index_every must be strictly shorter than sync_every (pre-sync indexing already runs at sync_every cadence)")
 	}
+	hook, err := resolveVolumeHook(raw.Hook)
+	if err != nil {
+		return nil, err
+	}
 	return &Volume{
 		Name:       name,
 		Path:       abs,
 		SyncTo:     raw.SyncTo,
 		SyncEvery:  syncEvery,
 		IndexEvery: indexEvery,
+		Hook:       hook,
+	}, nil
+}
+
+// resolveVolumeHook validates an optional `[volumes.X.hook]` block. A nil
+// raw (no block) yields a nil hook. When present, command is required and
+// every argv element must be non-empty (an empty element is almost always
+// a templating mistake that would exec the wrong program). timeout is
+// optional; empty falls back to DefaultHookTimeout.
+func resolveVolumeHook(raw *rawVolumeHook) (*VolumeHook, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	if len(raw.Command) == 0 {
+		return nil, errors.New("hook.command is required and must have at least one element")
+	}
+	for i, arg := range raw.Command {
+		if arg == "" {
+			return nil, fmt.Errorf("hook.command[%d] is empty", i)
+		}
+	}
+	timeout := DefaultHookTimeout
+	if raw.Timeout != "" {
+		dur, err := time.ParseDuration(raw.Timeout)
+		if err != nil {
+			return nil, fmt.Errorf("hook.timeout %q: %w", raw.Timeout, err)
+		}
+		if dur <= 0 {
+			return nil, fmt.Errorf("hook.timeout must be a positive duration, got %s", dur)
+		}
+		timeout = dur
+	}
+	return &VolumeHook{
+		Command: append([]string(nil), raw.Command...),
+		Timeout: timeout,
 	}, nil
 }
 

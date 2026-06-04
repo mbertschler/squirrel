@@ -39,6 +39,7 @@ const (
 	screenDashboard screen = iota
 	screenRuns
 	screenVolumes
+	screenHooks
 	screenBrowse
 )
 
@@ -83,6 +84,7 @@ type rootModel struct {
 	dashboard *dashboardModel
 	runs      *runsModel
 	volumes   *volumesModel
+	hooks     *hooksModel
 	browse    *browseModel
 }
 
@@ -95,6 +97,7 @@ func newRootModel(s *store.Store, cfg *config.Config) *rootModel {
 		dashboard: dash,
 		runs:      newRunsModel(s),
 		volumes:   newVolumesModel(s),
+		hooks:     newHooksModel(s),
 		browse:    newBrowseModel(s),
 	}
 }
@@ -118,6 +121,7 @@ func (m *rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, forwardSize(m.dashboard, msg))
 		cmds = append(cmds, forwardSize(m.runs, msg))
 		cmds = append(cmds, forwardSize(m.volumes, msg))
+		cmds = append(cmds, forwardSize(m.hooks, msg))
 		cmds = append(cmds, forwardSize(m.browse, msg))
 		return m, tea.Batch(cmds...)
 
@@ -174,6 +178,8 @@ func (m *rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.switchTo(screenRuns)
 		case "3":
 			return m, m.switchTo(screenVolumes)
+		case "4":
+			return m, m.switchTo(screenHooks)
 		case "esc":
 			if m.active == screenBrowse {
 				return m, m.switchTo(screenVolumes)
@@ -231,7 +237,7 @@ func (m *rootModel) modalConsumesKey(key string) bool {
 // Browse is excluded because it is reached from Volumes, not from the
 // tab bar.
 func (m *rootModel) nextTab(delta int) screen {
-	tabs := []screen{screenDashboard, screenRuns, screenVolumes}
+	tabs := []screen{screenDashboard, screenRuns, screenVolumes, screenHooks}
 	idx := 0
 	for i, t := range tabs {
 		if t == m.active {
@@ -266,6 +272,8 @@ func (m *rootModel) activeScreen() tea.Model {
 		return m.runs
 	case screenVolumes:
 		return m.volumes
+	case screenHooks:
+		return m.hooks
 	case screenBrowse:
 		return m.browse
 	}
@@ -281,6 +289,7 @@ func (m *rootModel) renderTabs() string {
 		{screenDashboard, "Dashboard", "1"},
 		{screenRuns, "Runs", "2"},
 		{screenVolumes, "Volumes", "3"},
+		{screenHooks, "Hooks", "4"},
 	}
 	var rendered []string
 	for _, l := range labels {
@@ -297,7 +306,7 @@ func (m *rootModel) renderTabs() string {
 }
 
 func (m *rootModel) renderStatusBar() string {
-	left := "q quit · tab / shift-tab switch · 1-3 jump"
+	left := "q quit · tab / shift-tab switch · 1-4 jump"
 	if m.active == screenBrowse {
 		left = "↑↓ navigate · enter descend · backspace ascend · esc / q back"
 	}

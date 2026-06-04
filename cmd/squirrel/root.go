@@ -44,6 +44,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newIndexCmd())
 	root.AddCommand(newQueryCmd())
 	root.AddCommand(newRunsCmd())
+	root.AddCommand(newHooksCmd())
 	root.AddCommand(newVolumesCmd())
 	root.AddCommand(newSyncCmd())
 	root.AddCommand(newRestoreCmd())
