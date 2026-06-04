@@ -296,16 +296,22 @@ func TestNodeSyncResolvesConflictOnLocalWriteOnReceiver(t *testing.T) {
 		t.Fatalf("BeginRun on receiver: %v", err)
 	}
 	_ = f.recvStore.FinishRun(ctx, runID, store.RunStatusSuccess, "", 1)
-	receiverDigest := bytesDigest(0x88)
+	// Write the receiver's local file first, then record its real
+	// on-disk hash. A real receiver indexes its own bytes, so the
+	// recorded digest matches what's on disk; otherwise the pre-stage
+	// re-hash would (correctly) relabel the preserved row to the actual
+	// content. The drift case itself is covered in the agent package by
+	// TestPreStageReHashRelabelsConflictDrift.
+	if err := os.WriteFile(filepath.Join(f.recvVol.Path, "doc.md"), []byte("recvr"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	receiverDigest := hashFile(t, filepath.Join(f.recvVol.Path, "doc.md"))
 	if err := f.recvStore.Upsert(ctx, store.FileRow{
 		VolumeID: v.ID, Path: "doc.md", Blake3: receiverDigest,
 		SizeBytes: 5, MtimeNs: 50, Status: store.StatusPresent,
 		FirstSeenRunID: runID, LastSeenRunID: runID, IndexedAtNs: 50,
 	}, nil); err != nil {
 		t.Fatalf("seed receiver file row: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(f.recvVol.Path, "doc.md"), []byte("recvr"), 0o644); err != nil {
-		t.Fatal(err)
 	}
 
 	// Initiator writes a *different* blake3 at the same path.
@@ -627,31 +633,39 @@ func TestPlanResponseContainsAllDispositions(t *testing.T) {
 	}
 	_ = f.recvStore.FinishRun(ctx, priorRun, store.RunStatusSuccess, "", 1)
 
-	mustUpsert := func(path string, b3 byte, prov *store.Provenance) {
+	mustUpsert := func(path string, digest []byte, prov *store.Provenance) {
 		t.Helper()
 		if err := f.recvStore.Upsert(ctx, store.FileRow{
-			VolumeID: v.ID, Path: path, Blake3: bytesDigest(b3),
+			VolumeID: v.ID, Path: path, Blake3: digest,
 			SizeBytes: 1, MtimeNs: 1, Status: store.StatusPresent,
 			FirstSeenRunID: priorRun, LastSeenRunID: priorRun, IndexedAtNs: 1,
 		}, prov); err != nil {
 			t.Fatalf("upsert receiver %s: %v", path, err)
 		}
 	}
-	mustUpsert("same.txt", 0xAA, nil)
-	mustUpsert("evolved.txt", 0xBB, &store.Provenance{NodeID: peer.ID, RunID: priorRun})
-	mustUpsert("local.txt", 0xCC, nil)
 
-	// Materialise files on disk so the supersede pre-move has
-	// something to rename.
+	// Materialise files on disk first, then record their real on-disk
+	// hash for the paths the pre-stage re-hashes (#76): evolved.txt
+	// (supersede) and local.txt (conflict) both get re-hashed before
+	// their bytes are moved, so their recorded digests must match what's
+	// on disk — a real receiver indexes its own content; a synthetic
+	// digest would look like out-of-band drift. The three files share the
+	// same "seed" bytes, so one digest serves both. same.txt is
+	// already-correct and never re-hashed, so a synthetic digest is fine.
 	for _, p := range []string{"same.txt", "evolved.txt", "local.txt"} {
 		if err := os.WriteFile(filepath.Join(f.recvVol.Path, p), []byte("seed"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
+	seedDigest := hashFile(t, filepath.Join(f.recvVol.Path, "evolved.txt"))
+
+	mustUpsert("same.txt", bytesDigest(0xAA), nil)
+	mustUpsert("evolved.txt", seedDigest, &store.Provenance{NodeID: peer.ID, RunID: priorRun})
+	mustUpsert("local.txt", seedDigest, nil)
 
 	// peer_sync_state watermark (in initiator-id space) high enough
 	// to cover the prior row's correlated id.
-	if err := f.recvStore.UpsertPeerSyncState(ctx, v.ID, peer.ID, priorInitiatorRunID+10); err != nil {
+	if err := f.recvStore.UpsertPeerSyncState(ctx, v.ID, peer.ID, priorInitiatorRunID+10, false); err != nil {
 		t.Fatalf("UpsertPeerSyncState: %v", err)
 	}
 
@@ -725,8 +739,8 @@ func TestPlanResponseContainsAllDispositions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetByPath %s: %v", plan.Conflicts[0].PreservedAtPath, err)
 	}
-	if hex.EncodeToString(conflictRow.Blake3) != hexDigest(0xCC) {
-		t.Fatalf("conflict-path row blake3 = %x, want prior digest (0xCC...)", conflictRow.Blake3)
+	if hex.EncodeToString(conflictRow.Blake3) != hex.EncodeToString(seedDigest) {
+		t.Fatalf("conflict-path row blake3 = %x, want the prior on-disk digest %x", conflictRow.Blake3, seedDigest)
 	}
 }
 
@@ -1001,7 +1015,7 @@ func TestBeginPendingWarningsSurfaceAuditDrift(t *testing.T) {
 	}
 	// peer_sync_state must exist so the audit-since watermark is set;
 	// it doesn't matter what the last_shared_run_id is here.
-	if err := f.recvStore.UpsertPeerSyncState(ctx, v.ID, peer.ID, 5); err != nil {
+	if err := f.recvStore.UpsertPeerSyncState(ctx, v.ID, peer.ID, 5, false); err != nil {
 		t.Fatalf("UpsertPeerSyncState: %v", err)
 	}
 
@@ -1092,7 +1106,7 @@ func TestBeginPendingWarningsSurfaceMissing(t *testing.T) {
 	}, &store.Provenance{NodeID: peer.ID, RunID: priorRun}); err != nil {
 		t.Fatalf("seed receiver row: %v", err)
 	}
-	if err := f.recvStore.UpsertPeerSyncState(ctx, v.ID, peer.ID, 5); err != nil {
+	if err := f.recvStore.UpsertPeerSyncState(ctx, v.ID, peer.ID, 5, false); err != nil {
 		t.Fatalf("UpsertPeerSyncState: %v", err)
 	}
 	if err := os.Remove(doc); err != nil {
@@ -1178,7 +1192,7 @@ func TestBeginPendingWarningsEmptyAfterWatermark(t *testing.T) {
 	// Advance the watermark past the audit timestamp so the
 	// post-watermark /begin sees no drift to surface. The audit row's
 	// started_at_ns is the truth; we use NowNs() which is >= it.
-	if err := f.recvStore.UpsertPeerSyncState(ctx, v.ID, peer.ID, 99); err != nil {
+	if err := f.recvStore.UpsertPeerSyncState(ctx, v.ID, peer.ID, 99, false); err != nil {
 		t.Fatalf("UpsertPeerSyncState: %v", err)
 	}
 
@@ -1558,7 +1572,7 @@ func TestPlanSupersedeWinsOverDedup(t *testing.T) {
 	}, &store.Provenance{NodeID: peer.ID, RunID: priorRunID}); err != nil {
 		t.Fatalf("seed source row: %v", err)
 	}
-	if err := f.recvStore.UpsertPeerSyncState(ctx, v.ID, peer.ID, 1); err != nil {
+	if err := f.recvStore.UpsertPeerSyncState(ctx, v.ID, peer.ID, 1, false); err != nil {
 		t.Fatalf("UpsertPeerSyncState: %v", err)
 	}
 	if err := f.recvStore.FinishRun(ctx, priorRunID, store.RunStatusSuccess, "", 2); err != nil {

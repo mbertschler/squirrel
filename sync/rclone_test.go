@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mbertschler/squirrel/config"
 )
@@ -140,7 +141,7 @@ password = "p"
 `)
 	r := &Rclone{}
 	target := filepath.Join(t.TempDir(), "rclone.conf")
-	if err := r.WriteRcloneConfig(target, cfg.Destinations); err != nil {
+	if _, err := r.WriteRcloneConfig(target, cfg.Destinations); err != nil {
 		t.Fatalf("WriteRcloneConfig: %v", err)
 	}
 	info, err := os.Stat(target)
@@ -177,7 +178,7 @@ password = "p"
 		t.Fatalf("seed loose-perm file: %v", err)
 	}
 	r := &Rclone{}
-	if err := r.WriteRcloneConfig(target, cfg.Destinations); err != nil {
+	if _, err := r.WriteRcloneConfig(target, cfg.Destinations); err != nil {
 		t.Fatalf("WriteRcloneConfig: %v", err)
 	}
 	info, err := os.Stat(target)
@@ -200,12 +201,59 @@ root = "/tmp/scratch"
 `)
 	r := &Rclone{}
 	target := filepath.Join(t.TempDir(), "rclone.conf")
-	if err := r.WriteRcloneConfig(target, cfg.Destinations); err != nil {
+	if _, err := r.WriteRcloneConfig(target, cfg.Destinations); err != nil {
 		t.Fatalf("WriteRcloneConfig: %v", err)
 	}
 	body, _ := os.ReadFile(target)
 	if strings.Contains(string(body), "scratch") {
 		t.Fatalf("local destination should not appear in rclone.conf:\n%s", body)
+	}
+}
+
+// TestWriteRcloneConfigSkipsUnchanged verifies the content-comparison
+// short-circuit: a second render of identical destinations reports
+// wrote=false and leaves the file's mtime untouched. The mtime is pinned
+// to a known past instant via Chtimes so the assertion can't race the
+// filesystem clock — if the function rewrote the file, the rename would
+// stamp a fresh mtime and the comparison would fail deterministically.
+func TestWriteRcloneConfigSkipsUnchanged(t *testing.T) {
+	cfg := writeFakeConfig(t, `
+[destinations.nas]
+type = "sftp"
+host = "nas.local"
+user = "martin"
+root = "/data"
+password = "p"
+`)
+	r := &Rclone{}
+	target := filepath.Join(t.TempDir(), "rclone.conf")
+
+	wrote, err := r.WriteRcloneConfig(target, cfg.Destinations)
+	if err != nil {
+		t.Fatalf("first WriteRcloneConfig: %v", err)
+	}
+	if !wrote {
+		t.Fatalf("first write reported wrote=false; want a fresh file to be written")
+	}
+
+	pinned := time.Unix(1_000_000, 0)
+	if err := os.Chtimes(target, pinned, pinned); err != nil {
+		t.Fatalf("pin mtime: %v", err)
+	}
+
+	wrote, err = r.WriteRcloneConfig(target, cfg.Destinations)
+	if err != nil {
+		t.Fatalf("second WriteRcloneConfig: %v", err)
+	}
+	if wrote {
+		t.Fatalf("identical render reported wrote=true; want the write skipped")
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if !info.ModTime().Equal(pinned) {
+		t.Fatalf("mtime changed to %v after identical render; want it left at %v (write was not skipped)", info.ModTime(), pinned)
 	}
 }
 

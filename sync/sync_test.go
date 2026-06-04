@@ -374,7 +374,7 @@ func TestRunPairRefusesWhenAnotherIsRunning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetVolumeByName: %v", err)
 	}
-	stuckID, err := f.store.BeginRun(context.Background(), store.RunKindSync, v.ID, f.dest.Name)
+	stuckID, err := f.store.BeginRun(context.Background(), store.RunKindSync, v.ID, f.dest.Name, false)
 	if err != nil {
 		t.Fatalf("seed running sync row: %v", err)
 	}

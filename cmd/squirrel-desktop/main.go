@@ -64,7 +64,15 @@ func run() error {
 	menubar := flag.Bool("menubar", false, "Use the macOS status-bar attached panel form factor (small frameless window pinned to the tray icon) instead of the regular full window")
 	flag.Parse()
 
-	cfg, err := config.Load(*cfgPath)
+	resolvedCfg := *cfgPath
+	if resolvedCfg == "" {
+		def, err := config.DefaultPath()
+		if err != nil {
+			return fmt.Errorf("resolve config path: %w", err)
+		}
+		resolvedCfg = def
+	}
+	cfg, err := config.Load(resolvedCfg)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}

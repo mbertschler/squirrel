@@ -89,14 +89,19 @@ func TestOpenRoundTripVersion(t *testing.T) {
 }
 
 func TestOpenRejectsDSNInjection(t *testing.T) {
-	cases := []string{
-		"foo.db?_pragma=journal_mode(DELETE)",
-		"foo.db#fragment",
-		"file:foo.db",
-		"sqlite://foo.db",
+	cases := map[string]string{
+		"query_string":     "foo.db?_pragma=journal_mode(DELETE)",
+		"fragment":         "foo.db#fragment",
+		"file_uri":         "file:foo.db",
+		"scheme_uri":       "sqlite://foo.db",
+		"nul_byte":         "foo.db\x00.evil",
+		"leading_space":    " foo.db",
+		"trailing_space":   "foo.db ",
+		"trailing_newline": "foo.db\n",
+		"leading_tab":      "\tfoo.db",
 	}
-	for _, p := range cases {
-		t.Run(p, func(t *testing.T) {
+	for name, p := range cases {
+		t.Run(name, func(t *testing.T) {
 			if _, err := Open(p); err == nil {
 				t.Fatalf("Open(%q) succeeded, want rejection", p)
 			}
@@ -1391,7 +1396,7 @@ func TestBeginRunDestinationRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginRun index: %v", err)
 	}
-	syncID, err := s.BeginRun(ctx, RunKindSync, vID, "nas")
+	syncID, err := s.BeginRun(ctx, RunKindSync, vID, "nas", false)
 	if err != nil {
 		t.Fatalf("BeginRun sync: %v", err)
 	}
@@ -1412,9 +1417,11 @@ func TestBeginRunDestinationRoundTrip(t *testing.T) {
 	}
 }
 
-// TestBeginIndexRunRecordsShallow verifies that BeginIndexRun stamps
-// the runs.shallow column with the value the caller passed and that
-// runs allocated via BeginRun (sync/restore) leave the column NULL.
+// TestBeginIndexRunRecordsShallow verifies that BeginIndexRun and
+// BeginRun both stamp the runs.shallow column with the value the caller
+// passed: a shallow run records 1, a full run records 0, across index,
+// audit, and sync/restore kinds. (The pre-v10 NULL state survives only
+// for the receiver side of a node sync and for migrated history.)
 func TestBeginIndexRunRecordsShallow(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "test.db")
 	s, err := Open(dsn)
@@ -1437,9 +1444,13 @@ func TestBeginIndexRunRecordsShallow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginIndexRun audit: %v", err)
 	}
-	syncID, err := s.BeginRun(ctx, RunKindSync, vID, "nas")
+	syncShallowID, err := s.BeginRun(ctx, RunKindSync, vID, "nas", true)
 	if err != nil {
-		t.Fatalf("BeginRun sync: %v", err)
+		t.Fatalf("BeginRun sync shallow: %v", err)
+	}
+	restoreFullID, err := s.BeginRun(ctx, RunKindRestore, vID, "nas", false)
+	if err != nil {
+		t.Fatalf("BeginRun restore full: %v", err)
 	}
 
 	runs, err := s.ListRuns(ctx, ListRunsOpts{})
@@ -1459,8 +1470,11 @@ func TestBeginIndexRunRecordsShallow(t *testing.T) {
 	if got := byID[auditID]; !got.Shallow.Valid || !got.Shallow.Bool {
 		t.Fatalf("audit shallow run: got %+v, want valid=true bool=true", got.Shallow)
 	}
-	if got := byID[syncID]; got.Shallow.Valid {
-		t.Fatalf("sync run: got %+v, want NULL", got.Shallow)
+	if got := byID[syncShallowID]; !got.Shallow.Valid || !got.Shallow.Bool {
+		t.Fatalf("sync shallow run: got %+v, want valid=true bool=true", got.Shallow)
+	}
+	if got := byID[restoreFullID]; !got.Shallow.Valid || got.Shallow.Bool {
+		t.Fatalf("restore full run: got %+v, want valid=true bool=false", got.Shallow)
 	}
 }
 
@@ -1498,7 +1512,7 @@ func TestBeginRunRejectsIndexAuditKind(t *testing.T) {
 	vID := makeVolume(t, s, "/v")
 
 	for _, kind := range []string{RunKindIndex, RunKindAudit} {
-		if _, err := s.BeginRun(ctx, kind, vID, ""); err == nil {
+		if _, err := s.BeginRun(ctx, kind, vID, "", false); err == nil {
 			t.Fatalf("BeginRun(%q) accepted, want error directing to BeginIndexRun", kind)
 		}
 	}
@@ -1527,7 +1541,7 @@ func TestLatestSuccessfulIndexRun(t *testing.T) {
 	okID, _ := s.BeginIndexRun(ctx, RunKindIndex, vID, false)
 	_ = s.FinishRun(ctx, okID, RunStatusSuccess, "", 3)
 
-	syncID, _ := s.BeginRun(ctx, RunKindSync, vID, "nas")
+	syncID, _ := s.BeginRun(ctx, RunKindSync, vID, "nas", false)
 	_ = s.FinishRun(ctx, syncID, RunStatusSuccess, "", 3)
 
 	got, err := s.LatestSuccessfulIndexRun(ctx, vID)
@@ -1563,9 +1577,9 @@ func TestLatestSuccessfulRunsByVolumeAndKind(t *testing.T) {
 	_ = s.FinishRun(ctx, oldIdx, RunStatusSuccess, "", 10)
 	failIdx, _ := s.BeginIndexRun(ctx, RunKindIndex, volA, false)
 	_ = s.FinishRun(ctx, failIdx, RunStatusFailed, "boom", 0)
-	syncNas, _ := s.BeginRun(ctx, RunKindSync, volA, "nas")
+	syncNas, _ := s.BeginRun(ctx, RunKindSync, volA, "nas", false)
 	_ = s.FinishRun(ctx, syncNas, RunStatusPartial, "", 5)
-	syncS3, _ := s.BeginRun(ctx, RunKindSync, volA, "s3")
+	syncS3, _ := s.BeginRun(ctx, RunKindSync, volA, "s3", false)
 	_ = s.FinishRun(ctx, syncS3, RunStatusSuccess, "", 5)
 
 	// volB: only a single successful index, no sync. The map should
@@ -1678,6 +1692,55 @@ func TestSanitiseNodeName(t *testing.T) {
 		if got != "" && !nodeNameRE.MatchString(got) {
 			t.Fatalf("sanitised %q = %q does not match nodeNameRE", c.in, got)
 		}
+	}
+}
+
+// TestFallbackNodeNameDeterministic covers the empty/pathological
+// hostname path (L2): rather than erroring when a hostname sanitises to
+// nothing, the store derives a stable, valid identifier. The test points
+// machineIDPath at a temp file so it doesn't depend on the host actually
+// having /etc/machine-id, and asserts the result is regex-compliant,
+// reproducible, and seeded from the machine id (not the empty hostname).
+func TestFallbackNodeNameDeterministic(t *testing.T) {
+	idFile := filepath.Join(t.TempDir(), "machine-id")
+	if err := os.WriteFile(idFile, []byte("0123456789abcdef0123456789abcdef\n"), 0o600); err != nil {
+		t.Fatalf("seed machine-id: %v", err)
+	}
+	orig := machineIDPath
+	machineIDPath = idFile
+	defer func() { machineIDPath = orig }()
+
+	// Empty hostname is the canonical "nothing usable" input. The
+	// fallback must still produce a non-empty, valid id.
+	got := fallbackNodeName("")
+	if !nodeNameRE.MatchString(got) {
+		t.Fatalf("fallbackNodeName(%q) = %q does not match nodeNameRE", "", got)
+	}
+	if got != fallbackNodeName("a-totally-different-host") {
+		t.Fatalf("fallback id depends on hostname; want it seeded from machine-id alone")
+	}
+	if got != "node-"+shortHashHex("0123456789abcdef0123456789abcdef") {
+		t.Fatalf("fallback id %q not derived from the trimmed machine-id", got)
+	}
+}
+
+// TestFallbackNodeNameHashesHostnameWithoutMachineID confirms the second
+// tier: when machineIDPath is unreadable the fallback hashes the raw
+// hostname so the id is at least stable per host, and remains valid.
+func TestFallbackNodeNameHashesHostnameWithoutMachineID(t *testing.T) {
+	orig := machineIDPath
+	machineIDPath = filepath.Join(t.TempDir(), "does-not-exist")
+	defer func() { machineIDPath = orig }()
+
+	got := fallbackNodeName("...")
+	if !nodeNameRE.MatchString(got) {
+		t.Fatalf("fallbackNodeName(%q) = %q does not match nodeNameRE", "...", got)
+	}
+	if got != "node-"+shortHashHex("...") {
+		t.Fatalf("fallback id %q not derived from the raw hostname", got)
+	}
+	if got == fallbackNodeName("other-host") {
+		t.Fatalf("distinct hostnames collided without a machine id")
 	}
 }
 
@@ -2569,7 +2632,7 @@ func TestListRunsByPeer(t *testing.T) {
 	r1, _ := s.BeginPeerSyncRun(ctx, vID, peerA.ID, 101, "peer-a")
 	r2, _ := s.BeginPeerSyncRun(ctx, vID, peerA.ID, 102, "peer-a")
 	r3, _ := s.BeginPeerSyncRun(ctx, vID, peerB.ID, 201, "peer-b")
-	bucketRun, _ := s.BeginRun(ctx, RunKindSync, vID, "scratch")
+	bucketRun, _ := s.BeginRun(ctx, RunKindSync, vID, "scratch", false)
 	_ = bucketRun
 	_ = makeRun(t, s, vID) // an index run, to confirm it's excluded too
 	_ = r3
@@ -3078,6 +3141,49 @@ func TestBeginSyncRunIfClearRejectsEmptyDestination(t *testing.T) {
 	_, _, err = s.BeginSyncRunIfClear(ctx, SyncRunSpec{VolumeID: vID, Destination: ""})
 	if err == nil || !strings.Contains(err.Error(), "destination must be non-empty") {
 		t.Fatalf("want destination-empty error, got %v", err)
+	}
+}
+
+// TestBeginSyncRunIfClearRecordsShallow pins M1 on the production sync
+// gate: a run started with Shallow:true persists shallow=1 so a forensic
+// reader can tell the transfer skipped BLAKE3 verification, while
+// Shallow:false (the default, full-verification) persists shallow=0.
+func TestBeginSyncRunIfClearRecordsShallow(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+
+	shallowID, _, err := s.BeginSyncRunIfClear(ctx, SyncRunSpec{
+		VolumeID: vID, Destination: "nas", Shallow: true,
+	})
+	if err != nil {
+		t.Fatalf("BeginSyncRunIfClear shallow: %v", err)
+	}
+	fullID, _, err := s.BeginSyncRunIfClear(ctx, SyncRunSpec{
+		VolumeID: vID, Destination: "scratch", Shallow: false,
+	})
+	if err != nil {
+		t.Fatalf("BeginSyncRunIfClear full: %v", err)
+	}
+
+	shallowRun, err := s.GetRun(ctx, shallowID)
+	if err != nil {
+		t.Fatalf("GetRun shallow: %v", err)
+	}
+	if !shallowRun.Shallow.Valid || !shallowRun.Shallow.Bool {
+		t.Fatalf("shallow sync run: got %+v, want valid=true bool=true", shallowRun.Shallow)
+	}
+	fullRun, err := s.GetRun(ctx, fullID)
+	if err != nil {
+		t.Fatalf("GetRun full: %v", err)
+	}
+	if !fullRun.Shallow.Valid || fullRun.Shallow.Bool {
+		t.Fatalf("full sync run: got %+v, want valid=true bool=false", fullRun.Shallow)
 	}
 }
 

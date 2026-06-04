@@ -65,10 +65,13 @@ func runSync(cmd *cobra.Command, volumeName, destinationName string, opts sync.O
 		return err
 	}
 	out := cmd.OutOrStdout()
+	if opts.Shallow {
+		fmt.Fprintln(out, shallowSyncWarning)
+	}
 	if err := sync.EnsureMinVersion(cmd.Context(), rcl, out, opts.Shallow); err != nil {
 		return err
 	}
-	if err := rcl.WriteRcloneConfig(rcloneConfigPathFor(cfg), cfg.Destinations); err != nil {
+	if err := writeRcloneConfigLogged(out, rcl, cfg); err != nil {
 		return err
 	}
 
@@ -86,12 +89,34 @@ func runSync(cmd *cobra.Command, volumeName, destinationName string, opts sync.O
 	return nil
 }
 
+// shallowSyncWarning is printed at the CLI layer when a sync or restore
+// runs with --shallow. It spells out the safety trade so the operator
+// knows a destination whose size and mtime happen to match the source
+// won't be re-verified by content hash on this run.
+const shallowSyncWarning = "warning: shallow mode: skipping BLAKE3 verification; destination drift with matching size/mtime will not be detected"
+
 // rcloneConfigPathFor co-locates the rclone.conf next to the squirrel
-// config so a user inspecting ~/.squirrel/ finds both files. The file is
-// fully rewritten on every sync invocation; its contents are derived from
-// the squirrel config and should not be edited by hand.
+// config so a user inspecting ~/.squirrel/ finds both files. Its contents
+// are derived from the squirrel config and should not be edited by hand;
+// squirrel rewrites the file only when that derived content changes.
 func rcloneConfigPathFor(cfg *config.Config) string {
 	return filepath.Join(filepath.Dir(cfg.Path), "rclone.conf")
+}
+
+// writeRcloneConfigLogged renders the rclone.conf and logs a single line
+// when the file actually changed. An unexpected rewrite is worth
+// surfacing: the config is derived deterministically from squirrel's
+// config, so a rewrite between two otherwise-identical invocations means a
+// destination's resolved credentials or layout shifted underfoot.
+func writeRcloneConfigLogged(out io.Writer, rcl *sync.Rclone, cfg *config.Config) error {
+	wrote, err := rcl.WriteRcloneConfig(rcloneConfigPathFor(cfg), cfg.Destinations)
+	if err != nil {
+		return err
+	}
+	if wrote {
+		fmt.Fprintf(out, "rclone.conf updated at %s\n", rcloneConfigPathFor(cfg))
+	}
+	return nil
 }
 
 func printSyncReport(w io.Writer, rep sync.Report, runErr error) {

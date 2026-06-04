@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -98,8 +100,20 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 
 // validateDBPath rejects DSN-injection vectors. The store appends its own
 // pragmas via buildDSN, so any '?', '#', or URI scheme in the caller's
-// path would let those defaults be overridden silently.
+// path would let those defaults be overridden silently. A NUL byte is
+// rejected because it truncates the path at the C boundary the SQLite
+// driver crosses — the file actually opened would differ from the string
+// validated here. Leading or trailing ASCII whitespace is rejected too:
+// it almost always signals a copy-paste or shell-quoting slip, and
+// silently opening " db" or "db\n" hides the typo behind a second,
+// surprising database file.
 func validateDBPath(path string) error {
+	if strings.ContainsRune(path, 0) {
+		return fmt.Errorf("db path %q must not contain a NUL byte", path)
+	}
+	if path != strings.TrimFunc(path, isASCIISpace) {
+		return fmt.Errorf("db path %q must not have leading or trailing whitespace", path)
+	}
 	if strings.ContainsAny(path, "?#") {
 		return fmt.Errorf("db path %q must not contain '?' or '#'", path)
 	}
@@ -107,6 +121,19 @@ func validateDBPath(path string) error {
 		return fmt.Errorf("db path %q must be a plain filesystem path, not a URI", path)
 	}
 	return nil
+}
+
+// isASCIISpace reports whether r is one of the ASCII whitespace runes
+// (space, tab, newline, carriage return, vertical tab, form feed). We
+// deliberately scope to ASCII rather than unicode.IsSpace: a path
+// legitimately containing a non-breaking space is none of our business,
+// but the ASCII set is what shell quoting and copy-paste slips produce.
+func isASCIISpace(r rune) bool {
+	switch r {
+	case ' ', '\t', '\n', '\r', '\v', '\f':
+		return true
+	}
+	return false
 }
 
 // buildDSN appends the pragmas the store relies on to the validated path.
@@ -148,6 +175,12 @@ func openSQLite(dsn string) (*sql.DB, error) {
 // is sanitised rather than rejected because real-world hostnames often
 // carry dots ("laptop.local") that the strict rule disallows; the
 // sanitised form is deterministic and stays human-readable.
+//
+// When the hostname sanitises to nothing usable (empty, or no
+// alphanumeric survives — e.g. a host literally named "..."),
+// fallbackNodeName synthesises a deterministic id rather than failing
+// Open: a machine should always get a stable self-identity without the
+// operator having to hand-pick OpenOptions.NodeName.
 func resolveNodeName(name string) (string, error) {
 	if name != "" {
 		if !nodeNameRE.MatchString(name) {
@@ -159,11 +192,50 @@ func resolveNodeName(name string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve hostname for self node name: %w", err)
 	}
-	sanitised := sanitiseNodeName(host)
-	if sanitised == "" {
-		return "", fmt.Errorf("os.Hostname %q has no characters usable as a node name; pass OpenOptions.NodeName", host)
+	if sanitised := sanitiseNodeName(host); sanitised != "" {
+		return sanitised, nil
 	}
-	return sanitised, nil
+	return fallbackNodeName(host), nil
+}
+
+// machineIDPath is the canonical location of the host's stable machine
+// id on Linux. Pulled out as a var so the deterministic-fallback test
+// doesn't depend on the host actually having the file.
+var machineIDPath = "/etc/machine-id"
+
+// fallbackNodeName synthesises a deterministic, nodeNameRE-compliant id
+// for a host whose name yields nothing usable. It prefers a hash of
+// /etc/machine-id (stable across reboots and independent of the unusable
+// hostname); when that file is missing or empty it falls back to a hash
+// of the raw hostname so the id is at least stable for this host. The
+// "node-" prefix guarantees the leading-alphanumeric the regex anchor
+// requires and labels the value as machine-derived rather than chosen.
+func fallbackNodeName(host string) string {
+	if seed := readMachineID(); seed != "" {
+		return "node-" + shortHashHex(seed)
+	}
+	return "node-" + shortHashHex(host)
+}
+
+// readMachineID returns the trimmed contents of machineIDPath, or "" when
+// the file is unreadable or blank. The trim drops the trailing newline
+// systemd writes plus any stray surrounding whitespace so the hashed
+// seed is exactly the id bytes.
+func readMachineID() string {
+	raw, err := os.ReadFile(machineIDPath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(raw))
+}
+
+// shortHashHex returns the first 12 hex characters (48 bits) of the
+// SHA-256 of seed. Hex is always within nodeNameRE's allowed set and 48
+// bits is ample to keep distinct machines distinct for an identifier
+// that only needs to be stable, not cryptographically unique.
+func shortHashHex(seed string) string {
+	sum := sha256.Sum256([]byte(seed))
+	return hex.EncodeToString(sum[:])[:12]
 }
 
 // nodeNameRE mirrors config.nameRE. Duplicated here to keep store

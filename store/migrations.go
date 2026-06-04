@@ -10,7 +10,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 11
+const SchemaVersion = 13
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -47,6 +47,8 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 9, up: migrateV8ToV9},
 		{version: 10, up: migrateV9ToV10},
 		{version: 11, up: migrateV10ToV11},
+		{version: 12, up: migrateV11ToV12},
+		{version: 13, up: migrateV12ToV13},
 	}
 }
 
@@ -1188,12 +1190,14 @@ func backfillFolderAggregatesV9(ctx context.Context, tx *sql.Tx) error {
 }
 
 // migrateV9ToV10 adds a nullable `shallow` flag to the runs table. The
-// flag is meaningful for index and audit runs — it records whether the
-// run took the (size, mtime) shortcut instead of rehashing every file —
-// and is left NULL for sync/restore (where the concept doesn't apply)
-// and for the history of pre-v10 rows (where the choice wasn't
-// recorded). A CHECK constraint keeps the column to 0/1/NULL so the
-// nullable bool semantics stay legible from raw SQL.
+// flag records whether the run skipped BLAKE3 verification in favour of
+// the (size, mtime) shortcut: for index and audit runs that means the
+// rehash was skipped, and for initiator-side sync/restore runs it means
+// rclone ran without --checksum --hash blake3. It stays NULL for the
+// receiver side of a node sync (which never makes the choice — it
+// pre-stages and verifies) and for the history of pre-v10 rows (where
+// the choice wasn't recorded). A CHECK constraint keeps the column to
+// 0/1/NULL so the nullable bool semantics stay legible from raw SQL.
 func migrateV9ToV10(ctx context.Context, db *sql.DB) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1213,7 +1217,107 @@ func migrateV9ToV10(ctx context.Context, db *sql.DB) error {
 	return tx.Commit()
 }
 
-// migrateV10ToV11 adds the hook_runs table: the generic outcome record
+// migrateV10ToV11 adds the insert-only `runs_audit` table: an
+// append-only log of run-lifecycle transitions. It exists so the runs
+// table — which is overwrite-in-place by design (FinishRun updates a
+// single row in place) — gains a forensic trail that distinguishes,
+// e.g., an operator's manual `runs fail` from a real process failure,
+// without mutating the run row's read shape.
+//
+// The schema is deliberately generic: `transition` is free text rather
+// than a CHECK-constrained enum so future call sites can record their
+// own transition kinds without a schema change. Today's writers tag
+// rows 'finish' (every FinishRun) and 'manual-fail' (the `runs fail`
+// CLI); the peer-sync correlation work (#77) will write
+// 'set-correlated-run-id' rows against the same table. `operator` and
+// `note` are nullable: machine-driven transitions leave operator NULL,
+// and note carries an optional human-readable detail (the resulting
+// status, a timestamp, etc.).
+//
+// run_id is a real FK to runs(id) — every audited transition concerns
+// an existing run. Rows are never updated or deleted (no code path
+// does so), keeping the table consistent with the project's
+// append-only-history principle. The idx_runs_audit_run index backs
+// the per-run read (ListRunAudit); run_id is high-cardinality (one
+// distinct value per run) so a plain index is appropriate here rather
+// than a partial one.
+func migrateV10ToV11(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`CREATE TABLE runs_audit (
+			id         INTEGER PRIMARY KEY,
+			run_id     INTEGER NOT NULL REFERENCES runs(id),
+			transition TEXT NOT NULL,
+			operator   TEXT,
+			at_ns      INTEGER NOT NULL,
+			note       TEXT
+		)`,
+		`CREATE INDEX idx_runs_audit_run ON runs_audit(run_id)`,
+		`INSERT INTO schema_version (version) VALUES (11)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("v10→v11: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// migrateV11ToV12 adds the insert-only `peer_sync_state_history` table:
+// an append-only log of every watermark advance written to
+// peer_sync_state. peer_sync_state itself is overwrite-in-place by
+// design (UpsertPeerSyncState does an upsert), so the live row only
+// ever shows the *current* watermark; this table preserves the prior
+// values so a bad or hostile watermark move can be detected and the
+// drift anchor can be reconstructed (SAFETY-AUDIT H6).
+//
+// Columns mirror the upsert payload — (volume_id, peer_node_id,
+// last_shared_run_id, last_synced_at) — plus an at_ns insertion
+// timestamp distinct from last_synced_at so two history rows written in
+// the same NowNs() tick still order deterministically by id.
+// last_shared_run_id is nullable for the same reason it is on
+// peer_sync_state: the first contact carries no shared run id. Like
+// runs_audit, rows are never updated or deleted, keeping the table
+// consistent with the project's append-only-history principle.
+//
+// The index on (volume_id, peer_node_id) backs the per-pair history read
+// (ListPeerSyncStateHistory); the pair is high-cardinality across a fleet
+// of volumes and peers so a plain composite index is appropriate rather
+// than a partial one.
+func migrateV11ToV12(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`CREATE TABLE peer_sync_state_history (
+			id                 INTEGER PRIMARY KEY,
+			volume_id          INTEGER NOT NULL REFERENCES volumes(id),
+			peer_node_id       INTEGER NOT NULL REFERENCES nodes(id),
+			last_shared_run_id INTEGER,
+			last_synced_at     INTEGER NOT NULL,
+			at_ns              INTEGER NOT NULL
+		)`,
+		`CREATE INDEX idx_peer_sync_history_pair
+		 ON peer_sync_state_history(volume_id, peer_node_id)`,
+		`INSERT INTO schema_version (version) VALUES (12)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("v11→v12: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// migrateV12ToV13 adds the hook_runs table: the generic outcome record
 // for the per-volume external-tool hooks (#84). A hook run is squirrel
 // exec'ing a user-configured command on one of two triggers — 'change'
 // (after a successful index run that settled content) or 'interval' (on
@@ -1227,7 +1331,7 @@ func migrateV9ToV10(ctx context.Context, db *sql.DB) error {
 // `files` is untouched. triggering_run_id is a nullable FK to runs(id):
 // on-change hooks carry the index run that fired them; interval hooks
 // leave it NULL because no run triggered them.
-func migrateV10ToV11(ctx context.Context, db *sql.DB) error {
+func migrateV12ToV13(ctx context.Context, db *sql.DB) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1261,11 +1365,11 @@ func migrateV10ToV11(ctx context.Context, db *sql.DB) error {
 		// both read the latest hook run per (volume, trigger); index the
 		// pair the queries order by.
 		`CREATE INDEX idx_hook_runs_volume_trigger ON hook_runs(volume_id, trigger, started_at_ns)`,
-		`INSERT INTO schema_version (version) VALUES (11)`,
+		`INSERT INTO schema_version (version) VALUES (13)`,
 	}
 	for _, q := range stmts {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
-			return fmt.Errorf("v10→v11: %w", err)
+			return fmt.Errorf("v12→v13: %w", err)
 		}
 	}
 	return tx.Commit()

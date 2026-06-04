@@ -1,10 +1,13 @@
 package main
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	_ "modernc.org/sqlite"
 )
 
 // TestCLIAuditRecordsAuditRun is the issue #17 acceptance fixture:
@@ -103,5 +106,74 @@ func TestCLIAuditNoArgsFansOut(t *testing.T) {
 	out := runCLI(t, "--config", f.configPath, "audit")
 	if !strings.Contains(out, "audit a:") || !strings.Contains(out, "audit b:") {
 		t.Fatalf("audit output missing one of the volumes:\n%s", out)
+	}
+}
+
+// TestCLIAuditFoldersClean: a freshly indexed volume's stored folder
+// hashes match a re-derivation, so `audit --folders` reports consistent
+// and exits zero (M2 happy path).
+func TestCLIAuditFoldersClean(t *testing.T) {
+	src := t.TempDir()
+	writeTestFile(t, filepath.Join(src, "a.txt"), "alpha")
+	if err := os.MkdirAll(filepath.Join(src, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(src, "sub", "b.txt"), "beta")
+	f := writeConfigFor(t, map[string]string{"src": src})
+	runCLI(t, "--config", f.configPath, "index", "src")
+
+	out := runCLI(t, "--config", f.configPath, "audit", "src", "--folders")
+	if !strings.Contains(out, "audit src --folders: consistent") {
+		t.Fatalf("clean folder audit not reported consistent:\n%s", out)
+	}
+}
+
+// TestCLIAuditFoldersDetectsCorruption: corrupting one folder's stored
+// shallow hash makes `audit --folders` report the divergence and exit
+// non-zero (M2 acceptance).
+func TestCLIAuditFoldersDetectsCorruption(t *testing.T) {
+	src := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(src, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(src, "sub", "b.txt"), "beta")
+	f := writeConfigFor(t, map[string]string{"src": src})
+	runCLI(t, "--config", f.configPath, "index", "src")
+
+	corruptFolderShallowHash(t, f.dbPath, "sub")
+
+	out, err := runCLIExpectErr(t, "--config", f.configPath, "audit", "src", "--folders")
+	if err == nil {
+		t.Fatalf("corrupt folder audit unexpectedly succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "diverged") || !strings.Contains(out, "sub shallow") {
+		t.Fatalf("corrupt folder audit output missing divergence detail:\n%s", out)
+	}
+}
+
+// corruptFolderShallowHash flips one byte of the stored shallow_blake3
+// for the folder at the given path, simulating index corruption /
+// bit-rot of the Merkle column. Opens the DB directly (the store's hash
+// columns are deliberately immutable through the public API) and writes
+// the mutated digest back.
+func corruptFolderShallowHash(t *testing.T, dbPath, folderPath string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open db for corruption: %v", err)
+	}
+	defer db.Close()
+	var stored []byte
+	if err := db.QueryRow(
+		`SELECT shallow_blake3 FROM folders WHERE path = ?`, folderPath).Scan(&stored); err != nil {
+		t.Fatalf("read folder %q shallow hash: %v", folderPath, err)
+	}
+	if len(stored) != 32 {
+		t.Fatalf("folder %q shallow hash len = %d, want 32", folderPath, len(stored))
+	}
+	stored[0] ^= 0xFF
+	if _, err := db.Exec(
+		`UPDATE folders SET shallow_blake3 = ? WHERE path = ?`, stored, folderPath); err != nil {
+		t.Fatalf("corrupt folder %q shallow hash: %v", folderPath, err)
 	}
 }
