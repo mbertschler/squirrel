@@ -89,6 +89,25 @@ Because the command is exec'd without a shell, the volume path is never string-c
 
 > **Don't double-schedule verification.** If your external tool already runs its own verify on a timer (e.g. a cron/systemd job), don't *also* set `interval` for a verify command — two heavy passes will step on each other. Pick one driver: let squirrel schedule it (so the result lands in `squirrel hooks` / the TUI) **or** let the tool schedule it (maximum independence — verification keeps happening even when the agent is down), not both.
 
+### Index snapshots
+
+The catalog should be as redundant as the data it describes. After every successful sync, squirrel takes one `VACUUM INTO` snapshot of the whole index (a self-contained, `db check`-able `.db` file) to a **local tier** and — for destination (bucket/sftp/…) syncs — rides a copy **along to the destination**, under each synced volume's `.squirrel-index/`. A restore-from-cloud then yields the data *and* the index that explains it.
+
+This is **on by default, zero-config** — an absent `[backups]` table means it's enabled with the defaults below. Override or disable via:
+
+```toml
+[backups]
+enabled    = true   # local snapshot-on-sync (default true)
+dir        = ""     # local snapshot directory (default: <dir of db>/backups)
+keep       = 7      # local snapshots kept (rotation; 0 = keep all)
+cloud      = true   # ride a copy along to destination buckets (default true)
+cloud_keep = 7      # snapshots kept per <dest>/<volume>/.squirrel-index/ (0 = keep all)
+```
+
+`enabled = false` disables both halves; `cloud = false` keeps the local snapshot but uploads nothing. Snapshots are named `index-<ISO8601>-run-<id>.db` — lexically sortable and traceable to the run that produced them. A single snapshot is taken per `squirrel sync` invocation and fanned out to every target; a snapshot or upload failure is surfaced as a warning but never fails the sync.
+
+> **Privacy.** The ride-along payload is the *full global* `index.db` — paths and BLAKE3 hashes for **all** volumes (never file contents). It lands in the same bucket as your data (same trust boundary). Use a private bucket and server-side encryption.
+
 ## Quickstart
 
 Index a configured volume:
@@ -173,12 +192,15 @@ Each destination is a tree shaped like the local volumes:
   pictures/
     2024/cat.jpg
     .squirrel-history/run-7/2024/cat.jpg     # prior content of cat.jpg
+    .squirrel-index/index-2026-06-04T12:00:00Z-run-12.db   # global index snapshot (ride-along)
   docs/
     invoice.pdf
     .squirrel-history/run-9/invoice.pdf
 ```
 
 `.squirrel-history/run-<run-id>/` is rclone's `--backup-dir` target for that sync run. It is filtered out of all subsequent comparisons so it does not grow rclone's listing time or get uploaded back. A directory literally called `.squirrel-history` in your source volume is also filtered (with a warning), to keep the reserved name out of the destination tree by accident.
+
+`.squirrel-index/` holds the index snapshots ridden along after each successful sync (see [Index snapshots](#index-snapshots)). Like `.squirrel-history`, it is filtered out of all sync and restore transfers and from peer-sync, so a snapshot is never mistaken for user content.
 
 ## Notes
 

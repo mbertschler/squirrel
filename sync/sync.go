@@ -42,6 +42,14 @@ const ConflictsDirName = ".squirrel-conflicts"
 // destroyed atomically by rclone copy.
 const RestoreHistoryDirName = ".squirrel-restore-history"
 
+// IndexDirName is the per-volume directory at the destination where the
+// cloud ride-along (#75) lands index snapshots: one VACUUM INTO copy of
+// the global index.db per successful sync, under
+// <dest.root>/<volume>/.squirrel-index/. Like the other reserved
+// directories it is filtered out of the data transfer (sync and restore)
+// and from peer-sync so a snapshot is never mistaken for user content.
+const IndexDirName = ".squirrel-index"
+
 // Options shapes one Sync invocation.
 type Options struct {
 	// Shallow drops --checksum and --hash blake3 so rclone uses its default
@@ -69,6 +77,15 @@ type Options struct {
 	// must keep it cheap (non-blocking channel send is the canonical
 	// shape). nil means no-op.
 	Progress func(runevents.Progress)
+	// Snapshot, if non-nil, drives the snapshot-on-sync feature (#75):
+	// after a run reaches a terminal success/partial state, a single
+	// VACUUM INTO snapshot is taken (lazily, once per CLI invocation) to
+	// the local tier and, for destination syncs, ridden along to the
+	// destination bucket. nil disables the feature for this run (dry-run,
+	// restore, or `[backups] enabled=false`). One Snapshotter is shared
+	// across every pair of one `squirrel sync` so the VACUUM happens once
+	// and fans out.
+	Snapshot *Snapshotter
 }
 
 // Report is the outcome of one Sync invocation. Volume and Destination
@@ -107,6 +124,13 @@ type Report struct {
 	// and the new BLAKE3 plus the receiver-relative preserved path so
 	// the CLI can render a meaningful "review at <path>" pointer.
 	NodeConflicts []syncproto.ConflictDetail
+	// SnapshotErr captures a failure to take the post-sync index
+	// snapshot or to ride it along to the destination (#75). It is
+	// strictly defense-in-depth: a snapshot failure must not flip a
+	// successful sync to failed, so it is surfaced here and logged
+	// rather than folded into Status. Nil when no snapshot was attempted
+	// (dry-run, disabled, or a run that didn't reach success/partial).
+	SnapshotErr error
 	// NodePendingWarnings is the receiver's drift-detection advisory
 	// from the handshake (#17): one line per audit run on the volume
 	// since the last successful sync that flipped content
@@ -195,6 +219,11 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 		func(runID int64) ([]string, error) {
 			return buildRcloneArgs(vol, dest, runID, opts)
 		})
+	// runRcloneOperation's deferred finishRun has committed the run's
+	// terminal state by now, so the snapshot reflects this run's own row.
+	// Destination syncs are eligible for the cloud ride-along; the
+	// Snapshotter no-ops on dry-run and on non-terminal-success states.
+	opts.Snapshot.afterSync(ctx, &rep, vol, dest)
 	return rep, err
 }
 
@@ -463,6 +492,12 @@ func buildRcloneArgs(vol *config.Volume, dest *config.Destination, runID int64, 
 		// source volume; filtering it out of sync uploads keeps it
 		// from leaking onto destinations.
 		"--filter", "- /" + RestoreHistoryDirName + "/**",
+		// .squirrel-index holds the cloud ride-along snapshots (#75).
+		// It is written by a separate copyto *after* the data transfer,
+		// so filtering it out of the data sync keeps an existing snapshot
+		// dir from being treated as user content (re-uploaded, or pulled
+		// back down on restore).
+		"--filter", "- /" + IndexDirName + "/**",
 	}
 	if !opts.Shallow {
 		args = append(args, "--checksum", "--hash", "blake3")
@@ -793,6 +828,7 @@ func buildRestoreArgs(vol *config.Volume, dest *config.Destination, runID int64,
 		args = append(args, "--filter", "- /"+HistoryDirName+"/**")
 		args = append(args, "--filter", "- /"+volmark.MarkerName)
 		args = append(args, "--filter", "- /"+RestoreHistoryDirName+"/**")
+		args = append(args, "--filter", "- /"+IndexDirName+"/**")
 	}
 	if !opts.Shallow {
 		args = append(args, "--checksum", "--hash", "blake3")

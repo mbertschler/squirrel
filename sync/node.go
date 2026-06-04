@@ -44,6 +44,21 @@ func SyncNode(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volu
 	if err != nil {
 		return rep, err
 	}
+	err = runNodeSession(ctx, s, rcl, vol, volID, node, opts, &rep)
+	// runNodeSession's deferred finishRun has committed the run's
+	// terminal state by now, so the snapshot reflects this run's own row.
+	// Peer-sync takes the local snapshot only — there is no ride-along to
+	// peer nodes (dest=nil), and the Snapshotter no-ops on non-terminal
+	// states and dry-run.
+	opts.Snapshot.afterSync(ctx, &rep, vol, nil)
+	return rep, err
+}
+
+// runNodeSession runs the five-phase driver and owns the deferred
+// terminal-state write. It is split out of SyncNode so the deferred
+// finishRun commits before the snapshot-on-sync hook runs — the snapshot
+// must reflect this run's own committed row.
+func runNodeSession(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, volID int64, node *config.Node, opts Options, rep *Report) (err error) {
 	rep.Status = store.RunStatusFailed
 	defer func() {
 		// Re-derive on the way out: when we never made it past Begin we
@@ -74,9 +89,9 @@ func SyncNode(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volu
 		node:   node,
 		client: client,
 		opts:   opts,
-		report: &rep,
+		report: rep,
 	}
-	return rep, driver.run()
+	return driver.run()
 }
 
 // nodeSyncDriver drives the five-phase initiator-side flow. The
@@ -427,7 +442,8 @@ func (d *nodeSyncDriver) collectIndexEntries() ([]syncproto.IndexEntry, error) {
 func isReservedSyncPath(p string) bool {
 	return strings.HasPrefix(p, HistoryDirName+"/") ||
 		strings.HasPrefix(p, ConflictsDirName+"/") ||
-		strings.HasPrefix(p, RestoreHistoryDirName+"/")
+		strings.HasPrefix(p, RestoreHistoryDirName+"/") ||
+		strings.HasPrefix(p, IndexDirName+"/")
 }
 
 // isReservedFolderPath is the folder-path variant of
@@ -439,7 +455,7 @@ func isReservedSyncPath(p string) bool {
 // rejects, aborting the whole walk.
 func isReservedFolderPath(p string) bool {
 	return p == HistoryDirName || p == ConflictsDirName || p == RestoreHistoryDirName ||
-		isReservedSyncPath(p)
+		p == IndexDirName || isReservedSyncPath(p)
 }
 
 // phaseTransfer invokes rclone exactly once over the transfer +

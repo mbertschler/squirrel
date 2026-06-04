@@ -74,6 +74,13 @@ func runSync(cmd *cobra.Command, volumeName, destinationName string, opts sync.O
 	if err := writeRcloneConfigLogged(out, rcl, cfg); err != nil {
 		return err
 	}
+	// One snapshotter shared across every pair: the VACUUM INTO snapshot
+	// is taken once per invocation and fanned out (decision #1). Disabled
+	// for dry-run (no run rows to snapshot against) and when [backups] is
+	// turned off.
+	if !opts.DryRun && cfg.Backups.Enabled {
+		opts.Snapshot = sync.NewSnapshotter(s, rcl, snapshotConfig(cfg, s.Path()))
+	}
 
 	var anyFailed bool
 	for _, p := range pairs {
@@ -87,6 +94,23 @@ func runSync(cmd *cobra.Command, volumeName, destinationName string, opts sync.O
 		return fmt.Errorf("one or more sync runs did not succeed")
 	}
 	return nil
+}
+
+// snapshotConfig resolves the [backups] config into the sync package's
+// SnapshotConfig, filling an empty backups dir with the default sibling
+// backups/ directory next to the live DB (the same tier `db backup` and
+// the pre-migration snapshots use).
+func snapshotConfig(cfg *config.Config, dbPath string) sync.SnapshotConfig {
+	dir := cfg.Backups.Dir
+	if dir == "" {
+		dir = defaultBackupsDir(dbPath)
+	}
+	return sync.SnapshotConfig{
+		Dir:       dir,
+		Keep:      cfg.Backups.Keep,
+		Cloud:     cfg.Backups.Cloud,
+		CloudKeep: cfg.Backups.CloudKeep,
+	}
 }
 
 // shallowSyncWarning is printed at the CLI layer when a sync or restore
@@ -163,6 +187,12 @@ func printSyncReport(w io.Writer, rep sync.Report, runErr error) {
 		// Distinct from rclone errors: the data is at the destination, but
 		// the runs row is stuck in 'running' until manually reconciled.
 		fmt.Fprintf(w, "  warning: failed to record terminal run state: %v\n", rep.FinishErr)
+	}
+	if rep.SnapshotErr != nil {
+		// Defense-in-depth only: the sync itself succeeded; the index
+		// snapshot or its ride-along did not. Surface it without colouring
+		// the run's status.
+		fmt.Fprintf(w, "  warning: index snapshot: %v\n", rep.SnapshotErr)
 	}
 	if runErr != nil {
 		fmt.Fprintf(w, "  %v\n", runErr)

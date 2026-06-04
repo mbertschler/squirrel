@@ -180,7 +180,14 @@ func buildSchedulerSyncRunner(cfg *config.Config, s *store.Store, rcl *sync.Rclo
 		if err != nil {
 			return agent.SyncRunReport{Err: err}
 		}
-		rep, runErr := sync.RunPair(ctx, s, rcl, pair, sync.Options{})
+		// Snapshot-on-sync fires on each node's scheduled syncs too (#75):
+		// this is the operating cadence the catalog churns on. Each kick is
+		// a single pair, so a fresh Snapshotter per kick is the right unit.
+		opts := sync.Options{}
+		if cfg.Backups.Enabled {
+			opts.Snapshot = sync.NewSnapshotter(s, rcl, snapshotConfig(cfg, s.Path()))
+		}
+		rep, runErr := sync.RunPair(ctx, s, rcl, pair, opts)
 		return agent.SyncRunReport{RunID: rep.RunID, Status: rep.Status, Err: runErr}
 	}
 }
