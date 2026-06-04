@@ -208,3 +208,83 @@ func TestSchedulerFiresChangeHook(t *testing.T) {
 		t.Fatalf("hook command did not run (marker absent): %v", err)
 	}
 }
+
+// TestSchedulerFiresIntervalHook drives the interval ("check") trigger:
+// a volume with only a hook interval (no index/sync cadence) fires the
+// command on its cadence regardless of change, and not before. The
+// trigger is recorded as 'interval' with no triggering run and
+// changed=false.
+func TestSchedulerFiresIntervalHook(t *testing.T) {
+	vol := &config.Volume{
+		Name: "v",
+		Hook: &config.VolumeHook{
+			Command:  []string{"sh", "-c", "exit 0"},
+			Timeout:  5 * time.Second,
+			Interval: 10 * time.Minute,
+		},
+	}
+	f := newSchedulerFixture(t, vol)
+	sched := f.scheduler()
+	ctx := context.Background()
+
+	// First tick: no prior interval hook, so it is due.
+	sched.tick(ctx)
+	sched.hooks.wait()
+	assertIntervalHookCount(t, f, 1)
+
+	// The interval hook fires independent of indexing — no runs row exists.
+	runs, err := f.store.ListRuns(ctx, store.ListRunsOpts{})
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	if len(runs) != 0 {
+		t.Fatalf("interval hook created %d runs rows; want 0 (it never indexes)", len(runs))
+	}
+
+	hooks, err := f.store.ListHookRuns(ctx, store.HookRunListOpts{Descending: true})
+	if err != nil {
+		t.Fatalf("ListHookRuns: %v", err)
+	}
+	hr := hooks[0]
+	if hr.Trigger != store.HookTriggerInterval {
+		t.Fatalf("trigger = %q, want interval", hr.Trigger)
+	}
+	if hr.TriggeringRunID.Valid {
+		t.Fatalf("TriggeringRunID = %v, want NULL for interval hook", hr.TriggeringRunID)
+	}
+	if hr.Changed {
+		t.Fatalf("Changed = true, want false for interval hook")
+	}
+	if hr.Status != store.HookStatusSuccess {
+		t.Fatalf("status = %q, want success", hr.Status)
+	}
+
+	// Under the cadence: a second tick must not re-fire.
+	f.clock.Add(5 * time.Minute)
+	sched.tick(ctx)
+	sched.hooks.wait()
+	assertIntervalHookCount(t, f, 1)
+
+	// Past the cadence: the third tick re-fires.
+	f.clock.Add(10 * time.Minute)
+	sched.tick(ctx)
+	sched.hooks.wait()
+	assertIntervalHookCount(t, f, 2)
+}
+
+func assertIntervalHookCount(t *testing.T, f *schedulerFixture, want int) {
+	t.Helper()
+	hooks, err := f.store.ListHookRuns(context.Background(), store.HookRunListOpts{})
+	if err != nil {
+		t.Fatalf("ListHookRuns: %v", err)
+	}
+	n := 0
+	for _, h := range hooks {
+		if h.Trigger == store.HookTriggerInterval {
+			n++
+		}
+	}
+	if n != want {
+		t.Fatalf("interval hook runs = %d, want %d", n, want)
+	}
+}

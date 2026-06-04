@@ -173,3 +173,25 @@ func (s *Store) ListHookRuns(ctx context.Context, opts HookRunListOpts) ([]HookR
 	}
 	return queryRows(ctx, s.db, query, scanHookRunRow, args...)
 }
+
+// LatestHookRun returns the most recent hook run for the given (volume,
+// trigger), or sql.ErrNoRows when none exists. The interval-hook scheduler
+// computes `now - last_run` from this row to decide whether a
+// cadence-driven check is due; a still-running row counts (its
+// started_at_ns anchors the cadence, and the don't-stack guard prevents a
+// second concurrent invocation regardless).
+//
+// Ordering is by started_at_ns so the idx_hook_runs_volume_trigger index
+// (volume_id, trigger, started_at_ns) satisfies both the filter and the
+// sort — no separate sort pass as hook history grows. id breaks ties
+// deterministically and is the index's implicit trailing rowid, so it
+// stays index-only.
+func (s *Store) LatestHookRun(ctx context.Context, volumeID int64, trigger string) (HookRun, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT `+hookRunColumns+`
+		FROM hook_runs
+		WHERE volume_id = ? AND trigger = ?
+		ORDER BY started_at_ns DESC, id DESC LIMIT 1
+	`, volumeID, trigger)
+	return scanHookRun(row.Scan)
+}

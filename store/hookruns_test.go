@@ -172,6 +172,50 @@ func TestListHookRuns(t *testing.T) {
 	_ = id2
 }
 
+func TestLatestHookRun(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	vol, err := s.CreateVolume(ctx, "v", "/tmp/v")
+	if err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+
+	if _, err := s.LatestHookRun(ctx, vol.ID, HookTriggerInterval); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("LatestHookRun on empty = %v, want sql.ErrNoRows", err)
+	}
+
+	// The change hook needs a real triggering run (the trigger↔run coupling
+	// is enforced); interval hooks carry none.
+	runID, err := s.BeginIndexRun(ctx, RunKindIndex, vol.ID, true)
+	if err != nil {
+		t.Fatalf("BeginIndexRun: %v", err)
+	}
+	mustBegin := func(spec HookRunSpec) int64 {
+		t.Helper()
+		id, err := s.BeginHookRun(ctx, spec)
+		if err != nil {
+			t.Fatalf("BeginHookRun(%s): %v", spec.Trigger, err)
+		}
+		return id
+	}
+	// Two interval runs and a change run; LatestHookRun must return the
+	// newest of the requested trigger only.
+	mustBegin(HookRunSpec{VolumeID: vol.ID, Trigger: HookTriggerInterval})
+	mustBegin(HookRunSpec{VolumeID: vol.ID, Trigger: HookTriggerChange, TriggeringRunID: runID})
+	latestInterval := mustBegin(HookRunSpec{VolumeID: vol.ID, Trigger: HookTriggerInterval})
+
+	got, err := s.LatestHookRun(ctx, vol.ID, HookTriggerInterval)
+	if err != nil {
+		t.Fatalf("LatestHookRun: %v", err)
+	}
+	if got.ID != latestInterval {
+		t.Fatalf("latest interval id = %d, want %d", got.ID, latestInterval)
+	}
+	if got.Trigger != HookTriggerInterval {
+		t.Fatalf("trigger = %q, want interval", got.Trigger)
+	}
+}
+
 // hookRunByID reads a single hook run by id. It lives in the test
 // file (not the package surface) because production code never fetches a
 // hook run by primary key — it lists or, in the follow-up interval work,

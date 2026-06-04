@@ -50,11 +50,7 @@ func newHookRunner(s *store.Store, logger *slog.Logger) *hookRunner {
 //
 // A nil receiver is a no-op so tests can construct a bare scheduler
 // without wiring a runner.
-//
-// trigger is always "change" until the interval caller lands in #86;
-// keeping it a parameter keeps the foundation trigger-agnostic, hence the
-// nolint until the second caller exercises the other value.
-func (h *hookRunner) fire(ctx context.Context, vol *config.Volume, volumeID int64, trigger string, triggeringRunID int64, changed bool) { //nolint:unparam
+func (h *hookRunner) fire(ctx context.Context, vol *config.Volume, volumeID int64, trigger string, triggeringRunID int64, changed bool) {
 	if h == nil || vol.Hook == nil {
 		return
 	}

@@ -49,6 +49,71 @@ command = ["backup.sh"]
 	}
 }
 
+func TestLoadVolumeHookInterval(t *testing.T) {
+	p := writeConfig(t, `
+[volumes.photos]
+path = "/tmp/photos"
+
+[volumes.photos.hook]
+command = ["kopia", "snapshot", "verify"]
+interval = "24h"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Volumes["photos"].Hook.Interval; got != 24*time.Hour {
+		t.Fatalf("Interval = %s, want 24h", got)
+	}
+}
+
+func TestLoadVolumeHookIntervalDefaultsZero(t *testing.T) {
+	p := writeConfig(t, `
+[volumes.photos]
+path = "/tmp/photos"
+
+[volumes.photos.hook]
+command = ["backup.sh"]
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Volumes["photos"].Hook.Interval; got != 0 {
+		t.Fatalf("Interval = %s, want 0 (no interval firing)", got)
+	}
+}
+
+func TestLoadVolumeHookIntervalErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "bad interval",
+			body: "[volumes.v]\npath=\"/tmp/v\"\n[volumes.v.hook]\ncommand=[\"x\"]\ninterval=\"nope\"\n",
+			want: "hook.interval",
+		},
+		{
+			name: "below floor",
+			body: "[volumes.v]\npath=\"/tmp/v\"\n[volumes.v.hook]\ncommand=[\"x\"]\ninterval=\"10ms\"\n",
+			want: "hook.interval must be at least",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, tc.body))
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.want)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoadVolumeHookNoBlock(t *testing.T) {
 	p := writeConfig(t, `
 [volumes.photos]
