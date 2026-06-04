@@ -231,7 +231,17 @@ func rotateSnapshots(dir string, keep int) ([]string, error) {
 	if len(snaps) <= keep {
 		return nil, nil
 	}
-	sort.Slice(snaps, func(i, j int) bool { return snaps[i].modTime.Before(snaps[j].modTime) })
+	// Order oldest-first. Break modtime ties by name: filenames embed a
+	// sortable timestamp, so on filesystems with coarse mtime resolution
+	// (or snapshots written within one tick) the name keeps the order
+	// deterministic and chronological — without it, equal modtimes could
+	// rotate away a newer snapshot.
+	sort.Slice(snaps, func(i, j int) bool {
+		if snaps[i].modTime.Equal(snaps[j].modTime) {
+			return snaps[i].name < snaps[j].name
+		}
+		return snaps[i].modTime.Before(snaps[j].modTime)
+	})
 	var removed []string
 	for _, s := range snaps[:len(snaps)-keep] {
 		p := filepath.Join(dir, s.name)

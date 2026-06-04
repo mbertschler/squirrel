@@ -192,7 +192,7 @@ Each destination is a tree shaped like the local volumes:
   pictures/
     2024/cat.jpg
     .squirrel-history/run-7/2024/cat.jpg     # prior content of cat.jpg
-    .squirrel-index/index-2026-06-04T12:00:00Z-run-12.db   # global index snapshot (ride-along)
+    .squirrel-index/index-20260604T120000.000Z-run-12.db   # global index snapshot (ride-along)
   docs/
     invoice.pdf
     .squirrel-history/run-9/invoice.pdf
