@@ -58,6 +58,10 @@ type Config struct {
 	// Agent is non-nil when the config declares an `[agent]` block. The
 	// agent subcommand requires it; other subcommands ignore it.
 	Agent *Agent
+	// Backups is the resolved `[backups]` configuration. Always populated:
+	// an absent table resolves to DefaultBackups (snapshot-on-sync on with
+	// sensible defaults).
+	Backups Backups
 }
 
 // Volume is one indexable root.
@@ -190,6 +194,7 @@ type rawConfig struct {
 	Destinations map[string]map[string]any `toml:"destinations"`
 	Nodes        map[string]rawNode        `toml:"nodes"`
 	Agent        *rawAgent                 `toml:"agent"`
+	Backups      *rawBackups               `toml:"backups"`
 }
 
 type rawVolume struct {
@@ -257,6 +262,11 @@ func (r *rawConfig) resolve(path string) (*Config, error) {
 		}
 		cfg.Agent = a
 	}
+	backups, err := resolveBackups(r.Backups)
+	if err != nil {
+		return nil, fmt.Errorf("backups: %w", err)
+	}
+	cfg.Backups = backups
 	return cfg, nil
 }
 

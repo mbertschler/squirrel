@@ -314,6 +314,71 @@ func (r *Rclone) RunWithProgress(ctx context.Context, onProgress func(runevents.
 	return result, nil
 }
 
+// runPlain executes rclone with the wrapper's --config but without the
+// JSON-log and stats flags Run uses, returning captured stdout. It backs
+// the auxiliary commands the snapshot ride-along needs (copyto, lsf,
+// deletefile), where we want a simple exit-code success/failure and, for
+// lsf, a short listing — not the streamed copy stats parseJSONLog builds.
+// Stderr is folded into the error on failure for diagnostics.
+func (r *Rclone) runPlain(ctx context.Context, args ...string) ([]byte, error) {
+	if r.Config == "" {
+		return nil, errors.New("rclone wrapper: Config not set (call WriteRcloneConfig first)")
+	}
+	full := append([]string{"--config", r.Config}, args...)
+	cmd := exec.CommandContext(ctx, r.Binary, full...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return stdout.Bytes(), fmt.Errorf("rclone %s: %w: %s", args[0], err, msg)
+		}
+		return stdout.Bytes(), fmt.Errorf("rclone %s: %w", args[0], err)
+	}
+	return stdout.Bytes(), nil
+}
+
+// copyTo copies a single source file to a single destination path via
+// `rclone copyto`, creating intermediate directories as needed. Used by
+// the snapshot ride-along to land one .db file at a fixed destination
+// name (copy, by contrast, would treat the destination as a directory).
+func (r *Rclone) copyTo(ctx context.Context, src, dst string) error {
+	_, err := r.runPlain(ctx, "copyto", src, dst)
+	return err
+}
+
+// listSnapshots returns the snapshot filenames directly under dirURI via
+// `rclone lsf`. A missing directory yields an empty list, not an error:
+// the first ride-along to a volume legitimately finds nothing there yet,
+// and rclone reports the absent directory on stderr with a non-zero exit.
+// Only index-* .db entries are returned so an unrelated file in the tree
+// is never a rotation candidate.
+func (r *Rclone) listSnapshots(ctx context.Context, dirURI string) ([]string, error) {
+	out, err := r.runPlain(ctx, "lsf", "--files-only", dirURI)
+	if err != nil {
+		// lsf against a not-yet-created directory exits non-zero; treat an
+		// empty listing as "nothing to rotate" rather than a hard error.
+		if len(bytes.TrimSpace(out)) == 0 {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var names []string
+	for _, line := range strings.Split(string(out), "\n") {
+		name := strings.TrimSpace(line)
+		if strings.HasPrefix(name, snapshotPrefix) && strings.HasSuffix(name, ".db") {
+			names = append(names, name)
+		}
+	}
+	return names, nil
+}
+
+// deleteFile removes a single file at fileURI via `rclone deletefile`.
+func (r *Rclone) deleteFile(ctx context.Context, fileURI string) error {
+	_, err := r.runPlain(ctx, "deletefile", fileURI)
+	return err
+}
+
 // rcloneEvent captures the subset of rclone's JSON log we care about: the
 // level (for error filtering), the per-object message and object name (for
 // failed-file lists), and the stats object that rclone emits at the end of
