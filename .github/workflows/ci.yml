@@ -31,17 +31,14 @@ jobs:
       # Native deps for `go build -tags wailsdesktop` below. Wails v3
       # alpha targets WebKitGTK 6.0 (which pulls in GTK4 + libsoup-3.0);
       # Ubuntu 24.04 (ubuntu-latest) ships these as libwebkitgtk-6.0-dev.
-      # The default `go build ./...` doesn't need any of this — it's
-      # only the wailsdesktop-tagged build that links to the webview.
+      # The default build/vet/test don't need any of this — only the
+      # wailsdesktop-tagged build links to the webview.
       - name: Install Wails native deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libgtk-4-dev libwebkitgtk-6.0-dev libsoup-3.0-dev \
             pkg-config
-
-      - name: go build
-        run: go build ./...
 
       # Catch regressions in cmd/squirrel-desktop/main_wailsdesktop.go,
       # which is excluded from the default build by its build tag and
