@@ -14,13 +14,15 @@ import (
 	"github.com/mbertschler/squirrel/store"
 )
 
-// newDBCmd returns the `squirrel db` parent command. Subcommands cover
-// the SQLite-side hygiene primitives that issue #65 wanted shipped as
-// a coherent cluster: online backup via VACUUM INTO, integrity check
-// via PRAGMA integrity_check, and snapshot-restore for rolling back to
-// a known-good copy. The migration runner inside store.OpenWithOptions
-// also calls Backup automatically before any schema-advancing
-// migration; this command group is for the operator-facing surface.
+// newDBCmd returns the `squirrel db` parent command. Most subcommands are
+// the SQLite-side hygiene primitives that issue #65 wanted shipped as a
+// coherent cluster: online backup via VACUUM INTO, integrity check via
+// PRAGMA integrity_check, and snapshot-restore for rolling back to a
+// known-good copy. `schema` joins them as an inspection primitive — it
+// prints the live database's DDL. The migration runner inside
+// store.OpenWithOptions also calls Backup automatically before any
+// schema-advancing migration; this command group is for the
+// operator-facing surface.
 func newDBCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "db",
@@ -29,6 +31,7 @@ func newDBCmd() *cobra.Command {
 	cmd.AddCommand(newDBBackupCmd())
 	cmd.AddCommand(newDBCheckCmd())
 	cmd.AddCommand(newDBRestoreCmd())
+	cmd.AddCommand(newDBSchemaCmd())
 	return cmd
 }
 
