@@ -16,6 +16,21 @@ and operator-driven.
 Any new feature (sync, prune, dedup, GC) must preserve both: no deleting or
 overwriting history without an explicit, opt-in retention policy.
 
+# Schema & migrations
+
+Real databases migrate through the forward-only Go registry in
+`store/migrations.go` (a fresh DB applies the v5 baseline, then steps to
+`SchemaVersion`). That chain is the source of truth — there are no `.sql`
+migration files.
+
+`store/schema.sql` is a generated, flattened snapshot of the schema at
+`SchemaVersion`, for humans and agents who want the current shape without
+reading the whole migration chain. It does **not** bootstrap any database.
+After changing the schema (adding a migration), regenerate it with
+`go test ./store -update-schema`; the `TestSchemaSnapshot` golden test fails
+on drift, so CI catches a stale snapshot. `squirrel db schema` prints the DDL
+of a live database (which may sit at an older version).
+
 # Code quality
 
 Don't:
