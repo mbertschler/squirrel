@@ -68,8 +68,12 @@ func dumpSchema(ctx context.Context, db *sql.DB) (string, error) {
 // SchemaVersion through the same chain Open uses, then returns the snapshot
 // (header + DDL) that store/schema.sql must match. It is the single source
 // of truth shared by the golden test and its -update-schema rewrite path.
+//
+// The in-memory DB is opened via buildDSN so it carries the same pragmas
+// (foreign_keys, _txlock, …) a production Open applies — the snapshot is
+// generated under the same constraints real databases migrate under.
 func canonicalSchemaSQL(ctx context.Context) (string, error) {
-	db, err := openSQLite(":memory:")
+	db, err := openSQLite(buildDSN(":memory:"))
 	if err != nil {
 		return "", err
 	}
