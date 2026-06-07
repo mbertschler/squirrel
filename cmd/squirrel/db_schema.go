@@ -6,16 +6,17 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// newDBSchemaCmd returns `squirrel db schema`, which prints the live
-// database's DDL (tables, indexes, triggers) as a flattened script. It
-// reads the shape of whichever DB the usual --db/config resolution opens,
-// so an operator or agent can see what a real index actually looks like —
-// including its current schema version — without replaying migrations.go
-// or trusting the checked-in store/schema.sql to match an older file.
+// newDBSchemaCmd returns `squirrel db schema`, which prints the DDL
+// (tables, indexes, triggers) of whichever database the usual --db/config
+// resolution opens, as a flattened script. Opening runs the normal
+// migration chain first, so the output reflects the objects actually
+// materialised in that file at the binary's SchemaVersion — useful for an
+// operator or agent to inspect a real index directly, without a repo
+// checkout of store/schema.sql.
 func newDBSchemaCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "schema",
-		Short: "Print the live index database's DDL (tables, indexes, triggers)",
+		Short: "Print the index database's DDL (tables, indexes, triggers)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runDBSchema(cmd)
 		},

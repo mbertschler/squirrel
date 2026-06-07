@@ -29,7 +29,8 @@ reading the whole migration chain. It does **not** bootstrap any database.
 After changing the schema (adding a migration), regenerate it with
 `go test ./store -update-schema`; the `TestSchemaSnapshot` golden test fails
 on drift, so CI catches a stale snapshot. `squirrel db schema` prints the DDL
-of a live database (which may sit at an older version).
+of a database directly (opening it runs migrations first), for inspecting a
+real index without a repo checkout.
 
 # Code quality
 
