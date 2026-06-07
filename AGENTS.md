@@ -5,12 +5,16 @@ must stay retrievable. Paths are observations of content; content is the entity.
 
 So `Upsert` never rewrites a row's `blake3` in place: when content at a path
 changes it marks the prior row `superseded` and inserts a new one, keeping at
-most one live (non-`superseded`) row per path. The same no-loss rule governs the
-`runs` table and its history. The schema enforces it — the
-`files_blake3_immutable` trigger and the `uniq_files_live_per_path` partial
-unique index (`store/migrations.go`) — so any new feature (sync, prune, dedup,
-GC) must preserve it: no deleting or overwriting history without an explicit,
-opt-in retention policy.
+most one live (non-`superseded`) row per path. The schema enforces this on
+`files` — the `files_blake3_immutable` trigger and the `uniq_files_live_per_path`
+partial unique index (`store/migrations.go`).
+
+The `runs` table follows the same no-loss spirit by policy, not schema: squirrel
+never auto-prunes runs — they're an audit trail, and any retention is explicit
+and operator-driven.
+
+Any new feature (sync, prune, dedup, GC) must preserve both: no deleting or
+overwriting history without an explicit, opt-in retention policy.
 
 # Code quality
 
@@ -26,7 +30,7 @@ Don't:
 - Forget `go mod tidy` after adding a dependency
 - Keep names/visibility when moving code — re-evaluate
 
-Before pushing, verify like CI: `go vet ./...`, `go test ./...`, `golangci-lint run`.
+Before pushing: `go vet ./...`, `go test ./...`, `golangci-lint run`.
 
 # Pull requests
 
