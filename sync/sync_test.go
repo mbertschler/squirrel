@@ -618,6 +618,123 @@ func TestBuildRcloneArgsRefusesZeroRunIDOutsideDryRun(t *testing.T) {
 	}
 }
 
+// cryptFixtureDest returns a remote destination with a crypt overlay, the
+// shape the crypt addressing/verification tests share. No rclone process
+// ever touches it — these tests stop at argument construction.
+func cryptFixtureDest() *config.Destination {
+	return &config.Destination{
+		Name:  "offsite",
+		Type:  "sftp",
+		Root:  "/data",
+		Crypt: &config.Crypt{Password: "obscured-pw"},
+	}
+}
+
+// TestBuildRcloneArgsCryptAddressing pins the two crypt behaviours of the
+// sync args builder: transfers and the backup-dir address the overlay
+// remote (whose remote line carries the root, so paths are
+// volume-relative), and the BLAKE3 flags are dropped because crypt
+// remotes expose no content hashes.
+func TestBuildRcloneArgsCryptAddressing(t *testing.T) {
+	vol := &config.Volume{Name: "pics", Path: "/tmp/pics"}
+
+	args, err := buildRcloneArgs(vol, cryptFixtureDest(), 7, Options{})
+	if err != nil {
+		t.Fatalf("buildRcloneArgs: %v", err)
+	}
+	joined := strings.Join(args, " ")
+	if got := args[len(args)-1]; got != "offsite-crypt:pics/" {
+		t.Fatalf("dst arg = %q, want offsite-crypt:pics/", got)
+	}
+	if !strings.Contains(joined, "--backup-dir offsite-crypt:pics/"+HistoryDirName+"/run-7") {
+		t.Fatalf("backup-dir not addressed through the crypt remote: %s", joined)
+	}
+	if strings.Contains(joined, "--checksum") || strings.Contains(joined, "blake3") {
+		t.Fatalf("BLAKE3 flags passed to a crypt destination: %s", joined)
+	}
+
+	plain := cryptFixtureDest()
+	plain.Crypt = nil
+	plainArgs, err := buildRcloneArgs(vol, plain, 7, Options{})
+	if err != nil {
+		t.Fatalf("buildRcloneArgs (plain): %v", err)
+	}
+	plainJoined := strings.Join(plainArgs, " ")
+	if got := plainArgs[len(plainArgs)-1]; got != "offsite:/data/pics/" {
+		t.Fatalf("plain dst arg = %q, want offsite:/data/pics/", got)
+	}
+	if !strings.Contains(plainJoined, "--checksum --hash blake3") {
+		t.Fatalf("plain destination lost its BLAKE3 flags: %s", plainJoined)
+	}
+}
+
+// TestBuildRestoreArgsCryptAddressing mirrors the sync case for the pull
+// direction: the source is the crypt remote and the BLAKE3 flags stay off.
+func TestBuildRestoreArgsCryptAddressing(t *testing.T) {
+	vol := &config.Volume{Name: "pics", Path: "/tmp/pics"}
+	args := buildRestoreArgs(vol, cryptFixtureDest(), 3, RestoreOptions{ToPath: "/tmp/scratch"})
+	joined := strings.Join(args, " ")
+	if got := args[len(args)-2]; got != "offsite-crypt:pics/" {
+		t.Fatalf("src arg = %q, want offsite-crypt:pics/", got)
+	}
+	if strings.Contains(joined, "--checksum") || strings.Contains(joined, "blake3") {
+		t.Fatalf("BLAKE3 flags passed for a crypt source: %s", joined)
+	}
+}
+
+// TestIndexDirURICrypt: the snapshot ride-along lands inside the encrypted
+// tree, addressed through the same overlay as the data transfer.
+func TestIndexDirURICrypt(t *testing.T) {
+	if got := indexDirURI(cryptFixtureDest(), "pics"); got != "offsite-crypt:pics/"+IndexDirName {
+		t.Fatalf("indexDirURI = %q, want offsite-crypt:pics/%s", got, IndexDirName)
+	}
+}
+
+// TestEffectiveShallowCrypt pins that a crypt destination downgrades a
+// non-shallow request (and that the runs row will say so), while a plain
+// destination passes the flag through.
+func TestEffectiveShallowCrypt(t *testing.T) {
+	crypt := cryptFixtureDest()
+	plain := cryptFixtureDest()
+	plain.Crypt = nil
+	cases := []struct {
+		dest    *config.Destination
+		shallow bool
+		want    bool
+	}{
+		{crypt, false, true},
+		{crypt, true, true},
+		{plain, false, false},
+		{plain, true, true},
+	}
+	for _, c := range cases {
+		if got := effectiveShallow(c.dest, c.shallow); got != c.want {
+			t.Errorf("effectiveShallow(crypt=%v, shallow=%v) = %v, want %v",
+				c.dest.Crypt != nil, c.shallow, got, c.want)
+		}
+	}
+}
+
+// TestCryptVerificationWarning: the advisory fires exactly when the
+// fallback is implicit — a crypt destination without --shallow. An
+// explicit --shallow run already gets the CLI's shallow warning, and a
+// plain destination has nothing to warn about.
+func TestCryptVerificationWarning(t *testing.T) {
+	crypt := cryptFixtureDest()
+	w := cryptVerificationWarning(crypt, false)
+	if !strings.Contains(w, "size+mtime") || !strings.Contains(w, crypt.Name) {
+		t.Fatalf("warning = %q, want one naming the destination and the size+mtime fallback", w)
+	}
+	if w := cryptVerificationWarning(crypt, true); w != "" {
+		t.Fatalf("warning = %q for an explicit --shallow run, want empty", w)
+	}
+	plain := cryptFixtureDest()
+	plain.Crypt = nil
+	if w := cryptVerificationWarning(plain, false); w != "" {
+		t.Fatalf("warning = %q for a plain destination, want empty", w)
+	}
+}
+
 // TestSyncRefusesUninitialisedDestination removes the bootstrap
 // marker that setupFixture seeded and confirms Sync refuses to run
 // without --init. This is the threat model: a typo in dest.Root

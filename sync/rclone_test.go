@@ -210,6 +210,50 @@ root = "/tmp/scratch"
 	}
 }
 
+// TestWriteRcloneConfigRendersCryptOverlay is the file-level golden for a
+// crypt destination: the underlying remote section exactly as without
+// crypt, then the overlay section wrapping it at the destination root.
+func TestWriteRcloneConfigRendersCryptOverlay(t *testing.T) {
+	cfg := writeFakeConfig(t, `
+[destinations.offsite]
+type = "sftp"
+host = "host.example"
+user = "u"
+root = "/data"
+password = "transport-pw"
+
+[destinations.offsite.crypt]
+password  = "obscured-pw"
+password2 = "obscured-salt"
+`)
+	r := &Rclone{}
+	target := filepath.Join(t.TempDir(), "rclone.conf")
+	if _, err := r.WriteRcloneConfig(target, cfg.Destinations); err != nil {
+		t.Fatalf("WriteRcloneConfig: %v", err)
+	}
+	body, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read rclone.conf: %v", err)
+	}
+	want := `[offsite]
+type = sftp
+host = host.example
+user = u
+password = transport-pw
+
+[offsite-crypt]
+type = crypt
+remote = offsite:/data
+filename_encryption = off
+directory_name_encryption = false
+password = obscured-pw
+password2 = obscured-salt
+`
+	if string(body) != want {
+		t.Fatalf("rclone.conf:\n%s\nwant:\n%s", body, want)
+	}
+}
+
 // TestWriteRcloneConfigSkipsUnchanged verifies the content-comparison
 // short-circuit: a second render of identical destinations reports
 // wrote=false and leaves the file's mtime untouched. The mtime is pinned

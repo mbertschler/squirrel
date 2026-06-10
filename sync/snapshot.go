@@ -180,16 +180,10 @@ func (sn *Snapshotter) rotateCloud(ctx context.Context, dirURI string) error {
 }
 
 // indexDirURI returns the rclone URI of the per-volume .squirrel-index/
-// directory under dest, mirroring backupDirURI: an absolute filesystem
-// path for type=local, "<name>:<root>/<volume>/.squirrel-index" otherwise.
+// directory under dest, addressed the same way the data transfer is
+// (through the crypt overlay when the destination has one).
 func indexDirURI(dest *config.Destination, volumeName string) string {
-	subpath := path.Join(volumeName, IndexDirName)
-	switch dest.Type {
-	case "local":
-		return filepath.ToSlash(filepath.Join(dest.Root, subpath))
-	default:
-		return dest.Name + ":" + path.Join(dest.Root, subpath)
-	}
+	return remoteSubpathURI(dest, path.Join(volumeName, IndexDirName))
 }
 
 // rotateSnapshots deletes the oldest snapshots in dir until only keep
