@@ -3580,3 +3580,302 @@ func TestMigratePreMigrationBackup(t *testing.T) {
 		t.Fatalf("backup name = %q, want pre-migration-v5-to-v*", entries[0].Name())
 	}
 }
+
+// v13Fixture returns the DDL + seed for a fully populated v13 database
+// — the last schema before the contents split. The seed exercises every
+// backfill rule of migrateV13ToV14:
+//
+//   - hash X lives at two paths; the earliest observation (a.txt,
+//     first_seen_run_id=1, local write) donates the contents row's size
+//     and NULL origin even though the later sub/b.txt observation
+//     carries peer attribution.
+//   - hash Y is peer-sourced (node 2, run 2) and live at c.txt.
+//   - hash Z is c.txt's superseded predecessor.
+//   - hash W is a missing row.
+func v13Fixture() []string {
+	return []string{
+		`CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)`,
+		`CREATE TABLE volumes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL)`,
+		`CREATE TABLE nodes (
+			id                     INTEGER PRIMARY KEY,
+			name                   TEXT NOT NULL UNIQUE,
+			endpoint               TEXT,
+			public_key_fingerprint TEXT
+		)`,
+		`CREATE TABLE runs (
+			id            INTEGER PRIMARY KEY,
+			kind          TEXT NOT NULL CHECK (kind IN ('index','sync','restore','audit')),
+			volume_id     INTEGER REFERENCES volumes(id),
+			destination   TEXT,
+			started_at_ns INTEGER NOT NULL,
+			ended_at_ns   INTEGER,
+			status        TEXT NOT NULL CHECK (status IN ('running','success','failed','partial')),
+			error         TEXT,
+			file_count    INTEGER NOT NULL DEFAULT 0,
+			peer_node_id      INTEGER REFERENCES nodes(id),
+			correlated_run_id INTEGER,
+			shallow INTEGER CHECK (shallow IS NULL OR shallow IN (0, 1)),
+			CHECK (
+				(kind IN ('index','audit') AND destination IS NULL) OR
+				(kind IN ('sync','restore') AND destination IS NOT NULL AND destination != '')
+			)
+		)`,
+		`CREATE TABLE folders (
+			id                  INTEGER PRIMARY KEY,
+			volume_id           INTEGER NOT NULL REFERENCES volumes(id),
+			parent_id           INTEGER REFERENCES folders(id),
+			path                TEXT NOT NULL,
+			shallow_blake3      BLOB CHECK (shallow_blake3 IS NULL OR length(shallow_blake3) = 32),
+			deep_blake3         BLOB CHECK (deep_blake3    IS NULL OR length(deep_blake3)    = 32),
+			last_changed_run_id INTEGER REFERENCES runs(id),
+			file_count      INTEGER NOT NULL DEFAULT 0,
+			cumulative_size INTEGER NOT NULL DEFAULT 0,
+			UNIQUE (volume_id, path)
+		)`,
+		`CREATE TABLE files (
+			folder_id         INTEGER NOT NULL REFERENCES folders(id),
+			name              TEXT NOT NULL,
+			blake3            BLOB NOT NULL CHECK (length(blake3) = 32),
+			size_bytes        INTEGER NOT NULL,
+			mtime_ns          INTEGER NOT NULL,
+			status            TEXT NOT NULL CHECK (status IN ('present','missing','superseded')),
+			first_seen_run_id INTEGER NOT NULL REFERENCES runs(id),
+			last_seen_run_id  INTEGER NOT NULL REFERENCES runs(id),
+			indexed_at_ns     INTEGER NOT NULL,
+			source_node_id    INTEGER REFERENCES nodes(id),
+			source_run_id     INTEGER REFERENCES runs(id),
+			PRIMARY KEY (folder_id, name, blake3)
+		)`,
+		`CREATE UNIQUE INDEX uniq_files_live_per_path ON files(folder_id, name) WHERE status != 'superseded'`,
+		`CREATE TRIGGER files_blake3_immutable BEFORE UPDATE OF blake3 ON files
+		 BEGIN
+		     SELECT RAISE(ABORT, 'blake3 is immutable; supersede the row and insert a new one');
+		 END`,
+		`INSERT INTO schema_version (version) VALUES (13)`,
+		`INSERT INTO volumes (id, name, path) VALUES (1, 'photos', '/photos')`,
+		`INSERT INTO nodes (id, name) VALUES (1, 'self'), (2, 'peer')`,
+		`INSERT INTO runs (id, kind, volume_id, destination, started_at_ns, status, peer_node_id, correlated_run_id)
+		 VALUES (1, 'index', 1, NULL, 100, 'success', NULL, NULL),
+		        (2, 'sync',  1, 'peer', 200, 'success', 2, 900),
+		        (3, 'index', 1, NULL, 300, 'success', NULL, NULL)`,
+		`INSERT INTO folders (id, volume_id, parent_id, path) VALUES (1, 1, NULL, ''), (2, 1, 1, 'sub')`,
+		`INSERT INTO files (folder_id, name, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns, source_node_id, source_run_id) VALUES
+		 (1, 'a.txt', X'` + strings.Repeat("11", 32) + `', 10, 1, 'present',    1, 3, 1, NULL, NULL),
+		 (2, 'b.txt', X'` + strings.Repeat("11", 32) + `', 10, 2, 'present',    3, 3, 2, 2, 2),
+		 (1, 'c.txt', X'` + strings.Repeat("22", 32) + `', 20, 3, 'present',    2, 3, 3, 2, 2),
+		 (1, 'c.txt', X'` + strings.Repeat("33", 32) + `', 30, 4, 'superseded', 1, 1, 4, NULL, NULL),
+		 (2, 'd.txt', X'` + strings.Repeat("44", 32) + `', 40, 5, 'missing',    1, 3, 5, NULL, NULL)`,
+	}
+}
+
+// TestMigrateV13ContentsSplit drives a populated v13 database through
+// the v14–v16 chain and verifies the reshape end to end: row counts,
+// the hash↔content mapping with its size/origin backfill, preserved
+// statuses and run stamps, the surviving partial unique index, the
+// dropped immutability trigger, the widened runs CHECK, and the new
+// destination watermark store with its rewind refusal.
+func TestMigrateV13ContentsSplit(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	rawDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("raw sql.Open: %v", err)
+	}
+	for _, q := range v13Fixture() {
+		if _, err := rawDB.Exec(q); err != nil {
+			rawDB.Close()
+			t.Fatalf("v13 DDL %q: %v", q, err)
+		}
+	}
+	rawDB.Close()
+
+	s, err := OpenWithOptions(dsn, OpenOptions{NodeName: "self"})
+	if err != nil {
+		t.Fatalf("Open (migrates v13→v%d): %v", SchemaVersion, err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	if v, _ := s.CurrentSchemaVersion(ctx); v != SchemaVersion {
+		t.Fatalf("schema_version = %d, want %d", v, SchemaVersion)
+	}
+
+	assertContentsBackfill(t, s)
+	assertFilesReshape(t, s)
+	assertSchemaGuardsAfterSplit(t, s)
+	assertRunsOffloadCheck(t, s)
+	assertDestinationStoreAfterMigration(t, s)
+}
+
+// assertContentsBackfill checks the distinct-hash → contents mapping:
+// one row per hash, size and origin taken from the earliest observation.
+func assertContentsBackfill(t *testing.T, s *Store) {
+	t.Helper()
+	ctx := context.Background()
+
+	var fileCount, contentCount int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM files`).Scan(&fileCount); err != nil {
+		t.Fatalf("count files: %v", err)
+	}
+	if fileCount != 5 {
+		t.Fatalf("files rows = %d, want 5 (no row lost in the rebuild)", fileCount)
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM contents`).Scan(&contentCount); err != nil {
+		t.Fatalf("count contents: %v", err)
+	}
+	if contentCount != 4 {
+		t.Fatalf("contents rows = %d, want 4 (one per distinct hash)", contentCount)
+	}
+
+	cases := []struct {
+		hash       []byte
+		size       int64
+		originNode sql.NullInt64
+		originRun  sql.NullInt64
+	}{
+		// X: earliest observation is the local a.txt row, so the later
+		// peer-attributed duplicate does not become the origin.
+		{digest(0x11), 10, sql.NullInt64{}, sql.NullInt64{}},
+		{digest(0x22), 20, sql.NullInt64{Int64: 2, Valid: true}, sql.NullInt64{Int64: 2, Valid: true}},
+		{digest(0x33), 30, sql.NullInt64{}, sql.NullInt64{}},
+		{digest(0x44), 40, sql.NullInt64{}, sql.NullInt64{}},
+	}
+	for _, c := range cases {
+		var size int64
+		var originNode, originRun sql.NullInt64
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT size_bytes, origin_node_id, origin_run_id FROM contents WHERE blake3 = ?`,
+			c.hash).Scan(&size, &originNode, &originRun); err != nil {
+			t.Fatalf("contents row for %x: %v", c.hash[:2], err)
+		}
+		if size != c.size || originNode != c.originNode || originRun != c.originRun {
+			t.Fatalf("contents %x = (size=%d, origin=%+v/%+v), want (size=%d, origin=%+v/%+v)",
+				c.hash[:2], size, originNode, originRun, c.size, c.originNode, c.originRun)
+		}
+	}
+}
+
+// assertFilesReshape checks the per-path view through the store API:
+// statuses, run stamps, the supersede chain, and duplicate detection
+// across the shared content row.
+func assertFilesReshape(t *testing.T, s *Store) {
+	t.Helper()
+	ctx := context.Background()
+
+	a, err := s.GetByPath(ctx, 1, "a.txt")
+	if err != nil {
+		t.Fatalf("GetByPath a.txt: %v", err)
+	}
+	if !bytes.Equal(a.Blake3, digest(0x11)) || a.Status != StatusPresent ||
+		a.SizeBytes != 10 || a.FirstSeenRunID != 1 || a.LastSeenRunID != 3 {
+		t.Fatalf("a.txt = %+v, want X present first=1 last=3 size=10", a)
+	}
+
+	history, err := s.ListHistoryByPath(ctx, 1, "c.txt")
+	if err != nil {
+		t.Fatalf("ListHistoryByPath c.txt: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("c.txt history rows = %d, want 2", len(history))
+	}
+	if !bytes.Equal(history[0].Blake3, digest(0x33)) || history[0].Status != StatusSuperseded {
+		t.Fatalf("c.txt history[0] = %+v, want Z superseded", history[0])
+	}
+	if !bytes.Equal(history[1].Blake3, digest(0x22)) || history[1].Status != StatusPresent {
+		t.Fatalf("c.txt history[1] = %+v, want Y present", history[1])
+	}
+	if !history[1].OriginNodeID.Valid || history[1].OriginNodeID.Int64 != 2 {
+		t.Fatalf("c.txt live origin = %+v, want node 2", history[1].OriginNodeID)
+	}
+
+	d, err := s.GetByPath(ctx, 1, "sub/d.txt")
+	if err != nil {
+		t.Fatalf("GetByPath sub/d.txt: %v", err)
+	}
+	if d.Status != StatusMissing {
+		t.Fatalf("sub/d.txt status = %q, want missing", d.Status)
+	}
+
+	dups, err := s.ListDuplicates(ctx)
+	if err != nil {
+		t.Fatalf("ListDuplicates: %v", err)
+	}
+	if len(dups) != 2 {
+		t.Fatalf("duplicates = %d rows, want 2 (a.txt + sub/b.txt share X)", len(dups))
+	}
+	if dups[0].File.ContentID != dups[1].File.ContentID {
+		t.Fatalf("duplicate rows carry different content ids: %d vs %d",
+			dups[0].File.ContentID, dups[1].File.ContentID)
+	}
+}
+
+// assertSchemaGuardsAfterSplit checks the post-split schema shape: the
+// partial unique index still guards one live row per path, and the
+// blake3-immutability trigger is gone (id↔hash is immutable by
+// construction on contents).
+func assertSchemaGuardsAfterSplit(t *testing.T, s *Store) {
+	t.Helper()
+	ctx := context.Background()
+
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO contents (blake3, size_bytes) VALUES (?, 1)`, digest(0x55)); err != nil {
+		t.Fatalf("insert content: %v", err)
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO files (folder_id, name, content_id, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
+		VALUES (1, 'a.txt', (SELECT id FROM contents WHERE blake3 = ?), 9, 'present', 1, 1, 9)
+	`, digest(0x55))
+	if err == nil || !strings.Contains(err.Error(), "UNIQUE") {
+		t.Fatalf("second live row at a.txt: err = %v, want UNIQUE violation", err)
+	}
+
+	var triggers int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'files_blake3_immutable'`).Scan(&triggers); err != nil {
+		t.Fatalf("count triggers: %v", err)
+	}
+	if triggers != 0 {
+		t.Fatalf("files_blake3_immutable still present after v14, want dropped")
+	}
+}
+
+// assertRunsOffloadCheck checks the v15 kind CHECK: offload joins the
+// destination-NULL branch.
+func assertRunsOffloadCheck(t *testing.T, s *Store) {
+	t.Helper()
+	ctx := context.Background()
+
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO runs (kind, volume_id, destination, started_at_ns, status)
+		VALUES ('offload', 1, NULL, 400, 'running')
+	`); err != nil {
+		t.Fatalf("offload run with NULL destination rejected: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO runs (kind, volume_id, destination, started_at_ns, status)
+		VALUES ('offload', 1, 'bucket', 500, 'running')
+	`); err == nil {
+		t.Fatalf("offload run with a destination accepted, want CHECK violation")
+	}
+}
+
+// assertDestinationStoreAfterMigration checks the v16 watermark store
+// against the migrated DB: an advance lands with history, and a rewind
+// is refused.
+func assertDestinationStoreAfterMigration(t *testing.T, s *Store) {
+	t.Helper()
+	ctx := context.Background()
+
+	if err := s.UpsertDestinationRunID(ctx, 1, "bucket", 2, 5, false); err != nil {
+		t.Fatalf("UpsertDestinationRunID after migration: %v", err)
+	}
+	if err := s.UpsertDestinationRunID(ctx, 1, "bucket", 2, 4, false); !errors.Is(err, ErrWatermarkRewind) {
+		t.Fatalf("rewind err = %v, want ErrWatermarkRewind", err)
+	}
+	history, err := s.ListDestinationRunIDHistory(ctx, 1, "bucket")
+	if err != nil {
+		t.Fatalf("ListDestinationRunIDHistory: %v", err)
+	}
+	if len(history) != 1 || history[0].OriginRunID != 5 {
+		t.Fatalf("history = %+v, want one advance to 5", history)
+	}
+}
