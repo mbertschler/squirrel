@@ -263,7 +263,7 @@ func (h *Runs) runSyncGoroutine(name, dest string, pair syncpkg.Pair, rcl *syncp
 			h.hub.Close(runID)
 		}
 	}()
-	rep, err := syncpkg.RunPair(ctx, h.Store, rcl, pair, opts)
+	rep, err := syncpkg.RunPair(ctx, h.Store, syncpkg.Tools{Rclone: rcl}, pair, opts)
 	switch {
 	case err != nil:
 		log.Printf("desktop: sync %s → %s: %v", name, dest, err)

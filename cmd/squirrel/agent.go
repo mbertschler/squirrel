@@ -191,7 +191,7 @@ func buildSchedulerSyncRunner(cfg *config.Config, s *store.Store, rcl *sync.Rclo
 		if cfg.Backups.Enabled {
 			opts.Snapshot = sync.NewSnapshotter(s, rcl, snapshotConfig(cfg, s.Path()))
 		}
-		rep, runErr := sync.RunPair(ctx, s, rcl, pair, opts)
+		rep, runErr := sync.RunPair(ctx, s, sync.Tools{Rclone: rcl}, pair, opts)
 		return agent.SyncRunReport{RunID: rep.RunID, Status: rep.Status, Err: runErr}
 	}
 }

@@ -84,7 +84,7 @@ func runSync(cmd *cobra.Command, volumeName, destinationName string, opts sync.O
 
 	var anyFailed bool
 	for _, p := range pairs {
-		rep, err := sync.RunPair(cmd.Context(), s, rcl, p, opts)
+		rep, err := sync.RunPair(cmd.Context(), s, sync.Tools{Rclone: rcl}, p, opts)
 		printSyncReport(out, rep, err)
 		if err != nil || rep.Status != "success" {
 			anyFailed = true

@@ -381,7 +381,7 @@ func TestRunPairRefusesWhenAnotherIsRunning(t *testing.T) {
 
 	beforeRuns, _ := f.store.ListRuns(context.Background(), store.ListRunsOpts{})
 	p := Pair{Volume: f.vol, Destination: f.dest}
-	rep, err := RunPair(context.Background(), f.store, f.rcl, p, Options{})
+	rep, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, p, Options{})
 	if err == nil {
 		t.Fatalf("expected refusal while a run is in flight; got rep=%+v", rep)
 	}
@@ -400,7 +400,7 @@ func TestRunPairRefusesWhenAnotherIsRunning(t *testing.T) {
 	if err := f.store.FinishRun(context.Background(), stuckID, store.RunStatusFailed, "test cleanup", 0); err != nil {
 		t.Fatalf("FinishRun: %v", err)
 	}
-	if _, err := RunPair(context.Background(), f.store, f.rcl, p, Options{}); err != nil {
+	if _, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, p, Options{}); err != nil {
 		t.Fatalf("RunPair after clearing stuck row: %v", err)
 	}
 }
@@ -435,7 +435,7 @@ func TestRunPairRefusesConcurrentInvocations(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			_, err := RunPair(context.Background(), f.store, f.rcl, p, Options{})
+			_, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, p, Options{})
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
