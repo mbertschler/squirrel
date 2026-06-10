@@ -82,6 +82,33 @@ func (s *Store) CreateNode(ctx context.Context, name, endpoint string) (Node, er
 	return Node{ID: id, Name: name, Endpoint: endpointVal}, nil
 }
 
+// ValidNodeName reports whether name satisfies the node-name rule
+// (nodeNameRE). Exposed so wire-facing layers can validate
+// peer-declared node names before handing them to CreateNode, failing
+// the request instead of surfacing a store error mid-commit.
+func ValidNodeName(name string) bool {
+	return nodeNameRE.MatchString(name)
+}
+
+// GetOrCreateOriginNode resolves a node *name* — the cross-node
+// identity content origins travel under — to a local nodes row,
+// creating one on first contact. Unlike GetOrCreatePeerNode it matches
+// purely by name: a forwarded origin may name the self-row, a known
+// peer, or a node this host has never peered with. Created rows carry
+// the same "peer://<name>" placeholder endpoint the peer-sync handshake
+// records for initiators that expose no URL, so a later real handshake
+// under the same name finds a row it agrees with.
+func (s *Store) GetOrCreateOriginNode(ctx context.Context, name string) (Node, error) {
+	existing, err := s.GetNodeByName(ctx, name)
+	if err == nil {
+		return existing, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return Node{}, fmt.Errorf("lookup origin node: %w", err)
+	}
+	return s.CreateNode(ctx, name, "peer://"+name)
+}
+
 // GetOrCreatePeerNode looks up a peer node by name. If absent, a new
 // row is inserted with the supplied endpoint. If present, the
 // endpoint must agree with the stored value: a name re-used across

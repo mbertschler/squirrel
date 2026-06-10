@@ -290,6 +290,28 @@ func (s *Store) GetPresentByBlake3InVolume(ctx context.Context, volumeID int64, 
 	return r, err
 }
 
+// ContentIntroductionRunID returns the earliest first_seen_run_id among
+// every files row (any status) observing contentID in volumeID — the
+// local run at which the content was introduced to the volume. This is
+// the origin-run coordinate the peer-sync sender materialises for
+// locally-introduced content (contents.origin_* NULL). Returns
+// sql.ErrNoRows when the content has never been observed in the volume.
+func (s *Store) ContentIntroductionRunID(ctx context.Context, volumeID, contentID int64) (int64, error) {
+	var run sql.NullInt64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT MIN(f.first_seen_run_id) FROM files f
+		 JOIN folders fo ON fo.id = f.folder_id
+		 WHERE fo.volume_id = ? AND f.content_id = ?`,
+		volumeID, contentID).Scan(&run)
+	if err != nil {
+		return 0, fmt.Errorf("content introduction run: %w", err)
+	}
+	if !run.Valid {
+		return 0, sql.ErrNoRows
+	}
+	return run.Int64, nil
+}
+
 // GetByBlake3 returns all rows matching the given BLAKE3 digest (raw 32 bytes),
 // joined with their volume.
 func (s *Store) GetByBlake3(ctx context.Context, digest []byte) ([]FileWithVolume, error) {
