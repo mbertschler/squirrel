@@ -133,6 +133,27 @@ type Destination struct {
 	// { env = "VAR" } references already resolved to literal strings.
 	// Empty for type=local (no rclone remote needed).
 	Params map[string]string
+	// Crypt is non-nil when the destination declares a
+	// [destinations.<name>.crypt] block: client-side encryption through
+	// rclone's crypt overlay. Transfers then address the overlay remote
+	// (CryptRemoteName) instead of the underlying remote.
+	Crypt *Crypt
+}
+
+// Crypt is the optional client-side encryption overlay for a destination.
+// squirrel renders it as an rclone crypt remote stacked on the underlying
+// remote and addresses sync/restore transfers through it, so file contents
+// are encrypted before they leave the machine. Contents only:
+// filename_encryption is fixed off, keeping the destination tree layout
+// identical to an unencrypted destination.
+type Crypt struct {
+	// Password is the content-encryption password in rclone-obscured form,
+	// the same representation rclone's own crypt config stores (generate
+	// one with `rclone obscure`). Accepts a literal or { env = "VAR" }.
+	Password string
+	// Password2 is the salt, also rclone-obscured. Optional but
+	// recommended, matching rclone's crypt config.
+	Password2 string
 }
 
 // nameRE is the syntactic rule for volume and destination names. We pick a
@@ -237,6 +258,9 @@ func (r *rawConfig) resolve(path string) (*Config, error) {
 			return nil, fmt.Errorf("destinations.%s: %w", name, err)
 		}
 		cfg.Destinations[name] = dest
+	}
+	if err := validateCryptRemoteNames(cfg.Destinations); err != nil {
+		return nil, err
 	}
 	for name, raw := range r.Nodes {
 		if _, clash := cfg.Destinations[name]; clash {

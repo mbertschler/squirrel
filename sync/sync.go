@@ -184,6 +184,9 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 	if w := historyDirInSourceWarning(vol); w != "" {
 		rep.Warnings = append(rep.Warnings, w)
 	}
+	if w := cryptVerificationWarning(dest, opts.Shallow); w != "" {
+		rep.Warnings = append(rep.Warnings, w)
+	}
 
 	volID, err := requireIndexedVolume(ctx, s, vol)
 	if err != nil {
@@ -206,7 +209,7 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 	runID, err := beginSyncRunGuarded(ctx, s, opts.DryRun, store.SyncRunSpec{
 		VolumeID:    volID,
 		Destination: dest.Name,
-		Shallow:     opts.Shallow,
+		Shallow:     EffectiveShallow(dest, opts.Shallow),
 	}, vol.Name)
 	if err != nil {
 		return rep, err
@@ -499,7 +502,7 @@ func buildRcloneArgs(vol *config.Volume, dest *config.Destination, runID int64, 
 		// back down on restore).
 		"--filter", "- /" + IndexDirName + "/**",
 	}
-	if !opts.Shallow {
+	if !EffectiveShallow(dest, opts.Shallow) {
 		args = append(args, "--checksum", "--hash", "blake3")
 	}
 	if opts.DryRun {
@@ -519,17 +522,25 @@ func withTrailingSlash(p string) string {
 	return p + "/"
 }
 
-// destinationVolumeURI returns the rclone destination spec for the given
-// volume under dest. For type=local this is an absolute filesystem path;
-// for other types it is "<name>:<root>/<volume>/".
-func destinationVolumeURI(dest *config.Destination, volumeName string) string {
-	switch dest.Type {
-	case "local":
-		return filepath.ToSlash(filepath.Join(dest.Root, volumeName)) + "/"
+// remoteSubpathURI returns the rclone URI for subpath under dest's root.
+// type=local is an absolute filesystem path; a crypt destination is
+// addressed through its overlay remote, whose remote line already carries
+// the root; plain remotes prefix the root themselves.
+func remoteSubpathURI(dest *config.Destination, subpath string) string {
+	switch {
+	case dest.Type == "local":
+		return filepath.ToSlash(filepath.Join(dest.Root, subpath))
+	case dest.Crypt != nil:
+		return dest.CryptRemoteName() + ":" + subpath
 	default:
-		joined := path.Join(dest.Root, volumeName)
-		return dest.Name + ":" + joined + "/"
+		return dest.Name + ":" + path.Join(dest.Root, subpath)
 	}
+}
+
+// destinationVolumeURI returns the rclone destination spec for the given
+// volume under dest.
+func destinationVolumeURI(dest *config.Destination, volumeName string) string {
+	return remoteSubpathURI(dest, volumeName) + "/"
 }
 
 // backupDirURI returns the destination spec for rclone's --backup-dir for
@@ -541,13 +552,45 @@ func backupDirURI(dest *config.Destination, volumeName string, runID int64, dryR
 	if dryRun || runID == 0 {
 		id = "dry-run"
 	}
-	subpath := path.Join(volumeName, HistoryDirName, "run-"+id)
-	switch dest.Type {
-	case "local":
-		return filepath.ToSlash(filepath.Join(dest.Root, subpath))
-	default:
-		return dest.Name + ":" + path.Join(dest.Root, subpath)
+	return remoteSubpathURI(dest, path.Join(volumeName, HistoryDirName, "run-"+id))
+}
+
+// EffectiveShallow reports whether a transfer to dest runs without BLAKE3
+// verification. A crypt destination forces shallow: rclone crypt remotes
+// expose no content hashes, so --checksum --hash blake3 cannot pass
+// through the overlay and rclone falls back to its size+mtime comparison.
+// The result is what the runs row records, keeping the audit trail honest
+// about which transfers were content-verified.
+func EffectiveShallow(dest *config.Destination, shallow bool) bool {
+	return shallow || dest.Crypt != nil
+}
+
+// ShallowForPairs reports whether an invocation covering pairs runs
+// entirely without BLAKE3 verification: either the operator passed
+// --shallow, or every target is a crypt destination that forces it.
+// Used to scope the rclone version preflight to what the run will
+// actually invoke.
+func ShallowForPairs(pairs []Pair, shallow bool) bool {
+	if shallow {
+		return true
 	}
+	for _, p := range pairs {
+		if p.Destination == nil || p.Destination.Crypt == nil {
+			return false
+		}
+	}
+	return true
+}
+
+// cryptVerificationWarning returns the advisory for a non-shallow transfer
+// to a crypt destination, where EffectiveShallow downgrades verification
+// without the operator having asked for --shallow. An explicit --shallow
+// run already gets the CLI's shallow warning, so this stays empty then.
+func cryptVerificationWarning(dest *config.Destination, shallow bool) string {
+	if dest.Crypt == nil || shallow {
+		return ""
+	}
+	return fmt.Sprintf("destination %q is encrypted (crypt): BLAKE3 verification cannot pass through the crypt overlay — comparing by size+mtime for this run, recorded as shallow", dest.Name)
 }
 
 // EnsureMinVersion checks the installed rclone against MinRcloneVersion.
@@ -683,6 +726,9 @@ type RestoreOptions struct {
 // unless they explicitly intend to restore in place.
 func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, dest *config.Destination, opts RestoreOptions) (rep Report, err error) {
 	rep = Report{Volume: vol.Name, Destination: dest.Name}
+	if w := cryptVerificationWarning(dest, opts.Shallow); w != "" {
+		rep.Warnings = append(rep.Warnings, w)
+	}
 
 	// "In-place" is the dangerous direction: writing into the live
 	// volume path. Unsetting ToPath is the canonical request, but a
@@ -734,7 +780,7 @@ func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volum
 		return rep, err
 	}
 
-	runID, err := beginRestoreRun(ctx, s, opts.DryRun, v.ID, dest.Name, opts.Shallow)
+	runID, err := beginRestoreRun(ctx, s, opts.DryRun, v.ID, dest.Name, EffectiveShallow(dest, opts.Shallow))
 	if err != nil {
 		return rep, err
 	}
@@ -830,7 +876,7 @@ func buildRestoreArgs(vol *config.Volume, dest *config.Destination, runID int64,
 		args = append(args, "--filter", "- /"+RestoreHistoryDirName+"/**")
 		args = append(args, "--filter", "- /"+IndexDirName+"/**")
 	}
-	if !opts.Shallow {
+	if !EffectiveShallow(dest, opts.Shallow) {
 		args = append(args, "--checksum", "--hash", "blake3")
 	}
 	if opts.DryRun {
