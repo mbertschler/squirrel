@@ -167,8 +167,7 @@ func TestDestinationRunIDVector(t *testing.T) {
 }
 
 // TestUpsertDestinationRunIDRejectsEmptyDestination: the destination is
-// the vector's identity; an empty one would silently create an
-// unaddressable component.
+// the vector's identity, so it must be non-empty.
 func TestUpsertDestinationRunIDRejectsEmptyDestination(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

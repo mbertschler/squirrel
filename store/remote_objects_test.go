@@ -99,7 +99,7 @@ func TestRemoteObjectInsertRefusesDuplicate(t *testing.T) {
 
 // TestRemoteObjectFKsEnforced: content_id and uploaded_run_id are real
 // FKs — a fingerprint for content or a run the index doesn't know is a
-// caller bug, not recordable state.
+// caller bug.
 func TestRemoteObjectFKsEnforced(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
@@ -120,7 +120,7 @@ func TestRemoteObjectFKsEnforced(t *testing.T) {
 }
 
 // TestMarkRemoteObjectVerifiedUnknownPair: verifying an unrecorded
-// upload errors rather than silently affecting zero rows.
+// upload errors.
 func TestMarkRemoteObjectVerifiedUnknownPair(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
