@@ -13,6 +13,12 @@
 //	POST /v1/sync/close   initiator finalises; receiver commits the
 //	                      index updates and advances the watermark
 //
+// One session-less metadata endpoint shares the namespace:
+//
+//	POST /v1/sync/durability  returns the receiver's recorded
+//	                          destination durability vectors for a
+//	                          volume; reads only, writes nothing
+//
 // Wire-level invariants:
 //
 //   - Paths are always relative to the volume root (matches the
@@ -21,6 +27,13 @@
 //   - BLAKE3 digests travel as 64-char lowercase hex strings (not raw
 //     bytes), so payloads stay JSON-clean and human-readable in
 //     captured traffic.
+//   - Node identity travels as the node NAME. Numeric node ids are
+//     local surrogate keys and differ per node; every side maps a
+//     wire name to its own nodes row.
+//   - Content origin (origin node name + origin-space run id) is
+//     carried verbatim across every hop. A forwarder never relabels
+//     an origin to itself — the durability version-vector math
+//     depends on origins staying in their introduction coordinates.
 //   - Field names are part of the protocol; do not rename them
 //     without bumping the version path.
 package syncproto
@@ -34,22 +47,24 @@ const DispositionAlreadyCorrect = "already-correct"
 const DispositionTransfer = "transfer"
 
 // DispositionSupersede — receiver has a live row at this path with a
-// different blake3, *and* the row's provenance traces back to this
-// initiator at or before the last shared watermark. The receiver
-// pre-moves the prior bytes to `.squirrel-history/run-<id>/` before
-// responding. Ordinary supersession.
+// different blake3, *and* the row was delivered by this initiator at
+// or before the last shared watermark (delivery is judged by the run
+// that first materialised the row, not by the content's origin — a
+// forwarded origin still supersedes through its forwarder). The
+// receiver pre-moves the prior bytes to `.squirrel-history/run-<id>/`
+// before responding. Ordinary supersession.
 const DispositionSupersede = "supersede"
 
 // DispositionConflict — receiver has a live row at this path with a
-// different blake3 that is not traceable to this initiator's prior
-// writes (content introduced locally on the receiver, or originating
-// at a different peer post-watermark). The receiver pre-moves the
+// different blake3 that this initiator did not deliver (content
+// written locally on the receiver, or delivered by a different peer,
+// or by this peer past the watermark). The receiver pre-moves the
 // prior bytes to `.squirrel-conflicts/run-<id>/<path>` and seeds a new
-// `present` row at that path carrying the prior blake3 + prior
-// provenance, so both versions remain reachable by hash and by path.
-// The initiator wins live: rclone delivers its bytes to the original
-// path and /close inserts a new `present` row there whose content
-// origin records the initiator.
+// `present` row at that path carrying the prior blake3 + prior content
+// origin, so both versions remain reachable by hash and by path. The
+// initiator wins live: rclone delivers its bytes to the original path
+// and /close inserts a new `present` row there carrying the entry's
+// declared content origin.
 const DispositionConflict = "conflict"
 
 // DispositionCopyFromExisting — receiver has no live row at this path
@@ -58,9 +73,10 @@ const DispositionConflict = "conflict"
 // network, the receiver materialises the new path locally by copying
 // from `CopyFromPath` (an independent inode — not a hardlink). The
 // initiator excludes the path from the rclone scope but still verifies
-// the post-copy hash and writes a `present` row on /close attributed
-// to the initiator (the path is logically initiator-owned from the
-// receiver's view, identical to a successful Transfer).
+// the post-copy hash and writes a `present` row on /close carrying the
+// entry's declared content origin (the path is logically
+// initiator-owned from the receiver's view, identical to a successful
+// Transfer).
 const DispositionCopyFromExisting = "copy-from-existing"
 
 // DedupStrategyCopy enables receiver-side local dedup: when a /plan
@@ -208,8 +224,8 @@ type PlanRequest struct {
 	Entries       []IndexEntry `json:"entries"`
 }
 
-// IndexEntry is one (path, blake3, size, mtime) tuple sent from the
-// initiator's index. mtime_ns travels for symmetry with the schema
+// IndexEntry is one (path, blake3, size, mtime, origin) tuple sent from
+// the initiator's index. mtime_ns travels for symmetry with the schema
 // even though the plan decision is by blake3 + path + provenance, not
 // timestamp.
 type IndexEntry struct {
@@ -217,6 +233,19 @@ type IndexEntry struct {
 	Blake3Hex string `json:"blake3"`
 	SizeBytes int64  `json:"size_bytes"`
 	MtimeNs   int64  `json:"mtime_ns"`
+	// OriginNode and OriginRun are the content's global origin
+	// coordinate: the NAME of the node where the bytes first entered
+	// the system and that node's local run id at introduction. The
+	// sender materialises them for its own content (its node name +
+	// the content's introduction run) and forwards a stored origin
+	// verbatim — never relabelled to the immediate sender. The
+	// receiver records them on its contents row; the destination
+	// durability vectors are expressed in these coordinates. Both
+	// fields are set together; an initiator predating the origin
+	// exchange omits them and the receiver falls back to attributing
+	// the content to the initiator at its declared sync run.
+	OriginNode string `json:"origin_node,omitempty"`
+	OriginRun  int64  `json:"origin_run,omitempty"`
 }
 
 // PlanResponse carries the receiver's per-path verdict.
@@ -325,6 +354,36 @@ type CloseRequest struct {
 type CloseResponse struct {
 	ReceiverRunID int64 `json:"receiver_run_id"`
 	Committed     int   `json:"committed"`
+}
+
+// DurabilityRequest asks the receiver for its recorded destination
+// durability vectors for one volume (matched by name, like /begin).
+// The endpoint is session-less and read-only: it can be called outside
+// any sync, which is how a node holds offline evidence about
+// destinations only the peer can see.
+type DurabilityRequest struct {
+	Volume string `json:"volume"`
+}
+
+// DurabilityResponse carries every vector component the receiver has
+// recorded for the volume, across all of its destinations. Empty when
+// the receiver has never advanced a vector for the volume.
+type DurabilityResponse struct {
+	Components []DurabilityComponent `json:"components,omitempty"`
+}
+
+// DurabilityComponent is one destination-vector component: the highest
+// origin-space run of OriginNode's content the responding node has
+// verified durable on Destination. Destination names live in the flat
+// target namespace shared by buckets and peers; OriginNode is a node
+// name (the cross-node identity), and OriginRun is in that node's run
+// space. UpdatedAtNs is when the responding node last advanced or
+// re-confirmed the component.
+type DurabilityComponent struct {
+	Destination string `json:"destination"`
+	OriginNode  string `json:"origin_node"`
+	OriginRun   int64  `json:"origin_run"`
+	UpdatedAtNs int64  `json:"updated_at_ns"`
 }
 
 // ErrorResponse is the uniform error body. Mirrors agent's
