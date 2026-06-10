@@ -255,3 +255,38 @@ func TestGetOrCreateOriginNodeRejectsInvalidName(t *testing.T) {
 		t.Fatalf("invalid origin node name accepted, want error")
 	}
 }
+
+// TestGetOrCreatePeerNodeUpgradesPlaceholder: a row created from a
+// name-only context (a forwarded origin, or a durability pull before
+// any sync) carries the peer:// placeholder; the first real handshake
+// presenting an actual endpoint upgrades it in place instead of
+// refusing the collision. Real-endpoint mismatches stay refused.
+func TestGetOrCreatePeerNodeUpgradesPlaceholder(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, _ := Open(dsn)
+	defer s.Close()
+	ctx := context.Background()
+
+	seeded, err := s.GetOrCreateOriginNode(ctx, "nas")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode: %v", err)
+	}
+	upgraded, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.example:8443")
+	if err != nil {
+		t.Fatalf("GetOrCreatePeerNode after placeholder: %v", err)
+	}
+	if upgraded.ID != seeded.ID {
+		t.Fatalf("upgrade created a new row: %d → %d", seeded.ID, upgraded.ID)
+	}
+	if upgraded.Endpoint.String != "https://nas.example:8443" {
+		t.Fatalf("endpoint = %q, want the upgraded real endpoint", upgraded.Endpoint.String)
+	}
+	persisted, _ := s.GetNodeByName(ctx, "nas")
+	if persisted.Endpoint.String != "https://nas.example:8443" {
+		t.Fatalf("persisted endpoint = %q, want the upgrade written through", persisted.Endpoint.String)
+	}
+
+	if _, err := s.GetOrCreatePeerNode(ctx, "nas", "https://other.example"); err == nil {
+		t.Fatalf("real-endpoint mismatch accepted, want refusal")
+	}
+}

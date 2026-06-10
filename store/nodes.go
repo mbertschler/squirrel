@@ -106,7 +106,7 @@ func (s *Store) GetOrCreateOriginNode(ctx context.Context, name string) (Node, e
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Node{}, fmt.Errorf("lookup origin node: %w", err)
 	}
-	return s.CreateNode(ctx, name, "peer://"+name)
+	return s.CreateNode(ctx, name, placeholderEndpoint(name))
 }
 
 // GetOrCreatePeerNode looks up a peer node by name. If absent, a new
@@ -115,7 +115,10 @@ func (s *Store) GetOrCreateOriginNode(ctx context.Context, name string) (Node, e
 // peers with different endpoints is a configuration drift we'd
 // rather refuse than silently accept (the bearer token is per-peer,
 // so a name collision with a real peer would also be an auth
-// boundary issue).
+// boundary issue). One stored value is upgradeable: the name-derived
+// "peer://<name>" placeholder (written for initiators that expose no
+// URL, and for nodes first met as a forwarded origin) is replaced by
+// the presented endpoint on first real contact.
 //
 // The self-row is intentionally NOT returned by this function — its
 // endpoint is NULL, and a peer claiming the self-name would be
@@ -130,14 +133,27 @@ func (s *Store) GetOrCreatePeerNode(ctx context.Context, name, endpoint string) 
 		if !existing.Endpoint.Valid {
 			return Node{}, fmt.Errorf("node %q is the local self-row; refusing to overwrite with peer endpoint %q", name, endpoint)
 		}
-		if existing.Endpoint.String != endpoint {
-			return Node{}, fmt.Errorf("node %q already has endpoint %q in the local index; peer presented %q — resolve the collision before continuing",
-				name, existing.Endpoint.String, endpoint)
+		if existing.Endpoint.String == endpoint {
+			return existing, nil
 		}
-		return existing, nil
+		if existing.Endpoint.String == placeholderEndpoint(name) {
+			if _, err := s.db.ExecContext(ctx,
+				`UPDATE nodes SET endpoint = ? WHERE id = ?`, endpoint, existing.ID); err != nil {
+				return Node{}, fmt.Errorf("upgrade placeholder endpoint for %q: %w", name, err)
+			}
+			existing.Endpoint = sql.NullString{String: endpoint, Valid: true}
+			return existing, nil
+		}
+		return Node{}, fmt.Errorf("node %q already has endpoint %q in the local index; peer presented %q — resolve the collision before continuing",
+			name, existing.Endpoint.String, endpoint)
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Node{}, fmt.Errorf("lookup peer node: %w", err)
 	}
 	return s.CreateNode(ctx, name, endpoint)
 }
+
+// placeholderEndpoint is the synthetic endpoint stored for nodes known
+// only by name: peer-sync initiators that expose no URL of their own,
+// and nodes first encountered as a forwarded content origin.
+func placeholderEndpoint(name string) string { return "peer://" + name }
