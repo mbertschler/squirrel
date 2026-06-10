@@ -10,14 +10,16 @@ import (
 
 // destSchema declares the parameter schema for one destination type. The
 // schema drives validation (required/optional fields, secret handling) and
-// the rclone.conf rendering — every param key here that resolves to a
-// non-empty value is written verbatim to rclone.conf, except for "root"
-// which is squirrel's own concept (we use it to compose the destination URI
-// passed to rclone, not as an rclone backend param).
+// the rclone.conf rendering — for rclone-backed types, every param key here
+// that resolves to a non-empty value is written verbatim to rclone.conf,
+// except for "root" which is squirrel's own concept (we use it to compose
+// the destination URI passed to rclone, not as an rclone backend param).
+// Types with an empty rcloneType render no section, so their params stay
+// out of rclone.conf entirely.
 type destSchema struct {
 	// rcloneType is the value written as `type = ...` in rclone.conf for
-	// this destination. Empty means "no rclone remote" (used by the local
-	// backend, which is addressed by absolute path).
+	// this destination. Empty means "no rclone remote" (the local backend
+	// is addressed by absolute path; kopia drives its own binary).
 	rcloneType string
 	// requiredString fields must be present as plain strings and non-empty.
 	requiredString []string
@@ -26,6 +28,9 @@ type destSchema struct {
 	// secretFields accept either a string literal or an inline table
 	// { env = "VAR" }. The resolved literal is written to rclone.conf.
 	secretFields []string
+	// requiredSecret fields accept the same forms as secretFields but
+	// must resolve to a non-empty value.
+	requiredSecret []string
 }
 
 // destSchemas registers every supported destination type. Adding a new type
@@ -60,11 +65,19 @@ var destSchemas = map[string]destSchema{
 		optionalString: []string{"service_account_file"},
 		secretFields:   []string{"service_account_credentials"},
 	},
+	"kopia": {
+		// root is the local filesystem path of the kopia repository.
+		// The password unlocks the repository (and creates it on first
+		// use); kopia encrypts the repository contents itself, which is
+		// also why a crypt block is rejected for this type.
+		rcloneType:     "",
+		requiredSecret: []string{"password"},
+	},
 }
 
 // SupportedTypes returns the sorted list of destination types squirrel
-// knows how to render into rclone.conf. Used by error messages so users
-// see what they could have typed.
+// supports. Used by error messages so users see what they could have
+// typed.
 func SupportedTypes() []string {
 	out := make([]string, 0, len(destSchemas))
 	for t := range destSchemas {
@@ -114,8 +127,11 @@ func resolveCrypt(raw map[string]any, typ string) (*Crypt, error) {
 	if !ok {
 		return nil, nil
 	}
-	if typ == "local" {
+	switch typ {
+	case "local":
 		return nil, errors.New(`crypt requires an rclone-remote destination; type "local" is addressed by filesystem path`)
+	case "kopia":
+		return nil, errors.New(`crypt requires an rclone-remote destination; type "kopia" repositories are encrypted by kopia itself`)
 	}
 	table, ok := v.(map[string]any)
 	if !ok {
@@ -196,6 +212,17 @@ func validateAndResolveParams(schema destSchema, raw map[string]any) (map[string
 		if v != "" {
 			out[key] = v
 		}
+		seen[key] = true
+	}
+	for _, key := range schema.requiredSecret {
+		v, err := resolveSecret(raw, key)
+		if err != nil {
+			return nil, err
+		}
+		if v == "" {
+			return nil, fmt.Errorf("%s is required", key)
+		}
+		out[key] = v
 		seen[key] = true
 	}
 	for k := range raw {
