@@ -10,7 +10,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 13
+const SchemaVersion = 16
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -49,6 +49,9 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 11, up: migrateV10ToV11},
 		{version: 12, up: migrateV11ToV12},
 		{version: 13, up: migrateV12ToV13},
+		{version: 14, up: migrateV13ToV14},
+		{version: 15, up: migrateV14ToV15},
+		{version: 16, up: migrateV15ToV16},
 	}
 }
 
@@ -1370,6 +1373,271 @@ func migrateV12ToV13(ctx context.Context, db *sql.DB) error {
 	for _, q := range stmts {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("v12→v13: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// --- v13 → v14 ---
+
+// migrateV13ToV14 splits the files table into `contents` (the content
+// entity: one row per distinct blake3, carrying size and origin) and a
+// reshaped `files` (the path↔content observation, keyed on content_id
+// instead of blake3). The files status CHECK gains 'offloaded' — a
+// sibling of 'missing' for content intentionally removed from local
+// disk while it stays durable elsewhere.
+//
+// Backfill mapping: each distinct blake3 becomes one contents row whose
+// size_bytes and (origin_node_id, origin_run_id) come from the files
+// row with the earliest first_seen_run_id for that hash. The old
+// source_* columns recorded per-observation sender attribution while
+// origin_* is content-level first-introduction provenance, so the
+// earliest observation is the closest available approximation.
+//
+// The files_blake3_immutable trigger is dropped and not recreated: the
+// id↔blake3 binding on contents is immutable by construction (blake3 is
+// UNIQUE and contents rows are never updated), so a trigger guarding
+// in-place hash rewrites has nothing left to guard.
+//
+// FK enforcement is disabled across the rebuild (files references
+// folders, runs, and now contents; the old table is dropped
+// mid-migration) with the usual foreign_key_check verification before
+// commit.
+func migrateV13ToV14(ctx context.Context, db *sql.DB) error {
+	conn, restore, err := disableForeignKeys(ctx, db)
+	if err != nil {
+		return err
+	}
+	defer restore()
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := createAndSeedContentsV14(ctx, tx); err != nil {
+		return err
+	}
+	if err := rebuildFilesV14(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (14)`); err != nil {
+		return fmt.Errorf("record schema v14: %w", err)
+	}
+	if err := verifyForeignKeysClean(ctx, tx, "v13→v14"); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// createAndSeedContentsV14 creates the contents table and inserts one
+// row per distinct blake3 in the old files table. The seed row per hash
+// is chosen by (first_seen_run_id, rowid) ascending so the backfill is
+// deterministic when several rows share the earliest run.
+func createAndSeedContentsV14(ctx context.Context, tx *sql.Tx) error {
+	stmts := []string{
+		// origin_run_id is in the origin node's run space (NULL together
+		// with origin_node_id means "introduced locally"), so it is
+		// deliberately not a FK to the local runs table.
+		`CREATE TABLE contents (
+			id             INTEGER PRIMARY KEY,
+			blake3         BLOB NOT NULL UNIQUE CHECK (length(blake3) = 32),
+			size_bytes     INTEGER NOT NULL,
+			origin_node_id INTEGER REFERENCES nodes(id),
+			origin_run_id  INTEGER
+		)`,
+		`INSERT INTO contents (blake3, size_bytes, origin_node_id, origin_run_id)
+		 SELECT f.blake3, f.size_bytes, f.source_node_id, f.source_run_id
+		 FROM files f
+		 WHERE f.rowid = (
+		     SELECT f2.rowid FROM files f2 WHERE f2.blake3 = f.blake3
+		     ORDER BY f2.first_seen_run_id, f2.rowid LIMIT 1
+		 )`,
+		// Partial index backing "find content introduced by node X"
+		// (ListPresentByOrigin); excluding the local-origin majority keeps
+		// the index sized to the peer-sourced subset, the same trade the
+		// old idx_files_source_node made.
+		`CREATE INDEX idx_contents_origin_node ON contents(origin_node_id)
+		 WHERE origin_node_id IS NOT NULL`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("create contents: %w", err)
+		}
+	}
+	return nil
+}
+
+// rebuildFilesV14 stages the reshaped files table, copies every old row
+// with its blake3 resolved to the freshly seeded contents id, and swaps
+// the new table into place. blake3↔content_id is one-to-one, so the PK
+// widening from (folder_id, name, blake3) to (folder_id, name,
+// content_id) is conflict-free and row counts are preserved.
+func rebuildFilesV14(ctx context.Context, tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE files_v14 (
+			folder_id         INTEGER NOT NULL REFERENCES folders(id),
+			name              TEXT NOT NULL,
+			content_id        INTEGER NOT NULL REFERENCES contents(id),
+			mtime_ns          INTEGER NOT NULL,
+			status            TEXT NOT NULL CHECK (status IN ('present','missing','superseded','offloaded')),
+			first_seen_run_id INTEGER NOT NULL REFERENCES runs(id),
+			last_seen_run_id  INTEGER NOT NULL REFERENCES runs(id),
+			indexed_at_ns     INTEGER NOT NULL,
+			PRIMARY KEY (folder_id, name, content_id)
+		)`,
+		`INSERT INTO files_v14 (
+			folder_id, name, content_id, mtime_ns, status,
+			first_seen_run_id, last_seen_run_id, indexed_at_ns
+		)
+		SELECT f.folder_id, f.name, c.id, f.mtime_ns, f.status,
+		       f.first_seen_run_id, f.last_seen_run_id, f.indexed_at_ns
+		FROM files f JOIN contents c ON c.blake3 = f.blake3`,
+		`DROP TABLE files`,
+		`ALTER TABLE files_v14 RENAME TO files`,
+		`CREATE INDEX idx_files_content ON files(content_id)`,
+		`CREATE INDEX idx_files_missing ON files(folder_id, name) WHERE status = 'missing'`,
+		`CREATE UNIQUE INDEX uniq_files_live_per_path ON files(folder_id, name) WHERE status != 'superseded'`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("rebuild files: %w", err)
+		}
+	}
+	return nil
+}
+
+// --- v14 → v15 ---
+
+// migrateV14ToV15 rebuilds the runs table to add 'offload' to the kind
+// CHECK. An offload run records the local "delete on-disk bytes whose
+// content is durable elsewhere" operation, so it joins index and audit
+// in the destination-NULL branch of the kind↔destination coupling.
+// Same FK-off rebuild recipe as v6→v7 (runs is referenced by files and
+// hook_runs).
+func migrateV14ToV15(ctx context.Context, db *sql.DB) error {
+	conn, restore, err := disableForeignKeys(ctx, db)
+	if err != nil {
+		return err
+	}
+	defer restore()
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := rebuildRunsTableV15(ctx, tx); err != nil {
+		return err
+	}
+	if err := verifyForeignKeysClean(ctx, tx, "v14→v15"); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func rebuildRunsTableV15(ctx context.Context, tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE runs_v15 (
+			id            INTEGER PRIMARY KEY,
+			kind          TEXT NOT NULL CHECK (kind IN ('index','sync','restore','audit','offload')),
+			volume_id     INTEGER REFERENCES volumes(id),
+			destination   TEXT,
+			started_at_ns INTEGER NOT NULL,
+			ended_at_ns   INTEGER,
+			status        TEXT NOT NULL CHECK (status IN ('running','success','failed','partial')),
+			error         TEXT,
+			file_count    INTEGER NOT NULL DEFAULT 0,
+			peer_node_id      INTEGER REFERENCES nodes(id),
+			correlated_run_id INTEGER,
+			shallow INTEGER CHECK (shallow IS NULL OR shallow IN (0, 1)),
+			CHECK (
+				(kind IN ('index','audit','offload') AND destination IS NULL) OR
+				(kind IN ('sync','restore') AND destination IS NOT NULL AND destination != '')
+			)
+		)`,
+		`INSERT INTO runs_v15 (
+			id, kind, volume_id, destination, started_at_ns, ended_at_ns,
+			status, error, file_count, peer_node_id, correlated_run_id, shallow
+		)
+		SELECT id, kind, volume_id, destination, started_at_ns, ended_at_ns,
+		       status, error, file_count, peer_node_id, correlated_run_id, shallow
+		FROM runs`,
+		`DROP TABLE runs`,
+		`ALTER TABLE runs_v15 RENAME TO runs`,
+		`CREATE INDEX idx_runs_volume_started ON runs(volume_id, started_at_ns)`,
+		`CREATE INDEX idx_runs_destination ON runs(destination) WHERE destination IS NOT NULL`,
+		`INSERT INTO schema_version (version) VALUES (15)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("rebuild runs: %w", err)
+		}
+	}
+	return nil
+}
+
+// --- v15 → v16 ---
+
+// migrateV15ToV16 adds the offload substrate tables, all additive:
+//
+//   - destination_run_ids: the per-destination durability version
+//     vector. One row per (volume, destination, origin node) carrying
+//     the highest origin-space run id known durable on that
+//     destination. `destination` is the unified target name — a bucket
+//     destination or a peer node name, matching what runs.destination
+//     already stores. origin_run_id is in the origin node's run space,
+//     so like contents.origin_run_id it is not a local FK.
+//   - destination_run_ids_history: append-only log of every vector
+//     advance, written in the same transaction as the live-row upsert
+//     (the same recoverability contract peer_sync_state_history gives
+//     the peer-sync watermark).
+//   - remote_objects: per-(content, destination) upload fingerprints
+//     for destinations that can't be cheaply re-read — the provider's
+//     stored checksum recorded at upload time and compared verbatim on
+//     later verification passes.
+func migrateV15ToV16(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`CREATE TABLE destination_run_ids (
+			volume_id      INTEGER NOT NULL REFERENCES volumes(id),
+			destination    TEXT NOT NULL,
+			origin_node_id INTEGER NOT NULL REFERENCES nodes(id),
+			origin_run_id  INTEGER NOT NULL,
+			updated_at_ns  INTEGER NOT NULL,
+			PRIMARY KEY (volume_id, destination, origin_node_id)
+		)`,
+		`CREATE TABLE destination_run_ids_history (
+			id             INTEGER PRIMARY KEY,
+			volume_id      INTEGER NOT NULL,
+			destination    TEXT NOT NULL,
+			origin_node_id INTEGER NOT NULL,
+			origin_run_id  INTEGER NOT NULL,
+			at_ns          INTEGER NOT NULL
+		)`,
+		`CREATE INDEX idx_destination_run_ids_history
+		 ON destination_run_ids_history(volume_id, destination)`,
+		`CREATE TABLE remote_objects (
+			content_id      INTEGER NOT NULL REFERENCES contents(id),
+			destination     TEXT NOT NULL,
+			uploaded_run_id INTEGER NOT NULL REFERENCES runs(id),
+			checksum_algo   TEXT NOT NULL,
+			checksum        TEXT NOT NULL,
+			verified_at_ns  INTEGER,
+			PRIMARY KEY (content_id, destination)
+		)`,
+		`INSERT INTO schema_version (version) VALUES (16)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("v15→v16: %w", err)
 		}
 	}
 	return tx.Commit()

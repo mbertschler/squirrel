@@ -7,22 +7,23 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/zeebo/blake3"
+
 	"github.com/mbertschler/squirrel/store"
 )
 
-// sourceFixture lays out a config with a `pics` volume, indexes a few
-// files, then injects synthetic peer-attribution rows directly into
-// the store so the read-side CLI can be exercised without a full
-// agent round-trip. The peer's name is "peer-a"; the self-node's
-// name comes from the config's `node_name = "self-host"`.
+// sourceFixture lays out a config with a `pics` volume, indexes one
+// local file, then introduces two peer-origin files directly into the
+// store (the way a receiver's /close records freshly transferred
+// content) so the read-side CLI can be exercised without a full agent
+// round-trip. The peers are "peer-a" / "peer-b"; the self-node's name
+// comes from the config's `node_name = "self-host"`.
 type sourceFixture struct {
 	configPath string
-	dbPath     string
 	volumeDir  string
 	selfName   string
 	peerAName  string
 	peerBName  string
-	peerBID    int64
 	localPath  string
 	peerAPath  string
 	peerBPath  string
@@ -39,8 +40,6 @@ func writeSourceFixture(t *testing.T) sourceFixture {
 	peerAPath := "from-a.txt"
 	peerBPath := "from-b.txt"
 	writeTestFile(t, filepath.Join(volumeDir, localPath), "local content")
-	writeTestFile(t, filepath.Join(volumeDir, peerAPath), "from-a content")
-	writeTestFile(t, filepath.Join(volumeDir, peerBPath), "from-b content")
 
 	dbPath := filepath.Join(root, "index.db")
 	configPath := filepath.Join(root, "config.toml")
@@ -52,24 +51,26 @@ func writeSourceFixture(t *testing.T) sourceFixture {
 		t.Fatal(err)
 	}
 
-	// Index once so the DB has rows; provenance is initially NULL for all.
+	// Index the local file so its content carries a NULL (local) origin.
 	runCLI(t, "--config", configPath, "index", "pics")
 
-	// Promote the from-a / from-b rows to peer attribution by re-upserting
-	// with an explicit Provenance pointer. Upsert preserves blake3 and only
-	// rewrites the mutable columns. The store handle is opened and closed
-	// here, before any subsequent runCLI runs, so the test CLI has the DB
-	// to itself when it opens its own store.
-	peerBID := stampSourceFixture(t, dbPath, peerAPath, peerBPath)
+	// Introduce the from-a / from-b files as peer-origin content: bytes
+	// on disk plus an Upsert with an explicit Provenance, the same shape
+	// a receiver's /close write has. Origin is recorded on the contents
+	// row at first introduction, so these files must enter the store via
+	// the peer write, not via a local index run. The store handle is
+	// opened and closed here, before any subsequent runCLI runs, so the
+	// test CLI has the DB to itself when it opens its own store.
+	writeTestFile(t, filepath.Join(volumeDir, peerAPath), "from-a content")
+	writeTestFile(t, filepath.Join(volumeDir, peerBPath), "from-b content")
+	stampSourceFixture(t, dbPath, peerAPath, peerBPath)
 
 	return sourceFixture{
 		configPath: configPath,
-		dbPath:     dbPath,
 		volumeDir:  volumeDir,
 		selfName:   "self-host",
 		peerAName:  "peer-a",
 		peerBName:  "peer-b",
-		peerBID:    peerBID,
 		localPath:  localPath,
 		peerAPath:  peerAPath,
 		peerBPath:  peerBPath,
@@ -77,12 +78,12 @@ func writeSourceFixture(t *testing.T) sourceFixture {
 }
 
 // stampSourceFixture creates peer-a / peer-b nodes plus a sync run
-// for each, attributes peerAPath to peer-a and peerBPath to peer-b,
-// and returns peer-b's id (used by tests that need to inject further
-// rows). The store handle is opened, used, and closed within the
-// function so concurrent connections from runCLI calls can't race
-// with this fixture phase.
-func stampSourceFixture(t *testing.T, dbPath, peerAPath, peerBPath string) int64 {
+// for each and records peerAPath as content introduced by peer-a and
+// peerBPath by peer-b (hashing the on-disk bytes so a later index run
+// re-observes them unchanged). The store handle is opened, used, and
+// closed within the function so concurrent connections from runCLI
+// calls can't race with this fixture phase.
+func stampSourceFixture(t *testing.T, dbPath, peerAPath, peerBPath string) {
 	t.Helper()
 	s, err := store.OpenWithOptions(dbPath, store.OpenOptions{NodeName: "self-host"})
 	if err != nil {
@@ -118,21 +119,26 @@ func stampSourceFixture(t *testing.T, dbPath, peerAPath, peerBPath string) int64
 		t.Fatalf("FinishRun b: %v", err)
 	}
 	for _, c := range []struct {
-		path string
-		prov *store.Provenance
+		path  string
+		runID int64
+		prov  *store.Provenance
 	}{
-		{peerAPath, &store.Provenance{NodeID: peerA.ID, RunID: peerARun}},
-		{peerBPath, &store.Provenance{NodeID: peerB.ID, RunID: peerBRun}},
+		{peerAPath, peerARun, &store.Provenance{NodeID: peerA.ID, RunID: peerARun}},
+		{peerBPath, peerBRun, &store.Provenance{NodeID: peerB.ID, RunID: peerBRun}},
 	} {
-		row, err := s.GetByPath(ctx, vol.ID, c.path)
+		data, err := os.ReadFile(filepath.Join(vol.Path, c.path))
 		if err != nil {
-			t.Fatalf("GetByPath %s: %v", c.path, err)
+			t.Fatalf("read %s: %v", c.path, err)
 		}
-		if err := s.Upsert(ctx, row, c.prov); err != nil {
+		digest := blake3.Sum256(data)
+		if err := s.Upsert(ctx, store.FileRow{
+			VolumeID: vol.ID, Path: c.path, Blake3: digest[:],
+			SizeBytes: int64(len(data)), MtimeNs: 1, Status: store.StatusPresent,
+			FirstSeenRunID: c.runID, LastSeenRunID: c.runID, IndexedAtNs: 1,
+		}, c.prov); err != nil {
 			t.Fatalf("Upsert %s: %v", c.path, err)
 		}
 	}
-	return peerB.ID
 }
 
 // TestCLIQueryFromNodeListsAttributedRows is the acceptance test for
@@ -212,63 +218,27 @@ func TestCLIRunsRendersPeerAndCorrelated(t *testing.T) {
 }
 
 // TestCLIQueryDuplicatesAndFromComposes verifies the post-filter
-// against --duplicates: rows that share a hash are filtered down to
-// the ones whose source matches.
+// against --duplicates under content-level origin: every path sharing
+// a hash points at one contents row, so --from <peer> lists all of the
+// duplicate paths when the content originates at that peer and none of
+// them otherwise.
 func TestCLIQueryDuplicatesAndFromComposes(t *testing.T) {
 	f := writeSourceFixture(t)
-	// Add a duplicate of from-a content under a new path attributed to
-	// peer-b — that creates two hash-matched rows with different
-	// sources, which is exactly what --from must disambiguate.
+	// Duplicate the peer-a content under a new path. The new path's row
+	// resolves to the existing contents row, so it inherits peer-a's
+	// origin even though a local index run observed it.
 	dupRel := "dup.txt"
 	writeTestFile(t, filepath.Join(f.volumeDir, dupRel), "from-a content")
 	runCLI(t, "--config", f.configPath, "index", "pics")
-	stampOneRow(t, f.dbPath, f.selfName, dupRel, f.peerBID)
 
-	out := runCLI(t, "--config", f.configPath, "query", "--duplicates", "--from", f.peerBName)
-	if !strings.Contains(out, dupRel) {
-		t.Fatalf("duplicates --from peer-b missing %s:\n%s", dupRel, out)
+	out := runCLI(t, "--config", f.configPath, "query", "--duplicates", "--from", f.peerAName)
+	for _, want := range []string{f.peerAPath, dupRel} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("duplicates --from peer-a missing %s:\n%s", want, out)
+		}
 	}
-	if strings.Contains(out, f.peerAPath) {
-		t.Fatalf("duplicates --from peer-b leaked peer-a row:\n%s", out)
+	outB := runCLI(t, "--config", f.configPath, "query", "--duplicates", "--from", f.peerBName)
+	if strings.Contains(outB, dupRel) || strings.Contains(outB, f.peerAPath) {
+		t.Fatalf("duplicates --from peer-b leaked peer-a-origin content:\n%s", outB)
 	}
-}
-
-// stampOneRow attributes a single existing path to the given peer
-// node. Same single-handle-at-a-time discipline as the rest of the
-// fixture so concurrent runCLI store opens never overlap.
-func stampOneRow(t *testing.T, dbPath, selfName, relPath string, peerNodeID int64) {
-	t.Helper()
-	s, err := store.OpenWithOptions(dbPath, store.OpenOptions{NodeName: selfName})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer s.Close()
-	ctx := context.Background()
-	vol, err := s.GetVolumeByName(ctx, "pics")
-	if err != nil {
-		t.Fatalf("GetVolumeByName: %v", err)
-	}
-	row, err := s.GetByPath(ctx, vol.ID, relPath)
-	if err != nil {
-		t.Fatalf("GetByPath %s: %v", relPath, err)
-	}
-	runID := mustLatestPeerRun(t, s, ctx, peerNodeID)
-	if err := s.Upsert(ctx, row, &store.Provenance{NodeID: peerNodeID, RunID: runID}); err != nil {
-		t.Fatalf("Upsert %s: %v", relPath, err)
-	}
-}
-
-// mustLatestPeerRun returns the highest runs.id for kind='sync' with
-// the given peer_node_id. Used to satisfy the Provenance.RunID FK
-// when stamping a synthetic row in tests.
-func mustLatestPeerRun(t *testing.T, s *store.Store, ctx context.Context, peerNodeID int64) int64 {
-	t.Helper()
-	runs, err := s.ListRunsByPeer(ctx, peerNodeID, 1)
-	if err != nil {
-		t.Fatalf("ListRunsByPeer: %v", err)
-	}
-	if len(runs) == 0 {
-		t.Fatalf("no peer-sync runs for peer id=%d", peerNodeID)
-	}
-	return runs[0].ID
 }

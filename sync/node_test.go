@@ -193,7 +193,7 @@ func TestNodeSyncTransfersFiles(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetByPath %s on receiver: %v", name, err)
 		}
-		if !row.SourceNodeID.Valid {
+		if !row.OriginNodeID.Valid {
 			t.Fatalf("%s row has NULL source_node_id; want initiator attribution", name)
 		}
 	}
@@ -366,7 +366,7 @@ func TestNodeSyncResolvesConflictOnLocalWriteOnReceiver(t *testing.T) {
 	if hex.EncodeToString(liveRow.Blake3) == hex.EncodeToString(receiverDigest) {
 		t.Fatalf("live row still carries the prior blake3; want initiator's")
 	}
-	if !liveRow.SourceNodeID.Valid {
+	if !liveRow.OriginNodeID.Valid {
 		t.Fatalf("live doc.md row has NULL source_node_id; want initiator attribution")
 	}
 	preservedRow, err := f.recvStore.GetByPath(ctx, v.ID, preservedRel)
@@ -377,9 +377,9 @@ func TestNodeSyncResolvesConflictOnLocalWriteOnReceiver(t *testing.T) {
 		t.Fatalf("preserved row blake3 = %x, want %x (the prior content)",
 			preservedRow.Blake3, receiverDigest)
 	}
-	if preservedRow.SourceNodeID.Valid {
+	if preservedRow.OriginNodeID.Valid {
 		t.Fatalf("preserved row source_node_id = %d, want NULL (prior was a local write)",
-			preservedRow.SourceNodeID.Int64)
+			preservedRow.OriginNodeID.Int64)
 	}
 
 	// Loser is reachable by hash too — `squirrel query <prior>`
@@ -649,19 +649,23 @@ func TestPlanResponseContainsAllDispositions(t *testing.T) {
 	// (supersede) and local.txt (conflict) both get re-hashed before
 	// their bytes are moved, so their recorded digests must match what's
 	// on disk — a real receiver indexes its own content; a synthetic
-	// digest would look like out-of-band drift. The three files share the
-	// same "seed" bytes, so one digest serves both. same.txt is
-	// already-correct and never re-hashed, so a synthetic digest is fine.
+	// digest would look like out-of-band drift. evolved.txt and
+	// local.txt need *distinct* bytes: origin is content-level, so if
+	// the two paths shared content, local.txt would inherit evolved's
+	// peer origin and classify as supersede instead of conflict.
+	// same.txt is already-correct and never re-hashed, so a synthetic
+	// digest is fine.
 	for _, p := range []string{"same.txt", "evolved.txt", "local.txt"} {
-		if err := os.WriteFile(filepath.Join(f.recvVol.Path, p), []byte("seed"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(f.recvVol.Path, p), []byte("seed-"+p), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	seedDigest := hashFile(t, filepath.Join(f.recvVol.Path, "evolved.txt"))
+	evolvedDigest := hashFile(t, filepath.Join(f.recvVol.Path, "evolved.txt"))
+	localDigest := hashFile(t, filepath.Join(f.recvVol.Path, "local.txt"))
 
 	mustUpsert("same.txt", bytesDigest(0xAA), nil)
-	mustUpsert("evolved.txt", seedDigest, &store.Provenance{NodeID: peer.ID, RunID: priorRun})
-	mustUpsert("local.txt", seedDigest, nil)
+	mustUpsert("evolved.txt", evolvedDigest, &store.Provenance{NodeID: peer.ID, RunID: priorRun})
+	mustUpsert("local.txt", localDigest, nil)
 
 	// peer_sync_state watermark (in initiator-id space) high enough
 	// to cover the prior row's correlated id.
@@ -739,8 +743,8 @@ func TestPlanResponseContainsAllDispositions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetByPath %s: %v", plan.Conflicts[0].PreservedAtPath, err)
 	}
-	if hex.EncodeToString(conflictRow.Blake3) != hex.EncodeToString(seedDigest) {
-		t.Fatalf("conflict-path row blake3 = %x, want the prior on-disk digest %x", conflictRow.Blake3, seedDigest)
+	if hex.EncodeToString(conflictRow.Blake3) != hex.EncodeToString(localDigest) {
+		t.Fatalf("conflict-path row blake3 = %x, want the prior on-disk digest %x", conflictRow.Blake3, localDigest)
 	}
 }
 
@@ -789,9 +793,9 @@ func TestNodeSyncEndToEndConflictAfterAgentSideIndex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetByPath before round 2: %v", err)
 	}
-	if beforeRound2.SourceNodeID.Valid {
+	if beforeRound2.OriginNodeID.Valid {
 		t.Fatalf("post-index row has source_node_id %d; want NULL (local write)",
-			beforeRound2.SourceNodeID.Int64)
+			beforeRound2.OriginNodeID.Int64)
 	}
 
 	// Round 2: initiator writes Z and re-syncs. The receiver's row
@@ -913,9 +917,9 @@ func TestNodeSyncConflictWhenPriorRowFromDifferentPeer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetByPath %s: %v", rep.NodeConflicts[0].PreservedAtPath, err)
 	}
-	if !preservedRow.SourceNodeID.Valid || preservedRow.SourceNodeID.Int64 != otherPeer.ID {
+	if !preservedRow.OriginNodeID.Valid || preservedRow.OriginNodeID.Int64 != otherPeer.ID {
 		t.Fatalf("preserved row source_node_id = %+v, want %d (third-party)",
-			preservedRow.SourceNodeID, otherPeer.ID)
+			preservedRow.OriginNodeID, otherPeer.ID)
 	}
 }
 
@@ -1338,7 +1342,7 @@ func TestNodeSyncCopyFromExistingDedup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetByPath pets/a.jpg: %v", err)
 	}
-	if !newRow.SourceNodeID.Valid {
+	if !newRow.OriginNodeID.Valid {
 		t.Fatalf("pets/a.jpg row has NULL source_node_id; want initiator attribution")
 	}
 }

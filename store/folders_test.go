@@ -584,10 +584,10 @@ func upsertMissing(ctx context.Context, s *Store, volumeID int64, relPath string
 		return err
 	}
 	// MarkMissing won't help here (it acts on whole-run staleness). Use
-	// a raw UPDATE inside the same supersede contract: blake3 stays, status
-	// flips to missing. The folder hash recompute lives behind TouchSeen /
-	// Upsert; we trigger one explicitly to mirror what the real indexer
-	// would do after marking absent.
+	// a raw UPDATE inside the same supersede contract: content_id stays,
+	// status flips to missing. The folder hash recompute lives behind
+	// TouchSeen / Upsert; we trigger one explicitly to mirror what the
+	// real indexer would do after marking absent.
 	folderPath, name := splitFilePath(relPath)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -602,8 +602,8 @@ func upsertMissing(ctx context.Context, s *Store, volumeID int64, relPath string
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE files SET status = 'missing', last_seen_run_id = ?
-		 WHERE folder_id = ? AND name = ? AND blake3 = ?`,
-		runID, folderID, name, row.Blake3); err != nil {
+		 WHERE folder_id = ? AND name = ? AND content_id = ?`,
+		runID, folderID, name, row.ContentID); err != nil {
 		return err
 	}
 	if err := recomputeFolderAndAncestors(ctx, tx, folderID, runID); err != nil {
@@ -646,8 +646,9 @@ func snapshotFolderHashes(t *testing.T, s *Store, volumeID int64, shallow bool) 
 // migration round-trip test and drift test.
 func freshRecomputeShallow(ctx context.Context, s *Store, volumeID int64, folderPath string) ([]byte, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT f.name, f.blake3 FROM files f
+		SELECT f.name, c.blake3 FROM files f
 		JOIN folders fo ON fo.id = f.folder_id
+		JOIN contents c ON c.id = f.content_id
 		WHERE fo.volume_id = ? AND fo.path = ? AND f.status = 'present'
 		ORDER BY f.name`,
 		volumeID, folderPath)

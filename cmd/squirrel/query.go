@@ -39,7 +39,7 @@ func newQueryCmd() *cobra.Command {
 			}
 			defer s.Close()
 
-			filter, err := resolveSourceFilter(cmd, s, fromNode)
+			filter, err := resolveOriginFilter(cmd, s, fromNode)
 			if err != nil {
 				return err
 			}
@@ -60,7 +60,7 @@ func newQueryCmd() *cobra.Command {
 					return queryArg(cmd, s, args[0], history, filter)
 				}
 				if filter.active {
-					return queryBySource(cmd, s, filter)
+					return queryByOrigin(cmd, s, filter)
 				}
 				return errors.New("query requires <hash>, <path>, --duplicates, --missing, or --from")
 			}
@@ -69,53 +69,54 @@ func newQueryCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&duplicates, "duplicates", false, "list hashes that appear at more than one path")
 	cmd.Flags().BoolVar(&missing, "missing", false, "list previously-indexed paths no longer on disk")
 	cmd.Flags().BoolVar(&history, "history", false, "when querying a path, also print the full content history at that path")
-	cmd.Flags().StringVar(&fromNode, "from", "", "restrict results to rows whose source_node_id matches this node name (use the self-node name for local writes)")
+	cmd.Flags().StringVar(&fromNode, "from", "", "restrict results to rows whose content originates at this node (use the self-node name for locally introduced content)")
 	return cmd
 }
 
-// sourceFilter encodes the result of `--from <name>`. active=false means
+// originFilter encodes the result of `--from <name>`. active=false means
 // no filter; nodeID.Valid==true filters to that node id; nodeID.Valid==false
-// (and active==true) means "self / local writes" (source_node_id IS NULL).
-type sourceFilter struct {
+// (and active==true) means "self / locally introduced" (origin_node_id IS
+// NULL).
+type originFilter struct {
 	active bool
 	nodeID sql.NullInt64
 }
 
-// matches reports whether the row's source_node_id passes the filter.
+// matches reports whether the row's origin_node_id passes the filter.
 // A non-active filter matches everything.
-func (f sourceFilter) matches(rowSource sql.NullInt64) bool {
+func (f originFilter) matches(rowOrigin sql.NullInt64) bool {
 	if !f.active {
 		return true
 	}
 	if !f.nodeID.Valid {
-		return !rowSource.Valid
+		return !rowOrigin.Valid
 	}
-	return rowSource.Valid && rowSource.Int64 == f.nodeID.Int64
+	return rowOrigin.Valid && rowOrigin.Int64 == f.nodeID.Int64
 }
 
-// resolveSourceFilter turns the --from <name> argument into a
-// sourceFilter. The self-node's name resolves to "match NULL source"
-// (local writes); any other named node resolves to that node's id.
-// An empty name produces an inactive filter.
-func resolveSourceFilter(cmd *cobra.Command, s *store.Store, name string) (sourceFilter, error) {
+// resolveOriginFilter turns the --from <name> argument into an
+// originFilter. The self-node's name resolves to "match NULL origin"
+// (locally introduced content); any other named node resolves to that
+// node's id. An empty name produces an inactive filter.
+func resolveOriginFilter(cmd *cobra.Command, s *store.Store, name string) (originFilter, error) {
 	if name == "" {
-		return sourceFilter{}, nil
+		return originFilter{}, nil
 	}
 	self, err := s.GetSelfNode(cmd.Context())
 	if err != nil {
-		return sourceFilter{}, fmt.Errorf("lookup self node: %w", err)
+		return originFilter{}, fmt.Errorf("lookup self node: %w", err)
 	}
 	if name == self.Name {
-		return sourceFilter{active: true}, nil
+		return originFilter{active: true}, nil
 	}
 	node, err := s.GetNodeByName(cmd.Context(), name)
 	if err != nil {
 		if store.IsNotFound(err) {
-			return sourceFilter{}, fmt.Errorf("no node named %q (use the self-node name %q for local writes)", name, self.Name)
+			return originFilter{}, fmt.Errorf("no node named %q (use the self-node name %q for locally introduced content)", name, self.Name)
 		}
-		return sourceFilter{}, fmt.Errorf("lookup node %q: %w", name, err)
+		return originFilter{}, fmt.Errorf("lookup node %q: %w", name, err)
 	}
-	return sourceFilter{active: true, nodeID: sql.NullInt64{Int64: node.ID, Valid: true}}, nil
+	return originFilter{active: true, nodeID: sql.NullInt64{Int64: node.ID, Valid: true}}, nil
 }
 
 // queryArg disambiguates between a path lookup and a hex digest lookup. A
@@ -124,7 +125,7 @@ func resolveSourceFilter(cmd *cobra.Command, s *store.Store, name string) (sourc
 // protects content-addressed workloads where filenames are themselves hex.
 // withHistory is only meaningful for path queries — hash lookups already
 // list every row for the digest.
-func queryArg(cmd *cobra.Command, s *store.Store, arg string, withHistory bool, filter sourceFilter) error {
+func queryArg(cmd *cobra.Command, s *store.Store, arg string, withHistory bool, filter originFilter) error {
 	if !looksLikePath(arg) && isHashLike(arg) {
 		if withHistory {
 			return errors.New("--history applies to path queries, not hash queries (hash queries already list every row)")
@@ -142,7 +143,7 @@ func looksLikePath(arg string) bool {
 	return err == nil
 }
 
-func queryByHash(cmd *cobra.Command, s *store.Store, hexDigest string, filter sourceFilter) error {
+func queryByHash(cmd *cobra.Command, s *store.Store, hexDigest string, filter originFilter) error {
 	digest, err := hex.DecodeString(hexDigest)
 	if err != nil {
 		return fmt.Errorf("decode hash: %w", err)
@@ -154,7 +155,7 @@ func queryByHash(cmd *cobra.Command, s *store.Store, hexDigest string, filter so
 	out := cmd.OutOrStdout()
 	var any bool
 	for _, r := range rows {
-		if !filter.matches(r.File.SourceNodeID) {
+		if !filter.matches(r.File.OriginNodeID) {
 			continue
 		}
 		fmt.Fprintf(out, "%s\t%s\t%d\n", r.File.Status, joinVolumePath(r.Volume.Path, r.File.Path), r.File.SizeBytes)
@@ -169,7 +170,7 @@ func queryByHash(cmd *cobra.Command, s *store.Store, hexDigest string, filter so
 	return nil
 }
 
-func queryByPath(cmd *cobra.Command, s *store.Store, arg string, withHistory bool, filter sourceFilter) error {
+func queryByPath(cmd *cobra.Command, s *store.Store, arg string, withHistory bool, filter originFilter) error {
 	absPath, err := filepath.Abs(arg)
 	if err != nil {
 		return err
@@ -181,7 +182,7 @@ func queryByPath(cmd *cobra.Command, s *store.Store, arg string, withHistory boo
 		}
 		return err
 	}
-	if !filter.matches(fv.File.SourceNodeID) {
+	if !filter.matches(fv.File.OriginNodeID) {
 		return fmt.Errorf("row at %s does not match --from filter", absPath)
 	}
 	out := cmd.OutOrStdout()
@@ -227,7 +228,7 @@ func printPathHistory(cmd *cobra.Command, s *store.Store, volumeID int64, relPat
 	return tw.Flush()
 }
 
-func queryDuplicates(cmd *cobra.Command, s *store.Store, filter sourceFilter) error {
+func queryDuplicates(cmd *cobra.Command, s *store.Store, filter originFilter) error {
 	rows, err := s.ListDuplicates(cmd.Context())
 	if err != nil {
 		return err
@@ -235,7 +236,7 @@ func queryDuplicates(cmd *cobra.Command, s *store.Store, filter sourceFilter) er
 	out := cmd.OutOrStdout()
 	var lastHex string
 	for _, r := range rows {
-		if !filter.matches(r.File.SourceNodeID) {
+		if !filter.matches(r.File.OriginNodeID) {
 			continue
 		}
 		h := hex.EncodeToString(r.File.Blake3)
@@ -251,14 +252,14 @@ func queryDuplicates(cmd *cobra.Command, s *store.Store, filter sourceFilter) er
 	return nil
 }
 
-func queryMissing(cmd *cobra.Command, s *store.Store, filter sourceFilter) error {
+func queryMissing(cmd *cobra.Command, s *store.Store, filter originFilter) error {
 	rows, err := s.ListMissing(cmd.Context())
 	if err != nil {
 		return err
 	}
 	out := cmd.OutOrStdout()
 	for _, r := range rows {
-		if !filter.matches(r.File.SourceNodeID) {
+		if !filter.matches(r.File.OriginNodeID) {
 			continue
 		}
 		fmt.Fprintf(out, "%s\t%s\n", hex.EncodeToString(r.File.Blake3), joinVolumePath(r.Volume.Path, r.File.Path))
@@ -266,19 +267,19 @@ func queryMissing(cmd *cobra.Command, s *store.Store, filter sourceFilter) error
 	return nil
 }
 
-// queryBySource lists every present row across volumes whose source
-// matches the filter — the bare `--from <name>` case with no
+// queryByOrigin lists every present row across volumes whose content
+// origin matches the filter — the bare `--from <name>` case with no
 // positional, duplicates, or missing flag. The underlying
-// ListPresentBySource is per-volume so we iterate (today's volume
+// ListPresentByOrigin is per-volume so we iterate (today's volume
 // counts are small); cross-volume widening is out of scope for #15.
-func queryBySource(cmd *cobra.Command, s *store.Store, filter sourceFilter) error {
+func queryByOrigin(cmd *cobra.Command, s *store.Store, filter originFilter) error {
 	vols, err := s.ListVolumes(cmd.Context())
 	if err != nil {
 		return fmt.Errorf("list volumes: %w", err)
 	}
 	out := cmd.OutOrStdout()
 	for _, v := range vols {
-		for row, err := range s.ListPresentBySource(cmd.Context(), v.ID, filter.nodeID) {
+		for row, err := range s.ListPresentByOrigin(cmd.Context(), v.ID, filter.nodeID) {
 			if err != nil {
 				return err
 			}
