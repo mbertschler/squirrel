@@ -984,3 +984,108 @@ func TestIndexRefusesMismatchedVolumeMarker(t *testing.T) {
 		t.Fatalf("err type = %T (%v), want *volmark.ErrMismatch", err, err)
 	}
 }
+
+// markOffloaded flips the live row at relPath to status='offloaded'
+// via an Upsert carrying the same content — the status transition the
+// future offload command records once durability is proven.
+func markOffloaded(t *testing.T, s *store.Store, volumeID int64, relPath string) {
+	t.Helper()
+	ctx := context.Background()
+	row, err := s.GetByPath(ctx, volumeID, relPath)
+	if err != nil {
+		t.Fatalf("GetByPath %s: %v", relPath, err)
+	}
+	row.Status = store.StatusOffloaded
+	if err := s.Upsert(ctx, row, nil); err != nil {
+		t.Fatalf("Upsert offloaded %s: %v", relPath, err)
+	}
+}
+
+// TestIndexLeavesOffloadedRowsAlone: an offloaded row's on-disk absence
+// is intentional, so a re-index neither flips it to missing nor counts
+// it in the report's Missing tally.
+func TestIndexLeavesOffloadedRowsAlone(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "keep.txt"), "kept")
+	writeFile(t, filepath.Join(root, "cold.txt"), "rarely needed")
+
+	s := setupStore(t)
+	ctx := context.Background()
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("first Index: %v", err)
+	}
+	absRoot, _ := filepath.Abs(root)
+	vol := volumeFor(t, s, absRoot)
+
+	markOffloaded(t, s, vol.ID, "cold.txt")
+	if err := os.Remove(filepath.Join(root, "cold.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := Index(ctx, s, root, Options{})
+	if err != nil {
+		t.Fatalf("re-Index: %v", err)
+	}
+	if rep.Missing != 0 {
+		t.Fatalf("report.Missing = %d, want 0 (offloaded absence is expected)", rep.Missing)
+	}
+	row, err := s.GetByPath(ctx, vol.ID, "cold.txt")
+	if err != nil {
+		t.Fatalf("GetByPath cold.txt: %v", err)
+	}
+	if row.Status != store.StatusOffloaded {
+		t.Fatalf("cold.txt status = %q after re-index, want offloaded", row.Status)
+	}
+}
+
+// TestIndexFlipsOffloadedBackToPresent: when the file reappears on disk
+// with its recorded content (a restore or manual copy-back), the next
+// index run flips the row back to present, preserving first_seen.
+func TestIndexFlipsOffloadedBackToPresent(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "cold.txt"), "rarely needed")
+
+	s := setupStore(t)
+	ctx := context.Background()
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("first Index: %v", err)
+	}
+	absRoot, _ := filepath.Abs(root)
+	vol := volumeFor(t, s, absRoot)
+	before, err := s.GetByPath(ctx, vol.ID, "cold.txt")
+	if err != nil {
+		t.Fatalf("GetByPath before: %v", err)
+	}
+
+	markOffloaded(t, s, vol.ID, "cold.txt")
+	if err := os.Remove(filepath.Join(root, "cold.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("Index while offloaded: %v", err)
+	}
+
+	writeFile(t, filepath.Join(root, "cold.txt"), "rarely needed")
+	rep, err := Index(ctx, s, root, Options{})
+	if err != nil {
+		t.Fatalf("Index after reappearance: %v", err)
+	}
+	if rep.Errors != 0 {
+		t.Fatalf("report errors = %+v", rep.ErrorList)
+	}
+
+	after, err := s.GetByPath(ctx, vol.ID, "cold.txt")
+	if err != nil {
+		t.Fatalf("GetByPath after: %v", err)
+	}
+	if after.Status != store.StatusPresent {
+		t.Fatalf("cold.txt status = %q after reappearance, want present", after.Status)
+	}
+	if !bytes.Equal(after.Blake3, before.Blake3) {
+		t.Fatalf("cold.txt content changed across offload round trip")
+	}
+	if after.FirstSeenRunID != before.FirstSeenRunID {
+		t.Fatalf("first_seen_run_id = %d, want %d (reappearance must not rewrite it)",
+			after.FirstSeenRunID, before.FirstSeenRunID)
+	}
+}
