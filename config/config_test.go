@@ -356,6 +356,182 @@ root   = "/p"
 	}
 }
 
+// TestLoadDestinationCrypt parses a crypt block with one env-resolved and
+// one literal password, the same secret forms destination credentials
+// accept.
+func TestLoadDestinationCrypt(t *testing.T) {
+	t.Setenv("CRYPT_PASSWORD", "obscured-pw")
+	p := writeConfig(t, `
+[destinations.offsite]
+type = "sftp"
+host = "host.example"
+user = "u"
+root = "/data"
+password = "transport-pw"
+
+[destinations.offsite.crypt]
+password  = { env = "CRYPT_PASSWORD" }
+password2 = "obscured-salt"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	d := cfg.Destinations["offsite"]
+	if d.Crypt == nil {
+		t.Fatalf("Crypt not parsed: %+v", d)
+	}
+	if d.Crypt.Password != "obscured-pw" || d.Crypt.Password2 != "obscured-salt" {
+		t.Fatalf("Crypt = %+v, want resolved password + literal salt", d.Crypt)
+	}
+	if d.CryptRemoteName() != "offsite-crypt" {
+		t.Fatalf("CryptRemoteName = %q, want offsite-crypt", d.CryptRemoteName())
+	}
+}
+
+// TestRcloneSectionCryptStacked pins the exact two-section render for a
+// crypt destination: the underlying remote exactly as without crypt, then
+// the overlay wrapping it at the destination root with the fixed
+// filename-encryption settings.
+func TestRcloneSectionCryptStacked(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.offsite]
+type = "sftp"
+host = "host.example"
+user = "u"
+root = "/data"
+password = "transport-pw"
+
+[destinations.offsite.crypt]
+password  = "obscured-pw"
+password2 = "obscured-salt"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := `[offsite]
+type = sftp
+host = host.example
+user = u
+password = transport-pw
+
+[offsite-crypt]
+type = crypt
+remote = offsite:/data
+filename_encryption = off
+directory_name_encryption = false
+password = obscured-pw
+password2 = obscured-salt
+`
+	if got := cfg.Destinations["offsite"].RcloneSection(); got != want {
+		t.Fatalf("RcloneSection:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestRcloneSectionCryptOmitsEmptySalt: password2 is optional, mirroring
+// rclone's own crypt config, and an absent salt renders no password2 line.
+func TestRcloneSectionCryptOmitsEmptySalt(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.offsite]
+type = "sftp"
+host = "h"
+user = "u"
+root = "/data"
+
+[destinations.offsite.crypt]
+password = "obscured-pw"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	section := cfg.Destinations["offsite"].RcloneSection()
+	if strings.Contains(section, "password2") {
+		t.Fatalf("section has a password2 line for an absent salt:\n%s", section)
+	}
+	if !strings.Contains(section, "password = obscured-pw") {
+		t.Fatalf("section missing crypt password:\n%s", section)
+	}
+}
+
+func TestLoadDestinationCryptMissingPassword(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.offsite]
+type = "sftp"
+host = "h"
+user = "u"
+root = "/r"
+
+[destinations.offsite.crypt]
+password2 = "salt-only"
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "crypt.password is required") {
+		t.Fatalf("expected crypt.password-required error, got %v", err)
+	}
+}
+
+func TestLoadRejectsCryptOnLocalDestination(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.scratch]
+type = "local"
+root = "/tmp/scratch"
+
+[destinations.scratch.crypt]
+password = "obscured-pw"
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), `type "local"`) {
+		t.Fatalf("expected crypt-on-local rejection, got %v", err)
+	}
+}
+
+// TestLoadRejectsUnknownCryptField doubles as the "filename encryption is
+// fixed, not configurable" pin: a user trying to switch it on gets a
+// load-time error.
+func TestLoadRejectsUnknownCryptField(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.offsite]
+type = "sftp"
+host = "h"
+user = "u"
+root = "/r"
+
+[destinations.offsite.crypt]
+password            = "obscured-pw"
+filename_encryption = "standard"
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), `unknown field "filename_encryption"`) {
+		t.Fatalf("expected unknown-crypt-field error, got %v", err)
+	}
+}
+
+// TestLoadRejectsCryptRemoteNameCollision: the overlay's rclone.conf
+// section is named <dest>-crypt, so a sibling destination already holding
+// that name would render two sections under one header.
+func TestLoadRejectsCryptRemoteNameCollision(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.offsite]
+type = "sftp"
+host = "h"
+user = "u"
+root = "/r"
+
+[destinations.offsite.crypt]
+password = "obscured-pw"
+
+[destinations.offsite-crypt]
+type = "local"
+root = "/tmp/x"
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), `crypt remote name "offsite-crypt"`) {
+		t.Fatalf("expected crypt-name collision error, got %v", err)
+	}
+}
+
 // TestLoadNodeName checks that the top-level node_name key is parsed and
 // surfaced on Config.NodeName for the store to consume on first migration.
 func TestLoadNodeName(t *testing.T) {
