@@ -287,9 +287,14 @@ func (h *Runs) prepareRclone(ctx context.Context) (*syncpkg.Rclone, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Shallow=false matches CLI defaults — the desktop trigger runs
-	// the full integrity-checking sync, not a fast path.
-	if err := syncpkg.EnsureMinVersion(ctx, rcl, io.Discard, false); err != nil {
+	// Desktop triggers run the full integrity-checking sync (the CLI
+	// default, Shallow=false); the pairs scope the version preflight to
+	// the blake3 use the configured targets will actually invoke.
+	pairs, err := syncpkg.PairsFor(h.Config, "", "")
+	if err != nil {
+		return nil, err
+	}
+	if err := syncpkg.EnsureMinVersion(ctx, rcl, io.Discard, syncpkg.ShallowForPairs(pairs, false)); err != nil {
 		return nil, err
 	}
 	confPath := filepath.Join(filepath.Dir(h.Config.Path), "rclone.conf")

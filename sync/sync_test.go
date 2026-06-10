@@ -619,8 +619,8 @@ func TestBuildRcloneArgsRefusesZeroRunIDOutsideDryRun(t *testing.T) {
 }
 
 // cryptFixtureDest returns a remote destination with a crypt overlay, the
-// shape the crypt addressing/verification tests share. No rclone process
-// ever touches it — these tests stop at argument construction.
+// shape the crypt addressing/verification tests share; these tests stop
+// at argument construction.
 func cryptFixtureDest() *config.Destination {
 	return &config.Destination{
 		Name:  "offsite",
@@ -708,9 +708,36 @@ func TestEffectiveShallowCrypt(t *testing.T) {
 		{plain, true, true},
 	}
 	for _, c := range cases {
-		if got := effectiveShallow(c.dest, c.shallow); got != c.want {
-			t.Errorf("effectiveShallow(crypt=%v, shallow=%v) = %v, want %v",
+		if got := EffectiveShallow(c.dest, c.shallow); got != c.want {
+			t.Errorf("EffectiveShallow(crypt=%v, shallow=%v) = %v, want %v",
 				c.dest.Crypt != nil, c.shallow, got, c.want)
+		}
+	}
+}
+
+// TestShallowForPairs pins the version-preflight scope: only an
+// invocation with at least one blake3-verified target (a plain bucket
+// or a peer node) requires the full rclone floor.
+func TestShallowForPairs(t *testing.T) {
+	crypt := cryptFixtureDest()
+	plain := cryptFixtureDest()
+	plain.Crypt = nil
+	node := Pair{Node: &config.Node{Name: "peer"}}
+	cases := []struct {
+		name    string
+		pairs   []Pair
+		shallow bool
+		want    bool
+	}{
+		{"user shallow wins", []Pair{{Destination: plain}}, true, true},
+		{"all crypt", []Pair{{Destination: crypt}, {Destination: crypt}}, false, true},
+		{"mixed crypt and plain", []Pair{{Destination: crypt}, {Destination: plain}}, false, false},
+		{"node target verifies", []Pair{{Destination: crypt}, node}, false, false},
+		{"no pairs", nil, false, true},
+	}
+	for _, c := range cases {
+		if got := ShallowForPairs(c.pairs, c.shallow); got != c.want {
+			t.Errorf("%s: ShallowForPairs = %v, want %v", c.name, got, c.want)
 		}
 	}
 }

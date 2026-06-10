@@ -68,7 +68,7 @@ func runSync(cmd *cobra.Command, volumeName, destinationName string, opts sync.O
 	if opts.Shallow {
 		fmt.Fprintln(out, shallowSyncWarning)
 	}
-	if err := sync.EnsureMinVersion(cmd.Context(), rcl, out, opts.Shallow); err != nil {
+	if err := sync.EnsureMinVersion(cmd.Context(), rcl, out, sync.ShallowForPairs(pairs, opts.Shallow)); err != nil {
 		return err
 	}
 	if err := writeRcloneConfigLogged(out, rcl, cfg); err != nil {

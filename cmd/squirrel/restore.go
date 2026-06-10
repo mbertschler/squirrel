@@ -92,7 +92,7 @@ func runRestore(cmd *cobra.Command, volumeName, fromName string, opts sync.Resto
 	if opts.Shallow {
 		fmt.Fprintln(out, shallowSyncWarning)
 	}
-	if err := sync.EnsureMinVersion(cmd.Context(), rcl, out, opts.Shallow); err != nil {
+	if err := sync.EnsureMinVersion(cmd.Context(), rcl, out, sync.EffectiveShallow(dest, opts.Shallow)); err != nil {
 		return err
 	}
 	if err := writeRcloneConfigLogged(out, rcl, cfg); err != nil {

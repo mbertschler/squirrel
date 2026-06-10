@@ -209,7 +209,7 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 	runID, err := beginSyncRunGuarded(ctx, s, opts.DryRun, store.SyncRunSpec{
 		VolumeID:    volID,
 		Destination: dest.Name,
-		Shallow:     effectiveShallow(dest, opts.Shallow),
+		Shallow:     EffectiveShallow(dest, opts.Shallow),
 	}, vol.Name)
 	if err != nil {
 		return rep, err
@@ -502,7 +502,7 @@ func buildRcloneArgs(vol *config.Volume, dest *config.Destination, runID int64, 
 		// back down on restore).
 		"--filter", "- /" + IndexDirName + "/**",
 	}
-	if !effectiveShallow(dest, opts.Shallow) {
+	if !EffectiveShallow(dest, opts.Shallow) {
 		args = append(args, "--checksum", "--hash", "blake3")
 	}
 	if opts.DryRun {
@@ -555,18 +555,35 @@ func backupDirURI(dest *config.Destination, volumeName string, runID int64, dryR
 	return remoteSubpathURI(dest, path.Join(volumeName, HistoryDirName, "run-"+id))
 }
 
-// effectiveShallow reports whether a transfer to dest runs without BLAKE3
+// EffectiveShallow reports whether a transfer to dest runs without BLAKE3
 // verification. A crypt destination forces shallow: rclone crypt remotes
 // expose no content hashes, so --checksum --hash blake3 cannot pass
 // through the overlay and rclone falls back to its size+mtime comparison.
 // The result is what the runs row records, keeping the audit trail honest
 // about which transfers were content-verified.
-func effectiveShallow(dest *config.Destination, shallow bool) bool {
+func EffectiveShallow(dest *config.Destination, shallow bool) bool {
 	return shallow || dest.Crypt != nil
 }
 
+// ShallowForPairs reports whether an invocation covering pairs runs
+// entirely without BLAKE3 verification: either the operator passed
+// --shallow, or every target is a crypt destination that forces it.
+// Used to scope the rclone version preflight to what the run will
+// actually invoke.
+func ShallowForPairs(pairs []Pair, shallow bool) bool {
+	if shallow {
+		return true
+	}
+	for _, p := range pairs {
+		if p.Destination == nil || p.Destination.Crypt == nil {
+			return false
+		}
+	}
+	return true
+}
+
 // cryptVerificationWarning returns the advisory for a non-shallow transfer
-// to a crypt destination, where effectiveShallow downgrades verification
+// to a crypt destination, where EffectiveShallow downgrades verification
 // without the operator having asked for --shallow. An explicit --shallow
 // run already gets the CLI's shallow warning, so this stays empty then.
 func cryptVerificationWarning(dest *config.Destination, shallow bool) string {
@@ -763,7 +780,7 @@ func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volum
 		return rep, err
 	}
 
-	runID, err := beginRestoreRun(ctx, s, opts.DryRun, v.ID, dest.Name, effectiveShallow(dest, opts.Shallow))
+	runID, err := beginRestoreRun(ctx, s, opts.DryRun, v.ID, dest.Name, EffectiveShallow(dest, opts.Shallow))
 	if err != nil {
 		return rep, err
 	}
@@ -859,7 +876,7 @@ func buildRestoreArgs(vol *config.Volume, dest *config.Destination, runID int64,
 		args = append(args, "--filter", "- /"+RestoreHistoryDirName+"/**")
 		args = append(args, "--filter", "- /"+IndexDirName+"/**")
 	}
-	if !effectiveShallow(dest, opts.Shallow) {
+	if !EffectiveShallow(dest, opts.Shallow) {
 		args = append(args, "--checksum", "--hash", "blake3")
 	}
 	if opts.DryRun {
