@@ -93,11 +93,12 @@ func scanDestinationRunID(s rowScanner) (DestinationRunID, error) {
 // destination has verifiably landed every piece of content up to that
 // origin run — a failed or partial push leaves the prior value in place.
 //
-// The component is meant to advance monotonically. When originRunID is
-// below the recorded value the upsert is refused with a
-// *DestinationRewindError (wrapping ErrWatermarkRewind) unless
-// allowRewind is set — the opt-in for genuine recovery, mirroring
-// UpsertPeerSyncState.
+// The component is meant to advance monotonically: the upsert statement
+// itself only applies when originRunID is at or above the recorded value
+// (or allowRewind is set — the opt-in for genuine recovery, mirroring
+// UpsertPeerSyncState), so a racing writer cannot regress the vector. A
+// refused rewind surfaces as a *DestinationRewindError (wrapping
+// ErrWatermarkRewind).
 //
 // The upsert and an insert-only destination_run_ids_history row are
 // written in one transaction so the append-only advance log can never
@@ -112,21 +113,27 @@ func (s *Store) UpsertDestinationRunID(ctx context.Context, volumeID int64, dest
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if !allowRewind {
-		if err := guardDestinationMonotonicTx(ctx, tx, volumeID, destination, originNodeID, originRunID); err != nil {
-			return err
-		}
-	}
-
 	atNs := NowNs()
-	if _, err := tx.ExecContext(ctx, `
+	res, err := tx.ExecContext(ctx, `
 		INSERT INTO destination_run_ids (volume_id, destination, origin_node_id, origin_run_id, updated_at_ns)
 		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(volume_id, destination, origin_node_id) DO UPDATE SET
 			origin_run_id = excluded.origin_run_id,
 			updated_at_ns = excluded.updated_at_ns
-	`, volumeID, destination, originNodeID, originRunID, atNs); err != nil {
+		WHERE excluded.origin_run_id >= destination_run_ids.origin_run_id OR ?
+	`, volumeID, destination, originNodeID, originRunID, atNs, allowRewind)
+	if err != nil {
 		return fmt.Errorf("upsert destination_run_ids: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("upsert destination_run_ids rows: %w", err)
+	}
+	if n == 0 {
+		if err := guardDestinationMonotonicTx(ctx, tx, volumeID, destination, originNodeID, originRunID); err != nil {
+			return err
+		}
+		return fmt.Errorf("upsert destination_run_ids: conditional update applied no row for (%d, %q, %d)", volumeID, destination, originNodeID)
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO destination_run_ids_history
@@ -143,7 +150,8 @@ func (s *Store) UpsertDestinationRunID(ctx context.Context, volumeID int64, dest
 
 // guardDestinationMonotonicTx reads the current vector component inside
 // tx and returns a *DestinationRewindError when attempted is strictly
-// below it. No row imposes no floor.
+// below it. No row imposes no floor. Called after the conditional
+// upsert applied nothing, to turn the refusal into a precise error.
 func guardDestinationMonotonicTx(ctx context.Context, tx *sql.Tx, volumeID int64, destination string, originNodeID, attempted int64) error {
 	var current int64
 	err := tx.QueryRowContext(ctx,

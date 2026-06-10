@@ -424,28 +424,59 @@ func provColumns(p *Provenance) (sql.NullInt64, sql.NullInt64) {
 // inserting the row on first contact with this content. The insert
 // records sizeBytes and the supplied provenance as the content's origin;
 // a digest that already has a row keeps its stored size and origin (the
-// contents table is append-only and rows are immutable).
+// contents table is append-only and rows are immutable). A stored size
+// that disagrees with sizeBytes surfaces as an error.
 func getOrCreateContentTx(ctx context.Context, tx *sql.Tx, digest []byte, sizeBytes int64, prov *Provenance) (int64, error) {
-	var id int64
-	err := tx.QueryRowContext(ctx,
-		`SELECT id FROM contents WHERE blake3 = ?`, digest).Scan(&id)
+	id, err := lookupContentTx(ctx, tx, digest, sizeBytes)
 	if err == nil {
 		return id, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return 0, fmt.Errorf("lookup content: %w", err)
+		return 0, err
 	}
 	originNode, originRun := provColumns(prov)
 	res, err := tx.ExecContext(ctx,
 		`INSERT INTO contents (blake3, size_bytes, origin_node_id, origin_run_id)
-		 VALUES (?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(blake3) DO NOTHING`,
 		digest, sizeBytes, originNode, originRun)
 	if err != nil {
 		return 0, fmt.Errorf("insert content: %w", err)
 	}
-	id, err = res.LastInsertId()
+	n, err := res.RowsAffected()
 	if err != nil {
-		return 0, fmt.Errorf("content last insert id: %w", err)
+		return 0, fmt.Errorf("insert content rows: %w", err)
+	}
+	if n == 1 {
+		id, err = res.LastInsertId()
+		if err != nil {
+			return 0, fmt.Errorf("content last insert id: %w", err)
+		}
+		return id, nil
+	}
+	// The digest landed via a concurrent writer between lookup and insert.
+	id, err = lookupContentTx(ctx, tx, digest, sizeBytes)
+	if err != nil {
+		return 0, fmt.Errorf("re-lookup content after conflict: %w", err)
+	}
+	return id, nil
+}
+
+// lookupContentTx returns the contents row id for digest. A stored
+// size_bytes that disagrees with sizeBytes means index corruption or a
+// mis-hashing caller, so it surfaces loudly instead of returning the row.
+func lookupContentTx(ctx context.Context, tx *sql.Tx, digest []byte, sizeBytes int64) (int64, error) {
+	var id, storedSize int64
+	err := tx.QueryRowContext(ctx,
+		`SELECT id, size_bytes FROM contents WHERE blake3 = ?`, digest).Scan(&id, &storedSize)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+	if err != nil {
+		return 0, fmt.Errorf("lookup content: %w", err)
+	}
+	if storedSize != sizeBytes {
+		return 0, fmt.Errorf("content %x: stored size %d disagrees with observed size %d", digest, storedSize, sizeBytes)
 	}
 	return id, nil
 }

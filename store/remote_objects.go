@@ -63,9 +63,8 @@ func (s *Store) GetRemoteObject(ctx context.Context, contentID int64, destinatio
 
 // MarkRemoteObjectVerified stamps verified_at_ns after a verification
 // pass re-read the provider checksum and found it equal to the recorded
-// one. Returns an error when no fingerprint exists for the pair — a
-// verification against an unrecorded upload is a caller bug, not a
-// silent no-op.
+// one. Returns an error when no fingerprint exists for the pair —
+// verifying an unrecorded upload is a caller bug.
 func (s *Store) MarkRemoteObjectVerified(ctx context.Context, contentID int64, destination string, atNs int64) error {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE remote_objects SET verified_at_ns = ?
@@ -76,7 +75,7 @@ func (s *Store) MarkRemoteObjectVerified(ctx context.Context, contentID int64, d
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return err
+		return fmt.Errorf("mark remote object verified rows: %w", err)
 	}
 	if n == 0 {
 		return fmt.Errorf("mark remote object verified: no remote object for content %d on %q", contentID, destination)
