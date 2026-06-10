@@ -59,6 +59,23 @@ Supported destination types: `local`, `sftp`, `s3`, `b2`, `gcs`. Secrets accept 
 
 Squirrel writes its own `rclone.conf` next to the config (`~/.squirrel/rclone.conf`, mode 0600) on every sync invocation. You do not run `rclone config` and you should not edit `rclone.conf` by hand.
 
+### Encrypted destinations
+
+Any non-`local` destination can add a `crypt` block to encrypt file contents client-side before upload, via rclone's [crypt](https://rclone.org/crypt/) overlay:
+
+```toml
+[destinations.offsite.crypt]
+password  = { env = "OFFSITE_CRYPT_PASSWORD" }
+password2 = { env = "OFFSITE_CRYPT_SALT" }    # salt — optional but recommended
+```
+
+`password` and `password2` are **rclone-obscured** values, the same representation `rclone config` stores for its own crypt remotes — generate one with `rclone obscure <plaintext>`. Both accept a literal or `{ env = "VAR" }`. Squirrel renders two sections into its `rclone.conf` — the underlying remote plus a crypt remote wrapping it — and addresses all sync and restore transfers through the crypt remote. Keep the passwords safe: restoring from an encrypted destination requires them.
+
+Two properties to be aware of:
+
+- **Contents only.** File and directory names are stored in clear at the destination (`filename_encryption = off`, fixed by design) — the tree stays browsable and keeps the same layout as an unencrypted destination. If the names themselves are sensitive, this overlay does not hide them.
+- **Verification falls back to size+mtime.** rclone crypt remotes cannot expose content hashes, so the end-to-end BLAKE3 check (`--checksum --hash blake3`) cannot pass through the overlay. Transfers to and from an encrypted destination compare by size+mtime instead — the same comparison `--shallow` uses — and say so in the run output; the runs row records the transfer as shallow. Deeper verification of encrypted destinations is planned via provider-side ciphertext fingerprints.
+
 ### Hooks
 
 A volume can declare a per-volume **hook** — a command the agent runs to nudge an external tool when the volume's content changes. squirrel stays tool-agnostic: it never learns what the command does (a backup with kopia/restic, an `rclone copy`, a shell script — all the same to squirrel). It exec's the command **without a shell**, passes context through environment variables, and records only the generic outcome (exit code, timestamps).
@@ -126,7 +143,7 @@ squirrel sync pictures --to nas     # just one
 squirrel sync                       # every (volume, destination) pair in config
 ```
 
-Sync verifies each uploaded file's BLAKE3 against the destination (using rclone's `--checksum --hash blake3`). Mismatches abort that file before the runs row is marked success. Use `--shallow` to fall back to rclone's default size+mtime comparison if you want speed over integrity for a big initial push.
+Sync verifies each uploaded file's BLAKE3 against the destination (using rclone's `--checksum --hash blake3`). Mismatches abort that file before the runs row is marked success. Use `--shallow` to fall back to rclone's default size+mtime comparison if you want speed over integrity for a big initial push. Encrypted (`crypt`) destinations always use the size+mtime comparison (see [Encrypted destinations](#encrypted-destinations)).
 
 Look up a file by its BLAKE3 hex hash:
 
