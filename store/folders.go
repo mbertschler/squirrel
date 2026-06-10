@@ -19,7 +19,7 @@ const folderHashContext = "squirrel-folder-v1"
 
 // folderHashKey is the 32-byte key seeded once at package init. blake3 keyed
 // hashing with this key produces digests that cannot collide with raw
-// file-content BLAKE3 digests stored on files.blake3, even if the
+// file-content BLAKE3 digests stored on contents.blake3, even if the
 // observable bytes coincide.
 var folderHashKey [32]byte
 
@@ -398,9 +398,10 @@ func recomputeFolderAndAncestors(ctx context.Context, tx *sql.Tx, folderID int64
 // value, never NULL — and zero aggregates.
 func computeShallowAndDirectAggregatesTx(ctx context.Context, tx *sql.Tx, folderID int64) ([]byte, int64, int64, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT name, blake3, size_bytes FROM files
-		 WHERE folder_id = ? AND status = 'present'
-		 ORDER BY name`,
+		`SELECT f.name, c.blake3, c.size_bytes
+		 FROM files f JOIN contents c ON c.id = f.content_id
+		 WHERE f.folder_id = ? AND f.status = 'present'
+		 ORDER BY f.name`,
 		folderID)
 	if err != nil {
 		return nil, 0, 0, fmt.Errorf("read folder %d files: %w", folderID, err)

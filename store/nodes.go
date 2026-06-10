@@ -35,7 +35,7 @@ func (s *Store) GetSelfNode(ctx context.Context) (Node, error) {
 }
 
 // GetNodeByID returns the node row with the given id, or
-// sql.ErrNoRows. The id is the surrogate key used by `files.source_node_id`
+// sql.ErrNoRows. The id is the surrogate key used by `contents.origin_node_id`
 // and `runs.peer_node_id`.
 func (s *Store) GetNodeByID(ctx context.Context, id int64) (Node, error) {
 	var n Node

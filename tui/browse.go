@@ -239,11 +239,11 @@ func (m *browseModel) renderFileDetail(f store.FileRow) string {
 		{"First seen", fmt.Sprintf("run #%d", f.FirstSeenRunID)},
 		{"Last seen", fmt.Sprintf("run #%d", f.LastSeenRunID)},
 	}
-	if f.SourceRunID.Valid {
-		lines = append(lines, [2]string{"Source run", fmt.Sprintf("#%d", f.SourceRunID.Int64)})
+	if f.OriginRunID.Valid {
+		lines = append(lines, [2]string{"Origin run", fmt.Sprintf("#%d", f.OriginRunID.Int64)})
 	}
-	if f.SourceNodeID.Valid {
-		lines = append(lines, [2]string{"Source node", fmt.Sprintf("#%d", f.SourceNodeID.Int64)})
+	if f.OriginNodeID.Valid {
+		lines = append(lines, [2]string{"Origin node", fmt.Sprintf("#%d", f.OriginNodeID.Int64)})
 	}
 	var b strings.Builder
 	b.WriteString(styleHeader.Render(path.Base(f.Path)))

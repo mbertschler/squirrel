@@ -11,15 +11,20 @@ import (
 // Run kinds. The runs.volume_id column is nullable so a future sync run can
 // span volumes; index runs are always scoped to a single volume. Sync and
 // restore runs additionally carry a non-empty runs.destination naming the
-// rclone destination; index and audit runs leave destination NULL. Audit
-// runs share the index run-kind's shape — they walk a volume root and
-// reconcile the index with on-disk reality — but are tagged separately so
-// out-of-band drift detections don't dilute the index-run history.
+// rclone destination; index, audit, and offload runs leave destination
+// NULL. Audit runs share the index run-kind's shape — they walk a volume
+// root and reconcile the index with on-disk reality — but are tagged
+// separately so out-of-band drift detections don't dilute the index-run
+// history. Offload runs record the local "remove on-disk bytes whose
+// content is durable on the required destinations" operation; the files
+// rows they touch flip 'present' → 'offloaded' with last_seen_run_id set
+// to the offload run.
 const (
 	RunKindIndex   = "index"
 	RunKindSync    = "sync"
 	RunKindRestore = "restore"
 	RunKindAudit   = "audit"
+	RunKindOffload = "offload"
 )
 
 // Run statuses. A run begins in 'running' and is moved to a terminal state by

@@ -42,13 +42,14 @@ const DispositionSupersede = "supersede"
 
 // DispositionConflict — receiver has a live row at this path with a
 // different blake3 that is not traceable to this initiator's prior
-// writes (local write on the receiver, or sourced from a different
-// peer post-watermark). The receiver pre-moves the prior bytes to
-// `.squirrel-conflicts/run-<id>/<path>` and seeds a new `present` row
-// at that path carrying the prior blake3 + prior provenance, so both
-// versions remain reachable by hash and by path. The initiator wins
-// live: rclone delivers its bytes to the original path and /close
-// inserts a new `present` row there with `source_node_id = initiator`.
+// writes (content introduced locally on the receiver, or originating
+// at a different peer post-watermark). The receiver pre-moves the
+// prior bytes to `.squirrel-conflicts/run-<id>/<path>` and seeds a new
+// `present` row at that path carrying the prior blake3 + prior
+// provenance, so both versions remain reachable by hash and by path.
+// The initiator wins live: rclone delivers its bytes to the original
+// path and /close inserts a new `present` row there whose content
+// origin records the initiator.
 const DispositionConflict = "conflict"
 
 // DispositionCopyFromExisting — receiver has no live row at this path
@@ -57,9 +58,9 @@ const DispositionConflict = "conflict"
 // network, the receiver materialises the new path locally by copying
 // from `CopyFromPath` (an independent inode — not a hardlink). The
 // initiator excludes the path from the rclone scope but still verifies
-// the post-copy hash and writes a `present` row on /close, with
-// `source_node_id = initiator` (the path is logically initiator-owned
-// from the receiver's view, identical to a successful Transfer).
+// the post-copy hash and writes a `present` row on /close attributed
+// to the initiator (the path is logically initiator-owned from the
+// receiver's view, identical to a successful Transfer).
 const DispositionCopyFromExisting = "copy-from-existing"
 
 // DedupStrategyCopy enables receiver-side local dedup: when a /plan

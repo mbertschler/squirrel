@@ -109,14 +109,14 @@ func TestCLIDBRestoreRejectsSchemaMismatch(t *testing.T) {
 
 // TestCLIDBSchemaPrintsDDL confirms `squirrel db schema` dumps the
 // opened database's DDL, including the invariants the schema enforces:
-// the foundational volumes table, the blake3-immutability trigger, and
-// the one-live-row-per-path partial unique index.
+// the foundational volumes table, the content entity table, and the
+// one-live-row-per-path partial unique index.
 func TestCLIDBSchemaPrintsDDL(t *testing.T) {
 	f := writeSyncFixture(t)
 	out := runCLI(t, "--config", f.configPath, "db", "schema")
 	for _, want := range []string{
 		"CREATE TABLE volumes",
-		"CREATE TRIGGER files_blake3_immutable",
+		"CREATE TABLE contents",
 		"uniq_files_live_per_path",
 	} {
 		if !strings.Contains(out, want) {

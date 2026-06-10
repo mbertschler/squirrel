@@ -21,15 +21,16 @@ type PeerSyncState struct {
 	LastSyncedAtNs  int64
 }
 
-// ErrWatermarkRewind is returned by UpsertPeerSyncState when the
-// supplied last_shared_run_id is below the watermark already recorded
-// for the (volume, peer) pair and allowRewind was not set. The watermark
-// is meant to advance monotonically — a backwards move usually signals a
-// misordered close or a hostile peer claiming a run id we never agreed
-// to, and silently accepting it would re-anchor drift detection against
-// the bad value (SAFETY-AUDIT H6). Genuine recovery passes allowRewind
-// to override. Matchable via errors.Is.
-var ErrWatermarkRewind = errors.New("peer-sync watermark would move backwards")
+// ErrWatermarkRewind is the shared sentinel for a refused backwards
+// watermark move, returned (wrapped) by UpsertPeerSyncState and
+// UpsertDestinationRunID when the supplied value is below the one
+// already recorded and allowRewind was not set. Watermarks are meant to
+// advance monotonically — a backwards move usually signals a misordered
+// close or a hostile peer claiming a run id we never agreed to, and
+// silently accepting it would re-anchor drift detection against the bad
+// value (SAFETY-AUDIT H6). Genuine recovery passes allowRewind to
+// override. Matchable via errors.Is.
+var ErrWatermarkRewind = errors.New("watermark would move backwards")
 
 // WatermarkRewindError carries the rejected and current watermarks
 // alongside ErrWatermarkRewind so a caller (or CLI) can report exactly

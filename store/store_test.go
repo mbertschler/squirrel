@@ -904,16 +904,21 @@ func TestMigrateV3ToV4(t *testing.T) {
 		t.Fatalf("schema_version = %d, want %d", v, SchemaVersion)
 	}
 
-	// PK now includes blake3 — confirm by inserting a second row at the
-	// same (folder, name) but different blake3, which would have collided
-	// pre-v4. v8 keys files off (folder_id, name) but the same widening
-	// invariant applies.
+	// PK now includes the content identity — confirm by inserting a second
+	// row at the same (folder, name) with different content, which would
+	// have collided pre-v4. v14 keys files off (folder_id, name,
+	// content_id) but the same widening invariant applies.
 	d2 := digest(0x66)
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO contents (blake3, size_bytes) VALUES (?, 1024)`, d2); err != nil {
+		t.Fatalf("insert second content: %v", err)
+	}
 	if _, err := s.db.ExecContext(ctx, `
-		INSERT INTO files (folder_id, name, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
-		VALUES ((SELECT id FROM folders WHERE volume_id = 1 AND path = ''), 'photo.jpg', ?, 1024, 60, 'superseded', 1, 1, 60)
+		INSERT INTO files (folder_id, name, content_id, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
+		VALUES ((SELECT id FROM folders WHERE volume_id = 1 AND path = ''), 'photo.jpg',
+		        (SELECT id FROM contents WHERE blake3 = ?), 60, 'superseded', 1, 1, 60)
 	`, d2); err != nil {
-		t.Fatalf("insert second blake3 at same path failed (PK not widened?): %v", err)
+		t.Fatalf("insert second content at same path failed (PK not widened?): %v", err)
 	}
 
 	// Status CHECK should accept 'superseded'.
@@ -1040,11 +1045,12 @@ func TestUpsertRevertContent(t *testing.T) {
 	}
 }
 
-// TestTriggerRejectsBlake3Update guards the schema-level "blake3 is
-// immutable" rule. The trigger must reject any UPDATE that mentions blake3
-// in its SET clause, even if invoked outside of Upsert (e.g. via raw SQL in
-// some future code path).
-func TestTriggerRejectsBlake3Update(t *testing.T) {
+// TestContentsRowSharedAcrossPaths pins the id↔hash construction the v14
+// split rests on: every path observing the same bytes resolves to the
+// same contents row, and the UNIQUE constraint on contents.blake3 rejects
+// a second row for the same digest, so a content id can never silently
+// change which hash it stands for.
+func TestContentsRowSharedAcrossPaths(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "test.db")
 	s, err := Open(dsn)
 	if err != nil {
@@ -1055,33 +1061,42 @@ func TestTriggerRejectsBlake3Update(t *testing.T) {
 
 	vID := makeVolume(t, s, "/v")
 	run := makeRun(t, s, vID)
-	if err := s.Upsert(ctx, FileRow{
-		VolumeID: vID, Path: "x", Blake3: digest(0xaa), SizeBytes: 1, MtimeNs: 1,
-		Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1,
-	}, nil); err != nil {
-		t.Fatalf("Upsert: %v", err)
+	d := digest(0xaa)
+	for _, p := range []string{"x", "sub/y"} {
+		if err := s.Upsert(ctx, FileRow{
+			VolumeID: vID, Path: p, Blake3: d, SizeBytes: 1, MtimeNs: 1,
+			Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1,
+		}, nil); err != nil {
+			t.Fatalf("Upsert %s: %v", p, err)
+		}
 	}
 
-	// Direct UPDATE bypassing the Upsert state machine — the trigger must
-	// abort it.
-	_, err = s.db.ExecContext(ctx,
-		`UPDATE files SET blake3 = ?
-		 WHERE folder_id = (SELECT id FROM folders WHERE volume_id = ? AND path = '') AND name = ?`,
-		digest(0xbb), vID, "x")
-	if err == nil {
-		t.Fatalf("direct UPDATE of blake3 succeeded; trigger did not fire")
-	}
-	if !strings.Contains(err.Error(), "blake3 is immutable") {
-		t.Fatalf("got error %q, want one mentioning blake3 immutability", err)
-	}
-
-	// Untouched: the original row still has its original hash.
-	row, err := s.GetByPath(ctx, vID, "x")
+	rowX, err := s.GetByPath(ctx, vID, "x")
 	if err != nil {
-		t.Fatalf("GetByPath: %v", err)
+		t.Fatalf("GetByPath x: %v", err)
 	}
-	if !bytes.Equal(row.Blake3, digest(0xaa)) {
-		t.Fatalf("blake3 = %x, want %x (trigger should have aborted the UPDATE)", row.Blake3, digest(0xaa))
+	rowY, err := s.GetByPath(ctx, vID, "sub/y")
+	if err != nil {
+		t.Fatalf("GetByPath sub/y: %v", err)
+	}
+	if rowX.ContentID == 0 || rowX.ContentID != rowY.ContentID {
+		t.Fatalf("content ids = (%d, %d), want one shared non-zero id", rowX.ContentID, rowY.ContentID)
+	}
+
+	var n int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM contents`).Scan(&n); err != nil {
+		t.Fatalf("count contents: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("contents rows = %d, want 1 (one row per distinct hash)", n)
+	}
+
+	_, err = s.db.ExecContext(ctx, `INSERT INTO contents (blake3, size_bytes) VALUES (?, 1)`, d)
+	if err == nil {
+		t.Fatalf("second contents row for the same blake3 succeeded; UNIQUE did not fire")
+	}
+	if !strings.Contains(err.Error(), "UNIQUE") {
+		t.Fatalf("got error %q, want one mentioning UNIQUE constraint", err)
 	}
 }
 
@@ -1115,10 +1130,20 @@ func TestUniqueIndexRejectsSecondLiveRow(t *testing.T) {
 		`SELECT id FROM folders WHERE volume_id = ? AND path = ''`, vID).Scan(&rootFolderID); err != nil {
 		t.Fatalf("lookup root folder: %v", err)
 	}
+	insertContent := func(d []byte) int64 {
+		t.Helper()
+		res, err := s.db.ExecContext(ctx,
+			`INSERT INTO contents (blake3, size_bytes) VALUES (?, 1)`, d)
+		if err != nil {
+			t.Fatalf("insert content: %v", err)
+		}
+		id, _ := res.LastInsertId()
+		return id
+	}
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO files (folder_id, name, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
-		VALUES (?, ?, ?, ?, ?, 'present', ?, ?, ?)
-	`, rootFolderID, "x", digest(0xbb), 1, 2, run, run, 2)
+		INSERT INTO files (folder_id, name, content_id, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
+		VALUES (?, ?, ?, ?, 'present', ?, ?, ?)
+	`, rootFolderID, "x", insertContent(digest(0xbb)), 2, run, run, 2)
 	if err == nil {
 		t.Fatalf("direct INSERT of second live row succeeded; unique index did not fire")
 	}
@@ -1130,17 +1155,18 @@ func TestUniqueIndexRejectsSecondLiveRow(t *testing.T) {
 	// superseded rows are exempt from the partial unique constraint, so the
 	// schema supports unbounded historical depth per path.
 	if _, err := s.db.ExecContext(ctx, `
-		INSERT INTO files (folder_id, name, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
-		VALUES (?, ?, ?, ?, ?, 'superseded', ?, ?, ?)
-	`, rootFolderID, "x", digest(0xcc), 1, 3, run, run, 3); err != nil {
+		INSERT INTO files (folder_id, name, content_id, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
+		VALUES (?, ?, ?, ?, 'superseded', ?, ?, ?)
+	`, rootFolderID, "x", insertContent(digest(0xcc)), 3, run, run, 3); err != nil {
 		t.Fatalf("inserting superseded row should be allowed, got: %v", err)
 	}
 }
 
-// TestMigrateV3ToV4InstallsSchemaGuards verifies that a v3 database upgraded
-// to v4 ends up with the trigger and the partial unique index, not just the
-// widened PK and the superseded status. Without these, the migration would
-// leave existing databases lacking the enforcement that fresh installs get.
+// TestMigrateV3ToV4InstallsSchemaGuards verifies that a v3 database
+// migrated through the full chain ends up with the same enforcement a
+// fresh install gets: the partial unique index keeps one live row per
+// path, and the seeded content survives the v14 split with its hash
+// resolvable through contents.
 func TestMigrateV3ToV4InstallsSchemaGuards(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "test.db")
 	rawDB, err := sql.Open("sqlite", dsn)
@@ -1171,20 +1197,25 @@ func TestMigrateV3ToV4InstallsSchemaGuards(t *testing.T) {
 	defer s.Close()
 	ctx := context.Background()
 
-	// Trigger must reject blake3 updates on the migrated DB.
-	_, err = s.db.ExecContext(ctx,
-		`UPDATE files SET blake3 = ?
-		 WHERE folder_id = (SELECT id FROM folders WHERE volume_id = 1 AND path = '') AND name = 'x'`,
-		digest(0xbb))
-	if err == nil || !strings.Contains(err.Error(), "blake3 is immutable") {
-		t.Fatalf("trigger missing after migration; err = %v", err)
+	// The seeded row's hash resolves through the v14 contents table.
+	row, err := s.GetByPath(ctx, 1, "x")
+	if err != nil {
+		t.Fatalf("GetByPath after migration: %v", err)
+	}
+	if !bytes.Equal(row.Blake3, digest(0xaa)) {
+		t.Fatalf("migrated row blake3 = %x, want %x", row.Blake3, digest(0xaa))
 	}
 
 	// Partial UNIQUE index must reject a second live row at the same
 	// (folder, name).
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO contents (blake3, size_bytes) VALUES (?, 1)`, digest(0xcc)); err != nil {
+		t.Fatalf("insert content: %v", err)
+	}
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO files (folder_id, name, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
-		VALUES ((SELECT id FROM folders WHERE volume_id = 1 AND path = ''), 'x', ?, 1, 2, 'present', 1, 1, 2)
+		INSERT INTO files (folder_id, name, content_id, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
+		VALUES ((SELECT id FROM folders WHERE volume_id = 1 AND path = ''), 'x',
+		        (SELECT id FROM contents WHERE blake3 = ?), 2, 'present', 1, 1, 2)
 	`, digest(0xcc))
 	if err == nil || !strings.Contains(err.Error(), "UNIQUE") {
 		t.Fatalf("unique index missing after migration; err = %v", err)
@@ -1853,9 +1884,9 @@ func TestMigrateV5ToV6(t *testing.T) {
 	if !bytes.Equal(row.Blake3, d) || row.SizeBytes != 10 || row.Status != StatusPresent {
 		t.Fatalf("file row mangled by migration: %+v", row)
 	}
-	if row.SourceNodeID.Valid || row.SourceRunID.Valid {
+	if row.OriginNodeID.Valid || row.OriginRunID.Valid {
 		t.Fatalf("migrated row has non-NULL provenance %+v / %+v, want NULL",
-			row.SourceNodeID, row.SourceRunID)
+			row.OriginNodeID, row.OriginRunID)
 	}
 
 	var peerNode, correlated sql.NullInt64
@@ -1890,11 +1921,11 @@ func TestMigrateV5ToV6(t *testing.T) {
 	}
 }
 
-// TestUpsertWithProvenance verifies that a non-nil *Provenance lands the
-// source_node_id and source_run_id columns on the inserted row, that a
-// subsequent provenance-aware overwrite supersedes the prior row, and
-// that the supersede flow itself is unchanged (the prior row's
-// provenance survives on the historical record).
+// TestUpsertWithProvenance verifies that a non-nil *Provenance lands as
+// the new content's (origin_node_id, origin_run_id), that a subsequent
+// local overwrite supersedes the prior row, and that the supersede flow
+// itself is unchanged (the prior content's origin survives on the
+// historical record).
 func TestUpsertWithProvenance(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "test.db")
 	s, err := OpenWithOptions(dsn, OpenOptions{NodeName: "local"})
@@ -1927,11 +1958,11 @@ func TestUpsertWithProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetByPath: %v", err)
 	}
-	if !live.SourceNodeID.Valid || live.SourceNodeID.Int64 != peerID {
-		t.Fatalf("SourceNodeID = %+v, want %d", live.SourceNodeID, peerID)
+	if !live.OriginNodeID.Valid || live.OriginNodeID.Int64 != peerID {
+		t.Fatalf("OriginNodeID = %+v, want %d", live.OriginNodeID, peerID)
 	}
-	if !live.SourceRunID.Valid || live.SourceRunID.Int64 != run1 {
-		t.Fatalf("SourceRunID = %+v, want %d", live.SourceRunID, run1)
+	if !live.OriginRunID.Valid || live.OriginRunID.Int64 != run1 {
+		t.Fatalf("OriginRunID = %+v, want %d", live.OriginRunID, run1)
 	}
 
 	// New content + nil provenance — supersede the peer-sourced row with a
@@ -1955,22 +1986,24 @@ func TestUpsertWithProvenance(t *testing.T) {
 	if old.Status != StatusSuperseded || !bytes.Equal(old.Blake3, digest(0xaa)) {
 		t.Fatalf("old row = %+v, want hashA superseded", old)
 	}
-	if !old.SourceNodeID.Valid || old.SourceNodeID.Int64 != peerID {
-		t.Fatalf("superseded row lost provenance: %+v", old.SourceNodeID)
+	if !old.OriginNodeID.Valid || old.OriginNodeID.Int64 != peerID {
+		t.Fatalf("superseded row lost provenance: %+v", old.OriginNodeID)
 	}
 	if newRow.Status != StatusPresent || !bytes.Equal(newRow.Blake3, digest(0xbb)) {
 		t.Fatalf("new row = %+v, want hashB present", newRow)
 	}
-	if newRow.SourceNodeID.Valid || newRow.SourceRunID.Valid {
+	if newRow.OriginNodeID.Valid || newRow.OriginRunID.Valid {
 		t.Fatalf("local-write row has non-NULL provenance: %+v / %+v",
-			newRow.SourceNodeID, newRow.SourceRunID)
+			newRow.OriginNodeID, newRow.OriginRunID)
 	}
 }
 
-// TestUpsertProvenanceFKRejected guards the FK enforcement on both new
-// provenance columns: pointing at a node or run id that does not exist
-// must fail rather than silently land a dangling reference.
-func TestUpsertProvenanceFKRejected(t *testing.T) {
+// TestUpsertProvenanceFK pins the FK shape of the contents origin
+// columns: origin_node_id is a real FK (a bogus node id must fail
+// rather than land a dangling reference), while origin_run_id is in the
+// origin node's run space and deliberately not FK-bound to local runs —
+// a run id with no local row must be accepted.
+func TestUpsertProvenanceFK(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "test.db")
 	s, err := Open(dsn)
 	if err != nil {
@@ -1988,26 +2021,24 @@ func TestUpsertProvenanceFKRejected(t *testing.T) {
 	}
 	peerID, _ := res.LastInsertId()
 
-	cases := []struct {
-		name string
-		prov *Provenance
-	}{
-		{"bogus node id", &Provenance{NodeID: 99999, RunID: run}},
-		{"bogus run id", &Provenance{NodeID: peerID, RunID: 99999}},
+	mkRow := func(path string, hash byte) FileRow {
+		return FileRow{
+			VolumeID: vID, Path: path, Blake3: digest(hash), SizeBytes: 1, MtimeNs: 1,
+			Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1,
+		}
 	}
-	for i, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			err := s.Upsert(ctx, FileRow{
-				// Distinct paths per case so a prior failure can't shadow a
-				// later one through the live-row state machine.
-				VolumeID: vID, Path: fmt.Sprintf("x-%d", i), Blake3: digest(byte(0x10 + i)),
-				SizeBytes: 1, MtimeNs: 1,
-				Status: StatusPresent, FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1,
-			}, c.prov)
-			if err == nil {
-				t.Fatalf("Upsert with %s succeeded; FK not enforced", c.name)
-			}
-		})
+	if err := s.Upsert(ctx, mkRow("x-node", 0x10), &Provenance{NodeID: 99999, RunID: run}); err == nil {
+		t.Fatalf("Upsert with bogus node id succeeded; FK not enforced")
+	}
+	if err := s.Upsert(ctx, mkRow("x-run", 0x11), &Provenance{NodeID: peerID, RunID: 99999}); err != nil {
+		t.Fatalf("Upsert with foreign-space run id rejected: %v (origin_run_id must not be a local FK)", err)
+	}
+	row, err := s.GetByPath(ctx, vID, "x-run")
+	if err != nil {
+		t.Fatalf("GetByPath: %v", err)
+	}
+	if !row.OriginRunID.Valid || row.OriginRunID.Int64 != 99999 {
+		t.Fatalf("OriginRunID = %+v, want 99999", row.OriginRunID)
 	}
 }
 
@@ -2043,11 +2074,10 @@ func TestPeerSyncStateAcceptsForeignRunID(t *testing.T) {
 	}
 }
 
-// TestPartialIndexOnSourceNodeExistsV6 verifies the schema-introspection
-// expectation called out in the PR description: the partial index on
-// files(source_node_id) WHERE status='present' exists on v6 (and is
-// absent on a v5 fixture that hasn't been migrated yet).
-func TestPartialIndexOnSourceNodeExistsV6(t *testing.T) {
+// TestPartialIndexOnOriginNodeExists verifies the partial index backing
+// ListPresentByOrigin: contents(origin_node_id) WHERE origin_node_id IS
+// NOT NULL, excluding the locally-introduced majority.
+func TestPartialIndexOnOriginNodeExists(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "test.db")
 	s, err := Open(dsn)
 	if err != nil {
@@ -2058,13 +2088,13 @@ func TestPartialIndexOnSourceNodeExistsV6(t *testing.T) {
 
 	var ddl string
 	err = s.db.QueryRowContext(ctx,
-		`SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_files_source_node'`).Scan(&ddl)
+		`SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_contents_origin_node'`).Scan(&ddl)
 	if err != nil {
 		t.Fatalf("look up partial index: %v", err)
 	}
-	for _, want := range []string{"source_node_id", "status = 'present'", "source_node_id IS NOT NULL"} {
+	for _, want := range []string{"origin_node_id", "origin_node_id IS NOT NULL"} {
 		if !strings.Contains(ddl, want) {
-			t.Fatalf("idx_files_source_node SQL = %q, missing %q (partial index must exclude local-write NULLs)", ddl, want)
+			t.Fatalf("idx_contents_origin_node SQL = %q, missing %q (partial index must exclude local-origin NULLs)", ddl, want)
 		}
 	}
 }
@@ -2327,11 +2357,11 @@ func TestFileRowScanInsertRoundTrip(t *testing.T) {
 		FirstSeenRunID: runID,
 		LastSeenRunID:  runID,
 		IndexedAtNs:    1_700_000_500_000_000_000,
-		SourceNodeID:   sql.NullInt64{Int64: peerNodeID, Valid: true},
-		SourceRunID:    sql.NullInt64{Int64: runID, Valid: true},
+		OriginNodeID:   sql.NullInt64{Int64: peerNodeID, Valid: true},
+		OriginRunID:    sql.NullInt64{Int64: runID, Valid: true},
 	}
 
-	if err := s.Upsert(ctx, want, &Provenance{NodeID: want.SourceNodeID.Int64, RunID: want.SourceRunID.Int64}); err != nil {
+	if err := s.Upsert(ctx, want, &Provenance{NodeID: want.OriginNodeID.Int64, RunID: want.OriginRunID.Int64}); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
 
@@ -2346,7 +2376,7 @@ func TestFileRowScanInsertRoundTrip(t *testing.T) {
 		got.Status != want.Status ||
 		got.FirstSeenRunID != want.FirstSeenRunID || got.LastSeenRunID != want.LastSeenRunID ||
 		got.IndexedAtNs != want.IndexedAtNs ||
-		got.SourceNodeID != want.SourceNodeID || got.SourceRunID != want.SourceRunID {
+		got.OriginNodeID != want.OriginNodeID || got.OriginRunID != want.OriginRunID {
 		t.Fatalf("round-trip mismatch:\n got=%+v\nwant=%+v", got, want)
 	}
 }
@@ -2491,11 +2521,11 @@ func TestCountFilesFirstSeenByRunWithPathPrefix(t *testing.T) {
 	}
 }
 
-// TestListPresentBySource pins the two filter modes: valid nodeID
+// TestListPresentByOrigin pins the two filter modes: valid nodeID
 // returns rows attributed to that peer, NULL nodeID returns rows
 // without provenance (local writes). Superseded and missing rows
 // must be excluded under either mode.
-func TestListPresentBySource(t *testing.T) {
+func TestListPresentByOrigin(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "test.db")
 	s, err := OpenWithOptions(dsn, OpenOptions{NodeName: "self"})
 	if err != nil {
@@ -2533,7 +2563,7 @@ func TestListPresentBySource(t *testing.T) {
 
 	collect := func(nodeID sql.NullInt64) []string {
 		var got []string
-		for row, err := range s.ListPresentBySource(ctx, vID, nodeID) {
+		for row, err := range s.ListPresentByOrigin(ctx, vID, nodeID) {
 			if err != nil {
 				t.Fatalf("iter: %v", err)
 			}
@@ -2559,11 +2589,11 @@ func TestListPresentBySource(t *testing.T) {
 	}
 }
 
-// TestListPresentBySourceEarlyBreakClosesRows confirms the iter.Seq2
+// TestListPresentByOriginEarlyBreakClosesRows confirms the iter.Seq2
 // implementation closes its underlying rows when the consumer breaks
 // early. Without this guarantee a long-running CLI could leak a
 // statement handle whenever the user pages results.
-func TestListPresentBySourceEarlyBreakClosesRows(t *testing.T) {
+func TestListPresentByOriginEarlyBreakClosesRows(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "test.db")
 	s, err := OpenWithOptions(dsn, OpenOptions{NodeName: "self"})
 	if err != nil {
@@ -2585,7 +2615,7 @@ func TestListPresentBySourceEarlyBreakClosesRows(t *testing.T) {
 	}
 
 	var seen int
-	for _, err := range s.ListPresentBySource(ctx, vID, sql.NullInt64{Int64: peer.ID, Valid: true}) {
+	for _, err := range s.ListPresentByOrigin(ctx, vID, sql.NullInt64{Int64: peer.ID, Valid: true}) {
 		if err != nil {
 			t.Fatalf("iter: %v", err)
 		}
@@ -2601,7 +2631,7 @@ func TestListPresentBySourceEarlyBreakClosesRows(t *testing.T) {
 	// rows handle (the store pins MaxOpenConns=1, so a leak would block
 	// the next QueryContext indefinitely — guard with a separate scan).
 	again := 0
-	for _, err := range s.ListPresentBySource(ctx, vID, sql.NullInt64{Int64: peer.ID, Valid: true}) {
+	for _, err := range s.ListPresentByOrigin(ctx, vID, sql.NullInt64{Int64: peer.ID, Valid: true}) {
 		if err != nil {
 			t.Fatalf("second iter: %v", err)
 		}
@@ -3548,5 +3578,304 @@ func TestMigratePreMigrationBackup(t *testing.T) {
 	}
 	if !strings.HasPrefix(entries[0].Name(), "pre-migration-v5-to-v") {
 		t.Fatalf("backup name = %q, want pre-migration-v5-to-v*", entries[0].Name())
+	}
+}
+
+// v13Fixture returns the DDL + seed for a fully populated v13 database
+// — the last schema before the contents split. The seed exercises every
+// backfill rule of migrateV13ToV14:
+//
+//   - hash X lives at two paths; the earliest observation (a.txt,
+//     first_seen_run_id=1, local write) donates the contents row's size
+//     and NULL origin even though the later sub/b.txt observation
+//     carries peer attribution.
+//   - hash Y is peer-sourced (node 2, run 2) and live at c.txt.
+//   - hash Z is c.txt's superseded predecessor.
+//   - hash W is a missing row.
+func v13Fixture() []string {
+	return []string{
+		`CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)`,
+		`CREATE TABLE volumes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL)`,
+		`CREATE TABLE nodes (
+			id                     INTEGER PRIMARY KEY,
+			name                   TEXT NOT NULL UNIQUE,
+			endpoint               TEXT,
+			public_key_fingerprint TEXT
+		)`,
+		`CREATE TABLE runs (
+			id            INTEGER PRIMARY KEY,
+			kind          TEXT NOT NULL CHECK (kind IN ('index','sync','restore','audit')),
+			volume_id     INTEGER REFERENCES volumes(id),
+			destination   TEXT,
+			started_at_ns INTEGER NOT NULL,
+			ended_at_ns   INTEGER,
+			status        TEXT NOT NULL CHECK (status IN ('running','success','failed','partial')),
+			error         TEXT,
+			file_count    INTEGER NOT NULL DEFAULT 0,
+			peer_node_id      INTEGER REFERENCES nodes(id),
+			correlated_run_id INTEGER,
+			shallow INTEGER CHECK (shallow IS NULL OR shallow IN (0, 1)),
+			CHECK (
+				(kind IN ('index','audit') AND destination IS NULL) OR
+				(kind IN ('sync','restore') AND destination IS NOT NULL AND destination != '')
+			)
+		)`,
+		`CREATE TABLE folders (
+			id                  INTEGER PRIMARY KEY,
+			volume_id           INTEGER NOT NULL REFERENCES volumes(id),
+			parent_id           INTEGER REFERENCES folders(id),
+			path                TEXT NOT NULL,
+			shallow_blake3      BLOB CHECK (shallow_blake3 IS NULL OR length(shallow_blake3) = 32),
+			deep_blake3         BLOB CHECK (deep_blake3    IS NULL OR length(deep_blake3)    = 32),
+			last_changed_run_id INTEGER REFERENCES runs(id),
+			file_count      INTEGER NOT NULL DEFAULT 0,
+			cumulative_size INTEGER NOT NULL DEFAULT 0,
+			UNIQUE (volume_id, path)
+		)`,
+		`CREATE TABLE files (
+			folder_id         INTEGER NOT NULL REFERENCES folders(id),
+			name              TEXT NOT NULL,
+			blake3            BLOB NOT NULL CHECK (length(blake3) = 32),
+			size_bytes        INTEGER NOT NULL,
+			mtime_ns          INTEGER NOT NULL,
+			status            TEXT NOT NULL CHECK (status IN ('present','missing','superseded')),
+			first_seen_run_id INTEGER NOT NULL REFERENCES runs(id),
+			last_seen_run_id  INTEGER NOT NULL REFERENCES runs(id),
+			indexed_at_ns     INTEGER NOT NULL,
+			source_node_id    INTEGER REFERENCES nodes(id),
+			source_run_id     INTEGER REFERENCES runs(id),
+			PRIMARY KEY (folder_id, name, blake3)
+		)`,
+		`CREATE UNIQUE INDEX uniq_files_live_per_path ON files(folder_id, name) WHERE status != 'superseded'`,
+		`CREATE TRIGGER files_blake3_immutable BEFORE UPDATE OF blake3 ON files
+		 BEGIN
+		     SELECT RAISE(ABORT, 'blake3 is immutable; supersede the row and insert a new one');
+		 END`,
+		`INSERT INTO schema_version (version) VALUES (13)`,
+		`INSERT INTO volumes (id, name, path) VALUES (1, 'photos', '/photos')`,
+		`INSERT INTO nodes (id, name) VALUES (1, 'self'), (2, 'peer')`,
+		`INSERT INTO runs (id, kind, volume_id, destination, started_at_ns, status, peer_node_id, correlated_run_id)
+		 VALUES (1, 'index', 1, NULL, 100, 'success', NULL, NULL),
+		        (2, 'sync',  1, 'peer', 200, 'success', 2, 900),
+		        (3, 'index', 1, NULL, 300, 'success', NULL, NULL)`,
+		`INSERT INTO folders (id, volume_id, parent_id, path) VALUES (1, 1, NULL, ''), (2, 1, 1, 'sub')`,
+		`INSERT INTO files (folder_id, name, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns, source_node_id, source_run_id) VALUES
+		 (1, 'a.txt', X'` + strings.Repeat("11", 32) + `', 10, 1, 'present',    1, 3, 1, NULL, NULL),
+		 (2, 'b.txt', X'` + strings.Repeat("11", 32) + `', 10, 2, 'present',    3, 3, 2, 2, 2),
+		 (1, 'c.txt', X'` + strings.Repeat("22", 32) + `', 20, 3, 'present',    2, 3, 3, 2, 2),
+		 (1, 'c.txt', X'` + strings.Repeat("33", 32) + `', 30, 4, 'superseded', 1, 1, 4, NULL, NULL),
+		 (2, 'd.txt', X'` + strings.Repeat("44", 32) + `', 40, 5, 'missing',    1, 3, 5, NULL, NULL)`,
+	}
+}
+
+// TestMigrateV13ContentsSplit drives a populated v13 database through
+// the v14–v16 chain and verifies the reshape end to end: row counts,
+// the hash↔content mapping with its size/origin backfill, preserved
+// statuses and run stamps, the surviving partial unique index, the
+// dropped immutability trigger, the widened runs CHECK, and the new
+// destination watermark store with its rewind refusal.
+func TestMigrateV13ContentsSplit(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	rawDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("raw sql.Open: %v", err)
+	}
+	for _, q := range v13Fixture() {
+		if _, err := rawDB.Exec(q); err != nil {
+			rawDB.Close()
+			t.Fatalf("v13 DDL %q: %v", q, err)
+		}
+	}
+	rawDB.Close()
+
+	s, err := OpenWithOptions(dsn, OpenOptions{NodeName: "self"})
+	if err != nil {
+		t.Fatalf("Open (migrates v13→v%d): %v", SchemaVersion, err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	if v, _ := s.CurrentSchemaVersion(ctx); v != SchemaVersion {
+		t.Fatalf("schema_version = %d, want %d", v, SchemaVersion)
+	}
+
+	assertContentsBackfill(t, s)
+	assertFilesReshape(t, s)
+	assertSchemaGuardsAfterSplit(t, s)
+	assertRunsOffloadCheck(t, s)
+	assertDestinationStoreAfterMigration(t, s)
+}
+
+// assertContentsBackfill checks the distinct-hash → contents mapping:
+// one row per hash, size and origin taken from the earliest observation.
+func assertContentsBackfill(t *testing.T, s *Store) {
+	t.Helper()
+	ctx := context.Background()
+
+	var fileCount, contentCount int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM files`).Scan(&fileCount); err != nil {
+		t.Fatalf("count files: %v", err)
+	}
+	if fileCount != 5 {
+		t.Fatalf("files rows = %d, want 5 (no row lost in the rebuild)", fileCount)
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM contents`).Scan(&contentCount); err != nil {
+		t.Fatalf("count contents: %v", err)
+	}
+	if contentCount != 4 {
+		t.Fatalf("contents rows = %d, want 4 (one per distinct hash)", contentCount)
+	}
+
+	cases := []struct {
+		hash       []byte
+		size       int64
+		originNode sql.NullInt64
+		originRun  sql.NullInt64
+	}{
+		// X: earliest observation is the local a.txt row, so the later
+		// peer-attributed duplicate does not become the origin.
+		{digest(0x11), 10, sql.NullInt64{}, sql.NullInt64{}},
+		{digest(0x22), 20, sql.NullInt64{Int64: 2, Valid: true}, sql.NullInt64{Int64: 2, Valid: true}},
+		{digest(0x33), 30, sql.NullInt64{}, sql.NullInt64{}},
+		{digest(0x44), 40, sql.NullInt64{}, sql.NullInt64{}},
+	}
+	for _, c := range cases {
+		var size int64
+		var originNode, originRun sql.NullInt64
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT size_bytes, origin_node_id, origin_run_id FROM contents WHERE blake3 = ?`,
+			c.hash).Scan(&size, &originNode, &originRun); err != nil {
+			t.Fatalf("contents row for %x: %v", c.hash[:2], err)
+		}
+		if size != c.size || originNode != c.originNode || originRun != c.originRun {
+			t.Fatalf("contents %x = (size=%d, origin=%+v/%+v), want (size=%d, origin=%+v/%+v)",
+				c.hash[:2], size, originNode, originRun, c.size, c.originNode, c.originRun)
+		}
+	}
+}
+
+// assertFilesReshape checks the per-path view through the store API:
+// statuses, run stamps, the supersede chain, and duplicate detection
+// across the shared content row.
+func assertFilesReshape(t *testing.T, s *Store) {
+	t.Helper()
+	ctx := context.Background()
+
+	a, err := s.GetByPath(ctx, 1, "a.txt")
+	if err != nil {
+		t.Fatalf("GetByPath a.txt: %v", err)
+	}
+	if !bytes.Equal(a.Blake3, digest(0x11)) || a.Status != StatusPresent ||
+		a.SizeBytes != 10 || a.FirstSeenRunID != 1 || a.LastSeenRunID != 3 {
+		t.Fatalf("a.txt = %+v, want X present first=1 last=3 size=10", a)
+	}
+
+	history, err := s.ListHistoryByPath(ctx, 1, "c.txt")
+	if err != nil {
+		t.Fatalf("ListHistoryByPath c.txt: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("c.txt history rows = %d, want 2", len(history))
+	}
+	if !bytes.Equal(history[0].Blake3, digest(0x33)) || history[0].Status != StatusSuperseded {
+		t.Fatalf("c.txt history[0] = %+v, want Z superseded", history[0])
+	}
+	if !bytes.Equal(history[1].Blake3, digest(0x22)) || history[1].Status != StatusPresent {
+		t.Fatalf("c.txt history[1] = %+v, want Y present", history[1])
+	}
+	if !history[1].OriginNodeID.Valid || history[1].OriginNodeID.Int64 != 2 {
+		t.Fatalf("c.txt live origin = %+v, want node 2", history[1].OriginNodeID)
+	}
+
+	d, err := s.GetByPath(ctx, 1, "sub/d.txt")
+	if err != nil {
+		t.Fatalf("GetByPath sub/d.txt: %v", err)
+	}
+	if d.Status != StatusMissing {
+		t.Fatalf("sub/d.txt status = %q, want missing", d.Status)
+	}
+
+	dups, err := s.ListDuplicates(ctx)
+	if err != nil {
+		t.Fatalf("ListDuplicates: %v", err)
+	}
+	if len(dups) != 2 {
+		t.Fatalf("duplicates = %d rows, want 2 (a.txt + sub/b.txt share X)", len(dups))
+	}
+	if dups[0].File.ContentID != dups[1].File.ContentID {
+		t.Fatalf("duplicate rows carry different content ids: %d vs %d",
+			dups[0].File.ContentID, dups[1].File.ContentID)
+	}
+}
+
+// assertSchemaGuardsAfterSplit checks the post-split schema shape: the
+// partial unique index still guards one live row per path, and the
+// blake3-immutability trigger is gone (id↔hash is immutable by
+// construction on contents).
+func assertSchemaGuardsAfterSplit(t *testing.T, s *Store) {
+	t.Helper()
+	ctx := context.Background()
+
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO contents (blake3, size_bytes) VALUES (?, 1)`, digest(0x55)); err != nil {
+		t.Fatalf("insert content: %v", err)
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO files (folder_id, name, content_id, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
+		VALUES (1, 'a.txt', (SELECT id FROM contents WHERE blake3 = ?), 9, 'present', 1, 1, 9)
+	`, digest(0x55))
+	if err == nil || !strings.Contains(err.Error(), "UNIQUE") {
+		t.Fatalf("second live row at a.txt: err = %v, want UNIQUE violation", err)
+	}
+
+	var triggers int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'files_blake3_immutable'`).Scan(&triggers); err != nil {
+		t.Fatalf("count triggers: %v", err)
+	}
+	if triggers != 0 {
+		t.Fatalf("files_blake3_immutable still present after v14, want dropped")
+	}
+}
+
+// assertRunsOffloadCheck checks the v15 kind CHECK: offload joins the
+// destination-NULL branch.
+func assertRunsOffloadCheck(t *testing.T, s *Store) {
+	t.Helper()
+	ctx := context.Background()
+
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO runs (kind, volume_id, destination, started_at_ns, status)
+		VALUES ('offload', 1, NULL, 400, 'running')
+	`); err != nil {
+		t.Fatalf("offload run with NULL destination rejected: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO runs (kind, volume_id, destination, started_at_ns, status)
+		VALUES ('offload', 1, 'bucket', 500, 'running')
+	`); err == nil {
+		t.Fatalf("offload run with a destination accepted, want CHECK violation")
+	}
+}
+
+// assertDestinationStoreAfterMigration checks the v16 watermark store
+// against the migrated DB: an advance lands with history, and a rewind
+// is refused.
+func assertDestinationStoreAfterMigration(t *testing.T, s *Store) {
+	t.Helper()
+	ctx := context.Background()
+
+	if err := s.UpsertDestinationRunID(ctx, 1, "bucket", 2, 5, false); err != nil {
+		t.Fatalf("UpsertDestinationRunID after migration: %v", err)
+	}
+	if err := s.UpsertDestinationRunID(ctx, 1, "bucket", 2, 4, false); !errors.Is(err, ErrWatermarkRewind) {
+		t.Fatalf("rewind err = %v, want ErrWatermarkRewind", err)
+	}
+	history, err := s.ListDestinationRunIDHistory(ctx, 1, "bucket")
+	if err != nil {
+		t.Fatalf("ListDestinationRunIDHistory: %v", err)
+	}
+	if len(history) != 1 || history[0].OriginRunID != 5 {
+		t.Fatalf("history = %+v, want one advance to 5", history)
 	}
 }

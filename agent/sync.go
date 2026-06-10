@@ -678,12 +678,13 @@ func (r *peerSyncRouter) classifyMissingPath(ctx context.Context, sess *peerSess
 // supersede from conflict (per CLAUDE.md "check authoritative state
 // first"). Rules:
 //
-//   - source_node_id IS NULL → local write on receiver → conflict.
-//   - source_node_id != this initiator → another peer wrote it →
+//   - origin_node_id IS NULL → content introduced locally on the
+//     receiver → conflict.
+//   - origin_node_id != this initiator → another peer introduced it →
 //     conflict.
-//   - source_node_id == this initiator → supersede, provided the
-//     row's correlated initiator run-id is ≤ the per-(volume, peer)
-//     watermark. Translating the row's local source_run_id back into
+//   - origin_node_id == this initiator → supersede, provided the
+//     content's correlated initiator run-id is ≤ the per-(volume, peer)
+//     watermark. Translating the content's local origin_run_id back into
 //     the initiator's id space requires looking up the receiver-side
 //     runs row and reading its correlated_run_id (the two columns are
 //     in different id spaces — receiver-local vs. initiator-local).
@@ -694,10 +695,10 @@ func (r *peerSyncRouter) classifyMissingPath(ctx context.Context, sess *peerSess
 // it may carry rows from a different peer that haven't synced
 // through us yet.
 func (r *peerSyncRouter) dispositionForExisting(ctx context.Context, sess *peerSession, existing store.FileRow) (string, string) {
-	if !existing.SourceNodeID.Valid {
+	if !existing.OriginNodeID.Valid {
 		return syncproto.DispositionConflict, "local write on receiver"
 	}
-	if existing.SourceNodeID.Int64 != sess.peerNodeID {
+	if existing.OriginNodeID.Int64 != sess.peerNodeID {
 		return syncproto.DispositionConflict, "sourced from a different peer"
 	}
 	state, err := r.srv.store.GetPeerSyncState(ctx, sess.volumeID, sess.peerNodeID)
@@ -710,10 +711,10 @@ func (r *peerSyncRouter) dispositionForExisting(ctx context.Context, sess *peerS
 	if !state.LastSharedRunID.Valid {
 		return syncproto.DispositionSupersede, ""
 	}
-	if !existing.SourceRunID.Valid {
+	if !existing.OriginRunID.Valid {
 		return syncproto.DispositionConflict, "peer-sourced row has no run attribution"
 	}
-	sourceRun, err := r.srv.store.GetRun(ctx, existing.SourceRunID.Int64)
+	sourceRun, err := r.srv.store.GetRun(ctx, existing.OriginRunID.Int64)
 	if err != nil {
 		return syncproto.DispositionConflict, fmt.Sprintf("source run lookup error: %v", err)
 	}
@@ -1047,17 +1048,18 @@ func (r *peerSyncRouter) conflictRowForPreStage(sess *peerSession, path, srcAbs,
 	}, nil
 }
 
-// priorProvenance lifts the prior row's (source_node_id, source_run_id)
-// into a *store.Provenance the way Upsert expects: nil for a local
-// write (both NULLs), pointer-carrying for peer-sourced rows. Either
-// half being NULL is treated as "local write" — partial provenance is
-// a schema-impossible state today, but degrading gracefully here keeps
-// the conflict path open if a future migration ever ends up with one.
+// priorProvenance lifts the prior row's (origin_node_id, origin_run_id)
+// into a *store.Provenance the way Upsert expects: nil for locally
+// introduced content (both NULLs), pointer-carrying for peer-sourced
+// rows. Either half being NULL is treated as "introduced locally" —
+// partial provenance is a schema-impossible state today, but degrading
+// gracefully here keeps the conflict path open if a future migration
+// ever ends up with one.
 func priorProvenance(r *store.FileRow) *store.Provenance {
-	if r == nil || !r.SourceNodeID.Valid || !r.SourceRunID.Valid {
+	if r == nil || !r.OriginNodeID.Valid || !r.OriginRunID.Valid {
 		return nil
 	}
-	return &store.Provenance{NodeID: r.SourceNodeID.Int64, RunID: r.SourceRunID.Int64}
+	return &store.Provenance{NodeID: r.OriginNodeID.Int64, RunID: r.OriginRunID.Int64}
 }
 
 // handleVerify implements POST /v1/sync/verify.

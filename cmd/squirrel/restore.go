@@ -18,7 +18,7 @@ import (
 // is there on a hash mismatch. Use --to to point at a scratch directory.
 // --from accepts either a destination name (pick which bucket to pull
 // from when the volume has multiple) or a node name (filter to paths
-// whose source_node_id matches that node — handy on a receiver that
+// whose content originates at that node — handy on a receiver that
 // holds files pushed by multiple peers). Destination and node names
 // share one namespace (config validation enforces uniqueness), so the
 // argument disambiguates by lookup, with no extra flag needed.
@@ -43,7 +43,7 @@ func newRestoreCmd() *cobra.Command {
 			})
 		},
 	}
-	cmd.Flags().StringVar(&from, "from", "", "destination name to pull from, or peer node name to filter source attribution (overloaded; names are unique across both kinds)")
+	cmd.Flags().StringVar(&from, "from", "", "destination name to pull from, or peer node name to filter by content origin (overloaded; names are unique across both kinds)")
 	cmd.Flags().StringVar(&to, "to", "", "local target path (default: the volume's declared path)")
 	cmd.Flags().BoolVar(&shallow, "shallow", false, "skip BLAKE3 verification on the way down")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview rclone actions without transferring")
@@ -67,13 +67,13 @@ func runRestore(cmd *cobra.Command, volumeName, fromName string, opts sync.Resto
 	}
 	defer s.Close()
 
-	dest, sourceNode, err := resolveRestoreTarget(cmd, s, cfg, vol, fromName)
+	dest, originNode, err := resolveRestoreTarget(cmd, s, cfg, vol, fromName)
 	if err != nil {
 		return err
 	}
 
-	if sourceNode.active {
-		includeFile, cleanup, err := writeRestorePathFilter(cmd, s, vol, sourceNode.nodeID)
+	if originNode.active {
+		includeFile, cleanup, err := writeRestorePathFilter(cmd, s, vol, originNode.nodeID)
 		if err != nil {
 			return err
 		}
@@ -107,18 +107,18 @@ func runRestore(cmd *cobra.Command, volumeName, fromName string, opts sync.Resto
 	return nil
 }
 
-// restoreSourceFilter is the resolution of `--from <name>` against the
+// restoreOriginFilter is the resolution of `--from <name>` against the
 // `nodes` table. active=false means the name (if any) is a
 // destination, not a node; active=true with nodeID.Valid filters to
-// that peer; active=true with nodeID zero filters to NULL source
-// (local writes).
-type restoreSourceFilter struct {
+// that peer; active=true with nodeID zero filters to NULL origin
+// (locally introduced content).
+type restoreOriginFilter struct {
 	active bool
 	nodeID sql.NullInt64
 }
 
 // resolveRestoreTarget decides what `--from <name>` means: a node name
-// (returns a source filter, picks the destination from sync_to), a
+// (returns an origin filter, picks the destination from sync_to), a
 // destination name (returns the destination, no filter), or empty
 // (auto-picks the destination).
 //
@@ -128,33 +128,33 @@ type restoreSourceFilter struct {
 // [nodes.X] and [destinations.X], but does not check the top-level
 // node_name. An honest collision is surfaced rather than picked one
 // way or the other.
-func resolveRestoreTarget(cmd *cobra.Command, s *store.Store, cfg *config.Config, vol *config.Volume, fromName string) (*config.Destination, restoreSourceFilter, error) {
+func resolveRestoreTarget(cmd *cobra.Command, s *store.Store, cfg *config.Config, vol *config.Volume, fromName string) (*config.Destination, restoreOriginFilter, error) {
 	if fromName == "" {
 		dest, err := pickSingleRestoreDestination(cfg, vol)
-		return dest, restoreSourceFilter{}, err
+		return dest, restoreOriginFilter{}, err
 	}
 	filter, nodeFound, err := lookupNodeFilter(cmd, s, fromName)
 	if err != nil {
-		return nil, restoreSourceFilter{}, err
+		return nil, restoreOriginFilter{}, err
 	}
 	destMatch, destOK := cfg.Destinations[fromName]
 	if nodeFound && destOK {
-		return nil, restoreSourceFilter{}, fmt.Errorf("--from %q is ambiguous: it names both a node (self or peer) and a destination — rename one to disambiguate", fromName)
+		return nil, restoreOriginFilter{}, fmt.Errorf("--from %q is ambiguous: it names both a node (self or peer) and a destination — rename one to disambiguate", fromName)
 	}
 	if nodeFound {
 		dest, err := pickSingleRestoreDestination(cfg, vol)
 		if err != nil {
-			return nil, restoreSourceFilter{}, fmt.Errorf("--from %q is a node name; %w", fromName, err)
+			return nil, restoreOriginFilter{}, fmt.Errorf("--from %q is a node name; %w", fromName, err)
 		}
 		return dest, filter, nil
 	}
 	if destOK {
 		if !slices.Contains(vol.SyncTo, fromName) {
-			return nil, restoreSourceFilter{}, fmt.Errorf("destination %q is not in sync_to for volume %q", fromName, vol.Name)
+			return nil, restoreOriginFilter{}, fmt.Errorf("destination %q is not in sync_to for volume %q", fromName, vol.Name)
 		}
-		return destMatch, restoreSourceFilter{}, nil
+		return destMatch, restoreOriginFilter{}, nil
 	}
-	return nil, restoreSourceFilter{}, fmt.Errorf("--from %q matches neither a configured destination nor a known node", fromName)
+	return nil, restoreOriginFilter{}, fmt.Errorf("--from %q matches neither a configured destination nor a known node", fromName)
 }
 
 // lookupNodeFilter asks the store whether name refers to a node — the
@@ -163,22 +163,22 @@ func resolveRestoreTarget(cmd *cobra.Command, s *store.Store, cfg *config.Config
 // "node lookup itself failed" so the caller can keep the dispatch
 // flat. A surfaced error reflects an underlying store failure, not a
 // missing row.
-func lookupNodeFilter(cmd *cobra.Command, s *store.Store, name string) (restoreSourceFilter, bool, error) {
+func lookupNodeFilter(cmd *cobra.Command, s *store.Store, name string) (restoreOriginFilter, bool, error) {
 	self, err := s.GetSelfNode(cmd.Context())
 	if err != nil {
-		return restoreSourceFilter{}, false, fmt.Errorf("lookup self node: %w", err)
+		return restoreOriginFilter{}, false, fmt.Errorf("lookup self node: %w", err)
 	}
 	if name == self.Name {
-		return restoreSourceFilter{active: true}, true, nil
+		return restoreOriginFilter{active: true}, true, nil
 	}
 	node, err := s.GetNodeByName(cmd.Context(), name)
 	if err != nil {
 		if store.IsNotFound(err) {
-			return restoreSourceFilter{}, false, nil
+			return restoreOriginFilter{}, false, nil
 		}
-		return restoreSourceFilter{}, false, fmt.Errorf("lookup node %q: %w", name, err)
+		return restoreOriginFilter{}, false, fmt.Errorf("lookup node %q: %w", name, err)
 	}
-	return restoreSourceFilter{active: true, nodeID: sql.NullInt64{Int64: node.ID, Valid: true}}, true, nil
+	return restoreOriginFilter{active: true, nodeID: sql.NullInt64{Int64: node.ID, Valid: true}}, true, nil
 }
 
 // pickSingleRestoreDestination resolves the destination when --from
@@ -204,7 +204,7 @@ func pickSingleRestoreDestination(cfg *config.Config, vol *config.Volume) (*conf
 
 // writeRestorePathFilter materialises the path subset implied by
 // `--from <node>` to a tempfile suitable for rclone's --files-from
-// flag. It iterates ListPresentBySource against the volume row in the
+// flag. It iterates ListPresentByOrigin against the volume row in the
 // DB (not the volume from config) so a missing volume row surfaces
 // before rclone gets invoked. Returns the file path, a cleanup func,
 // and an error. The cleanup is non-nil even on error so deferring it
@@ -223,11 +223,11 @@ func writeRestorePathFilter(cmd *cobra.Command, s *store.Store, vol *config.Volu
 	}
 	cleanup := func() { _ = os.Remove(f.Name()) }
 	var count int
-	for row, iterErr := range s.ListPresentBySource(cmd.Context(), v.ID, nodeID) {
+	for row, iterErr := range s.ListPresentByOrigin(cmd.Context(), v.ID, nodeID) {
 		if iterErr != nil {
 			_ = f.Close()
 			cleanup()
-			return "", func() {}, fmt.Errorf("list present by source: %w", iterErr)
+			return "", func() {}, fmt.Errorf("list present by origin: %w", iterErr)
 		}
 		if _, err := fmt.Fprintln(f, row.Path); err != nil {
 			_ = f.Close()
