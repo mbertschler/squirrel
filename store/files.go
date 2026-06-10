@@ -37,10 +37,13 @@ type FileRow struct {
 	OriginRunID    sql.NullInt64
 }
 
-// Provenance carries the "who introduced this content" attribution that
-// Upsert records as (origin_node_id, origin_run_id) when a write
-// creates a new contents row. NodeID references nodes(id) and RunID is
-// the receiving run's id on this node. A nil *Provenance records NULLs,
+// Provenance carries the "where did this content first enter the
+// system" attribution that Upsert records as (origin_node_id,
+// origin_run_id) when a write creates a new contents row. NodeID
+// references nodes(id); RunID is in the origin node's run space — the
+// run at which that node introduced the content — so it is not a local
+// runs FK. The pair is propagated verbatim across peer hops, never
+// relabelled to the immediate sender. A nil *Provenance records NULLs,
 // the convention for locally introduced content. Content that already
 // has a contents row keeps its recorded origin — origin is content-
 // level first-introduction provenance, not per-observation attribution.
