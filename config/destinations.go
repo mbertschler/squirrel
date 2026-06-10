@@ -108,9 +108,7 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 // resolveCrypt validates the optional `crypt` sub-table of a destination.
 // A missing key yields nil (no encryption overlay). The two password
 // fields go through the same secret resolution as destination credentials;
-// password is required, password2 (the salt) is optional. type=local is
-// rejected because the overlay needs an rclone remote to wrap and local
-// destinations are addressed by filesystem path.
+// password is required, password2 (the salt) is optional.
 func resolveCrypt(raw map[string]any, typ string) (*Crypt, error) {
 	v, ok := raw["crypt"]
 	if !ok {
@@ -270,7 +268,8 @@ func resolveSecret(raw map[string]any, key string) (string, error) {
 // rclone treats absolute paths as local-filesystem destinations directly).
 // A destination with a crypt block renders two sections: the underlying
 // remote exactly as without crypt, then the crypt overlay wrapping it.
-// The returned bytes do not include a trailing newline.
+// Each rendered section ends with a trailing newline, so sections
+// concatenate directly into a valid rclone.conf.
 func (d *Destination) RcloneSection() string {
 	schema := destSchemas[d.Type]
 	if schema.rcloneType == "" {
