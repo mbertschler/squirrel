@@ -831,6 +831,50 @@ func (s *Store) MarkMissing(ctx context.Context, volumeID int64, currentRunID in
 	return n, nil
 }
 
+// MarkOffloaded flips the live 'present' row at (volumeID, relPath)
+// carrying contentID to status='offloaded', stamping last_seen_run_id
+// with the offload run that removed the bytes. Matching on the exact
+// content id is part of the offload safety contract: the caller
+// verified the on-disk bytes against this content immediately before
+// unlinking, so a row whose content or status changed underfoot matches
+// nothing here and surfaces as an error instead of mislabelling a
+// different observation. The folder Merkle and ancestor chain are
+// recomputed in the same transaction because the flip removes the file
+// from the live set, mirroring MarkMissing.
+func (s *Store) MarkOffloaded(ctx context.Context, volumeID int64, relPath string, contentID, runID int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin mark offloaded: %w", err)
+	}
+	defer tx.Rollback()
+
+	folderPath, name := splitFilePath(relPath)
+	var folderID int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id FROM folders WHERE volume_id = ? AND path = ?`,
+		volumeID, folderPath).Scan(&folderID); err != nil {
+		return fmt.Errorf("mark offloaded %s: lookup folder: %w", relPath, err)
+	}
+	res, err := tx.ExecContext(ctx, `
+		UPDATE files SET status = 'offloaded', last_seen_run_id = ?
+		WHERE folder_id = ? AND name = ? AND content_id = ? AND status = 'present'
+	`, runID, folderID, name, contentID)
+	if err != nil {
+		return fmt.Errorf("mark offloaded %s: %w", relPath, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mark offloaded rows %s: %w", relPath, err)
+	}
+	if n != 1 {
+		return fmt.Errorf("mark offloaded %s: no live 'present' row with content id %d", relPath, contentID)
+	}
+	if err := recomputeFolderAndAncestors(ctx, tx, folderID, runID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ListDuplicates returns rows whose content appears at more than one
 // (volume_id, path), joined with their volume.
 func (s *Store) ListDuplicates(ctx context.Context) ([]FileWithVolume, error) {
