@@ -171,18 +171,83 @@ func runDBRestore(cmd *cobra.Command, snapshotPath string, force bool) error {
 		}
 	}
 
-	// Atomic-ish swap: rename the snapshot over the live DB and remove
-	// any stale -wal/-shm sidecars. os.Rename is atomic within one
-	// filesystem; if the snapshot and the live DB are on different
-	// filesystems the rename will fail and the user can copy first.
+	preRestore, err := preserveLiveDB(liveAbs)
+	if err != nil {
+		return err
+	}
+
+	// os.Rename is atomic within one filesystem; if the snapshot and the
+	// live DB are on different filesystems the rename fails and the user
+	// can copy first. preserveLiveDB has already moved the live DB and its
+	// sidecars aside, so no stale -wal can attach to the incoming snapshot.
+	// On failure, move the preserved DB back so the command doesn't strand
+	// the install with a missing live DB.
 	if err := os.Rename(snapshotAbs, liveAbs); err != nil {
+		if preRestore != "" {
+			rollbackLiveDB(preRestore, liveAbs)
+		}
 		return fmt.Errorf("replace live DB with snapshot: %w", err)
 	}
-	for _, suffix := range []string{"-wal", "-shm"} {
-		_ = os.Remove(liveAbs + suffix)
-	}
 	fmt.Fprintf(cmd.OutOrStdout(), "restored %s from %s\n", liveAbs, snapshotAbs)
+	if preRestore != "" {
+		fmt.Fprintf(cmd.OutOrStdout(), "preserved prior live DB at %s\n", preRestore)
+	}
 	return nil
+}
+
+// dbSidecarSuffixes are SQLite's WAL-mode side files. A stale one left
+// beside the live path would replay into whatever DB takes that path next.
+var dbSidecarSuffixes = []string{"-wal", "-shm"}
+
+// preserveLiveDB clears the live database path before a restore overwrites
+// it. The main file (when present) is renamed aside to
+// "<liveAbs>.pre-restore-<unixnano>" so a wrong restore is recoverable,
+// and its -wal/-shm sidecars move with it, keeping the preserved copy's
+// full state. Any sidecar without a main file (an orphan from a crash or
+// manual move) is removed instead — leaving it would let the incoming
+// snapshot replay a stale WAL. The timestamp follows how snapshot
+// filenames are stamped elsewhere. Returns the preserved main-file path,
+// or "" when no main live DB existed.
+//
+// Preserved copies are kept indefinitely — no rotation matches their
+// name — so an operator who restores repeatedly reaps them by hand.
+func preserveLiveDB(liveAbs string) (string, error) {
+	mainExists := true
+	if _, err := os.Stat(liveAbs); err != nil {
+		if !os.IsNotExist(err) {
+			return "", fmt.Errorf("stat live db: %w", err)
+		}
+		mainExists = false
+	}
+	if !mainExists {
+		for _, suffix := range dbSidecarSuffixes {
+			if err := os.Remove(liveAbs + suffix); err != nil && !os.IsNotExist(err) {
+				return "", fmt.Errorf("remove orphan %s sidecar: %w", suffix, err)
+			}
+		}
+		return "", nil
+	}
+	preRestore := fmt.Sprintf("%s.pre-restore-%d", liveAbs, time.Now().UTC().UnixNano())
+	if err := os.Rename(liveAbs, preRestore); err != nil {
+		return "", fmt.Errorf("preserve live DB: %w", err)
+	}
+	for _, suffix := range dbSidecarSuffixes {
+		if err := os.Rename(liveAbs+suffix, preRestore+suffix); err != nil && !os.IsNotExist(err) {
+			rollbackLiveDB(preRestore, liveAbs)
+			return "", fmt.Errorf("preserve live DB %s sidecar: %w", suffix, err)
+		}
+	}
+	return preRestore, nil
+}
+
+// rollbackLiveDB best-effort moves a preserved DB (and its sidecars) back
+// to liveAbs after a later step fails, so a failed restore leaves the live
+// DB where it started rather than stranded at the pre-restore path.
+func rollbackLiveDB(preRestore, liveAbs string) {
+	_ = os.Rename(preRestore, liveAbs)
+	for _, suffix := range dbSidecarSuffixes {
+		_ = os.Rename(preRestore+suffix, liveAbs+suffix)
+	}
 }
 
 // defaultBackupsDir returns the parent directory squirrel uses for its
@@ -196,7 +261,10 @@ func defaultBackupsDir(dbPath string) string {
 // rotateBackups deletes the oldest snapshots in dir until only `keep`
 // remain. Snapshots are identified by the index-* and pre-migration-*
 // filename prefixes the store and CLI write — unknown files are left
-// alone so we never delete something we didn't put there.
+// alone so we never delete something we didn't put there. This is the
+// explicit, operator-driven `db backup --keep` retention, so it does
+// include pre-migration-* snapshots; the routine snapshot-on-sync
+// rotation (sync.rotateSnapshots) exempts them.
 func rotateBackups(dir string, keep int) ([]string, error) {
 	if keep <= 0 {
 		return nil, nil

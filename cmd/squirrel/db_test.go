@@ -92,6 +92,140 @@ func TestCLIDBRestoreSwapsLiveDB(t *testing.T) {
 	}
 }
 
+// TestCLIDBRestorePreservesPriorLiveDB is the #111a guard: a restore
+// renames the prior live DB aside (recoverable) and prints its path. The
+// preserved copy still carries the mutation the snapshot predates, so a
+// wrong restore can be rolled back by moving it back.
+func TestCLIDBRestorePreservesPriorLiveDB(t *testing.T) {
+	f := writeSyncFixture(t)
+
+	snap := filepath.Join(t.TempDir(), "before.db")
+	runCLI(t, "--config", f.configPath, "db", "backup", "--to", snap)
+
+	writeTestFile(t, filepath.Join(f.volumeDir, "a.txt"), "alpha")
+	runCLI(t, "--config", f.configPath, "index", f.volumeName)
+
+	out := runCLI(t, "--config", f.configPath, "db", "restore", snap)
+	preserved := parsePreservedPath(t, out)
+	if !strings.HasPrefix(filepath.Base(preserved), "index.db.pre-restore-") {
+		t.Fatalf("preserved path %q lacks the pre-restore- stem", preserved)
+	}
+	if _, err := os.Stat(preserved); err != nil {
+		t.Fatalf("preserved prior live DB missing at reported path %q: %v", preserved, err)
+	}
+
+	// The preserved copy still has the post-snapshot volume row, so the
+	// restore is reversible: swap it back and the volume reappears.
+	if err := os.Rename(preserved, f.dbPath); err != nil {
+		t.Fatalf("roll back to preserved DB: %v", err)
+	}
+	listing := runCLI(t, "--config", f.configPath, "volumes")
+	if !strings.Contains(listing, f.volumeName) {
+		t.Fatalf("rolled-back DB lost the volume row; restore was not reversible:\n%s", listing)
+	}
+}
+
+// TestCLIDBRestoreClearsLiveSidecarsBeforeRename is the #111b guard: any
+// -wal/-shm beside the live DB is moved aside with it before the snapshot
+// is renamed in, so no stale WAL can be replayed into the restored
+// snapshot. We pre-seed sidecars at the live path and restore with
+// --force (the clean-open probe would otherwise checkpoint them away),
+// then assert none remain at the live path while the preserved copy
+// carries them — proving the clearing happens at the rename, not via the
+// probe.
+func TestCLIDBRestoreClearsLiveSidecarsBeforeRename(t *testing.T) {
+	f := writeSyncFixture(t)
+
+	snap := filepath.Join(t.TempDir(), "before.db")
+	runCLI(t, "--config", f.configPath, "db", "backup", "--to", snap)
+
+	// Force the live DB into existence, then plant stale sidecars beside it.
+	writeTestFile(t, filepath.Join(f.volumeDir, "a.txt"), "alpha")
+	runCLI(t, "--config", f.configPath, "index", f.volumeName)
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.WriteFile(f.dbPath+suffix, []byte("stale"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	out := runCLI(t, "--config", f.configPath, "db", "restore", "--force", snap)
+	preserved := parsePreservedPath(t, out)
+
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Stat(f.dbPath + suffix); !os.IsNotExist(err) {
+			t.Fatalf("stale %s sidecar still beside live DB after restore (err=%v)", suffix, err)
+		}
+		if _, err := os.Stat(preserved + suffix); err != nil {
+			t.Fatalf("preserved DB missing its %s sidecar: %v", suffix, err)
+		}
+	}
+}
+
+// TestPreserveLiveDBRemovesOrphanSidecars guards the case Copilot flagged:
+// a missing main DB but lingering -wal/-shm (crash or manual move). The
+// sidecars must be cleared so the incoming snapshot can't replay a stale
+// WAL, even though there is no main file to move aside.
+func TestPreserveLiveDBRemovesOrphanSidecars(t *testing.T) {
+	dir := t.TempDir()
+	live := filepath.Join(dir, "index.db")
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.WriteFile(live+suffix, []byte("stale"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	preRestore, err := preserveLiveDB(live)
+	if err != nil {
+		t.Fatalf("preserveLiveDB: %v", err)
+	}
+	if preRestore != "" {
+		t.Fatalf("preRestore = %q, want empty (no main DB to preserve)", preRestore)
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Stat(live + suffix); !os.IsNotExist(err) {
+			t.Fatalf("orphan %s sidecar not cleared (err=%v)", suffix, err)
+		}
+	}
+}
+
+// TestRollbackLiveDBRestoresPath asserts rollbackLiveDB moves a preserved
+// DB and its sidecars back to the live path, so a failed restore leaves
+// the live DB where it started.
+func TestRollbackLiveDBRestoresPath(t *testing.T) {
+	dir := t.TempDir()
+	live := filepath.Join(dir, "index.db")
+	preRestore := live + ".pre-restore-1"
+	if err := os.WriteFile(preRestore, []byte("main"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(preRestore+"-wal", []byte("wal"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rollbackLiveDB(preRestore, live)
+	if b, err := os.ReadFile(live); err != nil || string(b) != "main" {
+		t.Fatalf("live DB not restored: content=%q err=%v", b, err)
+	}
+	if b, err := os.ReadFile(live + "-wal"); err != nil || string(b) != "wal" {
+		t.Fatalf("live -wal not restored: content=%q err=%v", b, err)
+	}
+	if _, err := os.Stat(preRestore); !os.IsNotExist(err) {
+		t.Fatalf("preserved main still present after rollback (err=%v)", err)
+	}
+}
+
+// parsePreservedPath extracts the path from the
+// "preserved prior live DB at <path>" restore output line.
+func parsePreservedPath(t *testing.T, out string) string {
+	t.Helper()
+	const marker = "preserved prior live DB at "
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, marker) {
+			return strings.TrimSpace(strings.TrimPrefix(line, marker))
+		}
+	}
+	t.Fatalf("restore output did not report a preserved path:\n%s", out)
+	return ""
+}
+
 // TestCLIDBRestoreRejectsSchemaMismatch covers the safety property:
 // a snapshot whose schema_version differs from the binary is refused.
 // We simulate this by feeding a file that isn't a squirrel DB at all.
