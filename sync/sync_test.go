@@ -108,6 +108,24 @@ func TestSyncRequiresIndexedVolume(t *testing.T) {
 	}
 }
 
+// TestSyncRefusesOnVolumePathMismatch mirrors the restore and offload
+// cross-checks (#114): a DB volumes.path that no longer matches the
+// config-declared path makes the push handler refuse, so it cannot push
+// one tree while the durability advance covers another.
+func TestSyncRefusesOnVolumePathMismatch(t *testing.T) {
+	f := setupFixture(t)
+	// Seed the volume row with a path that differs from f.vol.Path so the
+	// shared requireIndexedVolume gate fails before rclone is invoked.
+	staleDir := t.TempDir()
+	if _, err := f.store.CreateVolume(context.Background(), f.vol.Name, staleDir); err != nil {
+		t.Fatalf("seed stale volume row: %v", err)
+	}
+	_, err := Sync(context.Background(), f.store, f.rcl, f.vol, f.dest, Options{})
+	if err == nil || !strings.Contains(err.Error(), "resolve the conflict") {
+		t.Fatalf("expected path-mismatch error, got %v", err)
+	}
+}
+
 func TestSyncHappyPath(t *testing.T) {
 	f := setupFixture(t)
 	if err := os.WriteFile(filepath.Join(f.vol.Path, "a.txt"), []byte("alpha"), 0o644); err != nil {
