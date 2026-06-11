@@ -758,7 +758,7 @@ func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volum
 		return rep, fmt.Errorf("destination %q is a kopia repository — restore from it with the kopia CLI (`kopia snapshot restore`)", dest.Name)
 	}
 	if dest.Layout == config.LayoutContentAddressed {
-		return rep, fmt.Errorf("destination %q uses the content-addressed layout — its restore tooling ships separately; the data is recoverable by replaying the manifest segments under %s/ against %s/ (see the README's manifest format)", dest.Name, ManifestDirName, ObjectsDirName)
+		return rep, fmt.Errorf("destination %q uses the content-addressed layout — its restore tooling ships separately; the data is recoverable by replaying the manifest segments under %s/%s/ against the destination-root %s/ (see the README's manifest format)", dest.Name, vol.Name, ManifestDirName, ObjectsDirName)
 	}
 	if w := cryptVerificationWarning(dest, opts.Shallow); w != "" {
 		rep.Warnings = append(rep.Warnings, w)
