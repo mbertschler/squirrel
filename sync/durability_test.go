@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -180,6 +181,66 @@ func TestPullDurabilityDropsUnconfiguredDestinations(t *testing.T) {
 	}
 	if _, err := f.initStore.GetDestinationRunID(ctx, v.ID, "junk", origin.ID); err == nil {
 		t.Fatal("junk component was stored, want it dropped")
+	}
+}
+
+// TestPullDurabilityDropsUnconfiguredFreshness: a freshness coordinate
+// for a destination outside the volume's accepted set is dropped and
+// counted (Kind "freshness") just like a stray vector component, so a
+// peer can't seed push-freshness for a destination this node never uses.
+func TestPullDurabilityDropsUnconfiguredFreshness(t *testing.T) {
+	f := setupNodeFixtureNoRclone(t)
+	ctx := context.Background()
+	f.initVol.OffloadRequires = []string{"offsite-a"}
+	f.initVol.SyncTo = nil
+	seedReceiverFreshness(t, f, map[string]int64{
+		"offsite-a": 12,
+		"junk":      99,
+	})
+
+	if _, err := f.initStore.CreateVolume(ctx, f.initVol.Name, f.initVol.Path); err != nil {
+		t.Fatalf("CreateVolume on initiator: %v", err)
+	}
+	rep, err := PullDurability(ctx, f.initStore, f.initVol, f.node, false)
+	if err != nil {
+		t.Fatalf("PullDurability: %v", err)
+	}
+	if rep.Dropped != 1 || len(rep.Drops) != 1 {
+		t.Fatalf("report = %+v, want exactly one drop", rep)
+	}
+	if rep.Drops[0].Destination != "junk" || rep.Drops[0].Kind != "freshness" {
+		t.Fatalf("drop = %+v, want a freshness drop for junk", rep.Drops[0])
+	}
+	if rep.Fetched < 1 || rep.Applied < 1 {
+		t.Fatalf("report = %+v, want the accepted offsite-a freshness still applied and counted", rep)
+	}
+}
+
+// TestPullDurabilityCapsDropSamples: a peer flooding many out-of-scope
+// destinations keeps the exact Dropped count but bounds the sampled
+// Drops slice, so neither the report nor the output it feeds can grow
+// unbounded under an adversarial peer.
+func TestPullDurabilityCapsDropSamples(t *testing.T) {
+	f := setupNodeFixtureNoRclone(t)
+	ctx := context.Background()
+	junk := make(map[string]int64, 50)
+	for i := range 50 {
+		junk[fmt.Sprintf("junk-%02d", i)] = 1
+	}
+	seedReceiverDurability(t, f, junk)
+
+	if _, err := f.initStore.CreateVolume(ctx, f.initVol.Name, f.initVol.Path); err != nil {
+		t.Fatalf("CreateVolume on initiator: %v", err)
+	}
+	rep, err := PullDurability(ctx, f.initStore, f.initVol, f.node, false)
+	if err != nil {
+		t.Fatalf("PullDurability: %v", err)
+	}
+	if rep.Fetched != 50 || rep.Applied != 0 || rep.Dropped != 50 {
+		t.Fatalf("report = fetched=%d applied=%d dropped=%d, want 50/0/50", rep.Fetched, rep.Applied, rep.Dropped)
+	}
+	if len(rep.Drops) > 16 {
+		t.Fatalf("len(Drops) = %d, want capped at 16", len(rep.Drops))
 	}
 }
 
