@@ -80,10 +80,12 @@ func TestOffloadFreshnessRefusesReacquiredFile(t *testing.T) {
 }
 
 // TestOffloadFreshnessRefusesUnpushedTarget: a target with a covering
-// vector component but no successful whole-volume push at all (watermark
-// 0) never gates — the over-advance windows in #103 surface here too,
-// since a row indexed mid-push has a status_changed_run_id no push run
-// can be at or beyond.
+// vector component but neither a local whole-volume push nor pulled
+// push-freshness evidence never gates. With no local push the target is
+// treated as relayed, and with no freshness evidence the relayed branch
+// refuses — the safe direction. This also covers the #103 over-advance
+// windows: a row indexed mid-push leaves a target whose freshness can't
+// reach it.
 func TestOffloadFreshnessRefusesUnpushedTarget(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "a.txt"), "alpha")
@@ -93,7 +95,7 @@ func TestOffloadFreshnessRefusesUnpushedTarget(t *testing.T) {
 	self := selfNode(t, s)
 
 	// Vector covers the content (e.g. a stale advance slipped through),
-	// but no push run exists.
+	// but no push run and no freshness evidence exist.
 	seedVerifiedComponent(t, s, v.ID, "t1", self.ID, idx.RunID)
 
 	rep, err := Offload(context.Background(), s, root, Options{
@@ -103,20 +105,115 @@ func TestOffloadFreshnessRefusesUnpushedTarget(t *testing.T) {
 		t.Fatalf("Offload: %v", err)
 	}
 	res := oneResult(t, rep, "a.txt", OutcomeNotDurable)
-	if len(res.Reasons) != 1 || !strings.Contains(res.Reasons[0], "last whole-volume push run 0") {
-		t.Fatalf("reasons = %v, want freshness failure with push run 0", res.Reasons)
+	if len(res.Reasons) != 1 || !strings.Contains(res.Reasons[0], "no whole-volume push freshness") {
+		t.Fatalf("reasons = %v, want a no-freshness-evidence failure", res.Reasons)
 	}
 	mustExist(t, filepath.Join(root, "a.txt"))
 }
 
-// TestOffloadPeerRelayedTargetNeedsLocalPush documents a deliberate
-// strictly-stricter consequence of the #115 freshness condition: the
-// watermark is in LOCAL run space, so a target whose evidence arrives
-// only by the peer durability pull (no local push to it) is refused
-// until a local whole-volume push covers the path. The laptop cannot
-// locally verify that a re-acquired path was re-pushed on a hop it never
-// performs, so the gate refuses rather than trust a stale pulled vector.
-func TestOffloadPeerRelayedTargetNeedsLocalPush(t *testing.T) {
+// seedRelayedFreshness records pulled origin-space push-freshness for a
+// relayed target (one the local node never pushes to): the coordinate the
+// peer durability pull merges from the pushing node's most recent
+// whole-volume push.
+func seedRelayedFreshness(t *testing.T, s *store.Store, volumeID int64, target string, nodeID, run int64) {
+	t.Helper()
+	if err := s.MergeDestinationPushFreshness(context.Background(), volumeID, target, nodeID, run); err != nil {
+		t.Fatalf("MergeDestinationPushFreshness(%s): %v", target, err)
+	}
+}
+
+// TestOffloadPeerRelayedTargetGatesOnPulledFreshness is the anti-wedge
+// proof. A peer-relayed target — named in offload_requires but never
+// pushed to by this node, so its local whole-volume push watermark is
+// always 0 — must NOT wedge into a permanent no-op. It offloads when the
+// pulled origin-space push-freshness covers the content's origin run, and
+// refuses when the freshness is below it or absent. Without the pulled
+// freshness coordinate every file on the offsite tier would fail
+// freshness forever — exactly the workflow the feature exists for.
+func TestOffloadPeerRelayedTargetGatesOnPulledFreshness(t *testing.T) {
+	const target = "remote-archive"
+
+	t.Run("passes when freshness covers origin", func(t *testing.T) {
+		root := t.TempDir()
+		writeFile(t, filepath.Join(root, "a.txt"), "alpha")
+		s := setupStore(t)
+		idx := indexVolume(t, s, root)
+		v := testVolume(t, s)
+		self := selfNode(t, s)
+
+		// Pulled vector + pulled freshness both cover the content's origin
+		// run; there is no local push to this target (watermark 0).
+		seedVerifiedComponent(t, s, v.ID, target, self.ID, idx.RunID)
+		seedRelayedFreshness(t, s, v.ID, target, self.ID, idx.RunID)
+
+		rep, err := Offload(context.Background(), s, root, Options{
+			Name: volName, Paths: []string{"."}, Require: []string{target},
+		})
+		if err != nil {
+			t.Fatalf("Offload: %v", err)
+		}
+		oneResult(t, rep, "a.txt", OutcomeOffloaded)
+		mustBeGone(t, filepath.Join(root, "a.txt"))
+	})
+
+	t.Run("refuses when freshness is below origin", func(t *testing.T) {
+		root := t.TempDir()
+		writeFile(t, filepath.Join(root, "a.txt"), "alpha")
+		s := setupStore(t)
+		idx := indexVolume(t, s, root)
+		v := testVolume(t, s)
+		self := selfNode(t, s)
+
+		seedVerifiedComponent(t, s, v.ID, target, self.ID, idx.RunID)
+		// Freshness predates the content's origin run: the pushing node's
+		// latest whole-volume push did not cover it.
+		seedRelayedFreshness(t, s, v.ID, target, self.ID, idx.RunID-1)
+
+		rep, err := Offload(context.Background(), s, root, Options{
+			Name: volName, Paths: []string{"."}, Require: []string{target},
+		})
+		if err != nil {
+			t.Fatalf("Offload: %v", err)
+		}
+		res := oneResult(t, rep, "a.txt", OutcomeNotDurable)
+		if len(res.Reasons) != 1 || !strings.Contains(res.Reasons[0], "push freshness") {
+			t.Fatalf("reasons = %v, want a stale-freshness failure", res.Reasons)
+		}
+		mustExist(t, filepath.Join(root, "a.txt"))
+	})
+
+	t.Run("refuses when no freshness evidence", func(t *testing.T) {
+		root := t.TempDir()
+		writeFile(t, filepath.Join(root, "a.txt"), "alpha")
+		s := setupStore(t)
+		idx := indexVolume(t, s, root)
+		v := testVolume(t, s)
+		self := selfNode(t, s)
+
+		// Vector covers the content but no freshness was ever pulled.
+		seedVerifiedComponent(t, s, v.ID, target, self.ID, idx.RunID)
+
+		rep, err := Offload(context.Background(), s, root, Options{
+			Name: volName, Paths: []string{"."}, Require: []string{target},
+		})
+		if err != nil {
+			t.Fatalf("Offload: %v", err)
+		}
+		res := oneResult(t, rep, "a.txt", OutcomeNotDurable)
+		if len(res.Reasons) != 1 || !strings.Contains(res.Reasons[0], "no whole-volume push freshness") {
+			t.Fatalf("reasons = %v, want a no-freshness-evidence failure", res.Reasons)
+		}
+		mustExist(t, filepath.Join(root, "a.txt"))
+	})
+}
+
+// TestOffloadLocalPushTargetIgnoresRelayedFreshness: a target this node
+// pushes to directly still gates on the local-run-space watermark, not on
+// pulled push-freshness. A local push watermark behind the path's
+// became-present run refuses even when relayed freshness would cover it —
+// the local determination wins for a locally-pushed target.
+func TestOffloadLocalPushTargetIgnoresRelayedFreshness(t *testing.T) {
+	const target = "t1"
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "a.txt"), "alpha")
 	s := setupStore(t)
@@ -124,19 +221,29 @@ func TestOffloadPeerRelayedTargetNeedsLocalPush(t *testing.T) {
 	v := testVolume(t, s)
 	self := selfNode(t, s)
 
-	// Pulled vector covers the content with a content-verified method,
-	// but there is no local push run to this target.
-	seedVerifiedComponent(t, s, v.ID, "remote-archive", self.ID, idx.RunID)
+	seedVerifiedComponent(t, s, v.ID, target, self.ID, idx.RunID)
+	// Relayed freshness would cover the origin, but this node pushes to
+	// the target directly, so the gate uses the local watermark instead.
+	seedRelayedFreshness(t, s, v.ID, target, self.ID, idx.RunID)
+
+	// A local push exists but it predates the re-acquisition of the path.
+	recordPush(t, s, v.ID, target)
+	if err := os.Remove(filepath.Join(root, "a.txt")); err != nil {
+		t.Fatal(err)
+	}
+	indexVolume(t, s, root)
+	writeFile(t, filepath.Join(root, "a.txt"), "alpha")
+	indexVolume(t, s, root) // re-acquire past the local push
 
 	rep, err := Offload(context.Background(), s, root, Options{
-		Name: volName, Paths: []string{"."}, Require: []string{"remote-archive"},
+		Name: volName, Paths: []string{"."}, Require: []string{target},
 	})
 	if err != nil {
 		t.Fatalf("Offload: %v", err)
 	}
 	res := oneResult(t, rep, "a.txt", OutcomeNotDurable)
-	if len(res.Reasons) != 1 || !strings.Contains(res.Reasons[0], "not freshly pushed") {
-		t.Fatalf("reasons = %v, want a freshness failure", res.Reasons)
+	if len(res.Reasons) != 1 || !strings.Contains(res.Reasons[0], "last whole-volume push run") {
+		t.Fatalf("reasons = %v, want a local-push freshness failure", res.Reasons)
 	}
 	mustExist(t, filepath.Join(root, "a.txt"))
 }

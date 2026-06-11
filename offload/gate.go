@@ -20,11 +20,13 @@ type component struct {
 
 // gate is the offline durability evidence for one invocation: the self
 // node (the coordinate content with NULL origin counts under) and one
-// durability vector per required target, loaded once up front, plus each
-// target's last-successful-whole-volume-push watermark in local run
-// space. These locally stored vector rows — including components pulled
-// from peers about targets only they can reach — are the entire evidence
-// base; the gate makes no network calls.
+// durability vector per required target, loaded once up front, plus two
+// freshness sources per target — the last-successful-whole-volume-push
+// watermark in local run space (for a target this node pushes to
+// directly) and the pulled origin-space push-freshness coordinates (for a
+// relayed target this node never pushes to). These locally stored rows —
+// including evidence pulled from peers about targets only they can reach
+// — are the entire evidence base; the gate makes no network calls.
 type gate struct {
 	store     *store.Store
 	volumeID  int64
@@ -32,6 +34,7 @@ type gate struct {
 	require   []string
 	vectors   map[string]map[int64]component // target → origin node id → component
 	lastPush  map[string]int64               // target → last whole-volume push run (local space)
+	freshness map[string]map[int64]int64     // target → origin node id → pulled push-freshness origin run
 	nodeNames map[int64]string
 }
 
@@ -47,6 +50,7 @@ func loadGate(ctx context.Context, s *store.Store, volumeID int64, require []str
 		require:   require,
 		vectors:   make(map[string]map[int64]component, len(require)),
 		lastPush:  make(map[string]int64, len(require)),
+		freshness: make(map[string]map[int64]int64, len(require)),
 		nodeNames: map[int64]string{self.ID: self.Name},
 	}
 	for _, target := range require {
@@ -65,6 +69,16 @@ func loadGate(ctx context.Context, s *store.Store, volumeID int64, require []str
 			return nil, fmt.Errorf("load last push watermark for %q: %w", target, err)
 		}
 		g.lastPush[target] = push
+
+		fresh, err := s.ListDestinationPushFreshness(ctx, volumeID, target)
+		if err != nil {
+			return nil, fmt.Errorf("load push freshness for %q: %w", target, err)
+		}
+		coords := make(map[int64]int64, len(fresh))
+		for _, f := range fresh {
+			coords[f.OriginNodeID] = f.OriginRunID
+		}
+		g.freshness[target] = coords
 	}
 	return g, nil
 }
@@ -73,10 +87,12 @@ func loadGate(ctx context.Context, s *store.Store, volumeID int64, require []str
 // (N, r) is durable on a target only when all three conditions hold:
 //
 //   - origin vector: the target's component for N covers r;
-//   - freshness: the target's last successful whole-volume push (local
-//     run space) is at or beyond the run in which the path last became
-//     present (status_changed_run_id), so a path re-acquired after the
-//     last push is held until a fresh push covers it;
+//   - freshness: a successful whole-volume push covers the run in which
+//     the path last became present, so a path re-acquired after the last
+//     push is held until a fresh push covers it. For a target this node
+//     pushes to directly the watermark is the last push in local run
+//     space; for a relayed target it never pushes to, the watermark is
+//     the pulled origin-space push-freshness coordinate for N;
 //   - method: that component is content-verified, or — for a presence-
 //     only content-addressed component — a verified scan-back
 //     fingerprint backs the gated object.
@@ -102,7 +118,7 @@ func (g *gate) check(ctx context.Context, row store.FileRow) ([]string, error) {
 				fmt.Sprintf("%s: stale: have %d need %d (origin %s)", target, comp.coveredRun, originRun, g.nodeName(ctx, originNode)))
 			continue
 		}
-		if reason := g.freshnessFailure(target, row); reason != "" {
+		if reason := g.freshnessFailure(ctx, target, row, originNode, originRun); reason != "" {
 			failures = append(failures, reason)
 			continue
 		}
@@ -118,22 +134,47 @@ func (g *gate) check(ctx context.Context, row store.FileRow) ([]string, error) {
 	return failures, nil
 }
 
-// freshnessFailure refuses the target when its last successful whole-
-// volume push (local run space) predates the run in which the path last
-// became present. This is what closes the re-acquisition hole: a path
-// deleted, re-introduced, and re-indexed carries a status_changed_run_id
-// past the last push, so it is not durable on the target yet regardless
-// of the origin-vector state. A row with no recorded
-// status_changed_run_id (a pre-v18 row never re-stamped) is treated as
-// "became present at first_seen" — the conservative floor.
-func (g *gate) freshnessFailure(target string, row store.FileRow) string {
-	changed := row.FirstSeenRunID
-	if row.StatusChangedRunID.Valid {
-		changed = row.StatusChangedRunID.Int64
+// freshnessFailure refuses the target when no successful whole-volume
+// push covers the run in which the path last became present, closing the
+// re-acquisition hole: a path deleted, re-introduced, and re-indexed must
+// not be claimed durable on the strength of an origin-vector component
+// alone.
+//
+// Two coordinate spaces, by whether this node pushes to the target
+// directly:
+//
+//   - Local push (lastPush > 0): the watermark is the last successful
+//     whole-volume push in local run space, compared against the path's
+//     status_changed_run_id. A row with no recorded status_changed_run_id
+//     (a pre-v18 row never re-stamped) is treated as "became present at
+//     first_seen" — the conservative floor.
+//   - Relayed target (no local push): the watermark is the pulled
+//     origin-space push-freshness coordinate for the content's origin
+//     node, compared against the content's origin run. The pushing node
+//     determines freshness in its own run space and reports the maxima of
+//     its latest whole-volume push per origin; the gate compares the
+//     gated content's origin run against it. Absence of freshness
+//     evidence refuses — a relayed target with no recorded push never
+//     gates.
+func (g *gate) freshnessFailure(ctx context.Context, target string, row store.FileRow, originNode, originRun int64) string {
+	if g.lastPush[target] > 0 {
+		changed := row.FirstSeenRunID
+		if row.StatusChangedRunID.Valid {
+			changed = row.StatusChangedRunID.Int64
+		}
+		if g.lastPush[target] < changed {
+			return fmt.Sprintf("%s: not freshly pushed: last whole-volume push run %d < became-present run %d", target, g.lastPush[target], changed)
+		}
+		return ""
 	}
-	push := g.lastPush[target]
-	if push < changed {
-		return fmt.Sprintf("%s: not freshly pushed: last whole-volume push run %d < became-present run %d", target, push, changed)
+	fresh, ok := g.freshness[target][originNode]
+	if !ok {
+		return fmt.Sprintf("%s: not freshly pushed: no whole-volume push freshness for origin %s (need %d)",
+			target, g.nodeName(ctx, originNode), originRun)
+	}
+	if fresh < originRun {
+		return fmt.Sprintf("%s: not freshly pushed: push freshness %d < origin run %d (origin %s)",
+			target, fresh, originRun, g.nodeName(ctx, originNode))
 	}
 	return ""
 }
