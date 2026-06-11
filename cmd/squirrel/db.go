@@ -208,6 +208,9 @@ var dbSidecarSuffixes = []string{"-wal", "-shm"}
 // snapshot replay a stale WAL. The timestamp follows how snapshot
 // filenames are stamped elsewhere. Returns the preserved main-file path,
 // or "" when no main live DB existed.
+//
+// Preserved copies are kept indefinitely — no rotation matches their
+// name — so an operator who restores repeatedly reaps them by hand.
 func preserveLiveDB(liveAbs string) (string, error) {
 	mainExists := true
 	if _, err := os.Stat(liveAbs); err != nil {
