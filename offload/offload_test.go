@@ -435,6 +435,12 @@ func TestOffloadOlderThanSelector(t *testing.T) {
 	}
 	oneResult(t, rep, "top-old.txt", OutcomeOffloaded)
 	mustExist(t, filepath.Join(root, "sub", "new.txt"))
+
+	if _, err := Offload(context.Background(), s, root, Options{
+		Name: volName, Paths: []string{"sub"}, OlderThan: -time.Hour, Require: []string{"t1"},
+	}); err == nil || !strings.Contains(err.Error(), "negative") {
+		t.Fatalf("negative --older-than err = %v, want refusal naming the negative duration", err)
+	}
 }
 
 // TestOffloadSelectorMissReported: a selector matching nothing is
@@ -687,14 +693,14 @@ func TestOffloadUnindexedVolumeRefused(t *testing.T) {
 }
 
 func TestCleanSelectors(t *testing.T) {
-	got, err := cleanSelectors([]string{"a/b/", "./c", "."})
+	got, err := cleanSelectors([]string{"a/b/", "./c", ".", "./"})
 	if err != nil {
 		t.Fatalf("cleanSelectors: %v", err)
 	}
-	if len(got) != 3 || got[0] != "a/b" || got[1] != "c" || got[2] != "." {
-		t.Fatalf("cleaned = %v, want [a/b c .]", got)
+	if len(got) != 4 || got[0] != "a/b" || got[1] != "c" || got[2] != "." || got[3] != "." {
+		t.Fatalf("cleaned = %v, want [a/b c . .]", got)
 	}
-	for _, bad := range []string{"", "/abs/path", "../escape", "a/../../b"} {
+	for _, bad := range []string{"", "/abs/path", "../escape", "a/../../b", "a/..", "b/c/../.."} {
 		if _, err := cleanSelectors([]string{bad}); err == nil {
 			t.Fatalf("cleanSelectors(%q) succeeded, want refusal", bad)
 		}

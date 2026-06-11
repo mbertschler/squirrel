@@ -163,7 +163,10 @@ func validateOptions(opts Options) ([]string, error) {
 	if len(opts.Require) == 0 {
 		return nil, fmt.Errorf("volume %q declares no offload policy; offload refuses to delete without an explicit list of required targets (offload_requires)", opts.Name)
 	}
-	if len(opts.Paths) == 0 && opts.OlderThan <= 0 {
+	if opts.OlderThan < 0 {
+		return nil, fmt.Errorf("--older-than %s is negative; the age cutoff must be a positive duration", opts.OlderThan)
+	}
+	if len(opts.Paths) == 0 && opts.OlderThan == 0 {
 		return nil, errors.New(`offload needs a selector: volume-relative paths/prefixes ("." for the whole volume) and/or an --older-than age`)
 	}
 	return cleanSelectors(opts.Paths)
@@ -183,6 +186,9 @@ func cleanSelectors(paths []string) ([]string, error) {
 		c := path.Clean(filepath.ToSlash(p))
 		if c == ".." || strings.HasPrefix(c, "../") {
 			return nil, fmt.Errorf("selector %q escapes the volume root", p)
+		}
+		if c == "." && strings.Contains(p, "..") {
+			return nil, fmt.Errorf(`selector %q collapses to the whole volume; spell out "." to select everything`, p)
 		}
 		out = append(out, c)
 	}
@@ -243,8 +249,9 @@ func underReservedSubtree(p string) bool {
 // matched younger files still counts as matched. Candidates come back
 // in path order for deterministic reports.
 func selectCandidates(rows map[string]store.FileRow, selectors []string, olderThan time.Duration) ([]store.FileRow, []string) {
+	ageFiltered := olderThan > 0
 	var cutoffNs int64
-	if olderThan > 0 {
+	if ageFiltered {
 		cutoffNs = time.Now().Add(-olderThan).UnixNano()
 	}
 	hit := make(map[string]bool, len(selectors))
@@ -260,7 +267,7 @@ func selectCandidates(rows map[string]store.FileRow, selectors []string, olderTh
 			}
 			hit[sel] = true
 		}
-		if cutoffNs != 0 && row.MtimeNs >= cutoffNs {
+		if ageFiltered && row.MtimeNs >= cutoffNs {
 			continue
 		}
 		out = append(out, row)
