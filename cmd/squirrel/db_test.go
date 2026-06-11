@@ -161,6 +161,57 @@ func TestCLIDBRestoreClearsLiveSidecarsBeforeRename(t *testing.T) {
 	}
 }
 
+// TestPreserveLiveDBRemovesOrphanSidecars guards the case Copilot flagged:
+// a missing main DB but lingering -wal/-shm (crash or manual move). The
+// sidecars must be cleared so the incoming snapshot can't replay a stale
+// WAL, even though there is no main file to move aside.
+func TestPreserveLiveDBRemovesOrphanSidecars(t *testing.T) {
+	dir := t.TempDir()
+	live := filepath.Join(dir, "index.db")
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.WriteFile(live+suffix, []byte("stale"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	preRestore, err := preserveLiveDB(live)
+	if err != nil {
+		t.Fatalf("preserveLiveDB: %v", err)
+	}
+	if preRestore != "" {
+		t.Fatalf("preRestore = %q, want empty (no main DB to preserve)", preRestore)
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Stat(live + suffix); !os.IsNotExist(err) {
+			t.Fatalf("orphan %s sidecar not cleared (err=%v)", suffix, err)
+		}
+	}
+}
+
+// TestRollbackLiveDBRestoresPath asserts rollbackLiveDB moves a preserved
+// DB and its sidecars back to the live path, so a failed restore leaves
+// the live DB where it started.
+func TestRollbackLiveDBRestoresPath(t *testing.T) {
+	dir := t.TempDir()
+	live := filepath.Join(dir, "index.db")
+	preRestore := live + ".pre-restore-1"
+	if err := os.WriteFile(preRestore, []byte("main"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(preRestore+"-wal", []byte("wal"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rollbackLiveDB(preRestore, live)
+	if b, err := os.ReadFile(live); err != nil || string(b) != "main" {
+		t.Fatalf("live DB not restored: content=%q err=%v", b, err)
+	}
+	if b, err := os.ReadFile(live + "-wal"); err != nil || string(b) != "wal" {
+		t.Fatalf("live -wal not restored: content=%q err=%v", b, err)
+	}
+	if _, err := os.Stat(preRestore); !os.IsNotExist(err) {
+		t.Fatalf("preserved main still present after rollback (err=%v)", err)
+	}
+}
+
 // parsePreservedPath extracts the path from the
 // "preserved prior live DB at <path>" restore output line.
 func parsePreservedPath(t *testing.T, out string) string {
