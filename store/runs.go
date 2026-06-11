@@ -143,6 +143,28 @@ func (s *Store) BeginIndexRun(ctx context.Context, kind string, volumeID int64, 
 	return id, nil
 }
 
+// BeginRemoteVerifyRun records the start of a remote-object verification
+// pass as a kind='audit' run. The pass is destination-scoped rather than
+// volume-scoped — the content-addressed objects/ space is shared by
+// every volume — so volume_id is NULL; and the runs CHECK keeps
+// destination NULL on audit rows, so the verified destination is
+// recorded in the run's 'verify-destination' runs_audit note instead.
+// Callers must pair it with FinishRun.
+func (s *Store) BeginRemoteVerifyRun(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `
+		INSERT INTO runs (kind, volume_id, destination, started_at_ns, status, file_count)
+		VALUES ('audit', NULL, NULL, ?, 'running', 0)
+	`, NowNs())
+	if err != nil {
+		return 0, fmt.Errorf("insert remote-verify run: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("remote-verify run last insert id: %w", err)
+	}
+	return id, nil
+}
+
 // BeginPeerSyncRun is BeginRun's sibling for kind='sync' rows tied to a
 // peer node. It records the (peer_node_id, correlated_run_id) pair
 // alongside the regular destination name (the peer's name from the

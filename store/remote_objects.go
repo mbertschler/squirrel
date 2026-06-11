@@ -54,6 +54,74 @@ func (s *Store) InsertRemoteObject(ctx context.Context, o RemoteObject) error {
 	return nil
 }
 
+// SetRemoteObjectChecksum fills the pending checksum pair on an upload
+// record: the scan-back fingerprint read from the provider after the
+// upload was confirmed. Only a NULL pair is filled — the recorded
+// fingerprint is what every later verification compares against, so a
+// second write for the same (content, destination) fails instead of
+// replacing it, and a missing record errors as a caller bug.
+func (s *Store) SetRemoteObjectChecksum(ctx context.Context, contentID int64, destination, algo, checksum string) error {
+	if algo == "" || checksum == "" {
+		return fmt.Errorf("SetRemoteObjectChecksum: algo and checksum must be non-empty")
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE remote_objects SET checksum_algo = ?, checksum = ?
+		WHERE content_id = ? AND destination = ?
+		  AND checksum_algo IS NULL AND checksum IS NULL
+	`, algo, checksum, contentID, destination)
+	if err != nil {
+		return fmt.Errorf("set remote object checksum: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("set remote object checksum rows: %w", err)
+	}
+	if n == 0 {
+		if _, getErr := s.GetRemoteObject(ctx, contentID, destination); errors.Is(getErr, sql.ErrNoRows) {
+			return fmt.Errorf("set remote object checksum: no remote object for content %d on %q", contentID, destination)
+		} else if getErr != nil {
+			return fmt.Errorf("set remote object checksum: %w", getErr)
+		}
+		return fmt.Errorf("set remote object checksum: content %d on %q already has a recorded fingerprint", contentID, destination)
+	}
+	return nil
+}
+
+// RemoteObjectRecord pairs an upload record with its content hash; the
+// destination-side object key is the lowercase hex of Blake3.
+type RemoteObjectRecord struct {
+	RemoteObject
+	Blake3 []byte
+}
+
+// ListRemoteObjects returns every upload record for the destination with
+// the content hash joined in, ordered by hash so verification output is
+// deterministic.
+func (s *Store) ListRemoteObjects(ctx context.Context, destination string) ([]RemoteObjectRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT r.content_id, r.destination, r.uploaded_run_id,
+		       r.checksum_algo, r.checksum, r.verified_at_ns, c.blake3
+		FROM remote_objects r
+		JOIN contents c ON c.id = r.content_id
+		WHERE r.destination = ?
+		ORDER BY c.blake3
+	`, destination)
+	if err != nil {
+		return nil, fmt.Errorf("list remote objects for %q: %w", destination, err)
+	}
+	defer rows.Close()
+	var out []RemoteObjectRecord
+	for rows.Next() {
+		var r RemoteObjectRecord
+		if err := rows.Scan(&r.ContentID, &r.Destination, &r.UploadedRunID,
+			&r.ChecksumAlgo, &r.Checksum, &r.VerifiedAtNs, &r.Blake3); err != nil {
+			return nil, fmt.Errorf("scan remote object row: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // GetRemoteObject returns the upload record for one (content,
 // destination), or sql.ErrNoRows when the content was never recorded as
 // uploaded there.
