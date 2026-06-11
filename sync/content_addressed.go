@@ -338,8 +338,8 @@ var errContentDrift = errors.New("source content drifted from its indexed hash")
 // guards the content-addressed invariant — the bytes stored under a hash
 // must be the bytes that produced it — by re-hashing the source file
 // immediately before the transfer and refusing (errContentDrift) when the
-// digest no longer matches the indexed hash; a size+mtime-preserving
-// in-place edit, which the metadata stat alone cannot catch, fails here.
+// digest no longer matches the indexed hash, catching a
+// size+mtime-preserving in-place edit that a metadata stat would pass.
 // The post-transfer stat confirms presence and size on the remote, and the
 // upload record is written only after that confirmation, so a recorded
 // hash is always a confirmed one; a crash in between re-uploads the same

@@ -582,9 +582,8 @@ func metadataMatches(existing store.FileRow, w workItem) bool {
 // rowFor builds the file row from the hashed-file result rather than the
 // walk-time workItem: SizeBytes and MtimeNs come from a Stat of the open
 // handle taken after hashing, so the digest and the metadata describe the
-// same inode state. A file appended-to between the walk and the hash would
-// otherwise bind the new digest to the stale walk size, minting a contents
-// row whose size_bytes can never match the honest content again.
+// same inode state — keeping the minted contents row internally
+// consistent against the immutable-contents size cross-check.
 func (i *indexer) rowFor(w workItem, hashed hashedFile) store.FileRow {
 	return store.FileRow{
 		VolumeID:       i.volumeID,
@@ -695,6 +694,11 @@ type hashedFile struct {
 // (rather than re-opening by path, which would reintroduce a race) pins the
 // metadata to the same bytes that produced the digest, even if the file was
 // growing during the walk-to-hash window.
+//
+// Residual: an append landing between the hash reaching EOF and the Stat
+// can still report a size above the bytes hashed; the window is a single
+// syscall gap (vs. the whole walk-to-hash span this closes), and a later
+// re-index of the settled file supersedes to a consistent row.
 func hashFile(path string, buf []byte) (hashedFile, error) {
 	f, err := os.Open(path)
 	if err != nil {
