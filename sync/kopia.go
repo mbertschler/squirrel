@@ -83,12 +83,15 @@ func (k *Kopia) run(ctx context.Context, cfgFile, password string, args ...strin
 // connect reports nothing usable there (first use). Connect runs on
 // every push so a repository path changed in squirrel's config is
 // re-pointed rather than silently snapshotting into the old one.
+// --no-persist-credentials keeps the password scoped to each
+// invocation's environment; kopia's default would write it to a
+// sidecar file next to the config on keyring-less hosts.
 func (k *Kopia) ensureRepository(ctx context.Context, cfgFile, password, repoPath string) error {
-	_, connectErr := k.run(ctx, cfgFile, password, "repository", "connect", "filesystem", "--path", repoPath)
+	_, connectErr := k.run(ctx, cfgFile, password, "repository", "connect", "filesystem", "--path", repoPath, "--no-persist-credentials")
 	if connectErr == nil {
 		return nil
 	}
-	if _, createErr := k.run(ctx, cfgFile, password, "repository", "create", "filesystem", "--path", repoPath); createErr != nil {
+	if _, createErr := k.run(ctx, cfgFile, password, "repository", "create", "filesystem", "--path", repoPath, "--no-persist-credentials"); createErr != nil {
 		return fmt.Errorf("kopia repository at %s: connect failed (%w); create failed: %w", repoPath, connectErr, createErr)
 	}
 	return nil
@@ -153,12 +156,12 @@ func (h *kopiaHandler) Push(ctx context.Context, opts Options) (Report, error) {
 	// Stamped up front so output renderers key kopia formatting off the
 	// method even when the push fails before a snapshot exists.
 	rep.Verification.Method = VerifyMethodKopia
-	if opts.DryRun {
-		return rep, fmt.Errorf("destination %q: kopia has no dry-run mode — run without --dry-run", h.dest.Name)
-	}
 	volID, err := requireIndexedVolume(ctx, h.store, h.vol)
 	if err != nil {
 		return rep, err
+	}
+	if opts.DryRun {
+		return rep, fmt.Errorf("destination %q: kopia has no dry-run mode — run without --dry-run", h.dest.Name)
 	}
 	runID, err := beginSyncRunGuarded(ctx, h.store, false, store.SyncRunSpec{
 		VolumeID:    volID,

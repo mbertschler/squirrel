@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -193,7 +194,7 @@ func TestKopiaPushHappyPath(t *testing.T) {
 	cfgFile := filepath.Join(filepath.Dir(f.cfg.Path), "kopia-mirror.config")
 	repo := f.pair.Destination.Root
 	wantArgv := []string{
-		"repository connect filesystem --path " + repo + " --config-file " + cfgFile,
+		"repository connect filesystem --path " + repo + " --no-persist-credentials --config-file " + cfgFile,
 		"snapshot create " + f.pair.Volume.Path + " --json --config-file " + cfgFile,
 		"snapshot verify snap123 --config-file " + cfgFile,
 	}
@@ -364,6 +365,10 @@ func TestKopiaIntegrationRealBinary(t *testing.T) {
 	}
 	if rep.Verification.SnapshotID == "" || rep.Verification.Files < 1 {
 		t.Fatalf("Verification = %+v, want a snapshot id and file count", rep.Verification)
+	}
+	cfgFile := filepath.Join(filepath.Dir(f.cfg.Path), "kopia-mirror.config")
+	if _, err := os.Stat(cfgFile + ".kopia-password"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("kopia persisted the repository password to %s (stat err=%v); --no-persist-credentials must prevent the sidecar", cfgFile+".kopia-password", err)
 	}
 
 	// Second push re-connects and snapshots again without error.
