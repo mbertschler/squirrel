@@ -382,6 +382,13 @@ func runRcloneOperation(
 // least one success-or-partial index run exists for it. Sync of an
 // unindexed volume is refused: without an index, we have no record of
 // what should be at the destination after the run.
+//
+// The DB row's recorded path must equal the config-declared path. A
+// handler enumerates the config path's tree while the durability advance
+// covers the rows the DB volume holds; if the two paths disagree (a stale
+// volumes.path) the push would claim durability for one tree while
+// transferring another. Offload and restore already make this
+// cross-check; the push handlers share it through this gate.
 func requireIndexedVolume(ctx context.Context, s *store.Store, vol *config.Volume) (int64, error) {
 	v, err := s.GetVolumeByName(ctx, vol.Name)
 	if err != nil {
@@ -389,6 +396,9 @@ func requireIndexedVolume(ctx context.Context, s *store.Store, vol *config.Volum
 			return 0, fmt.Errorf("volume %q has never been indexed — run `squirrel index %s` first", vol.Name, vol.Name)
 		}
 		return 0, fmt.Errorf("lookup volume %q: %w", vol.Name, err)
+	}
+	if v.Path != vol.Path {
+		return 0, fmt.Errorf("volume %q is at %q in the DB but config says %q — resolve the conflict before syncing", vol.Name, v.Path, vol.Path)
 	}
 	if _, err := s.LatestSuccessfulIndexRun(ctx, v.ID); err != nil {
 		if store.IsNotFound(err) {

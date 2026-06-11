@@ -22,6 +22,15 @@ func TestMigrateV18ToV19AddsVerifyMethod(t *testing.T) {
 		`CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)`,
 		`CREATE TABLE volumes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL)`,
 		`CREATE TABLE nodes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, endpoint TEXT, public_key_fingerprint TEXT)`,
+		// contents exists from v14 on; a real v18 DB carries it, and the
+		// v20→v21 triggers attach to it, so the minimal fixture must too.
+		`CREATE TABLE contents (
+			id             INTEGER PRIMARY KEY,
+			blake3         BLOB NOT NULL UNIQUE CHECK (length(blake3) = 32),
+			size_bytes     INTEGER NOT NULL,
+			origin_node_id INTEGER REFERENCES nodes(id),
+			origin_run_id  INTEGER
+		)`,
 		`CREATE TABLE destination_run_ids (
 			volume_id      INTEGER NOT NULL REFERENCES volumes(id),
 			destination    TEXT NOT NULL,

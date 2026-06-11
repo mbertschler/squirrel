@@ -10,7 +10,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 20
+const SchemaVersion = 21
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -56,6 +56,7 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 18, up: migrateV17ToV18},
 		{version: 19, up: migrateV18ToV19},
 		{version: 20, up: migrateV19ToV20},
+		{version: 21, up: migrateV20ToV21},
 	}
 }
 
@@ -1821,4 +1822,50 @@ func migrateV19ToV20(ctx context.Context, db *sql.DB) error {
 		}
 	}
 	return tx.Commit()
+}
+
+// --- v20 → v21 ---
+
+// migrateV20ToV21 restores schema-level immutability for the contents
+// table. contents is the append-only content entity: one row per BLAKE3,
+// carrying its size and origin. The id↔blake3 binding is already immutable
+// by construction (blake3 is UNIQUE), but the v13→v14 reshape dropped the
+// files_blake3_immutable trigger without installing an equivalent guard on
+// the new table, so a future bug could UPDATE a row's size_bytes/origin_*
+// in place or DELETE a row whose hash other rows still reference.
+//
+// Two triggers re-assert the guarantee the append-only contract implies:
+// any UPDATE or DELETE on a contents row aborts. The sanctioned way to
+// record different content at a path is to supersede the files row and
+// insert a new one (see Upsert), which leaves the contents row untouched.
+func migrateV20ToV21(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	for _, q := range append(contentsImmutableTriggers(), `INSERT INTO schema_version (version) VALUES (21)`) {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("v20→v21: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// contentsImmutableTriggers returns the DDL for the two triggers that make
+// the contents table append-only at the schema level: a row's size and
+// origin are fixed once written, and a row is never removed. Shared with
+// any future fresh-baseline so the guarantee survives a schema rebase.
+func contentsImmutableTriggers() []string {
+	return []string{
+		`CREATE TRIGGER contents_no_update BEFORE UPDATE ON contents
+		 BEGIN
+		     SELECT RAISE(ABORT, 'contents is append-only; supersede the files row and insert new content instead of updating');
+		 END`,
+		`CREATE TRIGGER contents_no_delete BEFORE DELETE ON contents
+		 BEGIN
+		     SELECT RAISE(ABORT, 'contents is append-only; a content row is never deleted');
+		 END`,
+	}
 }

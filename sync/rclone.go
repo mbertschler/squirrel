@@ -232,6 +232,12 @@ type RunResult struct {
 	// FatalError is true when the run failed in a way that did not produce
 	// per-file errors — e.g. source root missing, auth failure.
 	FatalError bool
+	// HashFallback is true when rclone reported that --checksum could not
+	// use the requested hash because source and destination share none,
+	// and silently fell back to a size-based comparison. A run that asked
+	// for BLAKE3 verification but hit this path was not content-verified,
+	// however rclone exited, so the caller must not record it as verified.
+	HashFallback bool
 }
 
 // FailedFile is one per-object error from the JSON log. Object may be
@@ -474,6 +480,16 @@ var retrySummaryRE = regexp.MustCompile(`^Attempt \d+/\d+ failed`)
 
 func isRetrySummary(msg string) bool { return retrySummaryRE.MatchString(msg) }
 
+// hashFallbackRE matches rclone's notice that --checksum has no common
+// hash to compare with and is degrading to a size-based check, e.g.
+// "--checksum is in use but the source and destination have no hashes in
+// common; falling back to --size-only". The trailing verb has varied
+// across rclone versions ("falling back"/"failing back") so the match
+// keys on the stable phrase "no hashes in common", at any log level.
+var hashFallbackRE = regexp.MustCompile(`no hashes in common`)
+
+func isHashFallback(msg string) bool { return hashFallbackRE.MatchString(msg) }
+
 // parseJSONLog reads JSON-per-line events from r and updates result in
 // place. Non-JSON lines (e.g. an early startup notice on an older rclone)
 // are skipped — we cannot make decisions on them and surfacing them as
@@ -490,6 +506,12 @@ func parseJSONLog(r io.Reader, result *RunResult, onProgress func(runevents.Prog
 		var ev rcloneEvent
 		if err := json.Unmarshal(line, &ev); err != nil {
 			continue
+		}
+		if isHashFallback(ev.Msg) {
+			// Emitted at NOTICE level (which the level filter below drops),
+			// so it is detected here before that filter: a run that asked
+			// for BLAKE3 but lost the hash must not be recorded as verified.
+			result.HashFallback = true
 		}
 		if ev.Stats != nil {
 			result.Transferred = ev.Stats.TotalTransfers

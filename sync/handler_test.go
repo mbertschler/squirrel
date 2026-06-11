@@ -54,17 +54,22 @@ func TestRcloneVerification(t *testing.T) {
 		dest         *config.Destination
 		opts         Options
 		status       string
+		hashFallback bool
 		wantVerified bool
 		wantMethod   string
 	}{
-		{"checksum success", plain, Options{}, store.RunStatusSuccess, true, VerifyMethodBlake3},
-		{"checksum partial", plain, Options{}, store.RunStatusPartial, false, VerifyMethodBlake3},
-		{"shallow success", plain, Options{Shallow: true}, store.RunStatusSuccess, false, VerifyMethodSizeMtime},
-		{"crypt forces shallow", crypt, Options{}, store.RunStatusSuccess, false, VerifyMethodSizeMtime},
+		{"checksum success", plain, Options{}, store.RunStatusSuccess, false, true, VerifyMethodBlake3},
+		{"checksum partial", plain, Options{}, store.RunStatusPartial, false, false, VerifyMethodBlake3},
+		{"shallow success", plain, Options{Shallow: true}, store.RunStatusSuccess, false, false, VerifyMethodSizeMtime},
+		{"crypt forces shallow", crypt, Options{}, store.RunStatusSuccess, false, false, VerifyMethodSizeMtime},
+		// rclone exited 0 with the integrity flags set, but reported the
+		// no-common-hash fallback: the copy was compared by size, so the
+		// result must be size+mtime and unverified.
+		{"hash fallback downgrades", plain, Options{}, store.RunStatusSuccess, true, false, VerifyMethodSizeMtime},
 	}
 	for _, c := range cases {
 		rep := &Report{Status: c.status}
-		rep.RcloneResult = RunResult{Transferred: 2, Checked: 3, Bytes: 42}
+		rep.RcloneResult = RunResult{Transferred: 2, Checked: 3, Bytes: 42, HashFallback: c.hashFallback}
 		v := rcloneVerification(c.dest, c.opts, rep)
 		if v.Verified() != c.wantVerified || v.Method != c.wantMethod {
 			t.Errorf("%s: verified=%t method=%q, want %t %q", c.name, v.Verified(), v.Method, c.wantVerified, c.wantMethod)

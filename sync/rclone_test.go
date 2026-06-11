@@ -72,6 +72,37 @@ func TestParseJSONLogCapturesObjectlessErrors(t *testing.T) {
 	}
 }
 
+// TestParseJSONLogDetectsHashFallback: rclone's no-common-hash notice is
+// emitted at NOTICE level, which the error filter drops; parseJSONLog
+// still flags it so a flags-set, exit-0 run that silently degraded to a
+// size comparison is not later recorded as content-verified.
+func TestParseJSONLogDetectsHashFallback(t *testing.T) {
+	stream := strings.Join([]string{
+		`{"level":"notice","msg":"--checksum is in use but the source and destination have no hashes in common; falling back to --size-only","source":"x"}`,
+		`{"stats":{"errors":0,"fatalError":false,"totalTransfers":2,"totalChecks":0,"bytes":10}}`,
+	}, "\n")
+	var r RunResult
+	parseJSONLog(strings.NewReader(stream), &r, nil)
+
+	if !r.HashFallback {
+		t.Fatalf("HashFallback = false, want true (no-common-hash notice should be detected)")
+	}
+	if len(r.FailedFiles) != 0 {
+		t.Fatalf("FailedFiles = %+v, want none (the notice is not a per-file error)", r.FailedFiles)
+	}
+}
+
+// TestParseJSONLogNoFalseHashFallback: an ordinary run never trips the
+// fallback flag.
+func TestParseJSONLogNoFalseHashFallback(t *testing.T) {
+	stream := `{"stats":{"errors":0,"fatalError":false,"totalTransfers":2,"totalChecks":1,"bytes":10}}`
+	var r RunResult
+	parseJSONLog(strings.NewReader(stream), &r, nil)
+	if r.HashFallback {
+		t.Fatalf("HashFallback = true on a clean run, want false")
+	}
+}
+
 func TestIsRetrySummary(t *testing.T) {
 	cases := []struct {
 		in   string
