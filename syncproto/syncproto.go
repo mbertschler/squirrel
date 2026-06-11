@@ -378,12 +378,16 @@ type DurabilityResponse struct {
 // target namespace shared by buckets and peers; OriginNode is a node
 // name (the cross-node identity), and OriginRun is in that node's run
 // space. UpdatedAtNs is when the responding node last advanced or
-// re-confirmed the component.
+// re-confirmed the component. VerifyMethod names the comparison that
+// advanced it on the responding node, carried verbatim so the puller's
+// offload gate weighs a pulled component exactly as the responder did
+// (empty for a pre-v19 responder, which the gate reads as unverified).
 type DurabilityComponent struct {
-	Destination string `json:"destination"`
-	OriginNode  string `json:"origin_node"`
-	OriginRun   int64  `json:"origin_run"`
-	UpdatedAtNs int64  `json:"updated_at_ns"`
+	Destination  string `json:"destination"`
+	OriginNode   string `json:"origin_node"`
+	OriginRun    int64  `json:"origin_run"`
+	UpdatedAtNs  int64  `json:"updated_at_ns"`
+	VerifyMethod string `json:"verify_method,omitempty"`
 }
 
 // ErrorResponse is the uniform error body. Mirrors agent's

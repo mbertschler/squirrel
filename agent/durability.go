@@ -68,10 +68,11 @@ func (r *peerSyncRouter) durabilityResponse(ctx context.Context, volumeName stri
 			names[row.OriginNodeID] = name
 		}
 		resp.Components = append(resp.Components, syncproto.DurabilityComponent{
-			Destination: row.Destination,
-			OriginNode:  name,
-			OriginRun:   row.OriginRunID,
-			UpdatedAtNs: row.UpdatedAtNs,
+			Destination:  row.Destination,
+			OriginNode:   name,
+			OriginRun:    row.OriginRunID,
+			UpdatedAtNs:  row.UpdatedAtNs,
+			VerifyMethod: row.VerifyMethod,
 		})
 	}
 	return resp, nil
