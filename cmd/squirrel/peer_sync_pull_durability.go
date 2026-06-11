@@ -70,4 +70,7 @@ func printDurabilityPull(w io.Writer, rep sync.DurabilityPullReport) {
 	for _, dr := range rep.Drops {
 		fmt.Fprintf(w, "  dropped %s\n", dr)
 	}
+	if more := rep.Dropped - len(rep.Drops); more > 0 {
+		fmt.Fprintf(w, "  … and %d more dropped\n", more)
+	}
 }

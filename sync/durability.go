@@ -10,13 +10,20 @@ import (
 	"github.com/mbertschler/squirrel/syncproto"
 )
 
+// maxDurabilityDropSamples caps how many dropped entries the report
+// retains as detail. The Dropped count stays exact; only the sampled
+// Drops slice is bounded, so an adversarial peer flooding out-of-scope
+// destinations cannot blow up the report or the output that renders it.
+const maxDurabilityDropSamples = 16
+
 // DurabilityPullReport summarises one durability metadata pull from a
-// peer: how many vector components were fetched, how many landed in
-// the local destination_run_ids (advanced or re-confirmed), how many
-// were refused as rewinds, and how many were dropped because the peer
-// named a destination outside this volume's accepted target set. Every
-// fetched component lands in exactly one of the applied / rewind /
-// dropped buckets.
+// peer: how many entries (vector components and freshness coordinates)
+// were fetched, how many components landed in the local
+// destination_run_ids (advanced or re-confirmed), how many were refused
+// as rewinds, and how many entries were dropped because the peer named a
+// destination outside this volume's accepted target set. Every fetched
+// entry lands in exactly one of the applied / rewind / dropped buckets
+// (a merged freshness coordinate counts as applied).
 type DurabilityPullReport struct {
 	Volume  string
 	Peer    string
@@ -24,12 +31,23 @@ type DurabilityPullReport struct {
 	Applied int
 	Dropped int
 	Rewinds []DurabilityRewind
-	Drops   []DurabilityDrop
+	// Drops samples the dropped entries up to maxDurabilityDropSamples;
+	// Dropped is the exact total.
+	Drops []DurabilityDrop
+}
+
+// recordDrop counts a dropped entry and samples it into Drops up to the
+// cap, so the exact total survives while the detail stays bounded.
+func (r *DurabilityPullReport) recordDrop(d DurabilityDrop) {
+	r.Dropped++
+	if len(r.Drops) < maxDurabilityDropSamples {
+		r.Drops = append(r.Drops, d)
+	}
 }
 
 // DurabilityDrop is one pulled entry the merge discarded because its
 // destination falls outside the volume's accepted target set
-// (offload_requires ∪ sync_to). Drops are counted and listed so a peer
+// (offload_requires ∪ sync_to). Drops are counted and sampled so a peer
 // asserting evidence for destinations this node uses for neither offload
 // nor sync stays observable.
 type DurabilityDrop struct {
@@ -111,7 +129,7 @@ func pullDurability(ctx context.Context, s *store.Store, client *nodeClient, vol
 	if err != nil {
 		return rep, err
 	}
-	rep.Fetched = len(resp.Components)
+	rep.Fetched = len(resp.Components) + len(resp.Freshness)
 	originIDs := make(map[string]int64, 4)
 	resolveOrigin := func(name string) (int64, error) {
 		if id, ok := originIDs[name]; ok {
@@ -125,17 +143,12 @@ func pullDurability(ctx context.Context, s *store.Store, client *nodeClient, vol
 		return node.ID, nil
 	}
 	for _, c := range resp.Components {
+		if _, ok := accepted[c.Destination]; !ok {
+			rep.recordDrop(DurabilityDrop{Destination: c.Destination, OriginNode: c.OriginNode, Kind: "component"})
+			continue
+		}
 		if err := validateComponent(c); err != nil {
 			return rep, fmt.Errorf("component %+v: %w", c, err)
-		}
-		if _, ok := accepted[c.Destination]; !ok {
-			rep.Dropped++
-			rep.Drops = append(rep.Drops, DurabilityDrop{
-				Destination: c.Destination,
-				OriginNode:  c.OriginNode,
-				Kind:        "component",
-			})
-			continue
 		}
 		nodeID, err := resolveOrigin(c.OriginNode)
 		if err != nil {
@@ -158,17 +171,12 @@ func pullDurability(ctx context.Context, s *store.Store, client *nodeClient, vol
 		rep.Applied++
 	}
 	for _, f := range resp.Freshness {
+		if _, ok := accepted[f.Destination]; !ok {
+			rep.recordDrop(DurabilityDrop{Destination: f.Destination, OriginNode: f.OriginNode, Kind: "freshness"})
+			continue
+		}
 		if err := validateFreshness(f); err != nil {
 			return rep, fmt.Errorf("freshness %+v: %w", f, err)
-		}
-		if _, ok := accepted[f.Destination]; !ok {
-			rep.Dropped++
-			rep.Drops = append(rep.Drops, DurabilityDrop{
-				Destination: f.Destination,
-				OriginNode:  f.OriginNode,
-				Kind:        "freshness",
-			})
-			continue
 		}
 		nodeID, err := resolveOrigin(f.OriginNode)
 		if err != nil {
@@ -177,6 +185,7 @@ func pullDurability(ctx context.Context, s *store.Store, client *nodeClient, vol
 		if err := s.MergeDestinationPushFreshness(ctx, volumeID, f.Destination, nodeID, f.OriginRun); err != nil {
 			return rep, fmt.Errorf("apply freshness for destination %q origin %q: %w", f.Destination, f.OriginNode, err)
 		}
+		rep.Applied++
 	}
 	return rep, nil
 }

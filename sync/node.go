@@ -677,10 +677,11 @@ func (d *nodeSyncDriver) phaseClose() error {
 }
 
 // pullPeerDurability fetches the peer's destination vectors and merges
-// them into the local store. Failures and refused rewinds surface as
-// report warnings rather than failing the run: the sync itself
-// succeeded, and the pull can be retried any time via the standalone
-// `peer-sync pull-durability` command.
+// them into the local store. Failures, refused rewinds, and components
+// dropped for unconfigured destinations surface as report warnings
+// rather than failing the run: the sync itself succeeded, and the pull
+// can be retried any time via the standalone `peer-sync pull-durability`
+// command.
 func (d *nodeSyncDriver) pullPeerDurability() {
 	rep, err := pullDurability(d.ctx, d.store, d.client, d.vol.Name, d.volID, d.node.Name, acceptedDestinations(d.vol), false)
 	d.report.DurabilityPull = rep
@@ -693,10 +694,33 @@ func (d *nodeSyncDriver) pullPeerDurability() {
 		d.report.Warnings = append(d.report.Warnings,
 			fmt.Sprintf("durability pull from %s refused rewind: %s", d.node.Name, rw))
 	}
-	for _, dr := range rep.Drops {
+	if rep.Dropped > 0 {
 		d.report.Warnings = append(d.report.Warnings,
-			fmt.Sprintf("durability pull from %s dropped %s", d.node.Name, dr))
+			fmt.Sprintf("durability pull from %s dropped %d entr%s for unconfigured destinations (e.g. %s)",
+				d.node.Name, rep.Dropped, plural(rep.Dropped, "y", "ies"), dropSample(rep.Drops)))
 	}
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
+// dropSample renders the sampled destinations from a drop list as a
+// compact, deduplicated, comma-separated string for one summary line.
+func dropSample(drops []DurabilityDrop) string {
+	seen := make(map[string]struct{}, len(drops))
+	var names []string
+	for _, d := range drops {
+		if _, ok := seen[d.Destination]; ok {
+			continue
+		}
+		seen[d.Destination] = struct{}{}
+		names = append(names, d.Destination)
+	}
+	return strings.Join(names, ", ")
 }
 
 func (d *nodeSyncDriver) abortWithError(phase string, err error) error {

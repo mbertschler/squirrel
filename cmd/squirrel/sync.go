@@ -192,7 +192,7 @@ func printSyncReport(w io.Writer, rep sync.Report, runErr error) {
 			fmt.Fprintf(w, "    mismatched %s: expected %s, actual %s\n", m.Path, m.ExpectedHex, m.ActualHex)
 		}
 		if rep.DurabilityPull.Fetched > 0 {
-			fmt.Fprintf(w, "  durability: applied %d/%d peer components",
+			fmt.Fprintf(w, "  durability: applied %d/%d peer entries",
 				rep.DurabilityPull.Applied, rep.DurabilityPull.Fetched)
 			if rep.DurabilityPull.Dropped > 0 {
 				fmt.Fprintf(w, " (dropped %d for unconfigured destinations)",
