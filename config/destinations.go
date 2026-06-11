@@ -70,7 +70,11 @@ var destSchemas = map[string]destSchema{
 		// The password unlocks the repository (and creates it on first
 		// use); kopia encrypts the repository contents itself, which is
 		// also why a crypt block is rejected for this type.
+		// verify_files_percent is the fraction of snapshot file bytes
+		// `kopia snapshot verify` reads back when this destination gates
+		// offload (default applied by the kopia handler when unset).
 		rcloneType:     "",
+		optionalString: []string{"verify_files_percent"},
 		requiredSecret: []string{"password"},
 	},
 }

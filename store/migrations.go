@@ -10,7 +10,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 18
+const SchemaVersion = 20
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -54,6 +54,8 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 16, up: migrateV15ToV16},
 		{version: 17, up: migrateV16ToV17},
 		{version: 18, up: migrateV17ToV18},
+		{version: 19, up: migrateV18ToV19},
+		{version: 20, up: migrateV19ToV20},
 	}
 }
 
@@ -1730,6 +1732,92 @@ func migrateV17ToV18(ctx context.Context, db *sql.DB) error {
 	for _, q := range stmts {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("v17→v18: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// --- v18 → v19 ---
+
+// migrateV18ToV19 adds the verification-method provenance the offload
+// gate needs to tell a content-verified durability component apart from
+// a presence-only one. destination_run_ids.verify_method records the
+// method that advanced a live component (blake3, peer-blake3,
+// kopia-verify, or presence+size); destination_run_ids_history.verify_method
+// records it per advance so the audit log keeps the same fact.
+//
+// Both columns are additive and nullable. Existing components are left
+// NULL: the gate reads a NULL method as "not content-verified" and holds
+// the target out until a fresh verified push re-stamps it. That is the
+// strictly-stricter reading — a pre-v19 component can only ever start
+// refusing offload, never start permitting it — and is harmless because
+// a verified push re-advances the component cheaply.
+func migrateV18ToV19(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`ALTER TABLE destination_run_ids ADD COLUMN verify_method TEXT`,
+		`ALTER TABLE destination_run_ids_history ADD COLUMN verify_method TEXT`,
+		`INSERT INTO schema_version (version) VALUES (19)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("v18→v19: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// --- v19 → v20 ---
+
+// migrateV19ToV20 adds destination_push_freshness: the per-origin-node
+// maxima of the present set captured at a destination's most recent
+// successful whole-volume push, in origin-space coordinates. The offload
+// gate's freshness condition reads it for a target the local node does
+// not push to directly (a peer-relayed offsite, named in offload_requires
+// but absent from the local sync_to). The local-run-space watermark
+// LastSuccessfulWholeVolumePushRunID is always 0 for such a target, so the
+// freshness condition would refuse every file forever; this table lets a
+// pulled-evidence target satisfy freshness from the pushing node's own
+// determination, expressed in the origin coordinates the gate already
+// holds for the gated content.
+//
+// origin_run_id is the snapshot maxima of the *latest* push — overwritten
+// per push (non-monotonic), distinct from destination_run_ids.origin_run_id
+// which is the monotonic durability vector. A push removing content from
+// the pushing node's present set lowers the freshness maxima even though
+// the append-only target still holds the bytes (the monotonic vector keeps
+// covering them), so a relayed file above the freshness watermark is held
+// out — the safe direction.
+//
+// The table is empty after migration: only a successful whole-volume push
+// writes a row. A target with no row yields no freshness evidence, which
+// the gate reads as "refuse" for a relayed target.
+func migrateV19ToV20(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`CREATE TABLE destination_push_freshness (
+			volume_id      INTEGER NOT NULL REFERENCES volumes(id),
+			destination    TEXT NOT NULL,
+			origin_node_id INTEGER NOT NULL REFERENCES nodes(id),
+			origin_run_id  INTEGER NOT NULL,
+			updated_at_ns  INTEGER NOT NULL,
+			PRIMARY KEY (volume_id, destination, origin_node_id)
+		)`,
+		`INSERT INTO schema_version (version) VALUES (20)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("v19→v20: %w", err)
 		}
 	}
 	return tx.Commit()

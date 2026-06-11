@@ -152,6 +152,10 @@ func (h *contentAddressedHandler) push(ctx context.Context, rep *Report, volID, 
 	if err != nil {
 		return err
 	}
+	advance, err := captureDurabilityAdvance(ctx, h.store, volID)
+	if err != nil {
+		return err
+	}
 	delta, err := h.store.ListPathDeltaSince(ctx, volID, watermark)
 	if err != nil {
 		return fmt.Errorf("compute path delta since run %d: %w", watermark, err)
@@ -163,7 +167,11 @@ func (h *contentAddressedHandler) push(ctx context.Context, rep *Report, volID, 
 	if err := h.uploadSegment(ctx, delta, runID); err != nil {
 		return err
 	}
-	if err := h.store.AdvanceDestinationVector(ctx, volID, h.dest.Name); err != nil {
+	// presence+size is not a content-verified method (crypt remotes
+	// expose no hashes): the component advances so a later scan-back
+	// fingerprint can upgrade it, but the offload gate holds this target
+	// out until a verified fingerprint backs the gated object.
+	if err := h.store.AdvanceDestinationVectorTo(ctx, volID, h.dest.Name, store.VerifyMethodPresenceSize, advance); err != nil {
 		return fmt.Errorf("advance destination vector for %s: %w", h.dest.Name, err)
 	}
 	rep.Status = store.RunStatusSuccess

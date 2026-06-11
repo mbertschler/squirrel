@@ -23,18 +23,19 @@ import (
 // SizeBytes to a contents row (creating one, with the supplied
 // *Provenance as its origin, on first contact) and ignores ContentID.
 type FileRow struct {
-	VolumeID       int64
-	Path           string
-	ContentID      int64
-	Blake3         []byte // raw 32-byte BLAKE3-256 digest
-	SizeBytes      int64
-	MtimeNs        int64
-	Status         string
-	FirstSeenRunID int64
-	LastSeenRunID  int64
-	IndexedAtNs    int64
-	OriginNodeID   sql.NullInt64
-	OriginRunID    sql.NullInt64
+	VolumeID           int64
+	Path               string
+	ContentID          int64
+	Blake3             []byte // raw 32-byte BLAKE3-256 digest
+	SizeBytes          int64
+	MtimeNs            int64
+	Status             string
+	FirstSeenRunID     int64
+	LastSeenRunID      int64
+	IndexedAtNs        int64
+	OriginNodeID       sql.NullInt64
+	OriginRunID        sql.NullInt64
+	StatusChangedRunID sql.NullInt64
 }
 
 // Provenance carries the "where did this content first enter the
@@ -78,7 +79,7 @@ const (
 // see one flat FileRow even though storage is split. Pair every new
 // SELECT with this list and the fileFromJoin clause below so columns stay
 // in lockstep with scanDests.
-const fileSelectColumns = `fo.volume_id, ` + pathFromFolderAndName + `, f.content_id, c.blake3, c.size_bytes, f.mtime_ns, f.status, f.first_seen_run_id, f.last_seen_run_id, f.indexed_at_ns, c.origin_node_id, c.origin_run_id`
+const fileSelectColumns = `fo.volume_id, ` + pathFromFolderAndName + `, f.content_id, c.blake3, c.size_bytes, f.mtime_ns, f.status, f.first_seen_run_id, f.last_seen_run_id, f.indexed_at_ns, c.origin_node_id, c.origin_run_id, f.status_changed_run_id`
 
 // fileFromJoin is the FROM clause every file read uses. files is the inner
 // table; folders is joined for volume_id + path reconstruction and
@@ -110,7 +111,7 @@ func (r *FileRow) scanDests() []any {
 	return []any{
 		&r.VolumeID, &r.Path, &r.ContentID, &r.Blake3, &r.SizeBytes, &r.MtimeNs,
 		&r.Status, &r.FirstSeenRunID, &r.LastSeenRunID, &r.IndexedAtNs,
-		&r.OriginNodeID, &r.OriginRunID,
+		&r.OriginNodeID, &r.OriginRunID, &r.StatusChangedRunID,
 	}
 }
 

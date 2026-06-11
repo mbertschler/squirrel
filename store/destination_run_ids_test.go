@@ -2,9 +2,75 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"path/filepath"
 	"testing"
 )
+
+// TestMigrateV18ToV19AddsVerifyMethod builds a minimal v18 database with
+// a pre-existing durability component and confirms the migration adds
+// verify_method (NULL on the carried-over row) without disturbing the
+// recorded coordinate.
+func TestMigrateV18ToV19AddsVerifyMethod(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	rawDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("raw sql.Open: %v", err)
+	}
+	v18DDL := []string{
+		`CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)`,
+		`CREATE TABLE volumes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL)`,
+		`CREATE TABLE nodes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, endpoint TEXT, public_key_fingerprint TEXT)`,
+		`CREATE TABLE destination_run_ids (
+			volume_id      INTEGER NOT NULL REFERENCES volumes(id),
+			destination    TEXT NOT NULL,
+			origin_node_id INTEGER NOT NULL REFERENCES nodes(id),
+			origin_run_id  INTEGER NOT NULL,
+			updated_at_ns  INTEGER NOT NULL,
+			PRIMARY KEY (volume_id, destination, origin_node_id)
+		)`,
+		`CREATE TABLE destination_run_ids_history (
+			id             INTEGER PRIMARY KEY,
+			volume_id      INTEGER NOT NULL,
+			destination    TEXT NOT NULL,
+			origin_node_id INTEGER NOT NULL,
+			origin_run_id  INTEGER NOT NULL,
+			at_ns          INTEGER NOT NULL
+		)`,
+		`INSERT INTO schema_version (version) VALUES (18)`,
+		`INSERT INTO volumes (id, name, path) VALUES (1, 'v', '/v')`,
+		`INSERT INTO nodes (id, name) VALUES (1, 'self')`,
+		`INSERT INTO destination_run_ids (volume_id, destination, origin_node_id, origin_run_id, updated_at_ns)
+			VALUES (1, 'bucket', 1, 7, 100)`,
+	}
+	for _, q := range v18DDL {
+		if _, err := rawDB.Exec(q); err != nil {
+			t.Fatalf("v18 DDL %q: %v", q, err)
+		}
+	}
+	rawDB.Close()
+
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open (migrates v18→v19): %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	if v, _ := s.CurrentSchemaVersion(ctx); v != SchemaVersion {
+		t.Fatalf("schema_version = %d, want %d", v, SchemaVersion)
+	}
+	got, err := s.GetDestinationRunID(ctx, 1, "bucket", 1)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID: %v", err)
+	}
+	if got.OriginRunID != 7 {
+		t.Fatalf("origin run = %d, want 7 (carried over)", got.OriginRunID)
+	}
+	if got.VerifyMethod != "" {
+		t.Fatalf("verify method = %q, want empty (NULL backfill)", got.VerifyMethod)
+	}
+}
 
 // TestUpsertDestinationRunIDWritesHistory: every successful advance
 // appends one destination_run_ids_history row alongside updating the
@@ -181,6 +247,27 @@ func TestUpsertDestinationRunIDRejectsEmptyDestination(t *testing.T) {
 	}
 }
 
+// advanceFromPresentSet snapshots the volume's present-set origin maxima
+// and advances the destination's vector to exactly that snapshot, the
+// snapshot-pinned path every handler drives. Tests use it to exercise the
+// PresentOriginMaxima → AdvanceDestinationVectorTo pair the way production
+// does.
+func advanceFromPresentSet(t *testing.T, s *Store, volumeID int64, destination string) {
+	t.Helper()
+	ctx := context.Background()
+	self, err := s.GetSelfNode(ctx)
+	if err != nil {
+		t.Fatalf("GetSelfNode: %v", err)
+	}
+	components, err := s.PresentOriginMaxima(ctx, volumeID, self.ID)
+	if err != nil {
+		t.Fatalf("PresentOriginMaxima: %v", err)
+	}
+	if err := s.AdvanceDestinationVectorTo(ctx, volumeID, destination, VerifyMethodPeer, components); err != nil {
+		t.Fatalf("AdvanceDestinationVectorTo: %v", err)
+	}
+}
+
 // TestAdvanceDestinationVector: the advance computes one component per
 // origin node over the volume's present rows — locally-introduced
 // content under the self node at its introduction run (the content's
@@ -228,9 +315,7 @@ func TestAdvanceDestinationVector(t *testing.T) {
 	upsert("gone.txt", 0xA4, StatusMissing, run3, nil)
 	upsert(".squirrel-conflicts/run-1/x.bin", 0xA5, StatusPresent, run3, &Provenance{NodeID: ext.ID, RunID: 999})
 
-	if err := s.AdvanceDestinationVector(ctx, vID, "nas"); err != nil {
-		t.Fatalf("AdvanceDestinationVector: %v", err)
-	}
+	advanceFromPresentSet(t, s, vID, "nas")
 	vector, err := s.ListDestinationRunIDs(ctx, vID, "nas")
 	if err != nil {
 		t.Fatalf("ListDestinationRunIDs: %v", err)
@@ -268,15 +353,68 @@ func TestAdvanceDestinationVectorKeepsHigherComponent(t *testing.T) {
 		t.Fatalf("seed component: %v", err)
 	}
 
-	if err := s.AdvanceDestinationVector(ctx, vID, "nas"); err != nil {
-		t.Fatalf("AdvanceDestinationVector: %v", err)
-	}
+	advanceFromPresentSet(t, s, vID, "nas")
 	got, err := s.GetDestinationRunID(ctx, vID, "nas", ext.ID)
 	if err != nil {
 		t.Fatalf("GetDestinationRunID: %v", err)
 	}
 	if got.OriginRunID != 60 {
 		t.Fatalf("ext component = %d, want 60 (higher recorded floor kept)", got.OriginRunID)
+	}
+}
+
+// TestAdvanceDestinationVectorToPeerSnapshotPinned proves the peer-path
+// advance covers only the captured snapshot: a row that becomes present
+// between snapshot capture and the advance is not folded in. The advance
+// is fed the snapshot taken before the row existed, tagged peer-blake3,
+// so the later row's higher origin run never reaches the vector.
+func TestAdvanceDestinationVectorToPeerSnapshotPinned(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+	run1 := makeRun(t, s, vID)
+	self, err := s.GetSelfNode(ctx)
+	if err != nil {
+		t.Fatalf("GetSelfNode: %v", err)
+	}
+
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: vID, Path: "a.txt", Blake3: digest(0xC1),
+		SizeBytes: 1, MtimeNs: 1, Status: StatusPresent,
+		FirstSeenRunID: run1, LastSeenRunID: run1, IndexedAtNs: 1,
+	}, nil); err != nil {
+		t.Fatalf("Upsert a.txt: %v", err)
+	}
+
+	// Snapshot captured before the second row exists — the peer driver
+	// takes this before the transfer.
+	snapshot, err := s.PresentOriginMaxima(ctx, vID, self.ID)
+	if err != nil {
+		t.Fatalf("PresentOriginMaxima: %v", err)
+	}
+
+	// A row committed mid-transfer with a strictly higher introduction run.
+	run2 := makeRun(t, s, vID)
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: vID, Path: "b.txt", Blake3: digest(0xC2),
+		SizeBytes: 1, MtimeNs: 1, Status: StatusPresent,
+		FirstSeenRunID: run2, LastSeenRunID: run2, IndexedAtNs: 1,
+	}, nil); err != nil {
+		t.Fatalf("Upsert b.txt: %v", err)
+	}
+
+	if err := s.AdvanceDestinationVectorTo(ctx, vID, "nas", VerifyMethodPeer, snapshot); err != nil {
+		t.Fatalf("AdvanceDestinationVectorTo: %v", err)
+	}
+	got, err := s.GetDestinationRunID(ctx, vID, "nas", self.ID)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID: %v", err)
+	}
+	if got.OriginRunID != run1 {
+		t.Fatalf("self component = %d, want run1 %d (the mid-transfer row at run2 %d must not be covered)", got.OriginRunID, run1, run2)
+	}
+	if got.VerifyMethod != VerifyMethodPeer {
+		t.Fatalf("verify method = %q, want %q", got.VerifyMethod, VerifyMethodPeer)
 	}
 }
 
@@ -315,5 +453,190 @@ func TestListVolumeDestinationRunIDs(t *testing.T) {
 	if rows[0].Destination != "bucket-a" || rows[0].OriginRunID != 3 ||
 		rows[1].Destination != "bucket-b" || rows[1].OriginRunID != 7 {
 		t.Fatalf("rows = %+v, want bucket-a→3 then bucket-b→7", rows)
+	}
+}
+
+// TestAdvanceDestinationVectorToSnapshot is the #103 fix: the advance
+// reflects exactly the captured enumeration snapshot, not the live
+// present set re-read after a transfer. A content row inserted between
+// the snapshot and the advance is NOT claimed durable.
+func TestAdvanceDestinationVectorToSnapshot(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+	run1 := makeRun(t, s, vID)
+	self, err := s.GetSelfNode(ctx)
+	if err != nil {
+		t.Fatalf("GetSelfNode: %v", err)
+	}
+
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: vID, Path: "a.txt", Blake3: digest(0xA1), SizeBytes: 1, MtimeNs: 1,
+		Status: StatusPresent, FirstSeenRunID: run1, LastSeenRunID: run1, IndexedAtNs: 1,
+	}, nil); err != nil {
+		t.Fatalf("Upsert a.txt: %v", err)
+	}
+
+	// Snapshot captured here, before a second row lands.
+	snapshot, err := s.PresentOriginMaxima(ctx, vID, self.ID)
+	if err != nil {
+		t.Fatalf("PresentOriginMaxima: %v", err)
+	}
+
+	// A row committed after the snapshot (a mid-push index) advances the
+	// live present set to run2 — but the snapshot still reads run1.
+	run2 := makeRun(t, s, vID)
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: vID, Path: "b.txt", Blake3: digest(0xA2), SizeBytes: 1, MtimeNs: 1,
+		Status: StatusPresent, FirstSeenRunID: run2, LastSeenRunID: run2, IndexedAtNs: 1,
+	}, nil); err != nil {
+		t.Fatalf("Upsert b.txt: %v", err)
+	}
+
+	if err := s.AdvanceDestinationVectorTo(ctx, vID, "nas", VerifyMethodBlake3, snapshot); err != nil {
+		t.Fatalf("AdvanceDestinationVectorTo: %v", err)
+	}
+	got, err := s.GetDestinationRunID(ctx, vID, "nas", self.ID)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID: %v", err)
+	}
+	if got.OriginRunID != run1 {
+		t.Fatalf("self component = %d, want %d (snapshot, not the live run2)", got.OriginRunID, run1)
+	}
+	if got.VerifyMethod != VerifyMethodBlake3 {
+		t.Fatalf("verify method = %q, want %q", got.VerifyMethod, VerifyMethodBlake3)
+	}
+}
+
+// TestUpsertDestinationRunIDRecordsMethod: the verified entry point
+// records the method on the live row and in history; the legacy entry
+// point records none.
+func TestUpsertDestinationRunIDRecordsMethod(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+	node, err := s.GetSelfNode(ctx)
+	if err != nil {
+		t.Fatalf("GetSelfNode: %v", err)
+	}
+
+	if err := s.UpsertDestinationRunIDVerified(ctx, vID, "bucket", node.ID, 5, VerifyMethodKopia, false); err != nil {
+		t.Fatalf("UpsertDestinationRunIDVerified: %v", err)
+	}
+	got, err := s.GetDestinationRunID(ctx, vID, "bucket", node.ID)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID: %v", err)
+	}
+	if got.VerifyMethod != VerifyMethodKopia {
+		t.Fatalf("verify method = %q, want %q", got.VerifyMethod, VerifyMethodKopia)
+	}
+	hist, err := s.ListDestinationRunIDHistory(ctx, vID, "bucket")
+	if err != nil {
+		t.Fatalf("ListDestinationRunIDHistory: %v", err)
+	}
+	if len(hist) != 1 || hist[0].VerifyMethod != VerifyMethodKopia {
+		t.Fatalf("history = %+v, want one row with method %q", hist, VerifyMethodKopia)
+	}
+
+	if err := s.UpsertDestinationRunID(ctx, vID, "bucket2", node.ID, 5, false); err != nil {
+		t.Fatalf("UpsertDestinationRunID: %v", err)
+	}
+	plain, err := s.GetDestinationRunID(ctx, vID, "bucket2", node.ID)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID: %v", err)
+	}
+	if plain.VerifyMethod != "" {
+		t.Fatalf("verify method = %q, want empty (no method recorded)", plain.VerifyMethod)
+	}
+}
+
+// TestUpsertDestinationRunIDPreservesMethodOnMethodlessReconfirm: a
+// methodless re-confirmation at the same origin run (e.g. a pull from a
+// pre-v19 peer) must not degrade a recorded content-verified method to
+// unknown — provenance is preserved when the run does not advance.
+func TestUpsertDestinationRunIDPreservesMethodOnMethodlessReconfirm(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+	node, err := s.GetSelfNode(ctx)
+	if err != nil {
+		t.Fatalf("GetSelfNode: %v", err)
+	}
+
+	if err := s.UpsertDestinationRunIDVerified(ctx, vID, "bucket", node.ID, 5, VerifyMethodBlake3, false); err != nil {
+		t.Fatalf("seed verified: %v", err)
+	}
+	// Methodless re-confirm at the same run.
+	if err := s.UpsertDestinationRunID(ctx, vID, "bucket", node.ID, 5, false); err != nil {
+		t.Fatalf("methodless reconfirm: %v", err)
+	}
+	got, err := s.GetDestinationRunID(ctx, vID, "bucket", node.ID)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID: %v", err)
+	}
+	if got.VerifyMethod != VerifyMethodBlake3 {
+		t.Fatalf("verify method = %q, want %q preserved", got.VerifyMethod, VerifyMethodBlake3)
+	}
+
+	// A methodless advance to a strictly higher run clears the method —
+	// the new coordinate is genuinely unverified.
+	if err := s.UpsertDestinationRunID(ctx, vID, "bucket", node.ID, 9, false); err != nil {
+		t.Fatalf("methodless advance: %v", err)
+	}
+	got, err = s.GetDestinationRunID(ctx, vID, "bucket", node.ID)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID: %v", err)
+	}
+	if got.OriginRunID != 9 || got.VerifyMethod != "" {
+		t.Fatalf("after methodless advance: run=%d method=%q, want 9 and empty", got.OriginRunID, got.VerifyMethod)
+	}
+}
+
+// TestDestinationRunIDNullVerifyMethodReadsUnverified pins the v19
+// backfill contract: a component with a NULL verify_method (a pre-v19
+// row, or a legacy upsert) scans back as an empty method, which
+// ContentVerifiedMethod treats as not content-verified — so the offload
+// gate refuses such a component rather than over-claiming.
+func TestDestinationRunIDNullVerifyMethodReadsUnverified(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+	node, err := s.GetSelfNode(ctx)
+	if err != nil {
+		t.Fatalf("GetSelfNode: %v", err)
+	}
+
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO destination_run_ids (volume_id, destination, origin_node_id, origin_run_id, updated_at_ns, verify_method)
+		VALUES (?, ?, ?, ?, ?, NULL)
+	`, vID, "legacy", node.ID, 5, NowNs()); err != nil {
+		t.Fatalf("insert NULL-method component: %v", err)
+	}
+
+	got, err := s.GetDestinationRunID(ctx, vID, "legacy", node.ID)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID: %v", err)
+	}
+	if got.VerifyMethod != "" {
+		t.Fatalf("verify method = %q, want empty for a NULL column", got.VerifyMethod)
+	}
+	if ContentVerifiedMethod(got.VerifyMethod) {
+		t.Fatalf("a NULL/empty method must not count as content-verified")
+	}
+}
+
+// TestContentVerifiedMethod pins which methods the offload gate accepts
+// as genuine content verification.
+func TestContentVerifiedMethod(t *testing.T) {
+	verified := []string{VerifyMethodBlake3, VerifyMethodPeer, VerifyMethodKopia}
+	for _, m := range verified {
+		if !ContentVerifiedMethod(m) {
+			t.Fatalf("method %q should be content-verified", m)
+		}
+	}
+	for _, m := range []string{VerifyMethodPresenceSize, VerifyMethodSizeMtime, "", "bogus"} {
+		if ContentVerifiedMethod(m) {
+			t.Fatalf("method %q must not be content-verified", m)
+		}
 	}
 }

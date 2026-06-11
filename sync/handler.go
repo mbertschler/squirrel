@@ -11,27 +11,30 @@ import (
 )
 
 // Verification methods reported by the curated handlers on
-// VerifyResult.Method. Callers key per-tool rendering off these.
+// VerifyResult.Method. They alias the canonical identifiers in store so
+// the durability vector's recorded method and the handler's reported
+// method are the same strings — store owns them because the offload gate
+// reads them to decide whether a component is content-verified.
 const (
 	// VerifyMethodBlake3 is rclone's end-to-end content check
 	// (--checksum --hash blake3).
-	VerifyMethodBlake3 = "blake3"
+	VerifyMethodBlake3 = store.VerifyMethodBlake3
 	// VerifyMethodSizeMtime is rclone's default comparison, used for
 	// --shallow runs and forced by crypt destinations.
-	VerifyMethodSizeMtime = "size+mtime"
+	VerifyMethodSizeMtime = store.VerifyMethodSizeMtime
 	// VerifyMethodPeer is the node-sync handshake's receiver-side
 	// BLAKE3 re-hash of every delivered path.
-	VerifyMethodPeer = "peer-blake3"
+	VerifyMethodPeer = store.VerifyMethodPeer
 	// VerifyMethodKopia is kopia's own repository consistency check
 	// (`kopia snapshot verify`).
-	VerifyMethodKopia = "kopia-verify"
+	VerifyMethodKopia = store.VerifyMethodKopia
 	// VerifyMethodPresenceSize is the content-addressed push's check:
 	// rclone reported every transfer succeeded, and a follow-up listing
 	// confirmed each object and the manifest segment present at the
 	// expected size. Presence evidence is weaker than a content check
 	// (crypt remotes expose no hashes), so results carrying it stay
 	// unverified until the provider-checksum fingerprint pass lands.
-	VerifyMethodPresenceSize = "presence+size"
+	VerifyMethodPresenceSize = store.VerifyMethodPresenceSize
 )
 
 // VerifyResult is the typed durability report of one handler push: how

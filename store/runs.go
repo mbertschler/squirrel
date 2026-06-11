@@ -508,12 +508,22 @@ type SyncRunSpec struct {
 }
 
 // BeginSyncRunIfClear atomically inserts a 'running' kind='sync' row for
-// (volume, destination) iff no other such row is currently in flight.
-// The check and the insert run inside a single BEGIN IMMEDIATE
-// transaction (the store's DSN sets `_txlock=immediate`), so two
-// concurrent callers cannot both observe "no running run" and both
-// insert — the second one's transaction sees the first one's row and
-// returns it as the blocker.
+// (volume, destination) iff no sync of the same pair and no index or
+// audit run on the volume is currently in flight. The check and the
+// insert run inside a single BEGIN IMMEDIATE transaction (the store's
+// DSN sets `_txlock=immediate`), so two concurrent callers cannot both
+// observe "no running run" and both insert — the second one's
+// transaction sees the first one's row and returns it as the blocker.
+//
+// Cross-kind exclusion: an in-flight index or audit run on the volume
+// blocks a sync. A sync advances the destination's durability vector from
+// the present set its own enumeration captured; an index or audit
+// committing a new present row concurrently would otherwise let that
+// advance claim durability for content the sync never transferred. The
+// block is one-directional — a running sync does NOT block a new index
+// (see BeginIndexRunIfClear for why) — so the guard lives only on the
+// sync side. Syncs to *different* destinations stay free to overlap —
+// they touch disjoint vectors.
 //
 // Returns (newID, nil, nil) when the row was inserted; (0, &blocker,
 // nil) when refused — the caller is expected to render a diagnostic
@@ -534,8 +544,11 @@ func (s *Store) BeginSyncRunIfClear(ctx context.Context, spec SyncRunSpec) (int6
 	row := tx.QueryRowContext(ctx, `
 		SELECT `+runColumns+`
 		FROM runs
-		WHERE kind = 'sync' AND status = 'running'
-		  AND volume_id = ? AND destination = ?
+		WHERE status = 'running' AND volume_id = ?
+		  AND (
+		    (kind = 'sync' AND destination = ?)
+		    OR kind IN ('index', 'audit')
+		  )
 		ORDER BY id LIMIT 1
 	`, spec.VolumeID, spec.Destination)
 	blocker, scanErr := scanRun(row.Scan)
@@ -574,6 +587,16 @@ func (s *Store) BeginSyncRunIfClear(ctx context.Context, spec SyncRunSpec) (int6
 // vice versa because both walk the volume and call MarkMissing with
 // their own run-id — letting them overlap is exactly the bug this
 // guards against.
+//
+// A running sync does not block an index here, while a running index
+// does block a new sync (BeginSyncRunIfClear). The asymmetry is
+// deliberate: the sync's durability advance is pinned to the present-set
+// snapshot it captured at the start (AdvanceDestinationVectorTo), so an
+// index committing rows mid-sync cannot be folded into that advance, and
+// the agent scheduler's invariant of always indexing before a sync would
+// otherwise wedge whenever an unrelated sync is in flight. The guard
+// that matters for soundness — keeping an index from mutating the tree
+// while a sync captures its enumeration — lives on the sync side.
 //
 // Returns (newID, nil, nil) when the row was inserted; (0, &blocker,
 // nil) when refused. Stale rows from crashed runs keep blocking here
@@ -737,6 +760,30 @@ func (s *Store) LatestSuccessfulSyncRun(ctx context.Context, volumeID int64, des
 		ORDER BY id DESC LIMIT 1
 	`, volumeID, destination)
 	return scanRun(row.Scan)
+}
+
+// LastSuccessfulWholeVolumePushRunID returns the highest local run id of
+// a successful whole-volume push of the volume to destination, or 0 when
+// the destination has no such push yet. Every curated push (rclone
+// bucket, content-addressed, kopia, and the peer handshake) records a
+// kind='sync' run whose status reaches 'success' only on a fully landed,
+// verified transfer of the volume's present set, so the max successful
+// sync id is the freshness watermark in local run space: a path that
+// became present after this run has not been pushed to destination since
+// it last changed. The offload gate requires this watermark to be at or
+// beyond a gated path's files.status_changed_run_id before it deletes
+// the local copy.
+func (s *Store) LastSuccessfulWholeVolumePushRunID(ctx context.Context, volumeID int64, destination string) (int64, error) {
+	var id sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT MAX(id) FROM runs
+		WHERE kind = 'sync' AND status = 'success'
+		  AND volume_id = ? AND destination = ?
+	`, volumeID, destination).Scan(&id)
+	if err != nil {
+		return 0, fmt.Errorf("last successful whole-volume push to %q: %w", destination, err)
+	}
+	return id.Int64, nil
 }
 
 // LatestSuccessfulRunsByVolumeAndKind returns the most recent success or

@@ -7,6 +7,47 @@ import (
 	"fmt"
 )
 
+// Verification methods recorded on a durability component's
+// VerifyMethod. They name the comparison that last advanced the
+// component, so the offload gate can require a genuinely content-checked
+// method before it deletes the only local copy. sync re-exports these as
+// its VerifyMethod* identifiers, keeping one source of truth.
+const (
+	// VerifyMethodBlake3 is rclone's end-to-end content check
+	// (--checksum --hash blake3).
+	VerifyMethodBlake3 = "blake3"
+	// VerifyMethodSizeMtime is rclone's default size+mtime comparison,
+	// used for --shallow runs and forced by crypt destinations. Not a
+	// content check.
+	VerifyMethodSizeMtime = "size+mtime"
+	// VerifyMethodPeer is the node-sync handshake's receiver-side BLAKE3
+	// re-hash of every delivered path.
+	VerifyMethodPeer = "peer-blake3"
+	// VerifyMethodKopia is kopia's own repository verification
+	// (`kopia snapshot verify`).
+	VerifyMethodKopia = "kopia-verify"
+	// VerifyMethodPresenceSize is the content-addressed push's check:
+	// presence plus the expected ciphertext size, no content hash. Not a
+	// content check on its own — a verified scan-back fingerprint must
+	// back the object before such a component gates offload.
+	VerifyMethodPresenceSize = "presence+size"
+)
+
+// ContentVerifiedMethod reports whether a durability component advanced
+// by method carries genuine content verification — the precondition the
+// offload gate applies before deleting a local copy. A presence-only or
+// size+mtime method is not content-verified; an empty method (a pre-v19
+// component, or one whose provenance is unknown) is treated as
+// unverified so the gate refuses rather than over-claims.
+func ContentVerifiedMethod(method string) bool {
+	switch method {
+	case VerifyMethodBlake3, VerifyMethodPeer, VerifyMethodKopia:
+		return true
+	default:
+		return false
+	}
+}
+
 // DestinationRunID is one component of a destination's durability
 // version vector: the highest origin-space run id of OriginNodeID's
 // content known durable on Destination for VolumeID. Destination is the
@@ -14,19 +55,21 @@ import (
 // same namespace runs.destination uses. OriginRunID is in the origin
 // node's run space, so like contents.origin_run_id it is not a local
 // runs FK. Content with origin (N, r) is durable on a destination iff
-// the vector's component for N is ≥ r.
+// the vector's component for N is ≥ r. VerifyMethod names the comparison
+// that last advanced the component (empty for a pre-v19 row).
 type DestinationRunID struct {
 	VolumeID     int64
 	Destination  string
 	OriginNodeID int64
 	OriginRunID  int64
 	UpdatedAtNs  int64
+	VerifyMethod string
 }
 
 // DestinationRunIDHistory is one row of the insert-only
 // destination_run_ids_history log: a single vector-component advance.
 // AtNs is the insertion timestamp; rows written in the same tick still
-// order by id.
+// order by id. VerifyMethod records the method behind this advance.
 type DestinationRunIDHistory struct {
 	ID           int64
 	VolumeID     int64
@@ -34,6 +77,7 @@ type DestinationRunIDHistory struct {
 	OriginNodeID int64
 	OriginRunID  int64
 	AtNs         int64
+	VerifyMethod string
 }
 
 // DestinationRewindError carries the rejected and current vector
@@ -60,14 +104,12 @@ func (e *DestinationRewindError) Unwrap() error { return ErrWatermarkRewind }
 // originating at originNodeID. "No row" imposes no floor: any origin
 // run id advances from it.
 func (s *Store) GetDestinationRunID(ctx context.Context, volumeID int64, destination string, originNodeID int64) (DestinationRunID, error) {
-	var d DestinationRunID
-	err := s.db.QueryRowContext(ctx,
-		`SELECT volume_id, destination, origin_node_id, origin_run_id, updated_at_ns
+	row := s.db.QueryRowContext(ctx,
+		`SELECT volume_id, destination, origin_node_id, origin_run_id, updated_at_ns, verify_method
 		 FROM destination_run_ids
 		 WHERE volume_id = ? AND destination = ? AND origin_node_id = ?`,
-		volumeID, destination, originNodeID).
-		Scan(&d.VolumeID, &d.Destination, &d.OriginNodeID, &d.OriginRunID, &d.UpdatedAtNs)
-	return d, err
+		volumeID, destination, originNodeID)
+	return scanDestinationRunID(row)
 }
 
 // ListDestinationRunIDs returns the full durability vector for one
@@ -75,7 +117,7 @@ func (s *Store) GetDestinationRunID(ctx context.Context, volumeID int64, destina
 // means the destination has no recorded durability yet.
 func (s *Store) ListDestinationRunIDs(ctx context.Context, volumeID int64, destination string) ([]DestinationRunID, error) {
 	return queryRows(ctx, s.db,
-		`SELECT volume_id, destination, origin_node_id, origin_run_id, updated_at_ns
+		`SELECT volume_id, destination, origin_node_id, origin_run_id, updated_at_ns, verify_method
 		 FROM destination_run_ids
 		 WHERE volume_id = ? AND destination = ?
 		 ORDER BY origin_node_id`,
@@ -89,7 +131,7 @@ func (s *Store) ListDestinationRunIDs(ctx context.Context, volumeID int64, desti
 // can see.
 func (s *Store) ListVolumeDestinationRunIDs(ctx context.Context, volumeID int64) ([]DestinationRunID, error) {
 	return queryRows(ctx, s.db,
-		`SELECT volume_id, destination, origin_node_id, origin_run_id, updated_at_ns
+		`SELECT volume_id, destination, origin_node_id, origin_run_id, updated_at_ns, verify_method
 		 FROM destination_run_ids
 		 WHERE volume_id = ?
 		 ORDER BY destination, origin_node_id`,
@@ -98,42 +140,26 @@ func (s *Store) ListVolumeDestinationRunIDs(ctx context.Context, volumeID int64)
 
 func scanDestinationRunID(s rowScanner) (DestinationRunID, error) {
 	var d DestinationRunID
-	err := s.Scan(&d.VolumeID, &d.Destination, &d.OriginNodeID, &d.OriginRunID, &d.UpdatedAtNs)
+	var method sql.NullString
+	err := s.Scan(&d.VolumeID, &d.Destination, &d.OriginNodeID, &d.OriginRunID, &d.UpdatedAtNs, &method)
+	d.VerifyMethod = method.String
 	return d, err
 }
 
-// AdvanceDestinationVector advances the destination's durability vector
-// to cover the volume's current present set: one component per origin
-// node, valued at the highest origin-space run among that node's
-// present content. Locally-introduced content (contents.origin_* NULL)
-// counts under this node's self row at its introduction run — the
-// content's earliest first_seen_run_id in the volume, the same
-// coordinate the peer-sync sender materialises on the wire — so a
-// duplicate path observed later never advances the component past the
-// coordinates actually in circulation. Rows under the reserved sync
-// subtrees are excluded — they never travel to a destination, so they
-// must not advance its evidence.
-//
-// Callers invoke it only once the destination has verifiably landed the
-// volume's full present set (a successful whole-volume sync); each
-// component routes through UpsertDestinationRunID so the advance is
-// monotonic and history-logged. A component already recorded above the
-// computed value is left in place: destinations are append-only, so the
-// higher recorded floor still holds (componentwise max, like a version-
-// vector join). This is the single advancement path for the vector —
-// destination handlers and the peer-sync initiator both call it rather
-// than writing components directly.
-func (s *Store) AdvanceDestinationVector(ctx context.Context, volumeID int64, destination string) error {
-	self, err := s.GetSelfNode(ctx)
-	if err != nil {
-		return fmt.Errorf("advance destination vector: self node: %w", err)
-	}
-	components, err := s.presentOriginMaxima(ctx, volumeID, self.ID)
-	if err != nil {
-		return err
-	}
+// AdvanceDestinationVectorTo advances the destination's durability
+// vector to exactly the supplied components, tagging each with
+// verifyMethod. Callers compute the components once from the push's own
+// enumeration snapshot (a content-addressed delta, a peer plan, a
+// pre-transfer listing) so the advance reflects only what was actually
+// transferred — never a wider live set re-read after the transfer, which
+// would claim durability for rows committed mid-push. Each component
+// routes through the monotonic upsert; an attempted rewind is skipped
+// (the recorded floor already covers it). This is the single
+// advancement path the destination handlers and the peer-sync initiator
+// use rather than writing components directly.
+func (s *Store) AdvanceDestinationVectorTo(ctx context.Context, volumeID int64, destination, verifyMethod string, components []OriginComponent) error {
 	for _, c := range components {
-		err := s.UpsertDestinationRunID(ctx, volumeID, destination, c.OriginNodeID, c.OriginRunID, false)
+		err := s.upsertDestinationRunID(ctx, volumeID, destination, c.OriginNodeID, c.OriginRunID, verifyMethod, false)
 		if errors.Is(err, ErrWatermarkRewind) {
 			continue
 		}
@@ -141,26 +167,51 @@ func (s *Store) AdvanceDestinationVector(ctx context.Context, volumeID int64, de
 			return err
 		}
 	}
+	return s.recordPushFreshness(ctx, volumeID, destination, components)
+}
+
+// recordPushFreshness overwrites the destination's push-freshness maxima
+// to exactly the supplied snapshot — the per-origin-node maxima of the
+// present set this push enumerated. Distinct from the monotonic vector
+// advance above: freshness reflects only the latest push, so a push that
+// dropped content from the present set lowers the maxima. The offload
+// gate reads it as origin-space freshness for a relayed target.
+//
+// A node absent from the snapshot keeps its prior freshness row: the push
+// enumerated no present content for that origin, which says nothing about
+// whether that node's earlier content stopped being fresh, so leaving the
+// row is the conservative choice (the monotonic vector still governs
+// durability).
+func (s *Store) recordPushFreshness(ctx context.Context, volumeID int64, destination string, components []OriginComponent) error {
+	for _, c := range components {
+		if err := s.UpsertDestinationPushFreshness(ctx, volumeID, destination, c.OriginNodeID, c.OriginRunID); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-// originComponent is one (origin node, max origin run) pair computed
-// over a volume's present rows by presentOriginMaxima.
-type originComponent struct {
+// OriginComponent is one (origin node, max origin run) pair computed
+// over a volume's present rows by PresentOriginMaxima.
+type OriginComponent struct {
 	OriginNodeID int64
 	OriginRunID  int64
 }
 
-// presentOriginMaxima computes the per-origin-node maximum origin run
+// PresentOriginMaxima computes the per-origin-node maximum origin run
 // over the volume's present files, deduplicated to one coordinate per
 // content. Content whose origin is NULL (or partially NULL — degraded
 // the same way the conflict pre-stage treats partial provenance) maps
 // to selfNodeID at its introduction run, mirroring
 // ContentIntroductionRunID (the introduction MIN spans every
 // observation of the content, any status). The reserved sync subtrees
-// are excluded from the present set for the reason documented on
-// AdvanceDestinationVector.
-func (s *Store) presentOriginMaxima(ctx context.Context, volumeID, selfNodeID int64) ([]originComponent, error) {
+// are excluded from the present set — they never travel to a
+// destination, so they must not advance its evidence.
+//
+// Handlers capture this snapshot before the transfer and feed it to
+// AdvanceDestinationVectorTo, so a row committed between the snapshot and
+// the advance is never claimed durable.
+func (s *Store) PresentOriginMaxima(ctx context.Context, volumeID, selfNodeID int64) ([]OriginComponent, error) {
 	return queryRows(ctx, s.db, `
 		WITH present_contents AS (
 			SELECT DISTINCT f.content_id, c.origin_node_id, c.origin_run_id
@@ -185,16 +236,18 @@ func (s *Store) presentOriginMaxima(ctx context.Context, volumeID, selfNodeID in
 	`, scanOriginComponent, volumeID, selfNodeID, volumeID)
 }
 
-func scanOriginComponent(s rowScanner) (originComponent, error) {
-	var c originComponent
+func scanOriginComponent(s rowScanner) (OriginComponent, error) {
+	var c OriginComponent
 	err := s.Scan(&c.OriginNodeID, &c.OriginRunID)
 	return c, err
 }
 
 // UpsertDestinationRunID advances one component of a destination's
-// durability vector to originRunID. Callers invoke it only once the
-// destination has verifiably landed every piece of content up to that
-// origin run — a failed or partial push leaves the prior value in place.
+// durability vector to originRunID, recording no verification method
+// (the component reads as unverified to the offload gate until a typed
+// advance re-stamps it). Callers invoke it only once the destination has
+// verifiably landed every piece of content up to that origin run — a
+// failed or partial push leaves the prior value in place.
 //
 // The component is meant to advance monotonically: the upsert statement
 // itself only applies when originRunID is at or above the recorded value
@@ -206,7 +259,27 @@ func scanOriginComponent(s rowScanner) (originComponent, error) {
 // The upsert and an insert-only destination_run_ids_history row are
 // written in one transaction so the append-only advance log can never
 // diverge from the live vector.
+//
+// verify_method follows the component: a non-empty method always wins
+// (an advance or a re-confirmation that upgrades the recorded method); an
+// empty method clears it when the run strictly advances (a new,
+// unverified coordinate) but preserves the existing method when the run
+// is unchanged, so a methodless re-confirmation (e.g. a pull from a
+// pre-v19 peer) never degrades a content-verified component to unknown.
 func (s *Store) UpsertDestinationRunID(ctx context.Context, volumeID int64, destination string, originNodeID, originRunID int64, allowRewind bool) error {
+	return s.upsertDestinationRunID(ctx, volumeID, destination, originNodeID, originRunID, "", allowRewind)
+}
+
+// UpsertDestinationRunIDVerified is UpsertDestinationRunID with an
+// explicit verification method recorded on the component — the entry
+// point the durability pull uses to carry a peer's reported method
+// verbatim, so the puller's offload gate weighs a pulled component
+// exactly as the responder did.
+func (s *Store) UpsertDestinationRunIDVerified(ctx context.Context, volumeID int64, destination string, originNodeID, originRunID int64, verifyMethod string, allowRewind bool) error {
+	return s.upsertDestinationRunID(ctx, volumeID, destination, originNodeID, originRunID, verifyMethod, allowRewind)
+}
+
+func (s *Store) upsertDestinationRunID(ctx context.Context, volumeID int64, destination string, originNodeID, originRunID int64, verifyMethod string, allowRewind bool) error {
 	if destination == "" {
 		return fmt.Errorf("UpsertDestinationRunID: destination must be non-empty")
 	}
@@ -217,14 +290,20 @@ func (s *Store) UpsertDestinationRunID(ctx context.Context, volumeID int64, dest
 	defer func() { _ = tx.Rollback() }()
 
 	atNs := NowNs()
+	method := nullableString(verifyMethod)
 	res, err := tx.ExecContext(ctx, `
-		INSERT INTO destination_run_ids (volume_id, destination, origin_node_id, origin_run_id, updated_at_ns)
-		VALUES (?, ?, ?, ?, ?)
+		INSERT INTO destination_run_ids (volume_id, destination, origin_node_id, origin_run_id, updated_at_ns, verify_method)
+		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(volume_id, destination, origin_node_id) DO UPDATE SET
 			origin_run_id = excluded.origin_run_id,
-			updated_at_ns = excluded.updated_at_ns
+			updated_at_ns = excluded.updated_at_ns,
+			verify_method = CASE
+				WHEN excluded.verify_method IS NOT NULL THEN excluded.verify_method
+				WHEN excluded.origin_run_id > destination_run_ids.origin_run_id THEN NULL
+				ELSE destination_run_ids.verify_method
+			END
 		WHERE excluded.origin_run_id >= destination_run_ids.origin_run_id OR ?
-	`, volumeID, destination, originNodeID, originRunID, atNs, allowRewind)
+	`, volumeID, destination, originNodeID, originRunID, atNs, method, allowRewind)
 	if err != nil {
 		return fmt.Errorf("upsert destination_run_ids: %w", err)
 	}
@@ -240,15 +319,21 @@ func (s *Store) UpsertDestinationRunID(ctx context.Context, volumeID int64, dest
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO destination_run_ids_history
-			(volume_id, destination, origin_node_id, origin_run_id, at_ns)
-		VALUES (?, ?, ?, ?, ?)
-	`, volumeID, destination, originNodeID, originRunID, atNs); err != nil {
+			(volume_id, destination, origin_node_id, origin_run_id, at_ns, verify_method)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, volumeID, destination, originNodeID, originRunID, atNs, method); err != nil {
 		return fmt.Errorf("append destination_run_ids_history: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit upsert destination_run_ids: %w", err)
 	}
 	return nil
+}
+
+// nullableString maps "" to a SQL NULL so an unset verify method stays
+// NULL rather than an empty string the gate would have to special-case.
+func nullableString(s string) sql.NullString {
+	return sql.NullString{String: s, Valid: s != ""}
 }
 
 // guardDestinationMonotonicTx reads the current vector component inside
@@ -285,7 +370,7 @@ func guardDestinationMonotonicTx(ctx context.Context, tx *sql.Tx, volumeID int64
 // recorded advances.
 func (s *Store) ListDestinationRunIDHistory(ctx context.Context, volumeID int64, destination string) ([]DestinationRunIDHistory, error) {
 	return queryRows(ctx, s.db, `
-		SELECT id, volume_id, destination, origin_node_id, origin_run_id, at_ns
+		SELECT id, volume_id, destination, origin_node_id, origin_run_id, at_ns, verify_method
 		FROM destination_run_ids_history
 		WHERE volume_id = ? AND destination = ?
 		ORDER BY id
@@ -294,6 +379,8 @@ func (s *Store) ListDestinationRunIDHistory(ctx context.Context, volumeID int64,
 
 func scanDestinationRunIDHistory(s rowScanner) (DestinationRunIDHistory, error) {
 	var h DestinationRunIDHistory
-	err := s.Scan(&h.ID, &h.VolumeID, &h.Destination, &h.OriginNodeID, &h.OriginRunID, &h.AtNs)
+	var method sql.NullString
+	err := s.Scan(&h.ID, &h.VolumeID, &h.Destination, &h.OriginNodeID, &h.OriginRunID, &h.AtNs, &method)
+	h.VerifyMethod = method.String
 	return h, err
 }

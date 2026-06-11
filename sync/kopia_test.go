@@ -196,7 +196,7 @@ func TestKopiaPushHappyPath(t *testing.T) {
 	wantArgv := []string{
 		"repository connect filesystem --path " + repo + " --no-persist-credentials --config-file " + cfgFile,
 		"snapshot create " + f.pair.Volume.Path + " --json --config-file " + cfgFile,
-		"snapshot verify snap123 --config-file " + cfgFile,
+		"snapshot verify --verify-files-percent 10 snap123 --config-file " + cfgFile,
 	}
 	if len(argv) != len(wantArgv) {
 		t.Fatalf("argv lines = %q, want %q", argv, wantArgv)
@@ -378,5 +378,203 @@ func TestKopiaIntegrationRealBinary(t *testing.T) {
 	}
 	if rep2.Status != store.RunStatusSuccess {
 		t.Fatalf("second push status = %q, want success", rep2.Status)
+	}
+}
+
+// setupKopiaFixtureWithPercent is setupKopiaFixture with an explicit
+// verify_files_percent on the kopia destination, for the #108
+// configurable-depth test.
+func setupKopiaFixtureWithPercent(t *testing.T, percent string) *kopiaFixture {
+	t.Helper()
+	root := t.TempDir()
+	volPath := filepath.Join(root, "src")
+	if err := os.MkdirAll(volPath, 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(volPath, "a.txt"), []byte("alpha"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(root, "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	cfgPath := filepath.Join(root, "config.toml")
+	cfgBody := "[destinations.mirror]\ntype = \"kopia\"\nroot = \"" + filepath.Join(root, "repo") +
+		"\"\npassword = \"hunter2\"\nverify_files_percent = \"" + percent + "\"\n\n" +
+		"[volumes.pics]\npath = \"" + volPath + "\"\nsync_to = [\"mirror\"]\n"
+	if err := os.WriteFile(cfgPath, []byte(cfgBody), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	pairs, err := PairsFor(cfg, "", "")
+	if err != nil {
+		t.Fatalf("PairsFor: %v", err)
+	}
+	tools, err := ToolsFor(cfg, pairs, nil)
+	if err != nil {
+		t.Fatalf("ToolsFor: %v", err)
+	}
+	if _, err := index.Index(context.Background(), s, volPath, index.Options{Name: "pics"}); err != nil {
+		t.Fatalf("index.Index: %v", err)
+	}
+	return &kopiaFixture{store: s, cfg: cfg, tools: tools, pair: pairs[0]}
+}
+
+// TestKopiaVerifyFilesPercentConfigurable is the #108 depth fix: the
+// destination's verify_files_percent flows into the snapshot verify argv
+// so the verification reads a configured fraction of file bytes rather
+// than kopia's bytes-free default.
+func TestKopiaVerifyFilesPercentConfigurable(t *testing.T) {
+	logPath := installFakeKopia(t)
+	f := setupKopiaFixtureWithPercent(t, "42.5")
+
+	if _, err := RunPair(context.Background(), f.store, f.tools, f.pair, Options{}); err != nil {
+		t.Fatalf("RunPair: %v", err)
+	}
+	argv, _ := readCallLog(t, logPath)
+	var verify string
+	for _, line := range argv {
+		if strings.HasPrefix(line, "snapshot verify") {
+			verify = line
+		}
+	}
+	if !strings.Contains(verify, "--verify-files-percent 42.5") {
+		t.Fatalf("verify argv = %q, want --verify-files-percent 42.5", verify)
+	}
+}
+
+// TestKopiaVerifyFilesPercentDefault: an unset verify_files_percent uses
+// the non-zero default, so a kopia advance never rests on a zero-byte
+// verification.
+func TestKopiaVerifyFilesPercentDefault(t *testing.T) {
+	logPath := installFakeKopia(t)
+	f := setupKopiaFixture(t)
+
+	if _, err := RunPair(context.Background(), f.store, f.tools, f.pair, Options{}); err != nil {
+		t.Fatalf("RunPair: %v", err)
+	}
+	argv, _ := readCallLog(t, logPath)
+	var verify string
+	for _, line := range argv {
+		if strings.HasPrefix(line, "snapshot verify") {
+			verify = line
+		}
+	}
+	if !strings.Contains(verify, "--verify-files-percent 10") {
+		t.Fatalf("verify argv = %q, want the non-zero default --verify-files-percent 10", verify)
+	}
+}
+
+// TestKopiaVerifyFilesPercentRejectsZero pins the chosen finding-2
+// behavior: verify_files_percent = "0" is a configuration error, not an
+// accepted value. kopia accepts 0 (verify manifests and object existence,
+// read no file bytes), but a kopia component gates offload as
+// content-verified, so a zero-byte verify would let the gate delete the
+// only local copy on the strength of a check that read none of the
+// content. Negative and out-of-range values are rejected the same way; a
+// positive value passes.
+func TestKopiaVerifyFilesPercentRejectsZero(t *testing.T) {
+	for _, tc := range []struct {
+		raw     string
+		wantErr bool
+	}{
+		{"0", true},
+		{"0.0", true},
+		{"-1", true},
+		{"100.5", true},
+		{"not-a-number", true},
+		{"0.5", false},
+		{"100", false},
+	} {
+		t.Run(tc.raw, func(t *testing.T) {
+			dest := &config.Destination{
+				Name:   "mirror",
+				Params: map[string]string{"verify_files_percent": tc.raw},
+			}
+			_, err := kopiaVerifyFilesPercent(dest)
+			if tc.wantErr && err == nil {
+				t.Fatalf("verify_files_percent %q: want error, got nil", tc.raw)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("verify_files_percent %q: unexpected error: %v", tc.raw, err)
+			}
+		})
+	}
+}
+
+// TestKopiaPushFailsOnZeroVerifyPercent: end-to-end, a kopia push with
+// verify_files_percent = "0" fails rather than landing a content-verified
+// advance off a zero-byte verification.
+func TestKopiaPushFailsOnZeroVerifyPercent(t *testing.T) {
+	installFakeKopia(t)
+	f := setupKopiaFixtureWithPercent(t, "0")
+
+	rep, err := RunPair(context.Background(), f.store, f.tools, f.pair, Options{})
+	if err == nil {
+		t.Fatalf("RunPair: want error for verify_files_percent 0, got nil (status %v)", rep.Status)
+	}
+	if !strings.Contains(err.Error(), "verify_files_percent") {
+		t.Fatalf("error = %v, want it to name verify_files_percent", err)
+	}
+	vector, verr := f.store.ListDestinationRunIDs(context.Background(), volIDForKopia(t, f), "mirror")
+	if verr != nil {
+		t.Fatalf("ListDestinationRunIDs: %v", verr)
+	}
+	if len(vector) != 0 {
+		t.Fatalf("vector = %+v, want no advance on a rejected verify percent", vector)
+	}
+}
+
+// volIDForKopia resolves the kopia fixture volume's id.
+func volIDForKopia(t *testing.T, f *kopiaFixture) int64 {
+	t.Helper()
+	v, err := f.store.GetVolumeByName(context.Background(), "pics")
+	if err != nil {
+		t.Fatalf("GetVolumeByName: %v", err)
+	}
+	return v.ID
+}
+
+// TestKopiaAdvanceScopedToCapturedPresentSet is the #108 scope fix: the
+// kopia push advances the vector to the present-set snapshot captured at
+// push start, recorded with the kopia-verify method — not whatever
+// kopia's independent live walk happened to include.
+func TestKopiaAdvanceScopedToCapturedPresentSet(t *testing.T) {
+	installFakeKopia(t)
+	f := setupKopiaFixture(t)
+
+	if _, err := RunPair(context.Background(), f.store, f.tools, f.pair, Options{}); err != nil {
+		t.Fatalf("RunPair: %v", err)
+	}
+	v, err := f.store.GetVolumeByName(context.Background(), "pics")
+	if err != nil {
+		t.Fatalf("GetVolumeByName: %v", err)
+	}
+	self, err := f.store.GetSelfNode(context.Background())
+	if err != nil {
+		t.Fatalf("GetSelfNode: %v", err)
+	}
+	snapshot, err := f.store.PresentOriginMaxima(context.Background(), v.ID, self.ID)
+	if err != nil {
+		t.Fatalf("PresentOriginMaxima: %v", err)
+	}
+	vector, err := f.store.ListDestinationRunIDs(context.Background(), v.ID, "mirror")
+	if err != nil {
+		t.Fatalf("ListDestinationRunIDs: %v", err)
+	}
+	if len(vector) != len(snapshot) || len(vector) != 1 {
+		t.Fatalf("vector = %+v, want one component matching the captured snapshot %+v", vector, snapshot)
+	}
+	if vector[0].OriginNodeID != snapshot[0].OriginNodeID || vector[0].OriginRunID != snapshot[0].OriginRunID {
+		t.Fatalf("vector component %+v != captured snapshot %+v", vector[0], snapshot[0])
+	}
+	if vector[0].VerifyMethod != store.VerifyMethodKopia {
+		t.Fatalf("verify method = %q, want %q", vector[0].VerifyMethod, store.VerifyMethodKopia)
 	}
 }

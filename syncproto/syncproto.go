@@ -368,10 +368,13 @@ type DurabilityRequest struct {
 }
 
 // DurabilityResponse carries every vector component the receiver has
-// recorded for the volume, across all of its destinations. Empty when
-// the receiver has never advanced a vector for the volume.
+// recorded for the volume, across all of its destinations, plus the
+// freshness coordinates of each destination's most recent whole-volume
+// push. Empty when the receiver has never advanced a vector for the
+// volume.
 type DurabilityResponse struct {
 	Components []DurabilityComponent `json:"components,omitempty"`
+	Freshness  []DurabilityFreshness `json:"freshness,omitempty"`
 }
 
 // DurabilityComponent is one destination-vector component: the highest
@@ -380,8 +383,30 @@ type DurabilityResponse struct {
 // target namespace shared by buckets and peers; OriginNode is a node
 // name (the cross-node identity), and OriginRun is in that node's run
 // space. UpdatedAtNs is when the responding node last advanced or
-// re-confirmed the component.
+// re-confirmed the component. VerifyMethod names the comparison that
+// advanced it on the responding node, carried verbatim so the puller's
+// offload gate weighs a pulled component exactly as the responder did
+// (empty for a pre-v19 responder, which the gate reads as unverified).
 type DurabilityComponent struct {
+	Destination  string `json:"destination"`
+	OriginNode   string `json:"origin_node"`
+	OriginRun    int64  `json:"origin_run"`
+	UpdatedAtNs  int64  `json:"updated_at_ns"`
+	VerifyMethod string `json:"verify_method,omitempty"`
+}
+
+// DurabilityFreshness is one origin-space freshness coordinate: the
+// highest origin run of OriginNode's content the responding node held
+// present when it last completed a successful whole-volume push to
+// Destination. It travels alongside the monotonic vector components so a
+// puller that never pushes to Destination directly (a peer-relayed
+// offsite) can satisfy its offload gate's freshness condition from the
+// pushing node's own determination — the local-run-space push watermark
+// is always zero for such a target. Coordinates are in OriginNode's run
+// space, the same coordinates the gated content carries. Absent from an
+// older responder's reply; a puller that finds no freshness for a
+// relayed target refuses to offload (the safe direction).
+type DurabilityFreshness struct {
 	Destination string `json:"destination"`
 	OriginNode  string `json:"origin_node"`
 	OriginRun   int64  `json:"origin_run"`

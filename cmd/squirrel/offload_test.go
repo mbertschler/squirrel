@@ -42,10 +42,12 @@ func writeOffloadConfig(t *testing.T, requires []string) (configFixture, string)
 	return configFixture{configPath: configPath, dbPath: dbPath}, volumeDir
 }
 
-// seedOffloadEvidence opens the fixture DB directly and records
-// durability for the self node at the file's introduction run for every
-// target, the same write the destination handlers and the peer
-// durability pull perform.
+// seedOffloadEvidence opens the fixture DB directly and records the
+// durability a verified whole-volume push leaves: a content-verified
+// (blake3) vector component for the self node at the file's introduction
+// run, plus a successful kind='sync' run that advances the freshness
+// watermark past the file's became-present run — the same evidence the
+// destination handlers leave behind.
 func seedOffloadEvidence(t *testing.T, dbPath, relPath string, targets []string) {
 	t.Helper()
 	ctx := context.Background()
@@ -67,8 +69,15 @@ func seedOffloadEvidence(t *testing.T, dbPath, relPath string, targets []string)
 		t.Fatalf("GetSelfNode: %v", err)
 	}
 	for _, target := range targets {
-		if err := s.UpsertDestinationRunID(ctx, v.ID, target, self.ID, row.FirstSeenRunID, false); err != nil {
+		if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, target, self.ID, row.FirstSeenRunID, store.VerifyMethodBlake3, false); err != nil {
 			t.Fatalf("UpsertDestinationRunID(%s): %v", target, err)
+		}
+		id, blocker, err := s.BeginSyncRunIfClear(ctx, store.SyncRunSpec{VolumeID: v.ID, Destination: target})
+		if err != nil || blocker != nil {
+			t.Fatalf("BeginSyncRunIfClear(%s): err=%v blocker=%+v", target, err, blocker)
+		}
+		if err := s.FinishRun(ctx, id, store.RunStatusSuccess, "", 0); err != nil {
+			t.Fatalf("FinishRun(%s): %v", target, err)
 		}
 	}
 }

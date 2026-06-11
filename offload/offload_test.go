@@ -70,14 +70,36 @@ func selfNode(t *testing.T, s *store.Store) store.Node {
 	return n
 }
 
-// seedVector records durability evidence the same way every real
-// advancement path (destination handlers, peer-sync, the durability
-// pull) does: one monotonic UpsertDestinationRunID per component.
+// seedVector records durability evidence the same way a verified
+// whole-volume push does: a content-verified (blake3) vector component
+// plus a successful kind='sync' run for the target, so the gate's
+// origin-vector, freshness, and method conditions all clear. Tests that
+// want to exercise a single failing condition seed the rest through this
+// and break the one under test explicitly.
 func seedVector(t *testing.T, s *store.Store, volumeID int64, target string, nodeID, run int64) {
 	t.Helper()
-	if err := s.UpsertDestinationRunID(context.Background(), volumeID, target, nodeID, run, false); err != nil {
+	if err := s.UpsertDestinationRunIDVerified(context.Background(), volumeID, target, nodeID, run, store.VerifyMethodBlake3, false); err != nil {
 		t.Fatalf("UpsertDestinationRunID(%s): %v", target, err)
 	}
+	recordPush(t, s, volumeID, target)
+}
+
+// recordPush records a successful whole-volume push run for (volume,
+// target), advancing the freshness watermark the gate reads to "now"
+// (the latest run id), past every present row's status_changed_run_id.
+func recordPush(t *testing.T, s *store.Store, volumeID int64, target string) int64 {
+	t.Helper()
+	id, blocker, err := s.BeginSyncRunIfClear(context.Background(), store.SyncRunSpec{
+		VolumeID:    volumeID,
+		Destination: target,
+	})
+	if err != nil || blocker != nil {
+		t.Fatalf("BeginSyncRunIfClear(%s): err=%v blocker=%+v", target, err, blocker)
+	}
+	if err := s.FinishRun(context.Background(), id, store.RunStatusSuccess, "", 0); err != nil {
+		t.Fatalf("FinishRun(%s): %v", target, err)
+	}
+	return id
 }
 
 func rowAt(t *testing.T, s *store.Store, volumeID int64, relPath string) store.FileRow {
@@ -308,9 +330,12 @@ func TestOffloadPeerOriginContent(t *testing.T) {
 }
 
 // TestOffloadPeerPulledEvidenceTarget: the policy may require a target
-// no local config declares — its evidence arrives via the peer
-// durability pull, which lands in destination_run_ids under the peer's
-// target name. The gate consumes those rows like any other.
+// whose vector component arrives via the peer durability pull, landing
+// in destination_run_ids under the target name. The gate consumes those
+// rows like any other — here the target was also pushed to locally
+// (seedVector records the push), so its freshness watermark is current.
+// The peer-relayed-only case (no local push, gated on pulled freshness)
+// is covered by TestOffloadPeerRelayedTargetGatesOnPulledFreshness.
 func TestOffloadPeerPulledEvidenceTarget(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "a.txt"), "alpha")

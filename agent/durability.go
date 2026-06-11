@@ -53,21 +53,45 @@ func (r *peerSyncRouter) durabilityResponse(ctx context.Context, volumeName stri
 	if err != nil {
 		return syncproto.DurabilityResponse{}, fmt.Errorf("list destination vectors: %w", err)
 	}
+	fresh, err := r.srv.store.ListVolumeDestinationPushFreshness(ctx, v.ID)
+	if err != nil {
+		return syncproto.DurabilityResponse{}, fmt.Errorf("list push freshness: %w", err)
+	}
 	names := make(map[int64]string, 4)
+	resolve := func(nodeID int64) (string, error) {
+		if name, ok := names[nodeID]; ok {
+			return name, nil
+		}
+		node, err := r.srv.store.GetNodeByID(ctx, nodeID)
+		if err != nil {
+			return "", fmt.Errorf("resolve origin node %d: %w", nodeID, err)
+		}
+		names[nodeID] = node.Name
+		return node.Name, nil
+	}
 	resp := syncproto.DurabilityResponse{
 		Components: make([]syncproto.DurabilityComponent, 0, len(rows)),
+		Freshness:  make([]syncproto.DurabilityFreshness, 0, len(fresh)),
 	}
 	for _, row := range rows {
-		name, ok := names[row.OriginNodeID]
-		if !ok {
-			node, err := r.srv.store.GetNodeByID(ctx, row.OriginNodeID)
-			if err != nil {
-				return syncproto.DurabilityResponse{}, fmt.Errorf("resolve origin node %d: %w", row.OriginNodeID, err)
-			}
-			name = node.Name
-			names[row.OriginNodeID] = name
+		name, err := resolve(row.OriginNodeID)
+		if err != nil {
+			return syncproto.DurabilityResponse{}, err
 		}
 		resp.Components = append(resp.Components, syncproto.DurabilityComponent{
+			Destination:  row.Destination,
+			OriginNode:   name,
+			OriginRun:    row.OriginRunID,
+			UpdatedAtNs:  row.UpdatedAtNs,
+			VerifyMethod: row.VerifyMethod,
+		})
+	}
+	for _, row := range fresh {
+		name, err := resolve(row.OriginNodeID)
+		if err != nil {
+			return syncproto.DurabilityResponse{}, err
+		}
+		resp.Freshness = append(resp.Freshness, syncproto.DurabilityFreshness{
 			Destination: row.Destination,
 			OriginNode:  name,
 			OriginRun:   row.OriginRunID,
