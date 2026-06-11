@@ -188,13 +188,18 @@ func finishHandlerRun(ctx context.Context, s *store.Store, rep *Report, runErr e
 // bucket transfer: BLAKE3 end-to-end when the integrity flags were in
 // force, rclone's size+mtime comparison otherwise. Only a fully
 // successful BLAKE3 run counts as verified.
+//
+// A run that asked for BLAKE3 but hit rclone's "no hashes in common"
+// fallback is downgraded to size+mtime here even though the flags were
+// set and rclone exited 0: rclone silently compared by size, so the copy
+// was not content-verified and must not advance the durability vector.
 func rcloneVerification(dest *config.Destination, opts Options, rep *Report) VerifyResult {
 	v := VerifyResult{
 		Method: VerifyMethodBlake3,
 		Files:  rep.RcloneResult.Transferred + rep.RcloneResult.Checked,
 		Bytes:  rep.RcloneResult.Bytes,
 	}
-	if EffectiveShallow(dest, opts.Shallow) {
+	if EffectiveShallow(dest, opts.Shallow) || rep.RcloneResult.HashFallback {
 		v.Method = VerifyMethodSizeMtime
 	}
 	v.verified = v.Method == VerifyMethodBlake3 && rep.Status == store.RunStatusSuccess
