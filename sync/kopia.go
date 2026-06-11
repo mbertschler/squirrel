@@ -176,7 +176,7 @@ func (h *kopiaHandler) Push(ctx context.Context, opts Options) (Report, error) {
 	}
 
 	err = h.snapshotAndVerify(ctx, &rep)
-	h.finishRun(ctx, &rep, err)
+	finishHandlerRun(ctx, h.store, &rep, err)
 	// Local index snapshot only: the repository is kopia's own format,
 	// so the rclone ride-along stays out of it (dest=nil, mirroring the
 	// peer flow).
@@ -219,20 +219,4 @@ func (h *kopiaHandler) snapshotAndVerify(ctx context.Context, rep *Report) error
 	rep.Status = store.RunStatusSuccess
 	rep.Verification.verified = true
 	return nil
-}
-
-// finishRun writes the kopia run's terminal state, mirroring the shared
-// finishRun's contract: a FinishRun failure lands on rep.FinishErr so
-// the caller can surface it next to the push outcome.
-func (h *kopiaHandler) finishRun(ctx context.Context, rep *Report, runErr error) {
-	if rep.RunID == 0 {
-		return
-	}
-	errMsg := ""
-	if runErr != nil {
-		errMsg = runErr.Error()
-	}
-	if err := h.store.FinishRun(ctx, rep.RunID, rep.Status, errMsg, rep.Verification.Files); err != nil {
-		rep.FinishErr = err
-	}
 }

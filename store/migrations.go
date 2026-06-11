@@ -10,7 +10,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 16
+const SchemaVersion = 18
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -52,6 +52,8 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 14, up: migrateV13ToV14},
 		{version: 15, up: migrateV14ToV15},
 		{version: 16, up: migrateV15ToV16},
+		{version: 17, up: migrateV16ToV17},
+		{version: 18, up: migrateV17ToV18},
 	}
 }
 
@@ -1638,6 +1640,96 @@ func migrateV15ToV16(ctx context.Context, db *sql.DB) error {
 	for _, q := range stmts {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("v15→v16: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// --- v16 → v17 ---
+
+// migrateV16ToV17 relaxes remote_objects so the upload record and the
+// fingerprint are two separate facts: the content-addressed offsite
+// push records the upload immediately (checksum_algo and checksum both
+// NULL — uploaded, fingerprint pending) and a later scan-back pass
+// fills the provider checksum in. A CHECK keeps the pair atomic — a
+// checksum without its algorithm (or vice versa) is uninterpretable.
+//
+// remote_objects is a leaf table (nothing references it), so the
+// rebuild needs no FK-off recipe: the staged table is populated while
+// the old one still satisfies every constraint, then swapped in.
+// Existing rows carry over verbatim.
+func migrateV16ToV17(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`CREATE TABLE remote_objects_v17 (
+			content_id      INTEGER NOT NULL REFERENCES contents(id),
+			destination     TEXT NOT NULL,
+			uploaded_run_id INTEGER NOT NULL REFERENCES runs(id),
+			checksum_algo   TEXT,
+			checksum        TEXT,
+			verified_at_ns  INTEGER,
+			PRIMARY KEY (content_id, destination),
+			CHECK ((checksum_algo IS NULL) = (checksum IS NULL))
+		)`,
+		`INSERT INTO remote_objects_v17 (
+			content_id, destination, uploaded_run_id, checksum_algo, checksum, verified_at_ns
+		)
+		SELECT content_id, destination, uploaded_run_id, checksum_algo, checksum, verified_at_ns
+		FROM remote_objects`,
+		`DROP TABLE remote_objects`,
+		`ALTER TABLE remote_objects_v17 RENAME TO remote_objects`,
+		`INSERT INTO schema_version (version) VALUES (17)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("v16→v17: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// --- v17 → v18 ---
+
+// migrateV17ToV18 adds files.status_changed_run_id: the run during
+// which the row last changed status. last_seen_run_id can't answer
+// "what changed since run W" — it advances on every observation of a
+// present row and freezes at the last-alive run on supersession — so
+// the per-destination manifest delta needs a stamp that moves exactly
+// when status does. Every status writer maintains it from v18 on:
+// inserts stamp their first_seen run, supersession/missing flips stamp
+// the flipping run, and re-observations leave it alone.
+//
+// The backfill approximates history the old columns retain: a present
+// row last changed status when it was inserted (first_seen_run_id;
+// re-flips to present weren't recorded), and a superseded/missing row's
+// last_seen_run_id is the closest recorded coordinate to its flip (the
+// flip stamp for missing rows, the last-alive run for superseded ones).
+// The approximation only affects pre-v18 history; no content-addressed
+// destination can have synced before v18 exists, so every first delta
+// is computed against watermark 0 and reads the full live state anyway.
+func migrateV17ToV18(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`ALTER TABLE files ADD COLUMN status_changed_run_id INTEGER REFERENCES runs(id)`,
+		`UPDATE files SET status_changed_run_id = CASE
+			WHEN status = 'present' THEN first_seen_run_id
+			ELSE last_seen_run_id
+		END`,
+		`INSERT INTO schema_version (version) VALUES (18)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("v17→v18: %w", err)
 		}
 	}
 	return tx.Commit()

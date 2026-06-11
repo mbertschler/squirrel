@@ -168,10 +168,7 @@ func (s *Store) presentOriginMaxima(ctx context.Context, volumeID, selfNodeID in
 			JOIN folders fo ON fo.id = f.folder_id
 			JOIN contents c ON c.id = f.content_id
 			WHERE fo.volume_id = ? AND f.status = 'present'
-			  AND fo.path != '.squirrel-history'         AND fo.path NOT LIKE '.squirrel-history/%'
-			  AND fo.path != '.squirrel-conflicts'       AND fo.path NOT LIKE '.squirrel-conflicts/%'
-			  AND fo.path != '.squirrel-restore-history' AND fo.path NOT LIKE '.squirrel-restore-history/%'
-			  AND fo.path != '.squirrel-index'           AND fo.path NOT LIKE '.squirrel-index/%'
+			  AND `+reservedSubtreeFilter+`
 		)
 		SELECT
 			CASE WHEN pc.origin_node_id IS NULL OR pc.origin_run_id IS NULL

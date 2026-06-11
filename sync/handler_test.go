@@ -29,6 +29,15 @@ func TestHandlerForDispatch(t *testing.T) {
 		t.Fatalf("node pair resolved to %T (%q), want *peerHandler nas", h, h.TargetName())
 	}
 
+	ca := &config.Destination{Name: "offsite", Type: "sftp", Root: "/data", Layout: config.LayoutContentAddressed}
+	h, err = HandlerFor(nil, tools, Pair{Volume: vol, Destination: ca})
+	if err != nil {
+		t.Fatalf("content-addressed pair: %v", err)
+	}
+	if _, ok := h.(*contentAddressedHandler); !ok || h.TargetName() != "offsite" {
+		t.Fatalf("content-addressed pair resolved to %T (%q), want *contentAddressedHandler offsite", h, h.TargetName())
+	}
+
 	if _, err := HandlerFor(nil, tools, Pair{Volume: vol}); err == nil {
 		t.Fatalf("expected error for pair without a target")
 	}

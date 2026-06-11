@@ -155,15 +155,25 @@ func printSyncReport(w io.Writer, rep sync.Report, runErr error) {
 	for _, msg := range rep.NodePendingWarnings {
 		fmt.Fprintf(w, "warning: peer reports %s\n", msg)
 	}
-	// Kopia pushes have no rclone counters; render the snapshot's own
-	// numbers instead.
-	if rep.Verification.Method == sync.VerifyMethodKopia {
+	switch rep.Verification.Method {
+	case sync.VerifyMethodKopia:
+		// Kopia pushes have no rclone counters; render the snapshot's
+		// own numbers instead.
 		fmt.Fprintf(w, "%s → %s  status=%s files=%d bytes=%d snapshot=%s verified=%t run=%d\n",
 			rep.Volume, rep.Destination, rep.Status,
 			rep.Verification.Files, rep.Verification.Bytes,
 			rep.Verification.SnapshotID, rep.Verification.Verified(), rep.RunID,
 		)
-	} else {
+	case sync.VerifyMethodPresenceSize:
+		// Content-addressed pushes count objects, with skipped = hashes
+		// the destination already recorded and entries = manifest
+		// segment lines.
+		fmt.Fprintf(w, "%s → %s  status=%s objects=%d skipped=%d errors=%d bytes=%d entries=%d run=%d\n",
+			rep.Volume, rep.Destination, rep.Status,
+			r.Transferred, r.Checked, r.Errors, r.Bytes,
+			rep.Verification.Files, rep.RunID,
+		)
+	default:
 		fmt.Fprintf(w, "%s → %s  status=%s transferred=%d checked=%d errors=%d bytes=%d run=%d\n",
 			rep.Volume, rep.Destination, rep.Status,
 			r.Transferred, r.Checked, r.Errors, r.Bytes, rep.RunID,

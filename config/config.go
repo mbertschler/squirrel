@@ -142,6 +142,12 @@ type Destination struct {
 	Name string
 	Type string // local, sftp, s3, b2, gcs, kopia
 	Root string // remote-side base directory; for kopia, the repository path
+	// Layout selects how the destination stores a volume's data:
+	// LayoutMirror replicates the volume's tree, LayoutContentAddressed
+	// stores append-only content objects plus per-run manifest segments.
+	// Resolved at load time to one of the Layout* constants; an absent
+	// `layout` key resolves to LayoutMirror.
+	Layout string
 	// Params are type-specific parameters with any { env = "VAR" }
 	// references already resolved to literal strings: rclone backend
 	// parameters for the rclone types, the repository password for
@@ -153,6 +159,22 @@ type Destination struct {
 	// (CryptRemoteName) instead of the underlying remote.
 	Crypt *Crypt
 }
+
+// Destination layout values. The layout shapes what sync writes under
+// the destination's per-volume directory; it never changes how the
+// local volume is indexed.
+const (
+	// LayoutMirror is the default: the destination holds a tree shaped
+	// like the local volume, with overwrites preserved under
+	// .squirrel-history/run-<id>/.
+	LayoutMirror = "mirror"
+	// LayoutContentAddressed stores one immutable object per BLAKE3
+	// content hash under objects/ plus one manifest segment per sync
+	// run under index/, an append-only archive layout where a local
+	// rename re-uploads nothing. Valid for rclone-remote destinations
+	// only.
+	LayoutContentAddressed = "content-addressed"
+)
 
 // Crypt is the optional client-side encryption overlay for a destination.
 // squirrel renders it as an rclone crypt remote stacked on the underlying

@@ -413,7 +413,7 @@ func upsertRowInTx(ctx context.Context, tx *sql.Tx, r FileRow, prov *Provenance)
 	case err == nil && existingStatus == StatusSuperseded:
 		// Case 2: content revert — supersede whatever is live now, then
 		// revive the matched (formerly superseded) row.
-		if err := supersedeLiveRow(ctx, tx, folderID, name); err != nil {
+		if err := supersedeLiveRow(ctx, tx, folderID, name, r.LastSeenRunID); err != nil {
 			return 0, err
 		}
 		if err := updateLiveRow(ctx, tx, folderID, name, contentID, r); err != nil {
@@ -421,7 +421,7 @@ func upsertRowInTx(ctx context.Context, tx *sql.Tx, r FileRow, prov *Provenance)
 		}
 	case errors.Is(err, sql.ErrNoRows):
 		// Case 3: brand new content at this path (possibly first-ever).
-		if err := supersedeLiveRow(ctx, tx, folderID, name); err != nil {
+		if err := supersedeLiveRow(ctx, tx, folderID, name, r.LastSeenRunID); err != nil {
 			return 0, err
 		}
 		if err := insertNewRow(ctx, tx, folderID, name, contentID, r); err != nil {
@@ -507,14 +507,15 @@ func lookupContentTx(ctx context.Context, tx *sql.Tx, digest []byte, sizeBytes i
 }
 
 // supersedeLiveRow flips the single non-superseded row at (folderID, name)
-// (if any) to status='superseded'. A no-op when there is no live row, e.g.
-// the very first observation of a path. last_seen_run_id stays frozen at the
+// (if any) to status='superseded', stamping runID as the row's
+// status-change run. A no-op when there is no live row, e.g. the very
+// first observation of a path. last_seen_run_id stays frozen at the
 // value it had — that is the run during which the row was last seen alive.
-func supersedeLiveRow(ctx context.Context, tx *sql.Tx, folderID int64, name string) error {
+func supersedeLiveRow(ctx context.Context, tx *sql.Tx, folderID int64, name string, runID int64) error {
 	_, err := tx.ExecContext(ctx, `
-		UPDATE files SET status = 'superseded'
+		UPDATE files SET status = 'superseded', status_changed_run_id = ?
 		WHERE folder_id = ? AND name = ? AND status != 'superseded'
-	`, folderID, name)
+	`, runID, folderID, name)
 	if err != nil {
 		return fmt.Errorf("supersede live row: %w", err)
 	}
@@ -553,7 +554,7 @@ func (s *Store) RecordConflictPreStage(ctx context.Context, volumeID int64, orig
 	if err != nil {
 		return err
 	}
-	if err := supersedeLiveRow(ctx, tx, origFolderID, origName); err != nil {
+	if err := supersedeLiveRow(ctx, tx, origFolderID, origName, conflictRow.LastSeenRunID); err != nil {
 		return err
 	}
 
@@ -583,14 +584,19 @@ func (s *Store) RecordConflictPreStage(ctx context.Context, volumeID int64, orig
 
 // updateLiveRow refreshes the mutable fields on an existing row matching
 // (folder_id, name, content_id). content_id and first_seen_run_id are
-// never touched.
+// never touched. status_changed_run_id advances exactly when the write
+// changes the row's status (the CASE reads the pre-update status, per
+// SQL UPDATE semantics), covering the revive transitions Case 2 routes
+// through here.
 func updateLiveRow(ctx context.Context, tx *sql.Tx, folderID int64, name string, contentID int64, r FileRow) error {
 	_, err := tx.ExecContext(ctx, `
 		UPDATE files SET
-			mtime_ns = ?, status = ?,
+			mtime_ns = ?,
+			status_changed_run_id = CASE WHEN status = ? THEN status_changed_run_id ELSE ? END,
+			status = ?,
 			last_seen_run_id = ?, indexed_at_ns = ?
 		WHERE folder_id = ? AND name = ? AND content_id = ?
-	`, r.MtimeNs, r.Status, r.LastSeenRunID, r.IndexedAtNs,
+	`, r.MtimeNs, r.Status, r.LastSeenRunID, r.Status, r.LastSeenRunID, r.IndexedAtNs,
 		folderID, name, contentID)
 	if err != nil {
 		return fmt.Errorf("update live row: %w", err)
@@ -601,10 +607,12 @@ func updateLiveRow(ctx context.Context, tx *sql.Tx, folderID int64, name string,
 func insertNewRow(ctx context.Context, tx *sql.Tx, folderID int64, name string, contentID int64, r FileRow) error {
 	_, err := tx.ExecContext(ctx,
 		`INSERT INTO files (folder_id, name, content_id, mtime_ns,
-			status, first_seen_run_id, last_seen_run_id, indexed_at_ns)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			status, first_seen_run_id, last_seen_run_id, indexed_at_ns,
+			status_changed_run_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		folderID, name, contentID, r.MtimeNs,
-		r.Status, r.FirstSeenRunID, r.LastSeenRunID, r.IndexedAtNs)
+		r.Status, r.FirstSeenRunID, r.LastSeenRunID, r.IndexedAtNs,
+		r.FirstSeenRunID)
 	if err != nil {
 		return fmt.Errorf("insert new row: %w", err)
 	}
@@ -666,9 +674,11 @@ func touchSeenRowInTx(ctx context.Context, tx *sql.Tx, volumeID int64, relPath s
 		return 0, fmt.Errorf("lookup folder: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE files SET last_seen_run_id = ?, status = 'present'
+		`UPDATE files SET last_seen_run_id = ?,
+			status_changed_run_id = CASE WHEN status = 'present' THEN status_changed_run_id ELSE ? END,
+			status = 'present'
 		 WHERE folder_id = ? AND name = ? AND status != 'superseded'`,
-		runID, folderID, name); err != nil {
+		runID, runID, folderID, name); err != nil {
 		return 0, fmt.Errorf("touch seen: %w", err)
 	}
 	return folderID, nil
@@ -808,11 +818,11 @@ func (s *Store) MarkMissing(ctx context.Context, volumeID int64, currentRunID in
 	affRows.Close()
 
 	res, err := tx.ExecContext(ctx, `
-		UPDATE files SET status = 'missing', last_seen_run_id = ?
+		UPDATE files SET status = 'missing', last_seen_run_id = ?, status_changed_run_id = ?
 		WHERE status = 'present' AND folder_id IN (
 			SELECT id FROM folders WHERE volume_id = ?
 		) AND last_seen_run_id != ?
-	`, currentRunID, volumeID, currentRunID)
+	`, currentRunID, currentRunID, volumeID, currentRunID)
 	if err != nil {
 		return 0, fmt.Errorf("mark missing: %w", err)
 	}
@@ -856,9 +866,9 @@ func (s *Store) MarkOffloaded(ctx context.Context, volumeID int64, relPath strin
 		return fmt.Errorf("mark offloaded %s: lookup folder: %w", relPath, err)
 	}
 	res, err := tx.ExecContext(ctx, `
-		UPDATE files SET status = 'offloaded', last_seen_run_id = ?
+		UPDATE files SET status = 'offloaded', last_seen_run_id = ?, status_changed_run_id = ?
 		WHERE folder_id = ? AND name = ? AND content_id = ? AND status = 'present'
-	`, runID, folderID, name, contentID)
+	`, runID, runID, folderID, name, contentID)
 	if err != nil {
 		return fmt.Errorf("mark offloaded %s: %w", relPath, err)
 	}

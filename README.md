@@ -99,6 +99,48 @@ Properties that differ from rclone destinations:
 - **A `crypt` block is rejected**: kopia encrypts its repository itself. Keep the repository password safe; the repository is unreadable without it.
 - **Restore goes through the kopia CLI** (`kopia snapshot restore`), since the repository is kopia's own format. `squirrel restore` refuses kopia destinations and says so.
 
+### Content-addressed destinations
+
+By default a destination mirrors the volume's tree (see [Destination layout](#destination-layout)). Any rclone-remote destination — with or without a `crypt` block — can instead opt into an **append-only, content-addressed** layout, built for cold archive storage where objects should never be rewritten or moved:
+
+```toml
+[destinations.archive]
+type   = "sftp"
+host   = "archive.example"
+user   = "u"
+root   = "/data"
+layout = "content-addressed"
+```
+
+Instead of a browsable tree, the destination holds two streams:
+
+- **`objects/<hash>`** (at the destination root, shared by all volumes) — one object per BLAKE3 content hash (lowercase hex), the raw file bytes (encrypted client-side when the destination has a `crypt` block). Each hash is uploaded **exactly once** per destination and never moved, overwritten, or deleted. A local rename or reorg changes only the path mapping — no re-upload, no server-side copy — and content duplicated across volumes is stored once.
+- **`<volume>/index/run-<id>`** — one immutable **manifest segment** per sync run, per volume: the path-level delta of that run (see the format below). Replaying a volume's segments in run order yields its full current path→content mapping, and any past state.
+
+Durability is **transactional per run**: the run only counts as successful — and only then feeds the durability evidence squirrel records per destination — once *both* all its content objects *and* its manifest segment are confirmed on the remote (each transfer's success plus a follow-up presence/size listing). A failed run may leave objects without a segment; they are harmless (nothing maps them) and the next run skips re-uploading anything already recorded, pushing only what's missing.
+
+Properties that differ from mirrored destinations:
+
+- **Verification is presence+size**, recorded as such: per-object transfers can't carry the end-to-end BLAKE3 check (and `crypt` remotes expose no hashes at all), so the runs row is recorded shallow and the push never claims content verification. Provider-side ciphertext fingerprints (recorded in the index per upload) are the planned upgrade.
+- **Pick the layout when the destination is first used.** Switching an existing mirrored destination to `content-addressed` (or back) is not supported — point the new layout at a fresh destination or root. The push detects a mirrored history (a recorded successful sync without its manifest segment) and refuses.
+- **`squirrel restore` refuses the layout** for now; recovery tooling ships separately. The format is deliberately simple enough to recover without squirrel — see below.
+- `--dry-run` is not supported yet.
+
+#### Manifest segment format
+
+Each `<volume>/index/run-<id>` segment is JSONL — one JSON object per line, lines sorted by `(path, status)`:
+
+```json
+{"path":"2024/cat.jpg","blake3":"26e7…e5ad","status":"present","size_bytes":123,"mtime_ns":1712345678901234567}
+```
+
+- `path` — volume-relative path
+- `blake3` — 64-char lowercase hex BLAKE3-256 of the file content; the bytes live at `objects/<blake3>`
+- `status` — `present`, `superseded`, `missing`, or `offloaded`
+- `size_bytes`, `mtime_ns` — as indexed
+
+To replay: process segments in ascending run id; each line with status `present`, `missing`, or `offloaded` sets that path's current `(content, status)` — last write wins per path. `superseded` lines are history only (the outgoing content of a path that changed) and update no mapping. A full recovery script is: replay every segment, then for each `present`/`offloaded` path download `objects/<blake3>` (decrypting with the `crypt` password if one was set). `missing` paths are known-but-lost at the origin — the object may still exist from an earlier upload.
+
 ### Offloading
 
 `squirrel offload` deletes the **local** copy of files whose content is provably stored on every target the volume's offload policy requires — never a blind delete. It is the only squirrel command that deletes user data.
@@ -249,7 +291,7 @@ squirrel tui
 
 ## Destination layout
 
-Each destination is a tree shaped like the local volumes:
+Each mirrored destination (`layout = "mirror"`, the default) is a tree shaped like the local volumes:
 
 ```
 <dest.root>/
@@ -265,6 +307,8 @@ Each destination is a tree shaped like the local volumes:
 `.squirrel-history/run-<run-id>/` is rclone's `--backup-dir` target for that sync run. It is filtered out of all subsequent comparisons so it does not grow rclone's listing time or get uploaded back. A directory literally called `.squirrel-history` in your source volume is also filtered (with a warning), to keep the reserved name out of the destination tree by accident.
 
 `.squirrel-index/` holds the index snapshots ridden along after each successful sync (see [Index snapshots](#index-snapshots)). Like `.squirrel-history`, it is filtered out of all sync and restore transfers and from peer-sync, so a snapshot is never mistaken for user content.
+
+A [content-addressed destination](#content-addressed-destinations) holds a shared `objects/` directory at its root and `index/` under each per-volume directory instead of a mirrored tree (plus the same `.squirrel-index/` ride-along).
 
 ## Notes
 

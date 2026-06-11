@@ -379,6 +379,35 @@ func (r *Rclone) deleteFile(ctx context.Context, fileURI string) error {
 	return err
 }
 
+// statRemote returns the size of the single object at uri via
+// `rclone lsjson --stat`. The content-addressed push uses it to confirm
+// presence and size of each uploaded object and manifest segment;
+// through a crypt overlay the reported size is the decrypted length, so
+// it compares directly against local byte counts. A missing object
+// surfaces as an error (rclone exits non-zero; defensively, a `null`
+// stat on a tolerant rclone build is mapped to the same outcome).
+func (r *Rclone) statRemote(ctx context.Context, uri string) (int64, error) {
+	out, err := r.runPlain(ctx, "lsjson", "--stat", uri)
+	if err != nil {
+		return 0, err
+	}
+	trimmed := bytes.TrimSpace(out)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return 0, fmt.Errorf("rclone lsjson: no object at %s", uri)
+	}
+	var entry struct {
+		Size  int64 `json:"Size"`
+		IsDir bool  `json:"IsDir"`
+	}
+	if err := json.Unmarshal(trimmed, &entry); err != nil {
+		return 0, fmt.Errorf("parse lsjson --stat output for %s: %w", uri, err)
+	}
+	if entry.IsDir {
+		return 0, fmt.Errorf("%s is a directory, expected a single object", uri)
+	}
+	return entry.Size, nil
+}
+
 // rcloneEvent captures the subset of rclone's JSON log we care about: the
 // level (for error filtering), the per-object message and object name (for
 // failed-file lists), and the stats object that rclone emits at the end of
