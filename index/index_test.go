@@ -12,9 +12,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zeebo/blake3"
+
 	"github.com/mbertschler/squirrel/store"
 	"github.com/mbertschler/squirrel/volmark"
 )
+
+func blake3Of(t *testing.T, content string) []byte {
+	t.Helper()
+	sum := blake3.Sum256([]byte(content))
+	return sum[:]
+}
 
 func setupStore(t *testing.T) *store.Store {
 	t.Helper()
@@ -1087,5 +1095,69 @@ func TestIndexFlipsOffloadedBackToPresent(t *testing.T) {
 	if after.FirstSeenRunID != before.FirstSeenRunID {
 		t.Fatalf("first_seen_run_id = %d, want %d (reappearance must not rewrite it)",
 			after.FirstSeenRunID, before.FirstSeenRunID)
+	}
+}
+
+// TestHashStatPinnedToHashedBytes simulates a file that grows between the
+// walker's stat and the worker's hash: process must record the size read
+// from the open handle after hashing (matching the hashed content), not
+// the stale walk size. Binding the new digest to the old size would mint a
+// contents row whose size_bytes can never match the honest content again.
+func TestHashStatPinnedToHashedBytes(t *testing.T) {
+	root := t.TempDir()
+	abs := filepath.Join(root, "growing.txt")
+	content := "the full on-disk content after the append"
+	writeFile(t, abs, content)
+
+	s := setupStore(t)
+	ctx := context.Background()
+	idx, err := newIndexer(ctx, s, root, Options{Name: "vol"})
+	if err != nil {
+		t.Fatalf("newIndexer: %v", err)
+	}
+
+	stale := workItem{
+		absPath:   abs,
+		relPath:   "growing.txt",
+		sizeBytes: 3, // what the walker stat saw before the append
+		mtimeNs:   1,
+	}
+	res := idx.process(stale, make([]byte, hashReadBufferSize))
+	if res.err != nil {
+		t.Fatalf("process: %v", res.err)
+	}
+	if res.row.SizeBytes != int64(len(content)) {
+		t.Fatalf("row size = %d, want %d (the hashed bytes, not the stale walk size %d)",
+			res.row.SizeBytes, len(content), stale.sizeBytes)
+	}
+	want := blake3Of(t, content)
+	if !bytes.Equal(res.row.Blake3, want) {
+		t.Fatalf("row digest = %x, want %x", res.row.Blake3, want)
+	}
+}
+
+// TestReindexStableBytesNoSizeMismatch indexes a file, then re-indexes the
+// same untouched bytes. The contents row minted on the first pass carries
+// the size of the bytes that were hashed, so the second pass resolves the
+// same (digest, size) pair and ApplyIndexBatch does not hit the immutable
+// size cross-check that aborts the whole batch.
+func TestReindexStableBytesNoSizeMismatch(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "stable.txt"), "stable content that never changes")
+
+	s := setupStore(t)
+	ctx := context.Background()
+	if _, err := Index(ctx, s, root, Options{Name: "vol"}); err != nil {
+		t.Fatalf("first Index: %v", err)
+	}
+	rep, err := Index(ctx, s, root, Options{Name: "vol"})
+	if err != nil {
+		t.Fatalf("second Index aborted (size cross-check?): %v", err)
+	}
+	if rep.Errors != 0 {
+		t.Fatalf("re-index reported errors: %+v", rep.ErrorList)
+	}
+	if rep.Unchanged != 1 {
+		t.Fatalf("re-index unchanged = %d, want 1", rep.Unchanged)
 	}
 }

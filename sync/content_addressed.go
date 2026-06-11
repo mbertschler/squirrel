@@ -1,15 +1,20 @@
 package sync
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
 	"slices"
 	"strconv"
+
+	"github.com/zeebo/blake3"
 
 	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/store"
@@ -209,8 +214,16 @@ func (h *contentAddressedHandler) watermark(ctx context.Context, volID int64) (i
 // failures don't stop the loop — every object that lands now is recorded
 // and saves work on the retry — but any failure fails the run before
 // the segment is written.
+//
+// A source whose bytes drifted from the indexed hash is refused without a
+// remote_objects row (errContentDrift): it is surfaced as a warning and
+// fails the run, so the segment is not written and the watermark does not
+// advance. The next run recomputes the same delta and re-offers the
+// object, letting the honest bytes land once they are restored — without
+// the drifted bytes ever being recorded under the hash.
 func (h *contentAddressedHandler) uploadObjects(ctx context.Context, rep *Report, runID int64, delta []store.PathDelta) error {
 	var confirmed []store.PathDelta
+	var drifted int
 	for _, d := range plannedUploads(delta) {
 		recorded, err := h.store.HasRemoteObject(ctx, d.ContentID, h.dest.Name)
 		if err != nil {
@@ -221,6 +234,11 @@ func (h *contentAddressedHandler) uploadObjects(ctx context.Context, rep *Report
 			continue
 		}
 		if err := h.uploadOneObject(ctx, runID, d); err != nil {
+			if errors.Is(err, errContentDrift) {
+				drifted++
+				rep.Warnings = append(rep.Warnings, err.Error())
+				continue
+			}
 			rep.RcloneResult.Errors++
 			if int64(len(rep.RcloneResult.FailedFiles)) < maxFailedFiles {
 				rep.RcloneResult.FailedFiles = append(rep.RcloneResult.FailedFiles,
@@ -235,6 +253,9 @@ func (h *contentAddressedHandler) uploadObjects(ctx context.Context, rep *Report
 	h.captureFingerprints(ctx, rep, confirmed)
 	if rep.RcloneResult.Errors > 0 {
 		return fmt.Errorf("%d object(s) failed to land on %q; the manifest segment for run %d was not written and the durability vector did not advance", rep.RcloneResult.Errors, h.dest.Name, runID)
+	}
+	if drifted > 0 {
+		return fmt.Errorf("%d object(s) on %q were refused for drifting from their indexed hash; re-index the volume and sync again — the manifest segment for run %d was not written and the durability vector did not advance", drifted, h.dest.Name, runID)
 	}
 	return nil
 }
@@ -307,22 +328,39 @@ func plannedUploads(delta []store.PathDelta) []store.PathDelta {
 	return out
 }
 
-// uploadOneObject lands one content object and records the upload. The
-// pre-transfer stat guards the content-addressed invariant — the bytes
-// stored under a hash must be the bytes that produced it — by refusing
-// a source file whose size or mtime drifted from the indexed row; the
-// post-transfer stat confirms presence and size on the remote. The
+// errContentDrift marks a source file whose bytes no longer match the
+// content hash the index bound them to. The upload path raises it instead
+// of recording an object; uploadObjects turns it into a warning and fails
+// the run so the watermark holds and the object is re-offered next run.
+var errContentDrift = errors.New("source content drifted from its indexed hash")
+
+// uploadOneObject lands one content object and records the upload. It
+// guards the content-addressed invariant — the bytes stored under a hash
+// must be the bytes that produced it — by re-hashing the source file
+// immediately before the transfer and refusing (errContentDrift) when the
+// digest no longer matches the indexed hash, catching a
+// size+mtime-preserving in-place edit that a metadata stat would pass.
+// The post-transfer stat confirms presence and size on the remote, and the
 // upload record is written only after that confirmation, so a recorded
-// hash is always a confirmed one; a crash in between re-uploads the
-// same bytes idempotently on the next run.
+// hash is always a confirmed one; a crash in between re-uploads the same
+// bytes idempotently on the next run.
+//
+// Residual: rclone reads the file in a separate child process after the
+// re-hash, so a writer that edits the file in the window between the hash
+// and rclone's read could still upload drifted bytes. The window is the
+// fork/exec of one rclone invocation rather than the whole walk-to-push
+// span, and the scan-back fingerprint pass (#109) re-reads the landed
+// object to upgrade the durability vector, catching any byte that slipped
+// through before the object is treated as content-verified.
 func (h *contentAddressedHandler) uploadOneObject(ctx context.Context, runID int64, d store.PathDelta) error {
 	src := filepath.Join(h.vol.Path, filepath.FromSlash(d.Path))
-	fi, err := os.Stat(src)
+	digest, err := hashLocalFile(src)
 	if err != nil {
-		return fmt.Errorf("stat %s: %w", src, err)
+		return fmt.Errorf("re-hash %s before upload: %w", src, err)
 	}
-	if fi.Size() != d.SizeBytes || fi.ModTime().UnixNano() != d.MtimeNs {
-		return fmt.Errorf("%s changed on disk since it was indexed (size %d→%d, mtime %d→%d) — run `squirrel index %s` and sync again", d.Path, d.SizeBytes, fi.Size(), d.MtimeNs, fi.ModTime().UnixNano(), h.vol.Name)
+	if !bytes.Equal(digest, d.Blake3) {
+		return fmt.Errorf("%w: %s now hashes to %s, indexed as %s — run `squirrel index %s` and sync again",
+			errContentDrift, d.Path, hex.EncodeToString(digest), hex.EncodeToString(d.Blake3), h.vol.Name)
 	}
 	hash := hex.EncodeToString(d.Blake3)
 	uri := h.objectURI(hash)
@@ -344,6 +382,21 @@ func (h *contentAddressedHandler) uploadOneObject(ctx context.Context, runID int
 		return fmt.Errorf("record upload of %s: %w", hash, err)
 	}
 	return nil
+}
+
+// hashLocalFile streams the file at path through BLAKE3 and returns the
+// raw 32-byte digest, the same hash the indexer binds content under.
+func hashLocalFile(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	h := blake3.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return nil, err
+	}
+	return h.Sum(nil), nil
 }
 
 // uploadSegment writes the run's manifest segment and confirms it

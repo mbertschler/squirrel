@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zeebo/blake3"
 
@@ -676,6 +677,84 @@ func TestContentAddressedCrossVolumeDedup(t *testing.T) {
 	}
 	if _, err := os.Stat(f.remotePath(ObjectsDirName, blake3Hex("shared-bytes"))); err != nil {
 		t.Fatalf("shared object missing at the destination root: %v", err)
+	}
+}
+
+// TestContentAddressedDriftRefusesObject: a source file whose on-disk
+// bytes drift from the indexed hash (here a same-length, mtime-preserving
+// in-place edit the metadata stat alone cannot catch) is never recorded in
+// remote_objects. The run is refused and warned, the watermark holds, and
+// once the honest bytes are restored the next run lands and records the
+// object normally — the drifted bytes never bound to the hash.
+func TestContentAddressedDriftRefusesObject(t *testing.T) {
+	f := setupContentAddressedFixture(t)
+	f.write(t, "a.txt", "alpha")
+	f.index(t)
+
+	indexedMtime := f.mtimeNs(t, "a.txt")
+	src := filepath.Join(f.pair.Volume.Path, "a.txt")
+	if err := os.WriteFile(src, []byte("ALPHA"), 0o644); err != nil {
+		t.Fatalf("in-place edit: %v", err)
+	}
+	restoreMtime := time.Unix(0, indexedMtime)
+	if err := os.Chtimes(src, restoreMtime, restoreMtime); err != nil {
+		t.Fatalf("restore mtime: %v", err)
+	}
+
+	rep, err := f.sync(t)
+	if err == nil || !strings.Contains(err.Error(), "drifting from their indexed hash") {
+		t.Fatalf("expected a drift refusal, got %v", err)
+	}
+	if rep.Status != store.RunStatusFailed {
+		t.Fatalf("Status = %q, want failed", rep.Status)
+	}
+	if rep.RcloneResult.Transferred != 0 || rep.RcloneResult.Errors != 0 {
+		t.Fatalf("counts = transferred=%d errors=%d, want 0/0 (drift is a refusal, not a transfer error)",
+			rep.RcloneResult.Transferred, rep.RcloneResult.Errors)
+	}
+	if len(rep.Warnings) == 0 || !strings.Contains(strings.Join(rep.Warnings, "\n"), "drifted") {
+		t.Fatalf("Warnings = %+v, want a drift advisory", rep.Warnings)
+	}
+	if _, statErr := os.Stat(f.remotePath(ObjectsDirName, blake3Hex("alpha"))); statErr == nil {
+		t.Fatalf("drifted source uploaded an object under the indexed hash")
+	}
+
+	row, err := f.store.GetByPath(context.Background(), f.volumeID(t), "a.txt")
+	if err != nil {
+		t.Fatalf("GetByPath: %v", err)
+	}
+	if has, _ := f.store.HasRemoteObject(context.Background(), row.ContentID, "offsite"); has {
+		t.Fatalf("drifted object was recorded in remote_objects")
+	}
+	if _, statErr := os.Stat(f.remotePath("pics", ManifestDirName, fmt.Sprintf("run-%d", rep.RunID))); statErr == nil {
+		t.Fatalf("manifest segment written despite a refused object")
+	}
+	if vector, err := f.store.ListDestinationRunIDs(context.Background(), f.volumeID(t), "offsite"); err != nil || len(vector) != 0 {
+		t.Fatalf("vector = %+v (err=%v), want empty after a refused object", vector, err)
+	}
+
+	if err := os.WriteFile(src, []byte("alpha"), 0o644); err != nil {
+		t.Fatalf("restore honest bytes: %v", err)
+	}
+	if err := os.Chtimes(src, restoreMtime, restoreMtime); err != nil {
+		t.Fatalf("restore mtime again: %v", err)
+	}
+	rep2, err := f.sync(t)
+	if err != nil {
+		t.Fatalf("retry sync: %v", err)
+	}
+	if rep2.RcloneResult.Transferred != 1 {
+		t.Fatalf("retry transferred = %d, want 1 (honest bytes upload after drift cleared)", rep2.RcloneResult.Transferred)
+	}
+	if has, _ := f.store.HasRemoteObject(context.Background(), row.ContentID, "offsite"); !has {
+		t.Fatalf("honest re-upload was not recorded")
+	}
+	got, err := os.ReadFile(f.remotePath(ObjectsDirName, blake3Hex("alpha")))
+	if err != nil {
+		t.Fatalf("object missing after honest re-upload: %v", err)
+	}
+	if string(got) != "alpha" {
+		t.Fatalf("recorded object = %q, want the honest bytes %q", got, "alpha")
 	}
 }
 
