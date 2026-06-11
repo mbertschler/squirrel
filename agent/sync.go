@@ -52,12 +52,13 @@ const (
 	IndexDirName          = ".squirrel-index"
 )
 
-// maxPlanBodyBytes caps a decoded request body. Plan bodies carry one
-// IndexEntry per differing file, each a few hundred bytes; 256 MiB is a
-// generous ceiling for even a full-volume flat plan while still refusing
-// the unbounded body a token-holding peer could otherwise stream to OOM
-// the agent (#110c). A var so tests can drive the boundary without a
-// 256 MiB payload.
+// maxPlanBodyBytes caps a decoded request body. decodeJSON applies it to
+// every sync endpoint's body (begin/plan/verify/close/durability); plan
+// bodies are the largest, carrying one IndexEntry per differing file at a
+// few hundred bytes each, so 256 MiB is a generous ceiling for even a
+// full-volume flat plan while still refusing the unbounded body a
+// token-holding peer could otherwise stream to OOM the agent (#110c). A
+// var so tests can drive the boundary without a 256 MiB payload.
 var maxPlanBodyBytes int64 = 256 << 20
 
 // maxPlanEntries caps len(PlanRequest.Entries) so a single /plan can't
@@ -538,6 +539,9 @@ func (r *peerSyncRouter) planSession(ctx context.Context, sess *peerSession, ent
 	if err := r.preStageConflicts(ctx, sess); err != nil {
 		return syncproto.PlanResponse{}, fmt.Errorf("pre-stage conflicts: %w", err)
 	}
+	// A failure here can leave already-preserved out-of-band files under
+	// .squirrel-history/run-<id>/; that history is recoverable, so the
+	// pre-stage is intentionally not rolled back on a later planning error.
 	if err := r.preStageTransfers(sess); err != nil {
 		return syncproto.PlanResponse{}, fmt.Errorf("pre-stage transfers: %w", err)
 	}
