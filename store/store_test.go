@@ -3409,6 +3409,69 @@ func TestBeginIndexRunIfClearRejectsWrongKind(t *testing.T) {
 	}
 }
 
+// TestBeginSyncRunIfClearBlockedByIndex is the #103 cross-kind guard: a
+// running index (or audit) on the volume refuses a new sync, so a sync
+// never captures its enumeration snapshot against a tree an index is
+// mutating. Once the index finishes, the sync is admitted.
+func TestBeginSyncRunIfClearBlockedByIndex(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+
+	for _, indexKind := range []string{RunKindIndex, RunKindAudit} {
+		idxID, blocker, err := s.BeginIndexRunIfClear(ctx, indexKind, vID, false)
+		if err != nil || blocker != nil {
+			t.Fatalf("%s: begin index: id=%d blocker=%+v err=%v", indexKind, idxID, blocker, err)
+		}
+
+		syncID, syncBlocker, err := s.BeginSyncRunIfClear(ctx, SyncRunSpec{VolumeID: vID, Destination: "backup"})
+		if err != nil {
+			t.Fatalf("%s: begin sync: %v", indexKind, err)
+		}
+		if syncBlocker == nil || syncID != 0 {
+			t.Fatalf("%s: sync admitted (id=%d) while index running, want blocked", indexKind, syncID)
+		}
+		if syncBlocker.Kind != indexKind {
+			t.Fatalf("%s: blocker kind = %q, want %q", indexKind, syncBlocker.Kind, indexKind)
+		}
+
+		if err := s.FinishRun(ctx, idxID, RunStatusSuccess, "", 0); err != nil {
+			t.Fatalf("%s: finish index: %v", indexKind, err)
+		}
+		syncID, syncBlocker, err = s.BeginSyncRunIfClear(ctx, SyncRunSpec{VolumeID: vID, Destination: "backup"})
+		if err != nil || syncBlocker != nil || syncID == 0 {
+			t.Fatalf("%s: sync refused after index finished: id=%d blocker=%+v err=%v", indexKind, syncID, syncBlocker, err)
+		}
+		if err := s.FinishRun(ctx, syncID, RunStatusSuccess, "", 0); err != nil {
+			t.Fatalf("%s: finish sync: %v", indexKind, err)
+		}
+	}
+}
+
+// TestBeginIndexRunIfClearAllowsConcurrentSync pins the deliberate
+// asymmetry to the sync→index block (#103): a running sync does NOT
+// block a new index, because the sync's advance is pinned to the
+// snapshot it already captured and the agent scheduler must be free to
+// index before a sync even while an unrelated sync is in flight.
+func TestBeginIndexRunIfClearAllowsConcurrentSync(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+
+	syncID, blocker, err := s.BeginSyncRunIfClear(ctx, SyncRunSpec{VolumeID: vID, Destination: "backup"})
+	if err != nil || blocker != nil || syncID == 0 {
+		t.Fatalf("begin sync: id=%d blocker=%+v err=%v", syncID, blocker, err)
+	}
+
+	idxID, idxBlocker, err := s.BeginIndexRunIfClear(ctx, RunKindIndex, vID, false)
+	if err != nil {
+		t.Fatalf("begin index during sync: %v", err)
+	}
+	if idxBlocker != nil || idxID == 0 {
+		t.Fatalf("index blocked by running sync (id=%d blocker=%+v), want admitted", idxID, idxBlocker)
+	}
+}
+
 // TestBackupVacuumIntoProducesValidSnapshot exercises Backup against
 // a populated store, then opens the snapshot as a regular DB and
 // verifies it carries the same volume row. Cheapest reliable check
