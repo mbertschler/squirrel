@@ -115,11 +115,82 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 	if err != nil {
 		return nil, err
 	}
+	hashAlgo, err := resolveHashAlgo(raw, typ, layout)
+	if err != nil {
+		return nil, err
+	}
+	checkers, err := resolveCheckers(raw, typ)
+	if err != nil {
+		return nil, err
+	}
 	params, err := validateAndResolveParams(schema, raw)
 	if err != nil {
 		return nil, err
 	}
-	return &Destination{Name: name, Type: typ, Root: root, Layout: layout, Params: params, Crypt: crypt}, nil
+	return &Destination{
+		Name: name, Type: typ, Root: root, Layout: layout, Params: params,
+		Crypt: crypt, HashAlgo: hashAlgo, Checkers: checkers,
+	}, nil
+}
+
+// sftpHashAlgos are the checksum types rclone's sftp backend can read
+// via a server-side sum command, the valid values for `hash_algo`.
+var sftpHashAlgos = map[string]bool{
+	"md5": true, "sha1": true, "sha256": true, "crc32": true,
+	"blake3": true, "xxh3": true, "xxh128": true,
+}
+
+// resolveHashAlgo validates the optional `hash_algo` key. sftp is the
+// one backend where rclone must be told which server-side hash command
+// to run; every other type exposes a fixed checksum, so the key is
+// rejected there. Content-addressed sftp destinations default to
+// "sha256" so scan-back fingerprints get a strong checksum without
+// relying on rclone's md5/sha1 preference.
+func resolveHashAlgo(raw map[string]any, typ, layout string) (string, error) {
+	v, err := optionalString(raw, "hash_algo")
+	if err != nil {
+		return "", err
+	}
+	if v == "" {
+		if typ == "sftp" && layout == LayoutContentAddressed {
+			return "sha256", nil
+		}
+		return "", nil
+	}
+	if typ != "sftp" {
+		return "", fmt.Errorf(`hash_algo is only supported on type "sftp" destinations; type %q exposes a fixed checksum`, typ)
+	}
+	if !sftpHashAlgos[v] {
+		return "", fmt.Errorf("unknown hash_algo %q (supported: %v)", v, sortedKeys(sftpHashAlgos))
+	}
+	return v, nil
+}
+
+// resolveCheckers validates the optional `checkers` key: a positive
+// integer cap on rclone's concurrent checkers for this destination.
+func resolveCheckers(raw map[string]any, typ string) (int, error) {
+	v, ok := raw["checkers"]
+	if !ok {
+		return 0, nil
+	}
+	switch typ {
+	case "local", "kopia":
+		return 0, fmt.Errorf("checkers requires an rclone-remote destination type, not %q", typ)
+	}
+	n, isInt := v.(int64)
+	if !isInt || n <= 0 {
+		return 0, errors.New("checkers must be a positive integer")
+	}
+	return int(n), nil
+}
+
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // resolveLayout validates the optional `layout` key of a destination. An
@@ -215,7 +286,10 @@ func validateCryptRemoteNames(dests map[string]*Destination) error {
 // silently disabling a field at rclone time.
 func validateAndResolveParams(schema destSchema, raw map[string]any) (map[string]string, error) {
 	out := make(map[string]string)
-	seen := map[string]bool{"type": true, "root": true, "crypt": true, "layout": true}
+	seen := map[string]bool{
+		"type": true, "root": true, "crypt": true, "layout": true,
+		"hash_algo": true, "checkers": true,
+	}
 	for _, key := range schema.requiredString {
 		v, err := requireString(raw, key)
 		if err != nil {
@@ -346,6 +420,9 @@ func (d *Destination) RcloneSection() string {
 		if v, ok := d.Params[key]; ok {
 			fmt.Fprintf(&b, "%s = %s\n", key, v)
 		}
+	}
+	if d.Type == "sftp" && d.HashAlgo != "" {
+		fmt.Fprintf(&b, "hashes = %s\n", d.HashAlgo)
 	}
 	for _, key := range sortedSubset(schema.secretFields) {
 		if v, ok := d.Params[key]; ok {

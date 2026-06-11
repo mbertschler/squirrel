@@ -158,6 +158,17 @@ type Destination struct {
 	// rclone's crypt overlay. Transfers then address the overlay remote
 	// (CryptRemoteName) instead of the underlying remote.
 	Crypt *Crypt
+	// HashAlgo is the provider checksum type (rclone hash name, e.g.
+	// "sha256") that scan-back fingerprints record for this destination.
+	// Settable on sftp destinations only — the one backend where rclone
+	// must be told which server-side hash command to run (rendered as
+	// the sftp `hashes` option). Defaults to "sha256" for
+	// content-addressed sftp destinations; empty otherwise.
+	HashAlgo string
+	// Checkers caps rclone's concurrent checkers (--checkers) on
+	// invocations against this destination, for providers that cap
+	// simultaneous connections. Zero leaves rclone's default in force.
+	Checkers int
 }
 
 // Destination layout values. The layout shapes what sync writes under
