@@ -146,33 +146,6 @@ func scanDestinationRunID(s rowScanner) (DestinationRunID, error) {
 	return d, err
 }
 
-// AdvanceDestinationVector advances the destination's durability vector
-// to cover the volume's current present set, tagging every advanced
-// component as peer-blake3 verified. It reads the live present set at
-// call time and is the peer-sync close-phase advance — the receiver
-// re-hashed every delivered path with BLAKE3 during the handshake, so
-// the peer copy is content-verified. Bucket, content-addressed, and
-// kopia pushes instead pin their advance to a PresentOriginMaxima
-// snapshot captured before the transfer via AdvanceDestinationVectorTo.
-//
-// Callers invoke it only once the destination has verifiably landed the
-// volume's full present set (a successful whole-volume sync); each
-// component routes through the monotonic, history-logged upsert. A
-// component already recorded above the computed value is left in place:
-// destinations are append-only, so the higher recorded floor still holds
-// (componentwise max, like a version-vector join).
-func (s *Store) AdvanceDestinationVector(ctx context.Context, volumeID int64, destination string) error {
-	self, err := s.GetSelfNode(ctx)
-	if err != nil {
-		return fmt.Errorf("advance destination vector: self node: %w", err)
-	}
-	components, err := s.PresentOriginMaxima(ctx, volumeID, self.ID)
-	if err != nil {
-		return err
-	}
-	return s.AdvanceDestinationVectorTo(ctx, volumeID, destination, VerifyMethodPeer, components)
-}
-
 // AdvanceDestinationVectorTo advances the destination's durability
 // vector to exactly the supplied components, tagging each with
 // verifyMethod. Callers compute the components once from the push's own
@@ -191,6 +164,27 @@ func (s *Store) AdvanceDestinationVectorTo(ctx context.Context, volumeID int64, 
 			continue
 		}
 		if err != nil {
+			return err
+		}
+	}
+	return s.recordPushFreshness(ctx, volumeID, destination, components)
+}
+
+// recordPushFreshness overwrites the destination's push-freshness maxima
+// to exactly the supplied snapshot — the per-origin-node maxima of the
+// present set this push enumerated. Distinct from the monotonic vector
+// advance above: freshness reflects only the latest push, so a push that
+// dropped content from the present set lowers the maxima. The offload
+// gate reads it as origin-space freshness for a relayed target.
+//
+// A node absent from the snapshot keeps its prior freshness row: the push
+// enumerated no present content for that origin, which says nothing about
+// whether that node's earlier content stopped being fresh, so leaving the
+// row is the conservative choice (the monotonic vector still governs
+// durability).
+func (s *Store) recordPushFreshness(ctx context.Context, volumeID int64, destination string, components []OriginComponent) error {
+	for _, c := range components {
+		if err := s.UpsertDestinationPushFreshness(ctx, volumeID, destination, c.OriginNodeID, c.OriginRunID); err != nil {
 			return err
 		}
 	}
