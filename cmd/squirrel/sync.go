@@ -163,6 +163,15 @@ func printSyncReport(w io.Writer, rep sync.Report, runErr error) {
 			rep.Verification.Files, rep.Verification.Bytes,
 			rep.Verification.SnapshotID, rep.Verification.Verified(), rep.RunID,
 		)
+	} else if rep.Verification.Method == sync.VerifyMethodPresenceSize {
+		// Content-addressed pushes count objects, with skipped = hashes
+		// the destination already recorded and entries = manifest
+		// segment lines.
+		fmt.Fprintf(w, "%s → %s  status=%s objects=%d skipped=%d errors=%d bytes=%d entries=%d run=%d\n",
+			rep.Volume, rep.Destination, rep.Status,
+			r.Transferred, r.Checked, r.Errors, r.Bytes,
+			rep.Verification.Files, rep.RunID,
+		)
 	} else {
 		fmt.Fprintf(w, "%s → %s  status=%s transferred=%d checked=%d errors=%d bytes=%d run=%d\n",
 			rep.Volume, rep.Destination, rep.Status,
