@@ -97,4 +97,16 @@ func TestStatusChangedRunStamps(t *testing.T) {
 	if got := statusChangedRun(t, s, vID, StatusSuperseded); got != r6 {
 		t.Fatalf("displaced stamp = %d, want %d", got, r6)
 	}
+
+	row, err := s.GetByPath(ctx, vID, "a.txt")
+	if err != nil {
+		t.Fatalf("GetByPath: %v", err)
+	}
+	r7 := makeRun(t, s, vID)
+	if err := s.MarkOffloaded(ctx, vID, "a.txt", row.ContentID, r7); err != nil {
+		t.Fatalf("MarkOffloaded: %v", err)
+	}
+	if got := statusChangedRun(t, s, vID, StatusOffloaded); got != r7 {
+		t.Fatalf("offloaded stamp = %d, want %d", got, r7)
+	}
 }

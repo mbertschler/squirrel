@@ -598,6 +598,56 @@ func (s *Store) BeginIndexRunIfClear(ctx context.Context, kind string, volumeID 
 	return id, nil, nil
 }
 
+// BeginOffloadRunIfClear atomically inserts a 'running' kind='offload'
+// row for volumeID iff no run of any kind is currently in flight
+// against the volume. Offload is the one operation that deletes user
+// data, so it defers to everything else touching the volume: a
+// concurrent index or audit would race its walk against the unlinks,
+// and a concurrent sync or restore could rewrite a file between the
+// pre-unlink verification and the unlink. Same BEGIN IMMEDIATE
+// check+insert shape as BeginSyncRunIfClear; stale 'running' rows from
+// crashed runs keep blocking until cleared via `runs fail`.
+//
+// Returns (newID, nil, nil) when the row was inserted; (0, &blocker,
+// nil) when refused.
+func (s *Store) BeginOffloadRunIfClear(ctx context.Context, volumeID int64) (int64, *Run, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, nil, fmt.Errorf("begin offload-run tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	row := tx.QueryRowContext(ctx, `
+		SELECT `+runColumns+`
+		FROM runs
+		WHERE status = 'running' AND volume_id = ?
+		ORDER BY id LIMIT 1
+	`, volumeID)
+	blocker, scanErr := scanRun(row.Scan)
+	if scanErr == nil {
+		return 0, &blocker, nil
+	}
+	if !errors.Is(scanErr, sql.ErrNoRows) {
+		return 0, nil, fmt.Errorf("check running runs: %w", scanErr)
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		INSERT INTO runs (kind, volume_id, destination, started_at_ns, status, file_count, shallow)
+		VALUES ('offload', ?, NULL, ?, 'running', 0, 0)
+	`, volumeID, NowNs())
+	if err != nil {
+		return 0, nil, fmt.Errorf("insert offload run: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, nil, fmt.Errorf("offload run last insert id: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, nil, fmt.Errorf("commit offload run: %w", err)
+	}
+	return id, nil, nil
+}
+
 // LatestSuccessfulIndexRun returns the most recent index run for the given
 // volume that finished in status 'success' or 'partial'. Used by the sync
 // command as a prerequisite check: refusing to sync a volume that has never
