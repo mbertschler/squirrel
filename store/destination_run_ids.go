@@ -265,6 +265,13 @@ func scanOriginComponent(s rowScanner) (OriginComponent, error) {
 // The upsert and an insert-only destination_run_ids_history row are
 // written in one transaction so the append-only advance log can never
 // diverge from the live vector.
+//
+// verify_method follows the component: a non-empty method always wins
+// (an advance or a re-confirmation that upgrades the recorded method); an
+// empty method clears it when the run strictly advances (a new,
+// unverified coordinate) but preserves the existing method when the run
+// is unchanged, so a methodless re-confirmation (e.g. a pull from a
+// pre-v19 peer) never degrades a content-verified component to unknown.
 func (s *Store) UpsertDestinationRunID(ctx context.Context, volumeID int64, destination string, originNodeID, originRunID int64, allowRewind bool) error {
 	return s.upsertDestinationRunID(ctx, volumeID, destination, originNodeID, originRunID, "", allowRewind)
 }
@@ -296,7 +303,11 @@ func (s *Store) upsertDestinationRunID(ctx context.Context, volumeID int64, dest
 		ON CONFLICT(volume_id, destination, origin_node_id) DO UPDATE SET
 			origin_run_id = excluded.origin_run_id,
 			updated_at_ns = excluded.updated_at_ns,
-			verify_method = excluded.verify_method
+			verify_method = CASE
+				WHEN excluded.verify_method IS NOT NULL THEN excluded.verify_method
+				WHEN excluded.origin_run_id > destination_run_ids.origin_run_id THEN NULL
+				ELSE destination_run_ids.verify_method
+			END
 		WHERE excluded.origin_run_id >= destination_run_ids.origin_run_id OR ?
 	`, volumeID, destination, originNodeID, originRunID, atNs, method, allowRewind)
 	if err != nil {

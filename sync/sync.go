@@ -271,6 +271,13 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 
 	if !opts.DryRun {
 		if rep.durabilityAdvance, err = captureDurabilityAdvance(ctx, s, volID); err != nil {
+			// The runs row is already allocated; close it as failed so a
+			// capture error (context cancel, transient DB) before rclone
+			// starts cannot leave it stuck in 'running'.
+			rep.RunID = runID
+			rep.RcloneResult.FatalError = true
+			rep.RcloneResult.FailedFiles = []FailedFile{{Message: err.Error()}}
+			finishRun(ctx, s, opts.DryRun, runID, &rep)
 			return rep, err
 		}
 	}

@@ -478,6 +478,48 @@ func TestUpsertDestinationRunIDRecordsMethod(t *testing.T) {
 	}
 }
 
+// TestUpsertDestinationRunIDPreservesMethodOnMethodlessReconfirm: a
+// methodless re-confirmation at the same origin run (e.g. a pull from a
+// pre-v19 peer) must not degrade a recorded content-verified method to
+// unknown — provenance is preserved when the run does not advance.
+func TestUpsertDestinationRunIDPreservesMethodOnMethodlessReconfirm(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+	node, err := s.GetSelfNode(ctx)
+	if err != nil {
+		t.Fatalf("GetSelfNode: %v", err)
+	}
+
+	if err := s.UpsertDestinationRunIDVerified(ctx, vID, "bucket", node.ID, 5, VerifyMethodBlake3, false); err != nil {
+		t.Fatalf("seed verified: %v", err)
+	}
+	// Methodless re-confirm at the same run.
+	if err := s.UpsertDestinationRunID(ctx, vID, "bucket", node.ID, 5, false); err != nil {
+		t.Fatalf("methodless reconfirm: %v", err)
+	}
+	got, err := s.GetDestinationRunID(ctx, vID, "bucket", node.ID)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID: %v", err)
+	}
+	if got.VerifyMethod != VerifyMethodBlake3 {
+		t.Fatalf("verify method = %q, want %q preserved", got.VerifyMethod, VerifyMethodBlake3)
+	}
+
+	// A methodless advance to a strictly higher run clears the method —
+	// the new coordinate is genuinely unverified.
+	if err := s.UpsertDestinationRunID(ctx, vID, "bucket", node.ID, 9, false); err != nil {
+		t.Fatalf("methodless advance: %v", err)
+	}
+	got, err = s.GetDestinationRunID(ctx, vID, "bucket", node.ID)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID: %v", err)
+	}
+	if got.OriginRunID != 9 || got.VerifyMethod != "" {
+		t.Fatalf("after methodless advance: run=%d method=%q, want 9 and empty", got.OriginRunID, got.VerifyMethod)
+	}
+}
+
 // TestDestinationRunIDNullVerifyMethodReadsUnverified pins the v19
 // backfill contract: a component with a NULL verify_method (a pre-v19
 // row, or a legacy upsert) scans back as an empty method, which

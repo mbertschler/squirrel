@@ -516,12 +516,14 @@ type SyncRunSpec struct {
 // transaction sees the first one's row and returns it as the blocker.
 //
 // Cross-kind exclusion: an in-flight index or audit run on the volume
-// blocks a sync (and BeginIndexRunIfClear blocks the reverse). A sync
-// advances the destination's durability vector from the present set its
-// own enumeration captured; an index or audit committing a new present
-// row concurrently would otherwise let that advance claim durability for
-// content the sync never transferred. Syncs to *different* destinations
-// stay free to overlap — they touch disjoint vectors.
+// blocks a sync. A sync advances the destination's durability vector from
+// the present set its own enumeration captured; an index or audit
+// committing a new present row concurrently would otherwise let that
+// advance claim durability for content the sync never transferred. The
+// block is one-directional — a running sync does NOT block a new index
+// (see BeginIndexRunIfClear for why) — so the guard lives only on the
+// sync side. Syncs to *different* destinations stay free to overlap —
+// they touch disjoint vectors.
 //
 // Returns (newID, nil, nil) when the row was inserted; (0, &blocker,
 // nil) when refused — the caller is expected to render a diagnostic

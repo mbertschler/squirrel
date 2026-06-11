@@ -192,6 +192,7 @@ func (h *kopiaHandler) Push(ctx context.Context, opts Options) (Report, error) {
 	// over the indexed present set this push was scoped to, not whatever
 	// kopia's independent live walk happened to include.
 	if rep.durabilityAdvance, err = captureDurabilityAdvance(ctx, h.store, volID); err != nil {
+		rep.Status = store.RunStatusFailed
 		finishHandlerRun(ctx, h.store, &rep, err)
 		return rep, err
 	}
