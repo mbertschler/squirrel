@@ -318,6 +318,39 @@ func TestSyncDryRunPath(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(f.dest.Root, f.vol.Name, "a.txt")); err == nil {
 		t.Fatalf("dry-run wrote to destination; want no-op")
 	}
+	if rep.Verification.Verified() {
+		t.Fatalf("dry-run must report an unverified result; got %+v", rep.Verification)
+	}
+}
+
+// TestSyncHappyPathStampsVerification rides on the happy-path fixture
+// to pin the typed durability report a default (BLAKE3) bucket sync
+// produces.
+func TestSyncHappyPathStampsVerification(t *testing.T) {
+	f := setupFixture(t)
+	if err := os.WriteFile(filepath.Join(f.vol.Path, "a.txt"), []byte("alpha"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.runIndex(t)
+
+	rep, err := Sync(context.Background(), f.store, f.rcl, f.vol, f.dest, Options{})
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if !rep.Verification.Verified() || rep.Verification.Method != VerifyMethodBlake3 {
+		t.Fatalf("Verification = %+v, want verified blake3", rep.Verification)
+	}
+	if rep.Verification.Files != 1 {
+		t.Fatalf("Verification.Files = %d, want 1", rep.Verification.Files)
+	}
+
+	shallowRep, err := Sync(context.Background(), f.store, f.rcl, f.vol, f.dest, Options{Shallow: true})
+	if err != nil {
+		t.Fatalf("shallow Sync: %v", err)
+	}
+	if shallowRep.Verification.Verified() || shallowRep.Verification.Method != VerifyMethodSizeMtime {
+		t.Fatalf("shallow Verification = %+v, want unverified size+mtime", shallowRep.Verification)
+	}
 }
 
 // TestSyncWarnsAboutHistoryDirInSource exercises the advisory path: a

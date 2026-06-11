@@ -232,7 +232,9 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 		func(runID int64) ([]string, error) {
 			return buildRcloneArgs(vol, dest, runID, opts)
 		})
-	rep.Verification = rcloneVerification(dest, opts, &rep)
+	if !opts.DryRun {
+		rep.Verification = rcloneVerification(dest, opts, &rep)
+	}
 	// runRcloneOperation's deferred finishRun has committed the run's
 	// terminal state by now, so the snapshot reflects this run's own row.
 	// Destination syncs are eligible for the cloud ride-along; the
