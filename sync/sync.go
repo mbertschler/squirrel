@@ -187,6 +187,9 @@ func RunPair(ctx context.Context, s *store.Store, tools Tools, p Pair, opts Opti
 	if verr != nil {
 		return rep, fmt.Errorf("advance durability vector: resolve volume %q: %w", rep.Volume, verr)
 	}
+	// A failed advance surfaces as the command's error even though the
+	// runs row already closed as success: the bytes are on the
+	// destination, and the next verified push re-advances cheaply.
 	if aerr := s.AdvanceDestinationVector(ctx, vol.ID, p.TargetName()); aerr != nil {
 		return rep, fmt.Errorf("advance durability vector for %s → %s: %w", rep.Volume, p.TargetName(), aerr)
 	}

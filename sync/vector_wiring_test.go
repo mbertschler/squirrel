@@ -94,6 +94,9 @@ func TestKopiaPushAdvancesVector(t *testing.T) {
 	if len(comps) != 1 {
 		t.Fatalf("components = %+v, want exactly one self component", comps)
 	}
+	if comps[0].OriginRunID < 1 {
+		t.Fatalf("origin_run_id = %d, want >= 1", comps[0].OriginRunID)
+	}
 }
 
 // TestKopiaVerifyFailureLeavesVectorAlone: a failed verify means no
