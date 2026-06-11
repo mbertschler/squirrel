@@ -87,6 +87,9 @@ func TestKopiaPushAdvancesVector(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunPair: %v (rep=%+v)", err, rep)
 	}
+	if rep.Status != store.RunStatusSuccess || !rep.Verification.Verified() {
+		t.Fatalf("rep = %+v, want verified success backing the advance", rep)
+	}
 	comps := volumeComponents(t, f.store, f.pair.Volume.Name, f.pair.Destination.Name)
 	if len(comps) != 1 {
 		t.Fatalf("components = %+v, want exactly one self component", comps)

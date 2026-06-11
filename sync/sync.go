@@ -179,7 +179,7 @@ func RunPair(ctx context.Context, s *store.Store, tools Tools, p Pair, opts Opti
 		return rep, err
 	}
 	rep, err := h.Push(ctx, opts)
-	if err != nil || opts.DryRun || p.IsNode() ||
+	if err != nil || opts.DryRun || p.IsNode() || rep.FinishErr != nil ||
 		rep.Status != store.RunStatusSuccess || !rep.Verification.Verified() {
 		return rep, err
 	}
