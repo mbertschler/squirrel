@@ -2341,7 +2341,7 @@ func TestFileRowScanInsertRoundTrip(t *testing.T) {
 
 	volID := makeVolume(t, s, "/photos")
 	runID := makeRun(t, s, volID)
-	peerNode, err := s.GetOrCreatePeerNode(ctx, "peer-x", "https://peer-x.example")
+	peerNode, err := s.GetOrCreatePeerNode(ctx, "peer-x", "https://peer-x.example", true)
 	if err != nil {
 		t.Fatalf("GetOrCreatePeerNode: %v", err)
 	}
