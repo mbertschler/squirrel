@@ -106,10 +106,13 @@ func scanDestinationRunID(s rowScanner) (DestinationRunID, error) {
 // to cover the volume's current present set: one component per origin
 // node, valued at the highest origin-space run among that node's
 // present content. Locally-introduced content (contents.origin_* NULL)
-// counts under this node's self row at each observation's
-// first_seen_run_id. Rows under the reserved sync subtrees are excluded
-// — they never travel to a destination, so they must not advance its
-// evidence.
+// counts under this node's self row at its introduction run — the
+// content's earliest first_seen_run_id in the volume, the same
+// coordinate the peer-sync sender materialises on the wire — so a
+// duplicate path observed later never advances the component past the
+// coordinates actually in circulation. Rows under the reserved sync
+// subtrees are excluded — they never travel to a destination, so they
+// must not advance its evidence.
 //
 // Callers invoke it only once the destination has verifiably landed the
 // volume's full present set (a successful whole-volume sync); each
@@ -149,30 +152,40 @@ type originComponent struct {
 }
 
 // presentOriginMaxima computes the per-origin-node maximum origin run
-// over the volume's present files. Content whose origin is NULL (or
-// partially NULL — degraded the same way the conflict pre-stage treats
-// partial provenance) maps to selfNodeID with the observation's local
-// first_seen_run_id as its origin-space coordinate. The reserved sync
-// subtrees are excluded for the reason documented on
+// over the volume's present files, deduplicated to one coordinate per
+// content. Content whose origin is NULL (or partially NULL — degraded
+// the same way the conflict pre-stage treats partial provenance) maps
+// to selfNodeID at its introduction run, mirroring
+// ContentIntroductionRunID (the introduction MIN spans every
+// observation of the content, any status). The reserved sync subtrees
+// are excluded from the present set for the reason documented on
 // AdvanceDestinationVector.
 func (s *Store) presentOriginMaxima(ctx context.Context, volumeID, selfNodeID int64) ([]originComponent, error) {
 	return queryRows(ctx, s.db, `
+		WITH present_contents AS (
+			SELECT DISTINCT f.content_id, c.origin_node_id, c.origin_run_id
+			FROM files f
+			JOIN folders fo ON fo.id = f.folder_id
+			JOIN contents c ON c.id = f.content_id
+			WHERE fo.volume_id = ? AND f.status = 'present'
+			  AND fo.path != '.squirrel-history'         AND fo.path NOT LIKE '.squirrel-history/%'
+			  AND fo.path != '.squirrel-conflicts'       AND fo.path NOT LIKE '.squirrel-conflicts/%'
+			  AND fo.path != '.squirrel-restore-history' AND fo.path NOT LIKE '.squirrel-restore-history/%'
+			  AND fo.path != '.squirrel-index'           AND fo.path NOT LIKE '.squirrel-index/%'
+		)
 		SELECT
-			CASE WHEN c.origin_node_id IS NULL OR c.origin_run_id IS NULL
-			     THEN ? ELSE c.origin_node_id END AS origin_node,
-			MAX(CASE WHEN c.origin_node_id IS NULL OR c.origin_run_id IS NULL
-			     THEN f.first_seen_run_id ELSE c.origin_run_id END) AS origin_run
-		FROM files f
-		JOIN folders fo ON fo.id = f.folder_id
-		JOIN contents c ON c.id = f.content_id
-		WHERE fo.volume_id = ? AND f.status = 'present'
-		  AND fo.path != '.squirrel-history'         AND fo.path NOT LIKE '.squirrel-history/%'
-		  AND fo.path != '.squirrel-conflicts'       AND fo.path NOT LIKE '.squirrel-conflicts/%'
-		  AND fo.path != '.squirrel-restore-history' AND fo.path NOT LIKE '.squirrel-restore-history/%'
-		  AND fo.path != '.squirrel-index'           AND fo.path NOT LIKE '.squirrel-index/%'
+			CASE WHEN pc.origin_node_id IS NULL OR pc.origin_run_id IS NULL
+			     THEN ? ELSE pc.origin_node_id END AS origin_node,
+			MAX(CASE WHEN pc.origin_node_id IS NULL OR pc.origin_run_id IS NULL
+			     THEN (SELECT MIN(f2.first_seen_run_id)
+			           FROM files f2
+			           JOIN folders fo2 ON fo2.id = f2.folder_id
+			           WHERE fo2.volume_id = ? AND f2.content_id = pc.content_id)
+			     ELSE pc.origin_run_id END) AS origin_run
+		FROM present_contents pc
 		GROUP BY origin_node
 		ORDER BY origin_node
-	`, scanOriginComponent, selfNodeID, volumeID)
+	`, scanOriginComponent, volumeID, selfNodeID, volumeID)
 }
 
 func scanOriginComponent(s rowScanner) (originComponent, error) {

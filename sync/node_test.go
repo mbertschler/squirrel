@@ -191,7 +191,10 @@ func TestNodeSyncTransfersFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetVolumeByName on receiver: %v", err)
 	}
-	initSelfPre, _ := f.initStore.GetSelfNode(context.Background())
+	initSelfPre, err := f.initStore.GetSelfNode(context.Background())
+	if err != nil {
+		t.Fatalf("GetSelfNode on initiator: %v", err)
+	}
 	initVolRow, err := f.initStore.GetVolumeByName(context.Background(), "pics")
 	if err != nil {
 		t.Fatalf("GetVolumeByName on initiator: %v", err)

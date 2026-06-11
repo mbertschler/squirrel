@@ -183,9 +183,11 @@ func TestUpsertDestinationRunIDRejectsEmptyDestination(t *testing.T) {
 
 // TestAdvanceDestinationVector: the advance computes one component per
 // origin node over the volume's present rows — locally-introduced
-// content under the self node at its observation's first_seen_run_id,
-// forwarded content under its recorded origin verbatim — and excludes
-// non-present rows and the reserved sync subtrees.
+// content under the self node at its introduction run (the content's
+// earliest first_seen, so a duplicate path observed later doesn't move
+// the coordinate), forwarded content under its recorded origin
+// verbatim — and excludes non-present rows and the reserved sync
+// subtrees.
 func TestAdvanceDestinationVector(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
@@ -215,6 +217,11 @@ func TestAdvanceDestinationVector(t *testing.T) {
 	upsert("a.txt", 0xA1, StatusPresent, run1, nil)
 	upsert("b.txt", 0xA2, StatusPresent, run2, nil)
 	upsert("c.txt", 0xA3, StatusPresent, run1, &Provenance{NodeID: ext.ID, RunID: 50})
+	// A duplicate path of a.txt's content first seen at run3: the
+	// content's introduction run stays run1 — the coordinate the sender
+	// materialises on the wire — so the self component must stay at
+	// run2 (b.txt's introduction).
+	upsert("a-dup.txt", 0xA1, StatusPresent, run3, nil)
 	// Non-present and reserved-subtree rows must not advance anything:
 	// gone.txt would push the self component to run3, and the conflict
 	// leftover would push ext to 999.
