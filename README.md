@@ -99,6 +99,29 @@ Properties that differ from rclone destinations:
 - **A `crypt` block is rejected**: kopia encrypts its repository itself. Keep the repository password safe; the repository is unreadable without it.
 - **Restore goes through the kopia CLI** (`kopia snapshot restore`), since the repository is kopia's own format. `squirrel restore` refuses kopia destinations and says so.
 
+### Offloading
+
+`squirrel offload` deletes the **local** copy of files whose content is provably stored on every target the volume's offload policy requires — never a blind delete. It is the only squirrel command that deletes user data.
+
+```toml
+[volumes.pictures]
+path             = "~/Pictures"
+sync_to          = ["nas", "offsite"]
+offload_requires = ["nas", "offsite"]
+```
+
+`offload_requires` is the explicit per-volume policy: every named target's recorded durability must cover a file's content before its bytes may go, and a volume without the key refuses to offload entirely. The names share the flat destination/node namespace that `sync_to` uses. They may also name targets only a *peer* pushes to: evidence about those arrives through the peer durability pull (`squirrel peer-sync pull-durability`), and a name with no recorded evidence simply keeps the gate closed.
+
+```
+squirrel offload pictures 2019/             # a subtree
+squirrel offload pictures --older-than 90d  # by age (indexed mtime)
+squirrel offload pictures . --dry-run       # print the gate decisions, touch nothing
+```
+
+Selectors are volume-relative paths/prefixes plus `--older-than` (combinable); selecting the whole volume takes an explicit `.`. The durability gate is evaluated per file, entirely offline, against the durability version vectors in the local index: content with origin `(node, run)` passes for a target iff the target's recorded vector component for that node is ≥ `run`, for **every** required target. Files failing the gate are skipped and reported per target (`missing component for origin X` / `stale: have 40 need 45`).
+
+Immediately before each unlink, squirrel re-verifies the on-disk bytes against the indexed row — size, mtime, and BLAKE3, with symlink-refusing traversal — and skips loudly on any difference: the disk is newer than the index, and unindexed bytes are never deleted. Offloaded files flip `present → offloaded` in the index under one `kind='offload'` run. The indexer treats an offloaded row's on-disk absence as expected (it never becomes `missing`), and re-acquiring the bytes (restore or copy-back) flips the row back to `present`.
+
 ### Hooks
 
 A volume can declare a per-volume **hook** — a command the agent runs to nudge an external tool when the volume's content changes. squirrel stays tool-agnostic: it never learns what the command does (a backup with kopia/restic, an `rclone copy`, a shell script — all the same to squirrel). It exec's the command **without a shell**, passes context through environment variables, and records only the generic outcome (exit code, timestamps). That generic outcome is the ceiling: only the built-in destination types report verification results; a hook's exit code never counts as one. (For kopia specifically, squirrel can own the snapshot end-to-end instead via a [kopia destination](#kopia-destinations).)
@@ -207,6 +230,7 @@ squirrel        # bare invocation opens the TUI when stdin/stdout are a terminal
 ```
 squirrel index   <volume>            [--shallow] [--dry-run] [--workers N]
 squirrel sync    [<volume>]          [--to DEST] [--shallow] [--dry-run]
+squirrel offload <volume> [path...]  [--older-than DUR] [--dry-run]
 squirrel query   <hash-or-path>      [--history]
 squirrel query   --duplicates
 squirrel query   --missing
