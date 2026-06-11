@@ -106,6 +106,9 @@ func (k *Kopia) snapshotCreate(ctx context.Context, cfgFile, password, sourcePat
 	if err := json.Unmarshal(bytes.TrimSpace(out), &snap); err != nil {
 		return kopiaSnapshot{}, fmt.Errorf("parse kopia snapshot manifest: %w", err)
 	}
+	if snap.ID == "" {
+		return kopiaSnapshot{}, fmt.Errorf("kopia snapshot manifest carries no id: %q", bytes.TrimSpace(out))
+	}
 	return snap, nil
 }
 
