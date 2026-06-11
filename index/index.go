@@ -555,16 +555,16 @@ func (i *indexer) process(w workItem, buf []byte) resultItem {
 		return resultItem{row: existing, kind: kindUnchanged}
 	}
 
-	digest, err := hashFile(w.absPath, buf)
+	hashed, err := hashFile(w.absPath, buf)
 	if err != nil {
 		return resultItem{err: fmt.Errorf("hash %s: %w", w.absPath, err)}
 	}
 
-	row := i.rowFor(w, digest)
+	row := i.rowFor(w, hashed)
 	if !hasExisting {
 		return resultItem{row: row, kind: kindAdded}
 	}
-	if bytes.Equal(existing.Blake3, digest) && existing.Status == store.StatusPresent {
+	if bytes.Equal(existing.Blake3, hashed.digest) && existing.Status == store.StatusPresent {
 		return resultItem{row: existing, kind: kindUnchanged}
 	}
 	return resultItem{row: row, kind: kindModified}
@@ -579,13 +579,19 @@ func metadataMatches(existing store.FileRow, w workItem) bool {
 		existing.MtimeNs == w.mtimeNs
 }
 
-func (i *indexer) rowFor(w workItem, digest []byte) store.FileRow {
+// rowFor builds the file row from the hashed-file result rather than the
+// walk-time workItem: SizeBytes and MtimeNs come from a Stat of the open
+// handle taken after hashing, so the digest and the metadata describe the
+// same inode state. A file appended-to between the walk and the hash would
+// otherwise bind the new digest to the stale walk size, minting a contents
+// row whose size_bytes can never match the honest content again.
+func (i *indexer) rowFor(w workItem, hashed hashedFile) store.FileRow {
 	return store.FileRow{
 		VolumeID:       i.volumeID,
 		Path:           w.relPath,
-		Blake3:         digest,
-		SizeBytes:      w.sizeBytes,
-		MtimeNs:        w.mtimeNs,
+		Blake3:         hashed.digest,
+		SizeBytes:      hashed.sizeBytes,
+		MtimeNs:        hashed.mtimeNs,
 		Status:         store.StatusPresent,
 		FirstSeenRunID: i.runID,
 		LastSeenRunID:  i.runID,
@@ -676,15 +682,36 @@ func resolveNamedVolume(ctx context.Context, s *store.Store, name, absRoot strin
 // the run; allocating per-file made GC pressure outweigh the syscall win.
 const hashReadBufferSize = 1 << 20
 
-func hashFile(path string, buf []byte) ([]byte, error) {
+// hashedFile is the digest of a file's bytes paired with the size and
+// mtime read from the same open handle immediately after hashing.
+type hashedFile struct {
+	digest    []byte
+	sizeBytes int64
+	mtimeNs   int64
+}
+
+// hashFile hashes the file at path and reads its size and mtime from the
+// open handle after the hash completes. Stat-after-hash on the live handle
+// (rather than re-opening by path, which would reintroduce a race) pins the
+// metadata to the same bytes that produced the digest, even if the file was
+// growing during the walk-to-hash window.
+func hashFile(path string, buf []byte) (hashedFile, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return hashedFile{}, err
 	}
 	defer f.Close()
 	h := blake3.New()
 	if _, err := io.CopyBuffer(h, f, buf); err != nil {
-		return nil, err
+		return hashedFile{}, err
 	}
-	return h.Sum(nil), nil
+	fi, err := f.Stat()
+	if err != nil {
+		return hashedFile{}, err
+	}
+	return hashedFile{
+		digest:    h.Sum(nil),
+		sizeBytes: fi.Size(),
+		mtimeNs:   fi.ModTime().UnixNano(),
+	}, nil
 }
