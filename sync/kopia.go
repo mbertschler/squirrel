@@ -80,17 +80,27 @@ func (k *Kopia) run(ctx context.Context, cfgFile, password string, args ...strin
 }
 
 // ensureRepository connects the destination-scoped config file to the
-// filesystem repository at repoPath, creating the repository when
-// connect reports nothing usable there (first use). Connect runs on
-// every push so a repository path changed in squirrel's config is
-// re-pointed rather than silently snapshotting into the old one.
-// --no-persist-credentials keeps the password scoped to each
-// invocation's environment; kopia's default would write it to a
-// sidecar file next to the config on keyring-less hosts.
-func (k *Kopia) ensureRepository(ctx context.Context, cfgFile, password, repoPath string) error {
+// filesystem repository at repoPath. Connect runs on every push so a
+// repository path changed in squirrel's config is re-pointed rather than
+// silently snapshotting into the old one. --no-persist-credentials keeps
+// the password scoped to each invocation's environment; kopia's default
+// would write it to a sidecar file next to the config on keyring-less
+// hosts.
+//
+// A connect failure creates the repository only when init is set. Without
+// it, a failed connect is an error: creating on every connect failure
+// would mint a fresh, empty repository on a transient outage or a
+// mistyped path, and the destination's durability vector — monotonic and
+// without a CLI to rewind — would keep claiming coverage the new
+// repository cannot honour. init mirrors the --init gate the local
+// destination marker uses for first-use bootstrap.
+func (k *Kopia) ensureRepository(ctx context.Context, cfgFile, password, repoPath string, init bool) error {
 	_, connectErr := k.run(ctx, cfgFile, password, "repository", "connect", "filesystem", "--path", repoPath, "--no-persist-credentials")
 	if connectErr == nil {
 		return nil
+	}
+	if !init {
+		return fmt.Errorf("kopia repository at %s: connect failed (%w) — re-run with --init to create a new repository (refusing to auto-create in case the path is wrong or the destination is temporarily unreachable)", repoPath, connectErr)
 	}
 	if _, createErr := k.run(ctx, cfgFile, password, "repository", "create", "filesystem", "--path", repoPath, "--no-persist-credentials"); createErr != nil {
 		return fmt.Errorf("kopia repository at %s: connect failed (%w); create failed: %w", repoPath, connectErr, createErr)
@@ -197,7 +207,7 @@ func (h *kopiaHandler) Push(ctx context.Context, opts Options) (Report, error) {
 		return rep, err
 	}
 
-	err = h.snapshotAndVerify(ctx, &rep)
+	err = h.snapshotAndVerify(ctx, &rep, opts.Init)
 	finishHandlerRun(ctx, h.store, &rep, err)
 	// Local index snapshot only: the repository is kopia's own format,
 	// so the rclone ride-along stays out of it (dest=nil, mirroring the
@@ -237,12 +247,13 @@ func kopiaVerifyFilesPercent(dest *config.Destination) (float64, error) {
 // rep.Verification. Status starts failed and is promoted: success for a
 // clean verified snapshot, partial when the snapshot landed with
 // per-file errors kopia tolerated. Verified is reserved for the clean
-// path — a snapshot with skipped files is durable but incomplete.
-func (h *kopiaHandler) snapshotAndVerify(ctx context.Context, rep *Report) error {
+// path — a snapshot with skipped files is durable but incomplete. init
+// authorises first-use repository creation on a connect failure.
+func (h *kopiaHandler) snapshotAndVerify(ctx context.Context, rep *Report, init bool) error {
 	rep.Status = store.RunStatusFailed
 	cfgFile := h.kopia.configFile(h.dest.Name)
 	password := h.dest.Params["password"]
-	if err := h.kopia.ensureRepository(ctx, cfgFile, password, h.dest.Root); err != nil {
+	if err := h.kopia.ensureRepository(ctx, cfgFile, password, h.dest.Root, init); err != nil {
 		return err
 	}
 	verifyFilesPercent, err := kopiaVerifyFilesPercent(h.dest)

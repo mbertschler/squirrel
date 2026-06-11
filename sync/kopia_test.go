@@ -221,7 +221,7 @@ func TestKopiaConnectFallsBackToCreate(t *testing.T) {
 	t.Setenv("KOPIA_FAKE_CONNECT_EXIT", "1")
 	f := setupKopiaFixture(t)
 
-	rep, err := RunPair(context.Background(), f.store, f.tools, f.pair, Options{})
+	rep, err := RunPair(context.Background(), f.store, f.tools, f.pair, Options{Init: true})
 	if err != nil {
 		t.Fatalf("RunPair: %v (rep=%+v)", err, rep)
 	}
@@ -231,13 +231,41 @@ func TestKopiaConnectFallsBackToCreate(t *testing.T) {
 	}
 }
 
+// TestKopiaConnectFailWithoutInitRefuses: a connect failure without --init
+// is an error, not a silent re-create (#114). Auto-creating on every
+// connect failure would mint a fresh empty repository on a transient
+// outage or a mistyped path while the monotonic durability vector keeps
+// claiming coverage the new repository cannot honour.
+func TestKopiaConnectFailWithoutInitRefuses(t *testing.T) {
+	logPath := installFakeKopia(t)
+	t.Setenv("KOPIA_FAKE_CONNECT_EXIT", "1")
+	f := setupKopiaFixture(t)
+
+	rep, err := RunPair(context.Background(), f.store, f.tools, f.pair, Options{})
+	if err == nil {
+		t.Fatalf("expected connect-fail error without --init, got rep=%+v", rep)
+	}
+	if !strings.Contains(err.Error(), "--init") {
+		t.Fatalf("error should point at --init, got %v", err)
+	}
+	if rep.Status != store.RunStatusFailed {
+		t.Fatalf("Status = %q, want failed", rep.Status)
+	}
+	argv, _ := readCallLog(t, logPath)
+	for _, line := range argv {
+		if strings.HasPrefix(line, "repository create") {
+			t.Fatalf("repository was created despite no --init: argv = %q", argv)
+		}
+	}
+}
+
 func TestKopiaCreateFailureRecordsFailedRun(t *testing.T) {
 	installFakeKopia(t)
 	t.Setenv("KOPIA_FAKE_CONNECT_EXIT", "1")
 	t.Setenv("KOPIA_FAKE_CREATE_EXIT", "1")
 	f := setupKopiaFixture(t)
 
-	rep, err := RunPair(context.Background(), f.store, f.tools, f.pair, Options{})
+	rep, err := RunPair(context.Background(), f.store, f.tools, f.pair, Options{Init: true})
 	if err == nil {
 		t.Fatalf("expected error, got rep=%+v", rep)
 	}
@@ -356,7 +384,9 @@ func TestKopiaIntegrationRealBinary(t *testing.T) {
 	}
 	f := setupKopiaFixture(t)
 
-	rep, err := RunPair(context.Background(), f.store, f.tools, f.pair, Options{})
+	// First push bootstraps a fresh repository, so it needs --init; the
+	// gate now refuses a silent re-create on connect failure.
+	rep, err := RunPair(context.Background(), f.store, f.tools, f.pair, Options{Init: true})
 	if err != nil {
 		t.Fatalf("RunPair: %v (rep=%+v)", err, rep)
 	}

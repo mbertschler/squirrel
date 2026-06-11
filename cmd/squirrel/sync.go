@@ -41,7 +41,7 @@ func newSyncCmd() *cobra.Command {
 	cmd.Flags().StringVar(&to, "to", "", "limit to this destination name (default: every destination declared on the volume)")
 	cmd.Flags().BoolVar(&shallow, "shallow", false, "skip BLAKE3 verification; trust rclone's default size+mtime comparison")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview rclone actions without transferring; no runs row is written")
-	cmd.Flags().BoolVar(&initDst, "init", false, "bootstrap a .squirrel-volume marker at the destination on first sync (refused subsequently if the marker mismatches)")
+	cmd.Flags().BoolVar(&initDst, "init", false, "authorise first-use destination bootstrap: write a .squirrel-volume marker, or create a kopia repository when connect finds none (refused without --init so a typo or outage can't mint a fresh empty target)")
 	return cmd
 }
 
