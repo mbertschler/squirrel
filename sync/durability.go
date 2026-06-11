@@ -70,20 +70,26 @@ func pullDurability(ctx context.Context, s *store.Store, client *nodeClient, vol
 	}
 	rep.Fetched = len(resp.Components)
 	originIDs := make(map[string]int64, 4)
+	resolveOrigin := func(name string) (int64, error) {
+		if id, ok := originIDs[name]; ok {
+			return id, nil
+		}
+		node, err := s.GetOrCreateOriginNode(ctx, name)
+		if err != nil {
+			return 0, fmt.Errorf("resolve origin node %q: %w", name, err)
+		}
+		originIDs[name] = node.ID
+		return node.ID, nil
+	}
 	for _, c := range resp.Components {
 		if err := validateComponent(c); err != nil {
 			return rep, fmt.Errorf("component %+v: %w", c, err)
 		}
-		nodeID, ok := originIDs[c.OriginNode]
-		if !ok {
-			node, err := s.GetOrCreateOriginNode(ctx, c.OriginNode)
-			if err != nil {
-				return rep, fmt.Errorf("resolve origin node %q: %w", c.OriginNode, err)
-			}
-			nodeID = node.ID
-			originIDs[c.OriginNode] = nodeID
+		nodeID, err := resolveOrigin(c.OriginNode)
+		if err != nil {
+			return rep, err
 		}
-		err := s.UpsertDestinationRunIDVerified(ctx, volumeID, c.Destination, nodeID, c.OriginRun, c.VerifyMethod, allowRewind)
+		err = s.UpsertDestinationRunIDVerified(ctx, volumeID, c.Destination, nodeID, c.OriginRun, c.VerifyMethod, allowRewind)
 		var rewind *store.DestinationRewindError
 		if errors.As(err, &rewind) {
 			rep.Rewinds = append(rep.Rewinds, DurabilityRewind{
@@ -98,6 +104,18 @@ func pullDurability(ctx context.Context, s *store.Store, client *nodeClient, vol
 			return rep, fmt.Errorf("apply component for destination %q origin %q: %w", c.Destination, c.OriginNode, err)
 		}
 		rep.Applied++
+	}
+	for _, f := range resp.Freshness {
+		if err := validateFreshness(f); err != nil {
+			return rep, fmt.Errorf("freshness %+v: %w", f, err)
+		}
+		nodeID, err := resolveOrigin(f.OriginNode)
+		if err != nil {
+			return rep, err
+		}
+		if err := s.MergeDestinationPushFreshness(ctx, volumeID, f.Destination, nodeID, f.OriginRun); err != nil {
+			return rep, fmt.Errorf("apply freshness for destination %q origin %q: %w", f.Destination, f.OriginNode, err)
+		}
 	}
 	return rep, nil
 }
@@ -114,6 +132,22 @@ func validateComponent(c syncproto.DurabilityComponent) error {
 	}
 	if c.OriginRun <= 0 {
 		return fmt.Errorf("origin_run %d must be positive", c.OriginRun)
+	}
+	return nil
+}
+
+// validateFreshness guards a wire-supplied freshness coordinate before it
+// merges into the local table: same identity and positive-run-id rules as
+// validateComponent.
+func validateFreshness(f syncproto.DurabilityFreshness) error {
+	if f.Destination == "" {
+		return errors.New("destination must be non-empty")
+	}
+	if !store.ValidNodeName(f.OriginNode) {
+		return fmt.Errorf("origin_node %q is not a valid node name", f.OriginNode)
+	}
+	if f.OriginRun <= 0 {
+		return fmt.Errorf("origin_run %d must be positive", f.OriginRun)
 	}
 	return nil
 }

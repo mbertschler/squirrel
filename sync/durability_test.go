@@ -28,6 +28,69 @@ func seedReceiverDurability(t *testing.T, f *nodeFixture, components map[string]
 	return self.Name
 }
 
+// seedReceiverFreshness records push-freshness coordinates on the
+// receiver, mirroring seedReceiverDurability for the freshness table.
+// Reuses the receiver volume the durability seed created when present.
+func seedReceiverFreshness(t *testing.T, f *nodeFixture, coords map[string]int64) string {
+	t.Helper()
+	ctx := context.Background()
+	v, err := f.recvStore.GetOrCreateVolume(ctx, f.recvVol.Path)
+	if err != nil {
+		t.Fatalf("GetOrCreateVolume on receiver: %v", err)
+	}
+	self, err := f.recvStore.GetSelfNode(ctx)
+	if err != nil {
+		t.Fatalf("GetSelfNode on receiver: %v", err)
+	}
+	for dest, run := range coords {
+		if err := f.recvStore.UpsertDestinationPushFreshness(ctx, v.ID, dest, self.ID, run); err != nil {
+			t.Fatalf("seed freshness %s→%d: %v", dest, run, err)
+		}
+	}
+	return self.Name
+}
+
+// TestPullDurabilityMergesFreshness: the pull fetches the peer's
+// push-freshness coordinates alongside the vector and merges them into
+// the LOCAL destination_push_freshness, so a relayed target's freshness
+// evidence reaches a node that never pushes there. The merge is
+// monotonic: a stale pull below a higher local value is ignored.
+func TestPullDurabilityMergesFreshness(t *testing.T) {
+	f := setupNodeFixtureNoRclone(t)
+	ctx := context.Background()
+	originName := seedReceiverFreshness(t, f, map[string]int64{
+		"offsite-a": 12,
+		"offsite-b": 5,
+	})
+
+	v, err := f.initStore.CreateVolume(ctx, f.initVol.Name, f.initVol.Path)
+	if err != nil {
+		t.Fatalf("CreateVolume on initiator: %v", err)
+	}
+	origin, err := f.initStore.GetOrCreateOriginNode(ctx, originName)
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode: %v", err)
+	}
+	// A higher local floor on offsite-b: the stale pull must not lower it.
+	if err := f.initStore.MergeDestinationPushFreshness(ctx, v.ID, "offsite-b", origin.ID, 8); err != nil {
+		t.Fatalf("seed local freshness floor: %v", err)
+	}
+
+	if _, err := PullDurability(ctx, f.initStore, f.initVol, f.node, false); err != nil {
+		t.Fatalf("PullDurability: %v", err)
+	}
+
+	for dest, want := range map[string]int64{"offsite-a": 12, "offsite-b": 8} {
+		fresh, err := f.initStore.ListDestinationPushFreshness(ctx, v.ID, dest)
+		if err != nil {
+			t.Fatalf("ListDestinationPushFreshness %s: %v", dest, err)
+		}
+		if len(fresh) != 1 || fresh[0].OriginRunID != want {
+			t.Fatalf("%s freshness = %+v, want one coordinate at %d", dest, fresh, want)
+		}
+	}
+}
+
 // TestPullDurabilityCopiesComponents: the pull fetches the peer's
 // vector components and lands them in the LOCAL destination_run_ids
 // under the same destination names, with origin node names mapped to

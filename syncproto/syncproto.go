@@ -366,10 +366,13 @@ type DurabilityRequest struct {
 }
 
 // DurabilityResponse carries every vector component the receiver has
-// recorded for the volume, across all of its destinations. Empty when
-// the receiver has never advanced a vector for the volume.
+// recorded for the volume, across all of its destinations, plus the
+// freshness coordinates of each destination's most recent whole-volume
+// push. Empty when the receiver has never advanced a vector for the
+// volume.
 type DurabilityResponse struct {
 	Components []DurabilityComponent `json:"components,omitempty"`
+	Freshness  []DurabilityFreshness `json:"freshness,omitempty"`
 }
 
 // DurabilityComponent is one destination-vector component: the highest
@@ -388,6 +391,24 @@ type DurabilityComponent struct {
 	OriginRun    int64  `json:"origin_run"`
 	UpdatedAtNs  int64  `json:"updated_at_ns"`
 	VerifyMethod string `json:"verify_method,omitempty"`
+}
+
+// DurabilityFreshness is one origin-space freshness coordinate: the
+// highest origin run of OriginNode's content the responding node held
+// present when it last completed a successful whole-volume push to
+// Destination. It travels alongside the monotonic vector components so a
+// puller that never pushes to Destination directly (a peer-relayed
+// offsite) can satisfy its offload gate's freshness condition from the
+// pushing node's own determination — the local-run-space push watermark
+// is always zero for such a target. Coordinates are in OriginNode's run
+// space, the same coordinates the gated content carries. Absent from an
+// older responder's reply; a puller that finds no freshness for a
+// relayed target refuses to offload (the safe direction).
+type DurabilityFreshness struct {
+	Destination string `json:"destination"`
+	OriginNode  string `json:"origin_node"`
+	OriginRun   int64  `json:"origin_run"`
+	UpdatedAtNs int64  `json:"updated_at_ns"`
 }
 
 // ErrorResponse is the uniform error body. Mirrors agent's
