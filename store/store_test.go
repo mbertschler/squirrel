@@ -3942,3 +3942,206 @@ func assertDestinationStoreAfterMigration(t *testing.T, s *Store) {
 		t.Fatalf("history = %+v, want one advance to 5", history)
 	}
 }
+
+// v18Fixture is a populated v18 database covering the offload-substrate
+// tables (contents, remote_objects, destination_run_ids) so the
+// v18→v19→v20→v21 chain can be exercised against real rows. The runs
+// kind CHECK already carries 'offload' (v15) and status_changed_run_id
+// exists on files (v18); verify_method, destination_push_freshness, and
+// the contents triggers are what the chain still adds.
+func v18Fixture() []string {
+	return []string{
+		`CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)`,
+		`CREATE TABLE volumes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL)`,
+		`CREATE TABLE nodes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, endpoint TEXT, public_key_fingerprint TEXT)`,
+		`CREATE TABLE runs (
+			id            INTEGER PRIMARY KEY,
+			kind          TEXT NOT NULL CHECK (kind IN ('index','sync','restore','audit','offload')),
+			volume_id     INTEGER REFERENCES volumes(id),
+			destination   TEXT,
+			started_at_ns INTEGER NOT NULL,
+			ended_at_ns   INTEGER,
+			status        TEXT NOT NULL CHECK (status IN ('running','success','failed','partial')),
+			error         TEXT,
+			file_count    INTEGER NOT NULL DEFAULT 0,
+			peer_node_id      INTEGER REFERENCES nodes(id),
+			correlated_run_id INTEGER,
+			shallow INTEGER CHECK (shallow IS NULL OR shallow IN (0, 1)),
+			CHECK (
+				(kind IN ('index','audit','offload') AND destination IS NULL) OR
+				(kind IN ('sync','restore') AND destination IS NOT NULL AND destination != '')
+			)
+		)`,
+		`CREATE TABLE folders (
+			id                  INTEGER PRIMARY KEY,
+			volume_id           INTEGER NOT NULL REFERENCES volumes(id),
+			parent_id           INTEGER REFERENCES folders(id),
+			path                TEXT NOT NULL,
+			shallow_blake3      BLOB,
+			deep_blake3         BLOB,
+			last_changed_run_id INTEGER REFERENCES runs(id),
+			file_count      INTEGER NOT NULL DEFAULT 0,
+			cumulative_size INTEGER NOT NULL DEFAULT 0,
+			UNIQUE (volume_id, path)
+		)`,
+		`CREATE TABLE contents (
+			id             INTEGER PRIMARY KEY,
+			blake3         BLOB NOT NULL UNIQUE CHECK (length(blake3) = 32),
+			size_bytes     INTEGER NOT NULL,
+			origin_node_id INTEGER REFERENCES nodes(id),
+			origin_run_id  INTEGER
+		)`,
+		`CREATE TABLE files (
+			folder_id         INTEGER NOT NULL REFERENCES folders(id),
+			name              TEXT NOT NULL,
+			content_id        INTEGER NOT NULL REFERENCES contents(id),
+			mtime_ns          INTEGER NOT NULL,
+			status            TEXT NOT NULL CHECK (status IN ('present','missing','superseded','offloaded')),
+			first_seen_run_id INTEGER NOT NULL REFERENCES runs(id),
+			last_seen_run_id  INTEGER NOT NULL REFERENCES runs(id),
+			indexed_at_ns     INTEGER NOT NULL,
+			status_changed_run_id INTEGER REFERENCES runs(id),
+			PRIMARY KEY (folder_id, name, content_id)
+		)`,
+		`CREATE UNIQUE INDEX uniq_files_live_per_path ON files(folder_id, name) WHERE status != 'superseded'`,
+		`CREATE TABLE destination_run_ids (
+			volume_id      INTEGER NOT NULL REFERENCES volumes(id),
+			destination    TEXT NOT NULL,
+			origin_node_id INTEGER NOT NULL REFERENCES nodes(id),
+			origin_run_id  INTEGER NOT NULL,
+			updated_at_ns  INTEGER NOT NULL,
+			PRIMARY KEY (volume_id, destination, origin_node_id)
+		)`,
+		`CREATE TABLE destination_run_ids_history (
+			id             INTEGER PRIMARY KEY,
+			volume_id      INTEGER NOT NULL,
+			destination    TEXT NOT NULL,
+			origin_node_id INTEGER NOT NULL,
+			origin_run_id  INTEGER NOT NULL,
+			at_ns          INTEGER NOT NULL
+		)`,
+		`CREATE TABLE remote_objects (
+			content_id      INTEGER NOT NULL REFERENCES contents(id),
+			destination     TEXT NOT NULL,
+			uploaded_run_id INTEGER NOT NULL REFERENCES runs(id),
+			checksum_algo   TEXT,
+			checksum        TEXT,
+			verified_at_ns  INTEGER,
+			PRIMARY KEY (content_id, destination),
+			CHECK ((checksum_algo IS NULL) = (checksum IS NULL))
+		)`,
+		`INSERT INTO schema_version (version) VALUES (18)`,
+		`INSERT INTO volumes (id, name, path) VALUES (1, 'photos', '/photos')`,
+		`INSERT INTO nodes (id, name) VALUES (1, 'self'), (2, 'peer')`,
+		`INSERT INTO runs (id, kind, volume_id, destination, started_at_ns, status)
+		 VALUES (1, 'index', 1, NULL, 100, 'success'),
+		        (2, 'sync',  1, 'bucket', 200, 'success')`,
+		`INSERT INTO folders (id, volume_id, parent_id, path) VALUES (1, 1, NULL, '')`,
+		`INSERT INTO contents (id, blake3, size_bytes, origin_node_id, origin_run_id) VALUES
+		 (1, X'` + strings.Repeat("11", 32) + `', 10, NULL, NULL),
+		 (2, X'` + strings.Repeat("22", 32) + `', 20, 2, 9)`,
+		`INSERT INTO files (folder_id, name, content_id, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns, status_changed_run_id) VALUES
+		 (1, 'a.txt', 1, 1, 'present', 1, 1, 1, 1),
+		 (1, 'b.txt', 2, 2, 'present', 1, 1, 2, 1)`,
+		`INSERT INTO destination_run_ids (volume_id, destination, origin_node_id, origin_run_id, updated_at_ns)
+		 VALUES (1, 'bucket', 1, 7, 100)`,
+		`INSERT INTO destination_run_ids_history (volume_id, destination, origin_node_id, origin_run_id, at_ns)
+		 VALUES (1, 'bucket', 1, 7, 100)`,
+		`INSERT INTO remote_objects (content_id, destination, uploaded_run_id, checksum_algo, checksum, verified_at_ns)
+		 VALUES (1, 'bucket', 2, 'blake3', 'deadbeef', 150)`,
+	}
+}
+
+// TestMigrateV18ChainToV21 drives a populated v18 database through the
+// v19–v21 chain and confirms the offload-substrate rows survive intact
+// (destination_run_ids with its NULL-backfilled verify_method,
+// remote_objects with its fingerprint) and that the v21 contents triggers
+// actually abort an UPDATE and a DELETE on a contents row.
+func TestMigrateV18ChainToV21(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	rawDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("raw sql.Open: %v", err)
+	}
+	for _, q := range v18Fixture() {
+		if _, err := rawDB.Exec(q); err != nil {
+			rawDB.Close()
+			t.Fatalf("v18 DDL %q: %v", q, err)
+		}
+	}
+	rawDB.Close()
+
+	s, err := OpenWithOptions(dsn, OpenOptions{NodeName: "self"})
+	if err != nil {
+		t.Fatalf("Open (migrates v18→v%d): %v", SchemaVersion, err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	if v, _ := s.CurrentSchemaVersion(ctx); v != SchemaVersion {
+		t.Fatalf("schema_version = %d, want %d", v, SchemaVersion)
+	}
+
+	assertV18SubstrateSurvived(t, s)
+	assertContentsTriggersAbort(t, s)
+}
+
+// assertV18SubstrateSurvived checks the offload-substrate rows carried
+// through the v19–v21 chain: the durability vector keeps its coordinate
+// with a NULL-backfilled verify_method, and the remote_objects fingerprint
+// is intact.
+func assertV18SubstrateSurvived(t *testing.T, s *Store) {
+	t.Helper()
+	ctx := context.Background()
+
+	got, err := s.GetDestinationRunID(ctx, 1, "bucket", 1)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID: %v", err)
+	}
+	if got.OriginRunID != 7 {
+		t.Fatalf("origin run = %d, want 7 (carried over)", got.OriginRunID)
+	}
+	if got.VerifyMethod != "" {
+		t.Fatalf("verify method = %q, want empty (NULL backfill)", got.VerifyMethod)
+	}
+
+	var algo, checksum string
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT checksum_algo, checksum FROM remote_objects WHERE content_id = 1 AND destination = 'bucket'`).
+		Scan(&algo, &checksum); err != nil {
+		t.Fatalf("remote_objects row: %v", err)
+	}
+	if algo != "blake3" || checksum != "deadbeef" {
+		t.Fatalf("remote_objects fingerprint = (%q,%q), want (blake3,deadbeef)", algo, checksum)
+	}
+}
+
+// assertContentsTriggersAbort checks the v21 schema-level immutability:
+// an in-place UPDATE and a DELETE on a contents row both abort, while the
+// row stays exactly as written.
+func assertContentsTriggersAbort(t *testing.T, s *Store) {
+	t.Helper()
+	ctx := context.Background()
+
+	if _, err := s.db.ExecContext(ctx, `UPDATE contents SET size_bytes = 999 WHERE id = 1`); err == nil {
+		t.Fatalf("UPDATE on contents succeeded, want trigger ABORT")
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM contents WHERE id = 1`); err == nil {
+		t.Fatalf("DELETE on contents succeeded, want trigger ABORT")
+	}
+
+	var size int64
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT size_bytes FROM contents WHERE id = 1`).Scan(&size); err != nil {
+		t.Fatalf("contents row after refused mutations: %v", err)
+	}
+	if size != 10 {
+		t.Fatalf("size_bytes = %d after refused UPDATE, want 10", size)
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM contents`).Scan(&count); err != nil {
+		t.Fatalf("count contents: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("contents rows = %d after refused DELETE, want 2", count)
+	}
+}
