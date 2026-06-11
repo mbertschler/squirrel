@@ -18,9 +18,9 @@ import (
 // verified; objects uploaded before fingerprint capture (or whose
 // capture failed) get their fingerprint recorded on the first pass. A
 // mismatch or a missing object is potential offsite corruption or
-// tampering: it is reported per object and fails the command — verify
-// changes nothing at the destination, the recorded fingerprint included,
-// so the evidence is preserved for the operator.
+// tampering: it is reported per object and fails the command, with the
+// destination and the recorded fingerprint left exactly as found so the
+// operator inspects the evidence.
 func newVerifyCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "verify [<destination>]",
