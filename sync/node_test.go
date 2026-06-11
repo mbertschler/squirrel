@@ -183,18 +183,39 @@ func TestNodeSyncTransfersFiles(t *testing.T) {
 		}
 	}
 
-	// Receiver-side index reflects the new rows.
+	// Receiver-side index reflects the new rows, each carrying the
+	// content's origin coordinate: the initiator's node name (mapped
+	// to the receiver's row for it) and the initiator-side run that
+	// introduced the content — not the receiver's own run.
 	v, err := f.recvStore.GetVolumeByName(context.Background(), "pics")
 	if err != nil {
 		t.Fatalf("GetVolumeByName on receiver: %v", err)
+	}
+	initSelfPre, _ := f.initStore.GetSelfNode(context.Background())
+	initVolRow, err := f.initStore.GetVolumeByName(context.Background(), "pics")
+	if err != nil {
+		t.Fatalf("GetVolumeByName on initiator: %v", err)
+	}
+	originNode, err := f.recvStore.GetNodeByName(context.Background(), initSelfPre.Name)
+	if err != nil {
+		t.Fatalf("receiver has no nodes row named %q: %v", initSelfPre.Name, err)
 	}
 	for name := range files {
 		row, err := f.recvStore.GetByPath(context.Background(), v.ID, name)
 		if err != nil {
 			t.Fatalf("GetByPath %s on receiver: %v", name, err)
 		}
-		if !row.OriginNodeID.Valid {
-			t.Fatalf("%s row has NULL source_node_id; want initiator attribution", name)
+		if !row.OriginNodeID.Valid || row.OriginNodeID.Int64 != originNode.ID {
+			t.Fatalf("%s OriginNodeID = %+v, want %d (the initiator's row by name)",
+				name, row.OriginNodeID, originNode.ID)
+		}
+		initRow, err := f.initStore.GetByPath(context.Background(), initVolRow.ID, name)
+		if err != nil {
+			t.Fatalf("GetByPath %s on initiator: %v", name, err)
+		}
+		if !row.OriginRunID.Valid || row.OriginRunID.Int64 != initRow.FirstSeenRunID {
+			t.Fatalf("%s OriginRunID = %+v, want the initiator's introduction run %d",
+				name, row.OriginRunID, initRow.FirstSeenRunID)
 		}
 	}
 
@@ -367,7 +388,7 @@ func TestNodeSyncResolvesConflictOnLocalWriteOnReceiver(t *testing.T) {
 		t.Fatalf("live row still carries the prior blake3; want initiator's")
 	}
 	if !liveRow.OriginNodeID.Valid {
-		t.Fatalf("live doc.md row has NULL source_node_id; want initiator attribution")
+		t.Fatalf("live doc.md row has NULL origin; want the initiator-introduced content's origin")
 	}
 	preservedRow, err := f.recvStore.GetByPath(ctx, v.ID, preservedRel)
 	if err != nil {
@@ -601,13 +622,13 @@ func TestPlanResponseContainsAllDispositions(t *testing.T) {
 	// Receiver-side: prepare three pre-existing rows under one
 	// volume, three dispositions ahead of /plan:
 	//   - "same.txt"      → same blake3 ⇒ already-correct
-	//   - "evolved.txt"   → different blake3 sourced from initiator
-	//                       (we plant peer_sync_state to make the
-	//                       provenance trace back to the initiator
-	//                       at run ≤ watermark) ⇒ supersede
+	//   - "evolved.txt"   → different blake3 delivered by the
+	//                       initiator (its first-seen run is a
+	//                       peer-sync run correlated at ≤ the
+	//                       watermark) ⇒ supersede
 	//   - "novel.txt"     → no receiver-side row ⇒ transfer
-	//   - "local.txt"     → different blake3, source_node_id NULL
-	//                       ⇒ conflict
+	//   - "local.txt"     → different blake3, first seen by a local
+	//                       index run (no peer linkage) ⇒ conflict
 	v, err := f.recvStore.CreateVolume(ctx, f.recvVol.Name, f.recvVol.Path)
 	if err != nil {
 		t.Fatalf("seed receiver volume: %v", err)
@@ -632,13 +653,20 @@ func TestPlanResponseContainsAllDispositions(t *testing.T) {
 		t.Fatalf("BeginPeerSyncRun: %v", err)
 	}
 	_ = f.recvStore.FinishRun(ctx, priorRun, store.RunStatusSuccess, "", 1)
+	// A receiver-local index run: rows first seen by it have no peer
+	// linkage, which is what makes local.txt a conflict.
+	localRun, err := f.recvStore.BeginIndexRun(ctx, store.RunKindIndex, v.ID, false)
+	if err != nil {
+		t.Fatalf("BeginIndexRun: %v", err)
+	}
+	_ = f.recvStore.FinishRun(ctx, localRun, store.RunStatusSuccess, "", 1)
 
-	mustUpsert := func(path string, digest []byte, prov *store.Provenance) {
+	mustUpsert := func(path string, digest []byte, firstSeen int64, prov *store.Provenance) {
 		t.Helper()
 		if err := f.recvStore.Upsert(ctx, store.FileRow{
 			VolumeID: v.ID, Path: path, Blake3: digest,
 			SizeBytes: 1, MtimeNs: 1, Status: store.StatusPresent,
-			FirstSeenRunID: priorRun, LastSeenRunID: priorRun, IndexedAtNs: 1,
+			FirstSeenRunID: firstSeen, LastSeenRunID: firstSeen, IndexedAtNs: 1,
 		}, prov); err != nil {
 			t.Fatalf("upsert receiver %s: %v", path, err)
 		}
@@ -649,12 +677,9 @@ func TestPlanResponseContainsAllDispositions(t *testing.T) {
 	// (supersede) and local.txt (conflict) both get re-hashed before
 	// their bytes are moved, so their recorded digests must match what's
 	// on disk — a real receiver indexes its own content; a synthetic
-	// digest would look like out-of-band drift. evolved.txt and
-	// local.txt need *distinct* bytes: origin is content-level, so if
-	// the two paths shared content, local.txt would inherit evolved's
-	// peer origin and classify as supersede instead of conflict.
-	// same.txt is already-correct and never re-hashed, so a synthetic
-	// digest is fine.
+	// digest would look like out-of-band drift. same.txt is
+	// already-correct and never re-hashed, so a synthetic digest is
+	// fine.
 	for _, p := range []string{"same.txt", "evolved.txt", "local.txt"} {
 		if err := os.WriteFile(filepath.Join(f.recvVol.Path, p), []byte("seed-"+p), 0o644); err != nil {
 			t.Fatal(err)
@@ -663,9 +688,9 @@ func TestPlanResponseContainsAllDispositions(t *testing.T) {
 	evolvedDigest := hashFile(t, filepath.Join(f.recvVol.Path, "evolved.txt"))
 	localDigest := hashFile(t, filepath.Join(f.recvVol.Path, "local.txt"))
 
-	mustUpsert("same.txt", bytesDigest(0xAA), nil)
-	mustUpsert("evolved.txt", evolvedDigest, &store.Provenance{NodeID: peer.ID, RunID: priorRun})
-	mustUpsert("local.txt", localDigest, nil)
+	mustUpsert("same.txt", bytesDigest(0xAA), priorRun, nil)
+	mustUpsert("evolved.txt", evolvedDigest, priorRun, &store.Provenance{NodeID: peer.ID, RunID: priorInitiatorRunID})
+	mustUpsert("local.txt", localDigest, localRun, nil)
 
 	// peer_sync_state watermark (in initiator-id space) high enough
 	// to cover the prior row's correlated id.
@@ -877,16 +902,21 @@ func TestNodeSyncConflictWhenPriorRowFromDifferentPeer(t *testing.T) {
 		t.Fatalf("BeginPeerSyncRun: %v", err)
 	}
 	_ = f.recvStore.FinishRun(ctx, priorRun, store.RunStatusSuccess, "", 1)
-	priorDigest := bytesDigest(0x77)
-	if err := f.recvStore.Upsert(ctx, store.FileRow{
-		VolumeID: v.ID, Path: "shared.md", Blake3: priorDigest,
-		SizeBytes: 1, MtimeNs: 1, Status: store.StatusPresent,
-		FirstSeenRunID: priorRun, LastSeenRunID: priorRun, IndexedAtNs: 1,
-	}, &store.Provenance{NodeID: otherPeer.ID, RunID: priorRun}); err != nil {
-		t.Fatalf("seed third-party row: %v", err)
-	}
+	// Write the bytes first and record their real digest: the conflict
+	// pre-stage re-hashes before moving, and a synthetic digest would
+	// look like out-of-band drift (which deliberately drops the prior
+	// origin). The recorded origin is the third party's own coordinate
+	// (its node row + a run id in *its* run space), carried verbatim.
 	if err := os.WriteFile(filepath.Join(f.recvVol.Path, "shared.md"), []byte("from-third-party"), 0o644); err != nil {
 		t.Fatal(err)
+	}
+	priorDigest := hashFile(t, filepath.Join(f.recvVol.Path, "shared.md"))
+	if err := f.recvStore.Upsert(ctx, store.FileRow{
+		VolumeID: v.ID, Path: "shared.md", Blake3: priorDigest,
+		SizeBytes: int64(len("from-third-party")), MtimeNs: 1, Status: store.StatusPresent,
+		FirstSeenRunID: priorRun, LastSeenRunID: priorRun, IndexedAtNs: 1,
+	}, &store.Provenance{NodeID: otherPeer.ID, RunID: 7}); err != nil {
+		t.Fatalf("seed third-party row: %v", err)
 	}
 
 	// Initiator writes a *different* blake3.
@@ -1343,7 +1373,7 @@ func TestNodeSyncCopyFromExistingDedup(t *testing.T) {
 		t.Fatalf("GetByPath pets/a.jpg: %v", err)
 	}
 	if !newRow.OriginNodeID.Valid {
-		t.Fatalf("pets/a.jpg row has NULL source_node_id; want initiator attribution")
+		t.Fatalf("pets/a.jpg row has NULL origin; want the initiator-introduced content's origin")
 	}
 }
 
