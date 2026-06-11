@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 )
 
@@ -112,32 +113,58 @@ func (s *Store) BeginHookRun(ctx context.Context, spec HookRunSpec) (int64, erro
 	return id, nil
 }
 
+// isTerminalHookStatus reports whether status is one of the two terminal
+// hook states. A row in either must not be re-finalised by FinishHookRun.
+func isTerminalHookStatus(status string) bool {
+	return status == HookStatusSuccess || status == HookStatusFailed
+}
+
 // FinishHookRun records the terminal state of a hook run. exitCode is
 // stored as-is (pass an invalid sql.NullInt64 when the process produced
 // no code, e.g. spawn failure or timeout); errMsg is stored as NULL when
 // empty. Returns an error if id matches no row so a hook is never left
 // stuck in 'running'.
+//
+// Like FinishRun, the transition is guarded: a hook run already in a
+// terminal status is never re-finalised — the first terminal write wins
+// and FinishHookRun returns ErrAlreadyFinished (matchable via errors.Is)
+// without touching the row, so a double-finish bug or a buggy retry can't
+// silently rewrite the recorded status, exit code, and end timestamp. The
+// read and the update share one transaction so the check and the write
+// can't race.
 func (s *Store) FinishHookRun(ctx context.Context, id int64, status string, exitCode sql.NullInt64, errMsg string) error {
 	if status != HookStatusSuccess && status != HookStatusFailed {
 		return fmt.Errorf("FinishHookRun: status must be %q or %q, got %q", HookStatusSuccess, HookStatusFailed, status)
 	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin finish hook run %d: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var current string
+	switch err := tx.QueryRowContext(ctx, `SELECT status FROM hook_runs WHERE id = ?`, id).Scan(&current); {
+	case errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("finish hook run %d: no such hook run", id)
+	case err != nil:
+		return fmt.Errorf("finish hook run %d read status: %w", id, err)
+	}
+	if isTerminalHookStatus(current) {
+		return fmt.Errorf("finish hook run %d (status %s): %w", id, current, ErrAlreadyFinished)
+	}
+
 	var errVal sql.NullString
 	if errMsg != "" {
 		errVal = sql.NullString{String: errMsg, Valid: true}
 	}
-	res, err := s.db.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, `
 		UPDATE hook_runs SET ended_at_ns = ?, status = ?, exit_code = ?, error = ?
 		WHERE id = ?
-	`, NowNs(), status, exitCode, errVal, id)
-	if err != nil {
+	`, NowNs(), status, exitCode, errVal, id); err != nil {
 		return fmt.Errorf("finish hook run %d: %w", id, err)
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("finish hook run %d rows affected: %w", id, err)
-	}
-	if n == 0 {
-		return fmt.Errorf("finish hook run %d: no such hook run", id)
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit finish hook run %d: %w", id, err)
 	}
 	return nil
 }
