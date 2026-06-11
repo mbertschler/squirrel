@@ -124,6 +124,12 @@ type nodeSyncDriver struct {
 	// originNodeNames caches local node id → name lookups so a plan
 	// full of same-origin entries resolves each origin node once.
 	originNodeNames map[int64]string
+	// durabilityAdvance is the present-set origin maxima captured before
+	// the transfer. phaseClose advances the peer's durability vector to
+	// exactly this snapshot, so a row committed between enumeration and
+	// close is never claimed durable — matching the bucket, content-
+	// addressed, and kopia handlers.
+	durabilityAdvance []store.OriginComponent
 }
 
 // selfName returns this node's name — the identity locally-introduced
@@ -211,6 +217,13 @@ func (d *nodeSyncDriver) run() error {
 	// the original path is empty, so rclone treats the entry like a
 	// fresh transfer.
 	d.report.NodeConflicts = plan.Conflicts
+	if !d.opts.DryRun {
+		advance, err := captureDurabilityAdvance(d.ctx, d.store, d.volID)
+		if err != nil {
+			return d.abortWithError("capture durability advance", err)
+		}
+		d.durabilityAdvance = advance
+	}
 	if err := d.phaseTransfer(plan); err != nil {
 		return d.abortWithError("transfer", err)
 	}
@@ -635,11 +648,14 @@ func (d *nodeSyncDriver) phaseVerify() error {
 // On a verified successful close (status success acknowledged by the
 // receiver; never dry-run) the initiator records the durability
 // consequence: the peer is a destination in the flat target namespace,
-// so AdvanceDestinationVector moves its vector over the volume's
-// present set. A failed advance fails the run — the bytes are on the
-// peer but the evidence isn't recorded, and the next sync re-plans
-// (everything already-correct) and re-advances cheaply. The durability
-// pull that follows is metadata-only and merely warns on failure.
+// so the vector advances over the present-set origin maxima captured
+// before the transfer (tagged peer-blake3 — the receiver re-hashed every
+// delivered path). Pinning to that snapshot keeps a row committed between
+// enumeration and close from being claimed durable, matching the other
+// handlers. A failed advance fails the run — the bytes are on the peer
+// but the evidence isn't recorded, and the next sync re-plans (everything
+// already-correct) and re-advances cheaply. The durability pull that
+// follows is metadata-only and merely warns on failure.
 func (d *nodeSyncDriver) phaseClose() error {
 	failed := failingPaths(d.report.NodeVerify)
 	err := d.client.close(d.ctx, syncproto.CloseRequest{
@@ -653,7 +669,7 @@ func (d *nodeSyncDriver) phaseClose() error {
 	if d.report.Status != store.RunStatusSuccess || d.opts.DryRun {
 		return nil
 	}
-	if err := d.store.AdvanceDestinationVector(d.ctx, d.volID, d.node.Name); err != nil {
+	if err := d.store.AdvanceDestinationVectorTo(d.ctx, d.volID, d.node.Name, store.VerifyMethodPeer, d.durabilityAdvance); err != nil {
 		return fmt.Errorf("advance destination vector for %s: %w", d.node.Name, err)
 	}
 	d.pullPeerDurability()

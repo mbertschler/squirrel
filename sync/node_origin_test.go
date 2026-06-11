@@ -317,3 +317,64 @@ func TestNodeSyncAdvancesVectorAndPullsDurabilityAtClose(t *testing.T) {
 		t.Fatalf("offsite-x component = %d, want 7", got.OriginRunID)
 	}
 }
+
+// TestNodeSyncPeerAdvanceSnapshotPinned is the finding-3 fix: the peer
+// close-phase advance is pinned to the present-set origin maxima captured
+// before the transfer (and tagged peer-blake3), the same snapshot the
+// bucket, content-addressed, and kopia handlers use — not a live read of
+// the present set after the transfer. The advance equals
+// PresentOriginMaxima taken before the sync, and the same push records
+// the origin-space push-freshness coordinate so a downstream puller can
+// satisfy its relayed-target freshness condition.
+func TestNodeSyncPeerAdvanceSnapshotPinned(t *testing.T) {
+	f := setupNodeFixture(t)
+	ctx := context.Background()
+
+	if err := os.WriteFile(filepath.Join(f.initVol.Path, "a.txt"), []byte("alpha"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(f.initVol.Path, "b.txt"), []byte("bravo"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.indexInitiator(t)
+
+	v, err := f.initStore.GetVolumeByName(ctx, "pics")
+	if err != nil {
+		t.Fatalf("GetVolumeByName: %v", err)
+	}
+	self, err := f.initStore.GetSelfNode(ctx)
+	if err != nil {
+		t.Fatalf("GetSelfNode: %v", err)
+	}
+	snapshot, err := f.initStore.PresentOriginMaxima(ctx, v.ID, self.ID)
+	if err != nil {
+		t.Fatalf("PresentOriginMaxima: %v", err)
+	}
+
+	rep, err := SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	if err != nil || rep.Status != store.RunStatusSuccess {
+		t.Fatalf("SyncNode: err=%v status=%q", err, rep.Status)
+	}
+
+	vector, err := f.initStore.ListDestinationRunIDs(ctx, v.ID, f.node.Name)
+	if err != nil {
+		t.Fatalf("ListDestinationRunIDs: %v", err)
+	}
+	if len(vector) != len(snapshot) || len(vector) != 1 {
+		t.Fatalf("vector = %+v, want one component matching the captured snapshot %+v", vector, snapshot)
+	}
+	if vector[0].OriginNodeID != snapshot[0].OriginNodeID || vector[0].OriginRunID != snapshot[0].OriginRunID {
+		t.Fatalf("vector component %+v != captured snapshot %+v", vector[0], snapshot[0])
+	}
+	if vector[0].VerifyMethod != store.VerifyMethodPeer {
+		t.Fatalf("verify method = %q, want %q", vector[0].VerifyMethod, store.VerifyMethodPeer)
+	}
+
+	fresh, err := f.initStore.ListDestinationPushFreshness(ctx, v.ID, f.node.Name)
+	if err != nil {
+		t.Fatalf("ListDestinationPushFreshness: %v", err)
+	}
+	if len(fresh) != 1 || fresh[0].OriginNodeID != snapshot[0].OriginNodeID || fresh[0].OriginRunID != snapshot[0].OriginRunID {
+		t.Fatalf("push freshness = %+v, want it to match the captured snapshot %+v", fresh, snapshot)
+	}
+}
