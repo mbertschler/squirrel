@@ -10,7 +10,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 18
+const SchemaVersion = 19
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -54,6 +54,7 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 16, up: migrateV15ToV16},
 		{version: 17, up: migrateV16ToV17},
 		{version: 18, up: migrateV17ToV18},
+		{version: 19, up: migrateV18ToV19},
 	}
 }
 
@@ -1730,6 +1731,41 @@ func migrateV17ToV18(ctx context.Context, db *sql.DB) error {
 	for _, q := range stmts {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("v17→v18: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// --- v18 → v19 ---
+
+// migrateV18ToV19 adds the verification-method provenance the offload
+// gate needs to tell a content-verified durability component apart from
+// a presence-only one. destination_run_ids.verify_method records the
+// method that advanced a live component (blake3, peer-blake3,
+// kopia-verify, or presence+size); destination_run_ids_history.verify_method
+// records it per advance so the audit log keeps the same fact.
+//
+// Both columns are additive and nullable. Existing components are left
+// NULL: the gate reads a NULL method as "not content-verified" and holds
+// the target out until a fresh verified push re-stamps it. That is the
+// strictly-stricter reading — a pre-v19 component can only ever start
+// refusing offload, never start permitting it — and is harmless because
+// a verified push re-advances the component cheaply.
+func migrateV18ToV19(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`ALTER TABLE destination_run_ids ADD COLUMN verify_method TEXT`,
+		`ALTER TABLE destination_run_ids_history ADD COLUMN verify_method TEXT`,
+		`INSERT INTO schema_version (version) VALUES (19)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("v18→v19: %w", err)
 		}
 	}
 	return tx.Commit()
