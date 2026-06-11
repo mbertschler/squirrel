@@ -525,6 +525,10 @@ type SyncRunSpec struct {
 // sync side. Syncs to *different* destinations stay free to overlap —
 // they touch disjoint vectors.
 //
+// An in-flight offload also blocks: offload unlinks on-disk bytes the sync
+// is enumerating, and offload itself blocks on every kind, so the sync and
+// index gates name it too to keep the exclusion symmetric.
+//
 // Returns (newID, nil, nil) when the row was inserted; (0, &blocker,
 // nil) when refused — the caller is expected to render a diagnostic
 // using the blocker's id and started_at_ns. Stale rows from crashed
@@ -547,7 +551,7 @@ func (s *Store) BeginSyncRunIfClear(ctx context.Context, spec SyncRunSpec) (int6
 		WHERE status = 'running' AND volume_id = ?
 		  AND (
 		    (kind = 'sync' AND destination = ?)
-		    OR kind IN ('index', 'audit')
+		    OR kind IN ('index', 'audit', 'offload')
 		  )
 		ORDER BY id LIMIT 1
 	`, spec.VolumeID, spec.Destination)
@@ -579,14 +583,16 @@ func (s *Store) BeginSyncRunIfClear(ctx context.Context, spec SyncRunSpec) (int6
 }
 
 // BeginIndexRunIfClear atomically inserts a 'running' kind='index' or
-// kind='audit' row for volumeID iff no other index- or audit-kind run
-// is currently in flight against the same volume. Symmetric to
+// kind='audit' row for volumeID iff no index-, audit-, or offload-kind
+// run is currently in flight against the same volume. Symmetric to
 // BeginSyncRunIfClear (BEGIN IMMEDIATE + check + insert in one tx) so
 // two concurrent callers cannot both observe "no running run" and both
 // insert. Cross-kind: an in-flight 'index' blocks a new 'audit' and
 // vice versa because both walk the volume and call MarkMissing with
 // their own run-id — letting them overlap is exactly the bug this
-// guards against.
+// guards against. An in-flight offload blocks too: it unlinks bytes the
+// walk would otherwise observe and flip, and offload defers to every
+// kind, so the block is symmetric.
 //
 // A running sync does not block an index here, while a running index
 // does block a new sync (BeginSyncRunIfClear). The asymmetry is
@@ -614,7 +620,7 @@ func (s *Store) BeginIndexRunIfClear(ctx context.Context, kind string, volumeID 
 	row := tx.QueryRowContext(ctx, `
 		SELECT `+runColumns+`
 		FROM runs
-		WHERE kind IN ('index', 'audit') AND status = 'running'
+		WHERE kind IN ('index', 'audit', 'offload') AND status = 'running'
 		  AND volume_id = ?
 		ORDER BY id LIMIT 1
 	`, volumeID)

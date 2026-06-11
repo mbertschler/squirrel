@@ -3472,6 +3472,76 @@ func TestBeginIndexRunIfClearAllowsConcurrentSync(t *testing.T) {
 	}
 }
 
+// TestBeginSyncRunIfClearBlockedByOffload makes the run gate symmetric:
+// offload already blocks on every kind, so a sync must refuse to start
+// while an offload is in flight (#114). A concurrent unlink would
+// otherwise race the sync's enumeration.
+func TestBeginSyncRunIfClearBlockedByOffload(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+
+	offID, blocker, err := s.BeginOffloadRunIfClear(ctx, vID)
+	if err != nil || blocker != nil || offID == 0 {
+		t.Fatalf("begin offload: id=%d blocker=%+v err=%v", offID, blocker, err)
+	}
+
+	syncID, syncBlocker, err := s.BeginSyncRunIfClear(ctx, SyncRunSpec{VolumeID: vID, Destination: "backup"})
+	if err != nil {
+		t.Fatalf("begin sync during offload: %v", err)
+	}
+	if syncBlocker == nil || syncID != 0 {
+		t.Fatalf("sync admitted (id=%d) while offload running, want blocked", syncID)
+	}
+	if syncBlocker.Kind != RunKindOffload {
+		t.Fatalf("blocker kind = %q, want %q", syncBlocker.Kind, RunKindOffload)
+	}
+
+	if err := s.FinishRun(ctx, offID, RunStatusSuccess, "", 0); err != nil {
+		t.Fatalf("finish offload: %v", err)
+	}
+	syncID, syncBlocker, err = s.BeginSyncRunIfClear(ctx, SyncRunSpec{VolumeID: vID, Destination: "backup"})
+	if err != nil || syncBlocker != nil || syncID == 0 {
+		t.Fatalf("sync refused after offload finished: id=%d blocker=%+v err=%v", syncID, syncBlocker, err)
+	}
+}
+
+// TestBeginIndexRunIfClearBlockedByOffload: an in-flight offload blocks a
+// new index or audit so the walk can't observe-and-flip a row mid-unlink
+// (#114).
+func TestBeginIndexRunIfClearBlockedByOffload(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	for _, indexKind := range []string{RunKindIndex, RunKindAudit} {
+		vID := makeVolume(t, s, "/v-"+indexKind)
+
+		offID, blocker, err := s.BeginOffloadRunIfClear(ctx, vID)
+		if err != nil || blocker != nil || offID == 0 {
+			t.Fatalf("%s: begin offload: id=%d blocker=%+v err=%v", indexKind, offID, blocker, err)
+		}
+
+		idxID, idxBlocker, err := s.BeginIndexRunIfClear(ctx, indexKind, vID, false)
+		if err != nil {
+			t.Fatalf("%s: begin index during offload: %v", indexKind, err)
+		}
+		if idxBlocker == nil || idxID != 0 {
+			t.Fatalf("%s: index admitted (id=%d) while offload running, want blocked", indexKind, idxID)
+		}
+		if idxBlocker.Kind != RunKindOffload {
+			t.Fatalf("%s: blocker kind = %q, want %q", indexKind, idxBlocker.Kind, RunKindOffload)
+		}
+
+		if err := s.FinishRun(ctx, offID, RunStatusSuccess, "", 0); err != nil {
+			t.Fatalf("%s: finish offload: %v", indexKind, err)
+		}
+		idxID, idxBlocker, err = s.BeginIndexRunIfClear(ctx, indexKind, vID, false)
+		if err != nil || idxBlocker != nil || idxID == 0 {
+			t.Fatalf("%s: index refused after offload finished: id=%d blocker=%+v err=%v", indexKind, idxID, idxBlocker, err)
+		}
+	}
+}
+
 // TestBackupVacuumIntoProducesValidSnapshot exercises Backup against
 // a populated store, then opens the snapshot as a regular DB and
 // verifies it carries the same volume row. Cheapest reliable check
