@@ -87,8 +87,11 @@ func setupContentAddressedFixture(t *testing.T) *caFixture {
 
 	root := t.TempDir()
 	volPath := filepath.Join(root, "src")
-	if err := os.MkdirAll(volPath, 0o755); err != nil {
-		t.Fatalf("mkdir src: %v", err)
+	docsPath := filepath.Join(root, "docs-src")
+	for _, p := range []string{volPath, docsPath} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", p, err)
+		}
 	}
 	s, err := store.Open(filepath.Join(root, "test.db"))
 	if err != nil {
@@ -110,6 +113,10 @@ password = "obscured-pw"
 [volumes.pics]
 path    = "` + volPath + `"
 sync_to = ["offsite"]
+
+[volumes.docs]
+path    = "` + docsPath + `"
+sync_to = ["offsite"]
 `
 	if err := os.WriteFile(cfgPath, []byte(cfgBody), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -118,7 +125,7 @@ sync_to = ["offsite"]
 	if err != nil {
 		t.Fatalf("config.Load: %v", err)
 	}
-	pairs, err := PairsFor(cfg, "", "")
+	pairs, err := PairsFor(cfg, "pics", "")
 	if err != nil {
 		t.Fatalf("PairsFor: %v", err)
 	}
@@ -170,15 +177,15 @@ func (f *caFixture) volumeID(t *testing.T) int64 {
 	return v.ID
 }
 
-// remotePath maps a per-volume destination subpath to where the shim
-// materialised it.
+// remotePath maps a destination subpath to where the shim materialised
+// it: objects/ lives at the root, manifest segments per volume.
 func (f *caFixture) remotePath(parts ...string) string {
-	return filepath.Join(append([]string{f.fakeRoot, "pics"}, parts...)...)
+	return filepath.Join(append([]string{f.fakeRoot}, parts...)...)
 }
 
 func (f *caFixture) readSegment(t *testing.T, runID int64) []ManifestEntry {
 	t.Helper()
-	data, err := os.ReadFile(f.remotePath(ManifestDirName, fmt.Sprintf("run-%d", runID)))
+	data, err := os.ReadFile(f.remotePath("pics", ManifestDirName, fmt.Sprintf("run-%d", runID)))
 	if err != nil {
 		t.Fatalf("read manifest segment: %v", err)
 	}
@@ -283,7 +290,7 @@ func TestContentAddressedPushHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read shim log: %v", err)
 	}
-	if !strings.Contains(string(log), "copyto") || !strings.Contains(string(log), "offsite-crypt:pics/"+ObjectsDirName+"/") {
+	if !strings.Contains(string(log), "copyto") || !strings.Contains(string(log), "offsite-crypt:"+ObjectsDirName+"/") {
 		t.Fatalf("shim log lacks crypt-addressed copyto lines:\n%s", log)
 	}
 }
@@ -349,7 +356,7 @@ func TestContentAddressedManifestSegmentGolden(t *testing.T) {
 		line("d.txt", "dd", store.StatusPresent, f.mtimeNs(t, "d.txt")),
 	}, "\n") + "\n"
 
-	got, err := os.ReadFile(f.remotePath(ManifestDirName, fmt.Sprintf("run-%d", rep.RunID)))
+	got, err := os.ReadFile(f.remotePath("pics", ManifestDirName, fmt.Sprintf("run-%d", rep.RunID)))
 	if err != nil {
 		t.Fatalf("read segment: %v", err)
 	}
@@ -374,7 +381,7 @@ func TestContentAddressedObjectFailureIsTransactional(t *testing.T) {
 	if rep.Status != store.RunStatusFailed {
 		t.Fatalf("Status = %q, want failed", rep.Status)
 	}
-	if _, statErr := os.Stat(f.remotePath(ManifestDirName, fmt.Sprintf("run-%d", rep.RunID))); statErr == nil {
+	if _, statErr := os.Stat(f.remotePath("pics", ManifestDirName, fmt.Sprintf("run-%d", rep.RunID))); statErr == nil {
 		t.Fatalf("manifest segment written despite object failure")
 	}
 	run, err := f.store.GetRun(context.Background(), rep.RunID)
@@ -458,7 +465,7 @@ func TestContentAddressedEmptyDeltaStillLandsSegment(t *testing.T) {
 	if rep.Status != store.RunStatusSuccess || rep.Verification.Files != 0 {
 		t.Fatalf("rep = status=%q files=%d, want success with an empty delta", rep.Status, rep.Verification.Files)
 	}
-	data, err := os.ReadFile(f.remotePath(ManifestDirName, fmt.Sprintf("run-%d", rep.RunID)))
+	data, err := os.ReadFile(f.remotePath("pics", ManifestDirName, fmt.Sprintf("run-%d", rep.RunID)))
 	if err != nil {
 		t.Fatalf("empty segment missing: %v", err)
 	}
@@ -537,5 +544,58 @@ func TestRestoreRefusesContentAddressedDestination(t *testing.T) {
 	_, err := Restore(context.Background(), f.store, f.rcl, f.pair.Volume, f.pair.Destination, RestoreOptions{})
 	if err == nil || !strings.Contains(err.Error(), "content-addressed") {
 		t.Fatalf("expected content-addressed restore refusal, got %v", err)
+	}
+}
+
+// TestContentAddressedCrossVolumeDedup: objects/ is destination-global,
+// matching remote_objects' (content, destination) key — a second volume
+// carrying already-recorded content uploads nothing, and its manifest
+// still maps the path onto the shared object.
+func TestContentAddressedCrossVolumeDedup(t *testing.T) {
+	f := setupContentAddressedFixture(t)
+	f.write(t, "a.txt", "shared-bytes")
+	f.index(t)
+	if _, err := f.sync(t); err != nil {
+		t.Fatalf("pics sync: %v", err)
+	}
+
+	docs := f.cfg.Volumes["docs"]
+	if err := os.WriteFile(filepath.Join(docs.Path, "report.txt"), []byte("shared-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := index.Index(context.Background(), f.store, docs.Path, index.Options{Name: "docs"}); err != nil {
+		t.Fatalf("index docs: %v", err)
+	}
+	docsPairs, err := PairsFor(f.cfg, "docs", "")
+	if err != nil {
+		t.Fatalf("PairsFor docs: %v", err)
+	}
+	rep, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, docsPairs[0], Options{})
+	if err != nil {
+		t.Fatalf("docs sync: %v", err)
+	}
+	if rep.RcloneResult.Transferred != 0 || rep.RcloneResult.Checked != 1 {
+		t.Fatalf("docs transferred=%d checked=%d, want 0/1 (object shared across volumes)", rep.RcloneResult.Transferred, rep.RcloneResult.Checked)
+	}
+	data, err := os.ReadFile(f.remotePath("docs", ManifestDirName, fmt.Sprintf("run-%d", rep.RunID)))
+	if err != nil {
+		t.Fatalf("docs segment missing: %v", err)
+	}
+	if !strings.Contains(string(data), blake3Hex("shared-bytes")) || !strings.Contains(string(data), "report.txt") {
+		t.Fatalf("docs segment = %q, want report.txt mapped onto the shared object", data)
+	}
+	if _, err := os.Stat(f.remotePath(ObjectsDirName, blake3Hex("shared-bytes"))); err != nil {
+		t.Fatalf("shared object missing at the destination root: %v", err)
+	}
+}
+
+// TestContentAddressedRefusesVolumeNamedObjects: a volume named like
+// the destination-root objects/ directory would collide with it.
+func TestContentAddressedRefusesVolumeNamedObjects(t *testing.T) {
+	f := setupContentAddressedFixture(t)
+	pair := Pair{Volume: &config.Volume{Name: ObjectsDirName, Path: t.TempDir()}, Destination: f.pair.Destination}
+	_, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, pair, Options{})
+	if err == nil || !strings.Contains(err.Error(), "collides") {
+		t.Fatalf("expected volume-name collision refusal, got %v", err)
 	}
 }

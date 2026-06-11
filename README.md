@@ -112,10 +112,10 @@ root   = "/data"
 layout = "content-addressed"
 ```
 
-Instead of a browsable tree, the destination's per-volume directory holds two streams:
+Instead of a browsable tree, the destination holds two streams:
 
-- **`objects/<hash>`** — one object per BLAKE3 content hash (lowercase hex), the raw file bytes (encrypted client-side when the destination has a `crypt` block). Each hash is uploaded **exactly once** per destination and never moved, overwritten, or deleted. A local rename or reorg changes only the path mapping — no re-upload, no server-side copy.
-- **`index/run-<id>`** — one immutable **manifest segment** per sync run: the path-level delta of that run (see the format below). Replaying all segments in run order yields the full current path→content mapping, and any past state.
+- **`objects/<hash>`** (at the destination root, shared by all volumes) — one object per BLAKE3 content hash (lowercase hex), the raw file bytes (encrypted client-side when the destination has a `crypt` block). Each hash is uploaded **exactly once** per destination and never moved, overwritten, or deleted. A local rename or reorg changes only the path mapping — no re-upload, no server-side copy — and content duplicated across volumes is stored once.
+- **`<volume>/index/run-<id>`** — one immutable **manifest segment** per sync run, per volume: the path-level delta of that run (see the format below). Replaying a volume's segments in run order yields its full current path→content mapping, and any past state.
 
 Durability is **transactional per run**: the run only counts as successful — and only then feeds the durability evidence squirrel records per destination — once *both* all its content objects *and* its manifest segment are confirmed on the remote (each transfer's success plus a follow-up presence/size listing). A failed run may leave objects without a segment; they are harmless (nothing maps them) and the next run skips re-uploading anything already recorded, pushing only what's missing.
 
@@ -128,7 +128,7 @@ Properties that differ from mirrored destinations:
 
 #### Manifest segment format
 
-Each `index/run-<id>` segment is JSONL — one JSON object per line, lines sorted by `(path, status)`:
+Each `<volume>/index/run-<id>` segment is JSONL — one JSON object per line, lines sorted by `(path, status)`:
 
 ```json
 {"path":"2024/cat.jpg","blake3":"26e7…e5ad","status":"present","size_bytes":123,"mtime_ns":1712345678901234567}
@@ -284,7 +284,7 @@ Each mirrored destination (`layout = "mirror"`, the default) is a tree shaped li
 
 `.squirrel-index/` holds the index snapshots ridden along after each successful sync (see [Index snapshots](#index-snapshots)). Like `.squirrel-history`, it is filtered out of all sync and restore transfers and from peer-sync, so a snapshot is never mistaken for user content.
 
-A [content-addressed destination](#content-addressed-destinations) holds `objects/` and `index/` under each per-volume directory instead of a mirrored tree (plus the same `.squirrel-index/` ride-along).
+A [content-addressed destination](#content-addressed-destinations) holds a shared `objects/` directory at its root and `index/` under each per-volume directory instead of a mirrored tree (plus the same `.squirrel-index/` ride-along).
 
 ## Notes
 

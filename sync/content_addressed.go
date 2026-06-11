@@ -14,22 +14,25 @@ import (
 	"github.com/mbertschler/squirrel/store"
 )
 
-// Content-addressed destination layout: a per-volume, append-only store
-// of content objects plus the manifest segments that map paths onto
-// them. Everything under the per-volume directory is squirrel-written —
-// the layout has no mirrored user tree.
+// Content-addressed destination layout: an append-only store of content
+// objects plus the manifest segments that map paths onto them. The
+// layout has no mirrored user tree — every byte under the destination
+// root is squirrel-written.
 const (
 	// ObjectsDirName holds one immutable object per BLAKE3 content
-	// hash: <volume>/objects/<lowercase hex>, raw file bytes (encrypted
-	// by the crypt overlay when the destination has one). An object is
+	// hash at the destination root: objects/<lowercase hex>, raw file
+	// bytes (encrypted by the crypt overlay when the destination has
+	// one). The directory is destination-global — shared by every
+	// volume, matching remote_objects' (content, destination) key —
+	// so duplicated content across volumes uploads once. An object is
 	// uploaded once and never moved, overwritten, or deleted.
 	ObjectsDirName = "objects"
 	// ManifestDirName holds one immutable manifest segment per sync
-	// run: <volume>/index/run-<run id>, the JSONL path-level delta of
-	// that run (see ManifestEntry). Replaying all segments in run-id
-	// order reconstructs the full path→content mapping with no SQLite
-	// required. Distinct from IndexDirName, the dot-directory the
-	// snapshot ride-along writes.
+	// run, per volume: <volume>/index/run-<run id>, the JSONL
+	// path-level delta of that run (see ManifestEntry). Replaying a
+	// volume's segments in run-id order reconstructs its full
+	// path→content mapping with no SQLite required. Distinct from
+	// IndexDirName, the dot-directory the snapshot ride-along writes.
 	ManifestDirName = "index"
 )
 
@@ -103,6 +106,9 @@ func (h *contentAddressedHandler) Push(ctx context.Context, opts Options) (Repor
 	// Stamped up front so output renderers key content-addressed
 	// formatting off the method even when the push fails early.
 	rep.Verification.Method = VerifyMethodPresenceSize
+	if h.vol.Name == ObjectsDirName {
+		return rep, fmt.Errorf("volume %q: the name collides with the destination-root %s/ directory of content-addressed destination %q — rename the volume or use a mirrored destination", h.vol.Name, ObjectsDirName, h.dest.Name)
+	}
 	volID, err := requireIndexedVolume(ctx, h.store, h.vol)
 	if err != nil {
 		return rep, err
@@ -313,11 +319,11 @@ func (h *contentAddressedHandler) uploadSegment(ctx context.Context, delta []sto
 	return nil
 }
 
-// objectURI addresses one content object under the destination's
-// per-volume objects/ directory, through the crypt overlay when the
-// destination has one.
+// objectURI addresses one content object under the destination-root
+// objects/ directory, through the crypt overlay when the destination
+// has one.
 func (h *contentAddressedHandler) objectURI(hash string) string {
-	return remoteSubpathURI(h.dest, path.Join(h.vol.Name, ObjectsDirName, hash))
+	return remoteSubpathURI(h.dest, path.Join(ObjectsDirName, hash))
 }
 
 // segmentURI addresses one run's manifest segment under the
