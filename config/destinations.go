@@ -111,11 +111,41 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 	if err != nil {
 		return nil, err
 	}
+	layout, err := resolveLayout(raw, typ)
+	if err != nil {
+		return nil, err
+	}
 	params, err := validateAndResolveParams(schema, raw)
 	if err != nil {
 		return nil, err
 	}
-	return &Destination{Name: name, Type: typ, Root: root, Params: params, Crypt: crypt}, nil
+	return &Destination{Name: name, Type: typ, Root: root, Layout: layout, Params: params, Crypt: crypt}, nil
+}
+
+// resolveLayout validates the optional `layout` key of a destination. An
+// absent key resolves to LayoutMirror. LayoutContentAddressed drives
+// per-object rclone transfers, so it requires an rclone-remote type:
+// type "local" is addressed by filesystem path, and "kopia" repositories
+// already use kopia's own content-addressed format.
+func resolveLayout(raw map[string]any, typ string) (string, error) {
+	v, err := optionalString(raw, "layout")
+	if err != nil {
+		return "", err
+	}
+	switch v {
+	case "", LayoutMirror:
+		return LayoutMirror, nil
+	case LayoutContentAddressed:
+		switch typ {
+		case "local":
+			return "", fmt.Errorf(`layout %q requires an rclone-remote destination; type "local" is addressed by filesystem path`, LayoutContentAddressed)
+		case "kopia":
+			return "", fmt.Errorf(`layout %q requires an rclone-remote destination; type "kopia" repositories are content-addressed by kopia itself`, LayoutContentAddressed)
+		}
+		return LayoutContentAddressed, nil
+	default:
+		return "", fmt.Errorf("unknown layout %q (supported: %q, %q)", v, LayoutMirror, LayoutContentAddressed)
+	}
 }
 
 // resolveCrypt validates the optional `crypt` sub-table of a destination.
@@ -185,7 +215,7 @@ func validateCryptRemoteNames(dests map[string]*Destination) error {
 // silently disabling a field at rclone time.
 func validateAndResolveParams(schema destSchema, raw map[string]any) (map[string]string, error) {
 	out := make(map[string]string)
-	seen := map[string]bool{"type": true, "root": true, "crypt": true}
+	seen := map[string]bool{"type": true, "root": true, "crypt": true, "layout": true}
 	for _, key := range schema.requiredString {
 		v, err := requireString(raw, key)
 		if err != nil {
