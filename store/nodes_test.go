@@ -49,11 +49,11 @@ func TestGetOrCreatePeerNodeIdempotent(t *testing.T) {
 	defer s.Close()
 	ctx := context.Background()
 
-	first, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.local")
+	first, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.local", true)
 	if err != nil {
 		t.Fatalf("first: %v", err)
 	}
-	again, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.local")
+	again, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.local", true)
 	if err != nil {
 		t.Fatalf("second: %v", err)
 	}
@@ -71,10 +71,10 @@ func TestGetOrCreatePeerNodeRejectsEndpointMismatch(t *testing.T) {
 	defer s.Close()
 	ctx := context.Background()
 
-	if _, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.local"); err != nil {
+	if _, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.local", true); err != nil {
 		t.Fatalf("first: %v", err)
 	}
-	_, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.different")
+	_, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.different", true)
 	if err == nil || !strings.Contains(err.Error(), "already has endpoint") {
 		t.Fatalf("error = %v, want collision-message", err)
 	}
@@ -92,7 +92,7 @@ func TestGetOrCreatePeerNodeRefusesSelfNameCollision(t *testing.T) {
 	defer s.Close()
 	ctx := context.Background()
 
-	_, err = s.GetOrCreatePeerNode(ctx, "me", "http://attacker.example")
+	_, err = s.GetOrCreatePeerNode(ctx, "me", "http://attacker.example", true)
 	if err == nil || !strings.Contains(err.Error(), "self-row") {
 		t.Fatalf("error = %v, want self-row refusal", err)
 	}
@@ -107,7 +107,7 @@ func TestPeerSyncStateUpsertRoundtrip(t *testing.T) {
 	ctx := context.Background()
 
 	vID := makeVolume(t, s, "/v")
-	peer, _ := s.GetOrCreatePeerNode(ctx, "nas", "http://nas.example")
+	peer, _ := s.GetOrCreatePeerNode(ctx, "nas", "http://nas.example", true)
 
 	if err := s.UpsertPeerSyncState(ctx, vID, peer.ID, 7, false); err != nil {
 		t.Fatalf("first upsert: %v", err)
@@ -139,7 +139,7 @@ func TestBeginPeerSyncRunStampsLinkage(t *testing.T) {
 	ctx := context.Background()
 
 	vID := makeVolume(t, s, "/v")
-	peer, _ := s.GetOrCreatePeerNode(ctx, "nas", "http://nas.example")
+	peer, _ := s.GetOrCreatePeerNode(ctx, "nas", "http://nas.example", true)
 
 	id, err := s.BeginPeerSyncRun(ctx, vID, peer.ID, 99, "nas")
 	if err != nil {
@@ -170,7 +170,7 @@ func TestSetCorrelatedRunID(t *testing.T) {
 	ctx := context.Background()
 
 	vID := makeVolume(t, s, "/v")
-	peer, _ := s.GetOrCreatePeerNode(ctx, "nas", "http://nas.example")
+	peer, _ := s.GetOrCreatePeerNode(ctx, "nas", "http://nas.example", true)
 	id, _ := s.BeginPeerSyncRun(ctx, vID, peer.ID, 0, "nas")
 
 	if err := s.SetCorrelatedRunID(ctx, id, 1234); err != nil {
@@ -214,7 +214,7 @@ func TestGetOrCreateOriginNode(t *testing.T) {
 		t.Fatalf("second resolve created a new row: %d → %d", created.ID, again.ID)
 	}
 
-	peer, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.example")
+	peer, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.example", true)
 	if err != nil {
 		t.Fatalf("GetOrCreatePeerNode: %v", err)
 	}
@@ -258,9 +258,10 @@ func TestGetOrCreateOriginNodeRejectsInvalidName(t *testing.T) {
 
 // TestGetOrCreatePeerNodeUpgradesPlaceholder: a row created from a
 // name-only context (a forwarded origin, or a durability pull before
-// any sync) carries the peer:// placeholder; the first real handshake
-// presenting an actual endpoint upgrades it in place instead of
-// refusing the collision. Real-endpoint mismatches stay refused.
+// any sync) carries the peer:// placeholder; an operator-configured
+// (trusted) caller presenting an actual endpoint upgrades it in place
+// instead of refusing the collision. Real-endpoint mismatches stay
+// refused.
 func TestGetOrCreatePeerNodeUpgradesPlaceholder(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "test.db")
 	s, _ := Open(dsn)
@@ -271,7 +272,7 @@ func TestGetOrCreatePeerNodeUpgradesPlaceholder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetOrCreateOriginNode: %v", err)
 	}
-	upgraded, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.example:8443")
+	upgraded, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.example:8443", true)
 	if err != nil {
 		t.Fatalf("GetOrCreatePeerNode after placeholder: %v", err)
 	}
@@ -286,7 +287,39 @@ func TestGetOrCreatePeerNodeUpgradesPlaceholder(t *testing.T) {
 		t.Fatalf("persisted endpoint = %q, want the upgrade written through", persisted.Endpoint.String)
 	}
 
-	if _, err := s.GetOrCreatePeerNode(ctx, "nas", "https://other.example"); err == nil {
+	if _, err := s.GetOrCreatePeerNode(ctx, "nas", "https://other.example", true); err == nil {
 		t.Fatalf("real-endpoint mismatch accepted, want refusal")
+	}
+}
+
+// TestGetOrCreatePeerNodeUntrustedKeepsPlaceholder is the #110b guard:
+// an untrusted caller (allowEndpointUpgrade=false, the receiver-side
+// /begin path whose endpoint derives from wire input) must not rebind a
+// placeholder row to a presented endpoint. The placeholder stays put so
+// a peer cannot point an arbitrary node-name's dial-back URL at an
+// attacker address; the existing row is returned unchanged.
+func TestGetOrCreatePeerNodeUntrustedKeepsPlaceholder(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, _ := Open(dsn)
+	defer s.Close()
+	ctx := context.Background()
+
+	seeded, err := s.GetOrCreateOriginNode(ctx, "nas")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode: %v", err)
+	}
+	got, err := s.GetOrCreatePeerNode(ctx, "nas", "https://attacker.example:8443", false)
+	if err != nil {
+		t.Fatalf("GetOrCreatePeerNode untrusted: %v", err)
+	}
+	if got.ID != seeded.ID {
+		t.Fatalf("untrusted call created a new row: %d → %d", seeded.ID, got.ID)
+	}
+	if got.Endpoint.String != "peer://nas" {
+		t.Fatalf("returned endpoint = %q, want the untouched peer://nas placeholder", got.Endpoint.String)
+	}
+	persisted, _ := s.GetNodeByName(ctx, "nas")
+	if persisted.Endpoint.String != "peer://nas" {
+		t.Fatalf("persisted endpoint = %q, want the placeholder left in place", persisted.Endpoint.String)
 	}
 }

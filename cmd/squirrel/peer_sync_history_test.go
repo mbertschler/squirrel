@@ -67,7 +67,7 @@ func seedPeerSyncHistory(t *testing.T, dbPath, volumeName, peerName string, wate
 	if err != nil {
 		t.Fatalf("look up volume %q: %v", volumeName, err)
 	}
-	peer, err := s.GetOrCreatePeerNode(ctx, peerName, "http://nas.example")
+	peer, err := s.GetOrCreatePeerNode(ctx, peerName, "http://nas.example", true)
 	if err != nil {
 		t.Fatalf("create peer %q: %v", peerName, err)
 	}

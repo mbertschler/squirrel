@@ -231,7 +231,7 @@ func (d *nodeSyncDriver) run() error {
 // invocations against the same (volume, peer) can't both proceed —
 // the loser surfaces the same diagnostic the bucket path does.
 func (d *nodeSyncDriver) phaseBegin() error {
-	peer, err := d.store.GetOrCreatePeerNode(d.ctx, d.node.Name, d.node.Endpoint.String())
+	peer, err := d.store.GetOrCreatePeerNode(d.ctx, d.node.Name, d.node.Endpoint.String(), true)
 	if err != nil {
 		return fmt.Errorf("record peer node: %w", err)
 	}

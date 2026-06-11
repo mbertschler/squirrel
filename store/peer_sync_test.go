@@ -16,7 +16,7 @@ func TestUpsertPeerSyncStateWritesHistory(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 	vID := makeVolume(t, s, "/v")
-	peer, err := s.GetOrCreatePeerNode(ctx, "nas", "http://nas.example")
+	peer, err := s.GetOrCreatePeerNode(ctx, "nas", "http://nas.example", true)
 	if err != nil {
 		t.Fatalf("GetOrCreatePeerNode: %v", err)
 	}
@@ -61,7 +61,7 @@ func TestUpsertPeerSyncStateRefusesRewind(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 	vID := makeVolume(t, s, "/v")
-	peer, _ := s.GetOrCreatePeerNode(ctx, "nas", "http://nas.example")
+	peer, _ := s.GetOrCreatePeerNode(ctx, "nas", "http://nas.example", true)
 
 	if err := s.UpsertPeerSyncState(ctx, vID, peer.ID, 42, false); err != nil {
 		t.Fatalf("seed watermark: %v", err)
@@ -97,7 +97,7 @@ func TestUpsertPeerSyncStateAllowRewind(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 	vID := makeVolume(t, s, "/v")
-	peer, _ := s.GetOrCreatePeerNode(ctx, "nas", "http://nas.example")
+	peer, _ := s.GetOrCreatePeerNode(ctx, "nas", "http://nas.example", true)
 
 	if err := s.UpsertPeerSyncState(ctx, vID, peer.ID, 42, false); err != nil {
 		t.Fatalf("seed watermark: %v", err)
@@ -124,7 +124,7 @@ func TestSetCorrelatedRunIDWritesAudit(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 	vID := makeVolume(t, s, "/v")
-	peer, _ := s.GetOrCreatePeerNode(ctx, "nas", "http://nas.example")
+	peer, _ := s.GetOrCreatePeerNode(ctx, "nas", "http://nas.example", true)
 	// Use the initiator's real path: BeginSyncRunIfClear leaves
 	// correlated_run_id NULL, so the first stamp transitions none->value.
 	runID, blocker, err := s.BeginSyncRunIfClear(ctx, SyncRunSpec{

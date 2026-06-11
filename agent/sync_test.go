@@ -1,8 +1,12 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -463,4 +467,253 @@ func TestConflictDriftRelabelClearsOrigin(t *testing.T) {
 		t.Fatalf("preserved drifted row origin = (%+v, %+v), want NULLs (local introduction)",
 			row.OriginNodeID, row.OriginRunID)
 	}
+}
+
+// TestPlanRejectsSelfAttributedOrigin (#105): a peer is never
+// authoritative about the receiver's own introductions, so an origin
+// naming the receiver's self node is refused at /plan — whether it
+// carries a plausible run id (a peer must re-introduce locally with a
+// NULL origin) or an absurd one above the receiver's latest allocated
+// run id (the durability-vector poisoning attack). A legitimate
+// forwarded third-party origin under the same plan still commits.
+func TestPlanRejectsSelfAttributedOrigin(t *testing.T) {
+	ctx := context.Background()
+	f := newPreStageFixture(t)
+	self, err := f.store.GetSelfNode(ctx)
+	if err != nil {
+		t.Fatalf("GetSelfNode: %v", err)
+	}
+	content := []byte("incoming bytes")
+
+	t.Run("self name with plausible run refused", func(t *testing.T) {
+		sess := f.newSession()
+		_, err := f.router.planSession(ctx, sess, []syncproto.IndexEntry{
+			{Path: "a.txt", Blake3Hex: blakeHex(content), SizeBytes: int64(len(content)),
+				OriginNode: self.Name, OriginRun: 1},
+		})
+		if err == nil {
+			t.Fatalf("planSession accepted a self-attributed origin, want refusal")
+		}
+	})
+
+	t.Run("self name with absurd run refused", func(t *testing.T) {
+		sess := f.newSession()
+		_, err := f.router.planSession(ctx, sess, []syncproto.IndexEntry{
+			{Path: "a.txt", Blake3Hex: blakeHex(content), SizeBytes: int64(len(content)),
+				OriginNode: self.Name, OriginRun: sess.receiverRunID + 1_000_000},
+		})
+		if err == nil {
+			t.Fatalf("planSession accepted an absurd self origin_run, want refusal")
+		}
+	})
+
+	t.Run("forwarded third-party origin accepted", func(t *testing.T) {
+		sess := f.newSession()
+		if _, err := f.router.planSession(ctx, sess, []syncproto.IndexEntry{
+			{Path: "fwd.txt", Blake3Hex: blakeHex(content), SizeBytes: int64(len(content)),
+				OriginNode: "delta", OriginRun: 7},
+		}); err != nil {
+			t.Fatalf("planSession refused a legitimate third-party origin: %v", err)
+		}
+		if _, err := f.router.closeSession(ctx, sess, store.RunStatusSuccess, nil); err != nil {
+			t.Fatalf("closeSession: %v", err)
+		}
+		row, err := f.store.GetByPath(ctx, f.volID, "fwd.txt")
+		if err != nil {
+			t.Fatalf("GetByPath fwd.txt: %v", err)
+		}
+		delta, err := f.store.GetNodeByName(ctx, "delta")
+		if err != nil {
+			t.Fatalf("origin node delta not created: %v", err)
+		}
+		if !row.OriginNodeID.Valid || row.OriginNodeID.Int64 != delta.ID {
+			t.Fatalf("OriginNodeID = %+v, want delta's row %d", row.OriginNodeID, delta.ID)
+		}
+		if !row.OriginRunID.Valid || row.OriginRunID.Int64 != 7 {
+			t.Fatalf("OriginRunID = %+v, want 7 (origin run space, untranslated)", row.OriginRunID)
+		}
+	})
+}
+
+// TestPreStageTransferPreservesOutOfBandFile (#106a): a regular file
+// dropped at a Transfer destination out-of-band (no live index row) must
+// be moved into .squirrel-history/run-<id>/ before the rclone pass
+// overwrites it, since node syncs run without --backup-dir. The destination
+// is freed for the incoming bytes and the prior bytes stay recoverable.
+func TestPreStageTransferPreservesOutOfBandFile(t *testing.T) {
+	ctx := context.Background()
+	f := newPreStageFixture(t)
+
+	outOfBand := []byte("bytes a web app dropped in, never indexed")
+	incoming := []byte("the initiator's incoming content")
+	abs := filepath.Join(f.vol.Path, "drop.bin")
+	if err := os.WriteFile(abs, outOfBand, 0o644); err != nil {
+		t.Fatalf("write out-of-band file: %v", err)
+	}
+
+	sess := f.newSession()
+	plan, err := f.router.planSession(ctx, sess, []syncproto.IndexEntry{
+		{Path: "drop.bin", Blake3Hex: blakeHex(incoming), SizeBytes: int64(len(incoming))},
+	})
+	if err != nil {
+		t.Fatalf("planSession: %v", err)
+	}
+	if got := sess.dispositions["drop.bin"].disposition; got != syncproto.DispositionTransfer {
+		t.Fatalf("disposition = %q, want transfer", got)
+	}
+	if len(plan.Conflicts) != 0 {
+		t.Fatalf("conflicts = %d, want 0 (a plain out-of-band file is history, not a conflict)", len(plan.Conflicts))
+	}
+
+	// The destination is now free for rclone to deliver the incoming bytes.
+	if _, err := os.Lstat(abs); !os.IsNotExist(err) {
+		t.Fatalf("Lstat drop.bin err = %v, want the destination cleared for the transfer", err)
+	}
+
+	// The prior bytes are preserved verbatim under this run's history dir.
+	histPath := filepath.Join(f.vol.Path, HistoryDirName, "run-"+strconv.FormatInt(f.recvRun, 10), "drop.bin")
+	got, err := os.ReadFile(histPath)
+	if err != nil {
+		t.Fatalf("read preserved history file: %v", err)
+	}
+	if string(got) != string(outOfBand) {
+		t.Fatalf("preserved bytes = %q, want the out-of-band bytes", got)
+	}
+}
+
+// TestValidateRelPathRejectsAllReservedDirs (#106b): the receiver's wire
+// path allow-list must reject all four reserved sync directories, matching
+// the initiator-side filter. A path under .squirrel-restore-history or
+// .squirrel-index could otherwise let a peer overwrite the receiver's only
+// pre-restore backup or its index ride-along.
+func TestValidateRelPathRejectsAllReservedDirs(t *testing.T) {
+	reserved := []string{
+		HistoryDirName + "/run-1/x",
+		ConflictsDirName + "/run-1/x",
+		RestoreHistoryDirName + "/run-1/x",
+		IndexDirName + "/index.db",
+		RestoreHistoryDirName,
+		IndexDirName,
+	}
+	for _, p := range reserved {
+		t.Run(p, func(t *testing.T) {
+			if err := validateRelPath(p); err == nil {
+				t.Fatalf("validateRelPath(%q) = nil, want a reserved-dir rejection", p)
+			}
+			if err := validateFolderPath(p); err == nil {
+				t.Fatalf("validateFolderPath(%q) = nil, want a reserved-dir rejection", p)
+			}
+		})
+	}
+	if err := validateRelPath("photos/2024/img.jpg"); err != nil {
+		t.Fatalf("validateRelPath rejected an ordinary path: %v", err)
+	}
+}
+
+// TestSessionBoundToCaller (#110a): a phase call presenting a caller
+// identity that differs from the node that opened the session is refused.
+// The single shared agent token carries no per-request identity yet
+// (#110d), so the production phase handlers pass "" (no binding) — this
+// exercises the binding directly to prove the chokepoint is correct for
+// when per-peer tokens make a caller identity recoverable.
+func TestSessionBoundToCaller(t *testing.T) {
+	f := newPreStageFixture(t)
+	r := f.router
+	r.storeSession(&peerSession{
+		receiverRunID:     f.recvRun,
+		volume:            f.vol,
+		volumeID:          f.volID,
+		peerNodeID:        f.peerID,
+		initiatorNodeName: "owner",
+		dispositions:      make(map[string]*sessionEntry),
+	})
+
+	if _, _, err := r.lookupSession(f.recvRun, "intruder"); err == nil {
+		t.Fatalf("lookupSession bound to a foreign caller, want %v", errSessionCallerMismatch)
+	}
+	if sess, ok, err := r.lookupSession(f.recvRun, "owner"); err != nil || !ok || sess == nil {
+		t.Fatalf("lookupSession for the owning caller = (%v, %v, %v), want the session", sess, ok, err)
+	}
+	if sess, ok, err := r.lookupSession(f.recvRun, ""); err != nil || !ok || sess == nil {
+		t.Fatalf("lookupSession with no caller identity = (%v, %v, %v), want the session (pre-#110d)", sess, ok, err)
+	}
+	// A foreign caller must not be able to take (and thereby abort) the
+	// session: it stays in place for the legitimate owner.
+	if _, _, err := r.takeSession(f.recvRun, "intruder"); err == nil {
+		t.Fatalf("takeSession bound to a foreign caller, want %v", errSessionCallerMismatch)
+	}
+	if sess, ok, err := r.takeSession(f.recvRun, "owner"); err != nil || !ok || sess == nil {
+		t.Fatalf("takeSession for the owning caller = (%v, %v, %v), want the session removed", sess, ok, err)
+	}
+}
+
+// TestPlanRejectsOversizedBody (#110c): /plan wraps the request body in
+// http.MaxBytesReader, so a body past the cap is refused with 400 before
+// it can be buffered into memory — a token-holding peer can't OOM the
+// agent with one huge body. A separate len(Entries) cap guards against an
+// entry count that stays within the byte ceiling.
+func TestPlanRejectsOversizedBody(t *testing.T) {
+	vol := &config.Volume{Name: "pics", Path: t.TempDir()}
+	srv := newTestServer(t, Config{Volumes: map[string]*config.Volume{vol.Name: vol}})
+
+	t.Run("body over the byte cap", func(t *testing.T) {
+		prev := maxPlanBodyBytes
+		maxPlanBodyBytes = 64
+		defer func() { maxPlanBodyBytes = prev }()
+
+		body := append([]byte(`{"receiver_run_id":1,"entries":[`), bytes.Repeat([]byte(" "), 256)...)
+		body = append(body, ']', '}')
+		if code := postRaw(t, srv, "/v1/sync/plan", body); code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 for an over-cap body", code)
+		}
+	})
+
+	t.Run("entry count over the cap", func(t *testing.T) {
+		prev := maxPlanEntries
+		maxPlanEntries = 1
+		defer func() { maxPlanEntries = prev }()
+
+		req := syncproto.PlanRequest{
+			ReceiverRunID: 1,
+			Entries: []syncproto.IndexEntry{
+				{Path: "a.txt", Blake3Hex: blakeHex([]byte("a"))},
+				{Path: "b.txt", Blake3Hex: blakeHex([]byte("b"))},
+			},
+		}
+		encoded, err := json.Marshal(req)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if code := postRaw(t, srv, "/v1/sync/plan", encoded); code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 for an over-cap entry count", code)
+		}
+	})
+}
+
+// TestPeerEndpointIgnoresWireEndpoint (#110b): the receiver derives the
+// peer-row endpoint from the node name alone, never the unauthenticated
+// InitiatorEndpoint, so a peer cannot bind an arbitrary dial-back URL at
+// /begin. A real endpoint is bound only by operator config on the
+// initiator side.
+func TestPeerEndpointIgnoresWireEndpoint(t *testing.T) {
+	got := peerEndpoint(syncproto.BeginRequest{
+		InitiatorNodeName: "owner",
+		InitiatorEndpoint: "https://attacker.example:8443",
+	})
+	if got != "peer://owner" {
+		t.Fatalf("peerEndpoint = %q, want the name-derived placeholder peer://owner", got)
+	}
+}
+
+// postRaw POSTs body verbatim to urlPath with the test bearer token and
+// returns the HTTP status, so a malformed or oversized body can be driven
+// without the typed marshal helpers rejecting it first.
+func postRaw(t *testing.T, srv *Server, urlPath string, body []byte) int {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, urlPath, bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	return rec.Code
 }

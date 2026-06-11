@@ -17,7 +17,7 @@ import (
 // caller.
 func (r *peerSyncRouter) handleDurability(w http.ResponseWriter, req *http.Request) {
 	var body syncproto.DurabilityRequest
-	if err := decodeJSON(req, &body); err != nil {
+	if err := decodeJSON(w, req, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}

@@ -532,12 +532,6 @@ func TestVerifyReportsMismatch(t *testing.T) {
 	f := setupNodeFixture(t)
 	ctx := context.Background()
 
-	// Plant a file on disk at the receiver. This represents bytes
-	// that arrived after a (mocked) rclone transfer.
-	if err := os.WriteFile(filepath.Join(f.recvVol.Path, "a.txt"), []byte("not-what-initiator-claims"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
 	initSelf, _ := f.initStore.GetSelfNode(ctx)
 	client := newNodeClient(f.node)
 	begin, err := client.begin(ctx, syncproto.BeginRequest{
@@ -564,6 +558,14 @@ func TestVerifyReportsMismatch(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("/plan: %v", err)
+	}
+	// Plant a file on disk at the receiver after /plan: this represents
+	// the bytes a (mocked) rclone transfer delivered to the Transfer
+	// destination, with content that doesn't match the initiator's claim.
+	// Planting it post-plan keeps it clear of the Transfer pre-stage,
+	// which moves any out-of-band pre-existing file aside.
+	if err := os.WriteFile(filepath.Join(f.recvVol.Path, "a.txt"), []byte("not-what-initiator-claims"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 	v, err := client.verify(ctx, syncproto.VerifyRequest{ReceiverRunID: begin.ReceiverRunID})
 	if err != nil {
@@ -1587,7 +1589,7 @@ func TestPlanSupersedeWinsOverDedup(t *testing.T) {
 	// watermark that puts the target row's provenance "at or before"
 	// the shared watermark.
 	initSelf, _ := f.initStore.GetSelfNode(ctx)
-	peer, err := f.recvStore.GetOrCreatePeerNode(ctx, initSelf.Name, "peer://"+initSelf.Name)
+	peer, err := f.recvStore.GetOrCreatePeerNode(ctx, initSelf.Name, "peer://"+initSelf.Name, false)
 	if err != nil {
 		t.Fatalf("GetOrCreatePeerNode: %v", err)
 	}

@@ -118,8 +118,10 @@ type BeginRequest struct {
 	// row fails the handshake.
 	InitiatorNodeName string `json:"initiator_node_name"`
 	// InitiatorEndpoint is the URL the receiver could in theory dial
-	// back to reach the initiator. Stored on the peer nodes row for
-	// future symmetry; not used by PR 3.
+	// back to reach the initiator. The receiver currently ignores it —
+	// a peer-supplied endpoint must not bind a dial-back URL from
+	// unauthenticated wire input (#110b) — so it stays only for wire
+	// compatibility until an operator-verified dial-back path exists.
 	InitiatorEndpoint string `json:"initiator_endpoint,omitempty"`
 	// InitiatorRunID is the initiator's *local* runs.id for this
 	// sync. The receiver records it as runs.correlated_run_id and

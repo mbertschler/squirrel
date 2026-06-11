@@ -115,16 +115,24 @@ func (s *Store) GetOrCreateOriginNode(ctx context.Context, name string) (Node, e
 // peers with different endpoints is a configuration drift we'd
 // rather refuse than silently accept (the bearer token is per-peer,
 // so a name collision with a real peer would also be an auth
-// boundary issue). One stored value is upgradeable: the name-derived
+// boundary issue).
+//
+// allowEndpointUpgrade gates the one mutating case: the name-derived
 // "peer://<name>" placeholder (written for initiators that expose no
 // URL, and for nodes first met as a forwarded origin) is replaced by
-// the presented endpoint on first real contact.
+// the presented endpoint on first real contact. Only an
+// operator-configured caller (the initiator dialling its own
+// config-declared peer) passes true; the receiver-side /begin path
+// passes false because its endpoint derives from unauthenticated wire
+// input, so a peer must not be able to bind an arbitrary dial-back URL
+// to a placeholder. With it false an existing row is returned verbatim
+// and the presented endpoint is used only to create an absent row.
 //
 // The self-row is intentionally NOT returned by this function — its
 // endpoint is NULL, and a peer claiming the self-name would be
 // caught here by the "different endpoint" comparison (NULL vs.
 // non-empty) and rejected.
-func (s *Store) GetOrCreatePeerNode(ctx context.Context, name, endpoint string) (Node, error) {
+func (s *Store) GetOrCreatePeerNode(ctx context.Context, name, endpoint string, allowEndpointUpgrade bool) (Node, error) {
 	if endpoint == "" {
 		return Node{}, errors.New("peer endpoint must not be empty")
 	}
@@ -134,6 +142,9 @@ func (s *Store) GetOrCreatePeerNode(ctx context.Context, name, endpoint string) 
 			return Node{}, fmt.Errorf("node %q is the local self-row; refusing to overwrite with peer endpoint %q", name, endpoint)
 		}
 		if existing.Endpoint.String == endpoint {
+			return existing, nil
+		}
+		if !allowEndpointUpgrade {
 			return existing, nil
 		}
 		if existing.Endpoint.String == placeholderEndpoint(name) {
