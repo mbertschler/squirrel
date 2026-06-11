@@ -181,7 +181,7 @@ func (h *contentAddressedHandler) watermark(ctx context.Context, volID int64) (i
 	}
 	segURI := h.segmentURI(last.ID)
 	if _, err := h.rcl.statRemote(ctx, segURI); err != nil {
-		return 0, fmt.Errorf("destination %q: the last successful sync (run %d) left no manifest segment at %s (%v) — its history does not look content-addressed; point the layout at a fresh destination or root instead of switching an existing one", h.dest.Name, last.ID, segURI, err)
+		return 0, fmt.Errorf("destination %q: the last successful sync (run %d) left no manifest segment at %s — its history does not look content-addressed; point the layout at a fresh destination or root instead of switching an existing one: %w", h.dest.Name, last.ID, segURI, err)
 	}
 	return last.ID, nil
 }
@@ -290,7 +290,7 @@ func (h *contentAddressedHandler) uploadSegment(ctx context.Context, delta []sto
 	if err != nil {
 		return fmt.Errorf("stage manifest segment: %w", err)
 	}
-	defer os.Remove(tmp.Name())
+	defer func() { _ = os.Remove(tmp.Name()) }()
 	if _, err := tmp.Write(body); err != nil {
 		tmp.Close()
 		return fmt.Errorf("write manifest segment: %w", err)
