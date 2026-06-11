@@ -72,13 +72,13 @@ Some optional params are specific to one backend type and rejected on the others
   host_key_algorithms = "ssh-ed25519 ssh-rsa"     # optional: pin accepted host-key algorithms
   ```
 
-- **`s3` storage class** — `storage_class` maps to rclone's s3 `storage_class` config key and accepts whatever value the backend supports (commonly `STANDARD` and various archive tiers such as `GLACIER` or `DEEP_ARCHIVE`); absent, the backend's default class is used.
+- **`s3` storage class** — `storage_class` maps to rclone's s3 `storage_class` config key and accepts whatever value the chosen s3-compatible backend supports (typically a default tier plus one or more cheaper archive/cold tiers); absent, the backend's default class is used. Use the exact value string your provider documents.
 
   ```toml
   [destinations.offsite]
   type          = "s3"
   # ...
-  storage_class = "DEEP_ARCHIVE"   # backend-specific; archive tiers cost less to store, more to read
+  storage_class = "<provider archive tier>"   # archive tiers cost less to store, more to read
   ```
 
 Squirrel writes its own `rclone.conf` next to the config (`~/.squirrel/rclone.conf`, mode 0600) on every sync invocation. You do not run `rclone config` and you should not edit `rclone.conf` by hand.
