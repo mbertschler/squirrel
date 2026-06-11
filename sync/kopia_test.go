@@ -471,6 +471,76 @@ func TestKopiaVerifyFilesPercentDefault(t *testing.T) {
 	}
 }
 
+// TestKopiaVerifyFilesPercentRejectsZero pins the chosen finding-2
+// behavior: verify_files_percent = "0" is a configuration error, not an
+// accepted value. kopia accepts 0 (verify manifests and object existence,
+// read no file bytes), but a kopia component gates offload as
+// content-verified, so a zero-byte verify would let the gate delete the
+// only local copy on the strength of a check that read none of the
+// content. Negative and out-of-range values are rejected the same way; a
+// positive value passes.
+func TestKopiaVerifyFilesPercentRejectsZero(t *testing.T) {
+	for _, tc := range []struct {
+		raw     string
+		wantErr bool
+	}{
+		{"0", true},
+		{"0.0", true},
+		{"-1", true},
+		{"100.5", true},
+		{"not-a-number", true},
+		{"0.5", false},
+		{"100", false},
+	} {
+		t.Run(tc.raw, func(t *testing.T) {
+			dest := &config.Destination{
+				Name:   "mirror",
+				Params: map[string]string{"verify_files_percent": tc.raw},
+			}
+			_, err := kopiaVerifyFilesPercent(dest)
+			if tc.wantErr && err == nil {
+				t.Fatalf("verify_files_percent %q: want error, got nil", tc.raw)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("verify_files_percent %q: unexpected error: %v", tc.raw, err)
+			}
+		})
+	}
+}
+
+// TestKopiaPushFailsOnZeroVerifyPercent: end-to-end, a kopia push with
+// verify_files_percent = "0" fails rather than landing a content-verified
+// advance off a zero-byte verification.
+func TestKopiaPushFailsOnZeroVerifyPercent(t *testing.T) {
+	installFakeKopia(t)
+	f := setupKopiaFixtureWithPercent(t, "0")
+
+	rep, err := RunPair(context.Background(), f.store, f.tools, f.pair, Options{})
+	if err == nil {
+		t.Fatalf("RunPair: want error for verify_files_percent 0, got nil (status %v)", rep.Status)
+	}
+	if !strings.Contains(err.Error(), "verify_files_percent") {
+		t.Fatalf("error = %v, want it to name verify_files_percent", err)
+	}
+	vector, verr := f.store.ListDestinationRunIDs(context.Background(), volIDForKopia(t, f), "mirror")
+	if verr != nil {
+		t.Fatalf("ListDestinationRunIDs: %v", verr)
+	}
+	if len(vector) != 0 {
+		t.Fatalf("vector = %+v, want no advance on a rejected verify percent", vector)
+	}
+}
+
+// volIDForKopia resolves the kopia fixture volume's id.
+func volIDForKopia(t *testing.T, f *kopiaFixture) int64 {
+	t.Helper()
+	v, err := f.store.GetVolumeByName(context.Background(), "pics")
+	if err != nil {
+		t.Fatalf("GetVolumeByName: %v", err)
+	}
+	return v.ID
+}
+
 // TestKopiaAdvanceScopedToCapturedPresentSet is the #108 scope fix: the
 // kopia push advances the vector to the present-set snapshot captured at
 // push start, recorded with the kopia-verify method — not whatever

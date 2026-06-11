@@ -210,9 +210,14 @@ func (h *kopiaHandler) sealed() {}
 
 // kopiaVerifyFilesPercent resolves the destination's verify_files_percent
 // param, falling back to DefaultVerifyFilesPercent when unset. The value
-// is a percentage in [0, 100]; a malformed or out-of-range value is a
-// configuration error rather than a silent fallback, since it governs how
-// much content a gating verification actually reads.
+// is a percentage in (0, 100]; a malformed, out-of-range, or zero value
+// is a configuration error rather than a silent fallback, since it
+// governs how much content a gating verification actually reads. Zero is
+// rejected explicitly: kopia accepts it (verify manifests and object
+// existence, read no file bytes) but a kopia component gates offload as
+// content-verified, so a zero-byte verify would let the gate delete the
+// only local copy on the strength of a check that read none of the
+// content.
 func kopiaVerifyFilesPercent(dest *config.Destination) (float64, error) {
 	raw, ok := dest.Params["verify_files_percent"]
 	if !ok || raw == "" {
@@ -222,8 +227,8 @@ func kopiaVerifyFilesPercent(dest *config.Destination) (float64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("destination %q: verify_files_percent %q is not a number", dest.Name, raw)
 	}
-	if pct < 0 || pct > 100 {
-		return 0, fmt.Errorf("destination %q: verify_files_percent %v is outside [0, 100]", dest.Name, pct)
+	if pct <= 0 || pct > 100 {
+		return 0, fmt.Errorf("destination %q: verify_files_percent %v is outside (0, 100] — a kopia verify that gates offload must read a non-zero fraction of file bytes", dest.Name, pct)
 	}
 	return pct, nil
 }
