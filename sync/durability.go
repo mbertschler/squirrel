@@ -13,8 +13,8 @@ import (
 // DurabilityPullReport summarises one durability metadata pull from a
 // peer: how many vector components were fetched, how many landed in
 // the local destination_run_ids (advanced or re-confirmed), and which
-// were refused as rewinds. Fetched > Applied + len(Rewinds) never
-// holds — every component is either applied or refused.
+// were refused as rewinds. Every fetched component lands in exactly
+// one of the two buckets.
 type DurabilityPullReport struct {
 	Volume  string
 	Peer    string
