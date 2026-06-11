@@ -55,7 +55,7 @@ bucket            = "squirrel-backup"
 root              = "/squirrel"
 ```
 
-Supported destination types: `local`, `sftp`, `s3`, `b2`, `gcs`. Secrets accept either a literal string or an inline `{ env = "VAR_NAME" }` table that is resolved at load time. Unknown fields, missing required fields, and unset env vars are rejected immediately — squirrel will not invoke rclone with a misconfigured destination.
+Supported destination types: `local`, `sftp`, `s3`, `b2`, `gcs` (rclone-backed), and `kopia` (see [kopia destinations](#kopia-destinations)). Secrets accept either a literal string or an inline `{ env = "VAR_NAME" }` table that is resolved at load time. Unknown fields, missing required fields, and unset env vars are rejected immediately — squirrel will not invoke rclone with a misconfigured destination.
 
 Squirrel writes its own `rclone.conf` next to the config (`~/.squirrel/rclone.conf`, mode 0600) on every sync invocation. You do not run `rclone config` and you should not edit `rclone.conf` by hand.
 
@@ -76,9 +76,32 @@ Two properties to be aware of:
 - **Contents only.** File and directory names are stored in clear at the destination (`filename_encryption = off`, fixed by design) — the tree stays browsable and keeps the same layout as an unencrypted destination. If the names themselves are sensitive, this overlay does not hide them.
 - **Verification falls back to size+mtime.** rclone crypt remotes cannot expose content hashes, so the end-to-end BLAKE3 check (`--checksum --hash blake3`) cannot pass through the overlay. Transfers to and from an encrypted destination compare by size+mtime instead — the same comparison `--shallow` uses — and say so in the run output; the runs row records the transfer as shallow. Deeper verification of encrypted destinations is planned via provider-side ciphertext fingerprints.
 
+### Kopia destinations
+
+A `kopia` destination pushes a volume into a local [kopia](https://kopia.io) repository instead of an rclone remote — useful as a second, independently-verifiable backup format on another disk:
+
+```toml
+[destinations.mirror]
+type     = "kopia"
+root     = "/mnt/backup/kopia-repo"      # repository path
+password = { env = "KOPIA_REPO_PASSWORD" }
+
+[volumes.pictures]
+path    = "~/Pictures"
+sync_to = ["nas", "mirror"]
+```
+
+Like rclone, the kopia binary is driven as an opaque child process with squirrel owning the command line: each sync connects to the repository at `root` (creating it on first use), runs `kopia snapshot create` on the volume path, then `kopia snapshot verify` on the new snapshot. The repository password is passed to kopia via its environment, never on the command line, and the per-destination kopia config file lives next to squirrel's own config — your personal kopia configuration is never touched.
+
+Properties that differ from rclone destinations:
+
+- **kopia verifies its own content hashes**, so the runs row is always recorded as fully verified (never shallow), and `--shallow` has no effect on kopia pairs. `--dry-run` is refused — kopia has no equivalent.
+- **A `crypt` block is rejected**: kopia encrypts its repository itself. Keep the repository password safe; the repository is unreadable without it.
+- **Restore goes through the kopia CLI** (`kopia snapshot restore`), since the repository is kopia's own format. `squirrel restore` refuses kopia destinations and says so.
+
 ### Hooks
 
-A volume can declare a per-volume **hook** — a command the agent runs to nudge an external tool when the volume's content changes. squirrel stays tool-agnostic: it never learns what the command does (a backup with kopia/restic, an `rclone copy`, a shell script — all the same to squirrel). It exec's the command **without a shell**, passes context through environment variables, and records only the generic outcome (exit code, timestamps).
+A volume can declare a per-volume **hook** — a command the agent runs to nudge an external tool when the volume's content changes. squirrel stays tool-agnostic: it never learns what the command does (a backup with kopia/restic, an `rclone copy`, a shell script — all the same to squirrel). It exec's the command **without a shell**, passes context through environment variables, and records only the generic outcome (exit code, timestamps). That generic outcome is the ceiling: only the built-in destination types report verification results; a hook's exit code never counts as one. (For kopia specifically, squirrel can own the snapshot end-to-end instead via a [kopia destination](#kopia-destinations).)
 
 ```toml
 [volumes.pictures.hook]
