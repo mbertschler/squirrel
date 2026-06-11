@@ -62,9 +62,15 @@ func runPeerSyncPullDurability(cmd *cobra.Command, volumeName, peerName string, 
 }
 
 func printDurabilityPull(w io.Writer, rep sync.DurabilityPullReport) {
-	fmt.Fprintf(w, "%s ← %s  fetched=%d applied=%d\n",
-		rep.Volume, rep.Peer, rep.Fetched, rep.Applied)
+	fmt.Fprintf(w, "%s ← %s  fetched=%d applied=%d dropped=%d\n",
+		rep.Volume, rep.Peer, rep.Fetched, rep.Applied, rep.Dropped)
 	for _, rw := range rep.Rewinds {
 		fmt.Fprintf(w, "  refused rewind: %s\n", rw)
+	}
+	for _, dr := range rep.Drops {
+		fmt.Fprintf(w, "  dropped %s\n", dr)
+	}
+	if more := rep.Dropped - len(rep.Drops); more > 0 {
+		fmt.Fprintf(w, "  … and %d more dropped\n", more)
 	}
 }

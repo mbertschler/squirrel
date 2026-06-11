@@ -73,6 +73,7 @@ func newPullDurabilityFixture(t *testing.T) pullDurabilityFixture {
 
 [volumes.pics]
 path = %q
+offload_requires = ["offsite-a"]
 
 [nodes.nas]
 endpoint = %q
