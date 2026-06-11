@@ -577,15 +577,19 @@ func EffectiveShallow(dest *config.Destination, shallow bool) bool {
 }
 
 // ShallowForPairs reports whether an invocation covering pairs runs
-// entirely without BLAKE3 verification: either the operator passed
-// --shallow, or every target is a crypt destination that forces it.
-// Used to scope the rclone version preflight to what the run will
-// actually invoke.
+// rclone entirely without BLAKE3 verification: either the operator
+// passed --shallow, or every rclone-driven target is a crypt
+// destination that forces it. Kopia pairs are skipped — they drive the
+// kopia binary, so they put no constraint on rclone. Used to scope the
+// rclone version preflight to what the run will actually invoke.
 func ShallowForPairs(pairs []Pair, shallow bool) bool {
 	if shallow {
 		return true
 	}
 	for _, p := range pairs {
+		if p.Destination != nil && p.Destination.Type == "kopia" {
+			continue
+		}
 		if p.Destination == nil || p.Destination.Crypt == nil {
 			return false
 		}
@@ -737,6 +741,9 @@ type RestoreOptions struct {
 // unless they explicitly intend to restore in place.
 func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, dest *config.Destination, opts RestoreOptions) (rep Report, err error) {
 	rep = Report{Volume: vol.Name, Destination: dest.Name}
+	if dest.Type == "kopia" {
+		return rep, fmt.Errorf("destination %q is a kopia repository — restore from it with the kopia CLI (`kopia snapshot restore`)", dest.Name)
+	}
 	if w := cryptVerificationWarning(dest, opts.Shallow); w != "" {
 		rep.Warnings = append(rep.Warnings, w)
 	}

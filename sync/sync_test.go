@@ -723,6 +723,7 @@ func TestShallowForPairs(t *testing.T) {
 	plain := cryptFixtureDest()
 	plain.Crypt = nil
 	node := Pair{Node: &config.Node{Name: "peer"}}
+	kopia := Pair{Destination: &config.Destination{Name: "mirror", Type: "kopia", Root: "/tmp/repo"}}
 	cases := []struct {
 		name    string
 		pairs   []Pair
@@ -733,6 +734,8 @@ func TestShallowForPairs(t *testing.T) {
 		{"all crypt", []Pair{{Destination: crypt}, {Destination: crypt}}, false, true},
 		{"mixed crypt and plain", []Pair{{Destination: crypt}, {Destination: plain}}, false, false},
 		{"node target verifies", []Pair{{Destination: crypt}, node}, false, false},
+		{"kopia pair puts no constraint on rclone", []Pair{kopia, {Destination: crypt}}, false, true},
+		{"kopia beside plain still verifies", []Pair{kopia, {Destination: plain}}, false, false},
 		{"no pairs", nil, false, true},
 	}
 	for _, c := range cases {

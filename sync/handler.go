@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 
 	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/store"
@@ -21,6 +22,9 @@ const (
 	// VerifyMethodPeer is the node-sync handshake's receiver-side
 	// BLAKE3 re-hash of every delivered path.
 	VerifyMethodPeer = "peer-blake3"
+	// VerifyMethodKopia is kopia's own repository consistency check
+	// (`kopia snapshot verify`).
+	VerifyMethodKopia = "kopia-verify"
 )
 
 // VerifyResult is the typed durability report of one handler push: how
@@ -45,9 +49,31 @@ type VerifyResult struct {
 func (v VerifyResult) Verified() bool { return v.verified }
 
 // Tools bundles the configured external-tool wrappers the curated
-// handlers drive. Rclone backs bucket and peer targets.
+// handlers drive. Rclone backs bucket and peer targets; Kopia backs
+// kopia targets and is filled in by ToolsFor exactly when a pair needs
+// it.
 type Tools struct {
 	Rclone *Rclone
+	Kopia  *Kopia
+}
+
+// ToolsFor bundles the wrappers pairs need: the caller's configured
+// rclone wrapper plus, when any pair targets a kopia destination, a
+// kopia wrapper whose destination config files live next to the
+// squirrel config — the same directory rclone.conf is managed in.
+func ToolsFor(cfg *config.Config, pairs []Pair, rcl *Rclone) (Tools, error) {
+	tools := Tools{Rclone: rcl}
+	for _, p := range pairs {
+		if p.Destination != nil && p.Destination.Type == "kopia" {
+			kop, err := FindKopia(filepath.Dir(cfg.Path))
+			if err != nil {
+				return Tools{}, err
+			}
+			tools.Kopia = kop
+			break
+		}
+	}
+	return tools, nil
 }
 
 // Handler is the curated, type-determined driver for one (volume,
@@ -80,6 +106,11 @@ func HandlerFor(s *store.Store, tools Tools, p Pair) (Handler, error) {
 		return &peerHandler{store: s, rcl: tools.Rclone, vol: p.Volume, node: p.Node}, nil
 	case p.Destination == nil:
 		return nil, errors.New("pair names no destination or node")
+	case p.Destination.Type == "kopia":
+		if tools.Kopia == nil {
+			return nil, fmt.Errorf("destination %q: kopia wrapper is required (build Tools via ToolsFor)", p.Destination.Name)
+		}
+		return &kopiaHandler{store: s, kopia: tools.Kopia, vol: p.Volume, dest: p.Destination}, nil
 	default:
 		if tools.Rclone == nil {
 			return nil, fmt.Errorf("destination %q: rclone wrapper is required", p.Destination.Name)
