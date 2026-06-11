@@ -123,15 +123,18 @@ type VolumeHook struct {
 // skipped rather than stacked.
 const DefaultHookTimeout = time.Hour
 
-// Destination is one rclone-backed remote. Type drives which Params are
-// required and how the destination is rendered into rclone.conf.
+// Destination is one sync target driven by a curated external tool. Type
+// selects the handler and drives which Params are required: the rclone
+// types (local, sftp, s3, b2, gcs) render into rclone.conf, while
+// type=kopia drives the kopia binary against a local repository.
 type Destination struct {
 	Name string
-	Type string // local, sftp, s3, b2, gcs
-	Root string // remote-side base directory for syncing volumes into
-	// Params are type-specific rclone backend parameters with any
-	// { env = "VAR" } references already resolved to literal strings.
-	// Empty for type=local (no rclone remote needed).
+	Type string // local, sftp, s3, b2, gcs, kopia
+	Root string // remote-side base directory; for kopia, the repository path
+	// Params are type-specific parameters with any { env = "VAR" }
+	// references already resolved to literal strings: rclone backend
+	// parameters for the rclone types, the repository password for
+	// kopia. Empty for type=local (no rclone remote needed).
 	Params map[string]string
 	// Crypt is non-nil when the destination declares a
 	// [destinations.<name>.crypt] block: client-side encryption through

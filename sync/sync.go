@@ -98,6 +98,11 @@ type Report struct {
 	RunID        int64
 	RcloneResult RunResult
 	Status       string // success / partial / failed
+	// Verification is the handler's typed durability report for this
+	// push: which comparison backed it, what the tool counted, and —
+	// via Verified() — whether the destination's copy was
+	// content-verified. Zero for restores and dry runs.
+	Verification VerifyResult
 	// FinishErr captures a failure to write the runs row's terminal state.
 	// It is independent of rclone success — the bytes may have transferred
 	// correctly but the audit-trail row got stuck in 'running'. Callers
@@ -147,24 +152,29 @@ type Report struct {
 }
 
 // RunPair is the single entry point for one sync invocation. It
-// dispatches between bucket-destination and node-destination flows
-// based on which slot of the Pair is populated. CLI callers use it
-// directly so the per-Pair printing loop is a one-liner; the
-// per-flavour functions (Sync, SyncNode) remain exported for tests
-// and for callers that already have the typed destination in hand.
+// resolves the curated Handler for the pair's target type and runs its
+// Push. CLI callers use it directly so the per-Pair printing loop is a
+// one-liner; the per-flavour functions (Sync, SyncNode) remain exported
+// for tests and for callers that already have the typed destination in
+// hand.
 //
-// Concurrency: both flows allocate the 'running' kind='sync' row via
-// store.BeginSyncRunIfClear, which does the check + insert atomically
-// inside a BEGIN IMMEDIATE transaction. Two concurrent RunPair calls
-// against the same (volume, target) cannot both win — the loser sees
-// the winner's row and returns the "already running" diagnostic from
-// alreadyRunningErr. Stale 'running' rows from crashed runs keep
-// blocking here until cleared by `squirrel runs fail` (#37).
-func RunPair(ctx context.Context, s *store.Store, rcl *Rclone, p Pair, opts Options) (Report, error) {
-	if p.IsNode() {
-		return SyncNode(ctx, s, rcl, p.Volume, p.Node, opts)
+// Concurrency: every handler allocates the 'running' kind='sync' row
+// via store.BeginSyncRunIfClear, which does the check + insert
+// atomically inside a BEGIN IMMEDIATE transaction. Two concurrent
+// RunPair calls against the same (volume, target) cannot both win — the
+// loser sees the winner's row and returns the "already running"
+// diagnostic from alreadyRunningErr. Stale 'running' rows from crashed
+// runs keep blocking here until cleared by `squirrel runs fail` (#37).
+func RunPair(ctx context.Context, s *store.Store, tools Tools, p Pair, opts Options) (Report, error) {
+	h, err := HandlerFor(s, tools, p)
+	if err != nil {
+		rep := Report{Destination: p.TargetName()}
+		if p.Volume != nil {
+			rep.Volume = p.Volume.Name
+		}
+		return rep, err
 	}
-	return Sync(ctx, s, rcl, p.Volume, p.Destination, opts)
+	return h.Push(ctx, opts)
 }
 
 // alreadyRunningErr formats the diagnostic returned when a sync is
@@ -228,6 +238,9 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 		func(runID int64) ([]string, error) {
 			return buildRcloneArgs(vol, dest, runID, opts)
 		})
+	if !opts.DryRun {
+		rep.Verification = rcloneVerification(dest, opts, &rep)
+	}
 	// runRcloneOperation's deferred finishRun has committed the run's
 	// terminal state by now, so the snapshot reflects this run's own row.
 	// Destination syncs are eligible for the cloud ride-along; the
@@ -572,15 +585,19 @@ func EffectiveShallow(dest *config.Destination, shallow bool) bool {
 }
 
 // ShallowForPairs reports whether an invocation covering pairs runs
-// entirely without BLAKE3 verification: either the operator passed
-// --shallow, or every target is a crypt destination that forces it.
-// Used to scope the rclone version preflight to what the run will
-// actually invoke.
+// rclone entirely without BLAKE3 verification: either the operator
+// passed --shallow, or every rclone-driven target is a crypt
+// destination that forces it. Kopia pairs are skipped — they drive the
+// kopia binary, so they put no constraint on rclone. Used to scope the
+// rclone version preflight to what the run will actually invoke.
 func ShallowForPairs(pairs []Pair, shallow bool) bool {
 	if shallow {
 		return true
 	}
 	for _, p := range pairs {
+		if p.Destination != nil && p.Destination.Type == "kopia" {
+			continue
+		}
 		if p.Destination == nil || p.Destination.Crypt == nil {
 			return false
 		}
@@ -732,6 +749,9 @@ type RestoreOptions struct {
 // unless they explicitly intend to restore in place.
 func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, dest *config.Destination, opts RestoreOptions) (rep Report, err error) {
 	rep = Report{Volume: vol.Name, Destination: dest.Name}
+	if dest.Type == "kopia" {
+		return rep, fmt.Errorf("destination %q is a kopia repository — restore from it with the kopia CLI (`kopia snapshot restore`)", dest.Name)
+	}
 	if w := cryptVerificationWarning(dest, opts.Shallow); w != "" {
 		rep.Warnings = append(rep.Warnings, w)
 	}

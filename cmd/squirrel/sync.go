@@ -64,6 +64,10 @@ func runSync(cmd *cobra.Command, volumeName, destinationName string, opts sync.O
 	if err != nil {
 		return err
 	}
+	tools, err := sync.ToolsFor(cfg, pairs, rcl)
+	if err != nil {
+		return err
+	}
 	out := cmd.OutOrStdout()
 	if opts.Shallow {
 		fmt.Fprintln(out, shallowSyncWarning)
@@ -84,7 +88,7 @@ func runSync(cmd *cobra.Command, volumeName, destinationName string, opts sync.O
 
 	var anyFailed bool
 	for _, p := range pairs {
-		rep, err := sync.RunPair(cmd.Context(), s, rcl, p, opts)
+		rep, err := sync.RunPair(cmd.Context(), s, tools, p, opts)
 		printSyncReport(out, rep, err)
 		if err != nil || rep.Status != "success" {
 			anyFailed = true
@@ -151,10 +155,20 @@ func printSyncReport(w io.Writer, rep sync.Report, runErr error) {
 	for _, msg := range rep.NodePendingWarnings {
 		fmt.Fprintf(w, "warning: peer reports %s\n", msg)
 	}
-	fmt.Fprintf(w, "%s → %s  status=%s transferred=%d checked=%d errors=%d bytes=%d run=%d\n",
-		rep.Volume, rep.Destination, rep.Status,
-		r.Transferred, r.Checked, r.Errors, r.Bytes, rep.RunID,
-	)
+	// Kopia pushes have no rclone counters; render the snapshot's own
+	// numbers instead.
+	if rep.Verification.Method == sync.VerifyMethodKopia {
+		fmt.Fprintf(w, "%s → %s  status=%s files=%d bytes=%d snapshot=%s verified=%t run=%d\n",
+			rep.Volume, rep.Destination, rep.Status,
+			rep.Verification.Files, rep.Verification.Bytes,
+			rep.Verification.SnapshotID, rep.Verification.Verified(), rep.RunID,
+		)
+	} else {
+		fmt.Fprintf(w, "%s → %s  status=%s transferred=%d checked=%d errors=%d bytes=%d run=%d\n",
+			rep.Volume, rep.Destination, rep.Status,
+			r.Transferred, r.Checked, r.Errors, r.Bytes, rep.RunID,
+		)
+	}
 	if rep.NodeReceiverRunID != 0 {
 		fmt.Fprintf(w, "  receiver_run=%d matched=%d mismatched=%d missing=%d conflicts=%d\n",
 			rep.NodeReceiverRunID,

@@ -318,6 +318,39 @@ func TestSyncDryRunPath(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(f.dest.Root, f.vol.Name, "a.txt")); err == nil {
 		t.Fatalf("dry-run wrote to destination; want no-op")
 	}
+	if rep.Verification.Verified() {
+		t.Fatalf("dry-run must report an unverified result; got %+v", rep.Verification)
+	}
+}
+
+// TestSyncHappyPathStampsVerification rides on the happy-path fixture
+// to pin the typed durability report a default (BLAKE3) bucket sync
+// produces.
+func TestSyncHappyPathStampsVerification(t *testing.T) {
+	f := setupFixture(t)
+	if err := os.WriteFile(filepath.Join(f.vol.Path, "a.txt"), []byte("alpha"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.runIndex(t)
+
+	rep, err := Sync(context.Background(), f.store, f.rcl, f.vol, f.dest, Options{})
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if !rep.Verification.Verified() || rep.Verification.Method != VerifyMethodBlake3 {
+		t.Fatalf("Verification = %+v, want verified blake3", rep.Verification)
+	}
+	if rep.Verification.Files != 1 {
+		t.Fatalf("Verification.Files = %d, want 1", rep.Verification.Files)
+	}
+
+	shallowRep, err := Sync(context.Background(), f.store, f.rcl, f.vol, f.dest, Options{Shallow: true})
+	if err != nil {
+		t.Fatalf("shallow Sync: %v", err)
+	}
+	if shallowRep.Verification.Verified() || shallowRep.Verification.Method != VerifyMethodSizeMtime {
+		t.Fatalf("shallow Verification = %+v, want unverified size+mtime", shallowRep.Verification)
+	}
 }
 
 // TestSyncWarnsAboutHistoryDirInSource exercises the advisory path: a
@@ -381,7 +414,7 @@ func TestRunPairRefusesWhenAnotherIsRunning(t *testing.T) {
 
 	beforeRuns, _ := f.store.ListRuns(context.Background(), store.ListRunsOpts{})
 	p := Pair{Volume: f.vol, Destination: f.dest}
-	rep, err := RunPair(context.Background(), f.store, f.rcl, p, Options{})
+	rep, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, p, Options{})
 	if err == nil {
 		t.Fatalf("expected refusal while a run is in flight; got rep=%+v", rep)
 	}
@@ -400,7 +433,7 @@ func TestRunPairRefusesWhenAnotherIsRunning(t *testing.T) {
 	if err := f.store.FinishRun(context.Background(), stuckID, store.RunStatusFailed, "test cleanup", 0); err != nil {
 		t.Fatalf("FinishRun: %v", err)
 	}
-	if _, err := RunPair(context.Background(), f.store, f.rcl, p, Options{}); err != nil {
+	if _, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, p, Options{}); err != nil {
 		t.Fatalf("RunPair after clearing stuck row: %v", err)
 	}
 }
@@ -435,7 +468,7 @@ func TestRunPairRefusesConcurrentInvocations(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			_, err := RunPair(context.Background(), f.store, f.rcl, p, Options{})
+			_, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, p, Options{})
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
@@ -723,6 +756,7 @@ func TestShallowForPairs(t *testing.T) {
 	plain := cryptFixtureDest()
 	plain.Crypt = nil
 	node := Pair{Node: &config.Node{Name: "peer"}}
+	kopia := Pair{Destination: &config.Destination{Name: "mirror", Type: "kopia", Root: "/tmp/repo"}}
 	cases := []struct {
 		name    string
 		pairs   []Pair
@@ -733,6 +767,8 @@ func TestShallowForPairs(t *testing.T) {
 		{"all crypt", []Pair{{Destination: crypt}, {Destination: crypt}}, false, true},
 		{"mixed crypt and plain", []Pair{{Destination: crypt}, {Destination: plain}}, false, false},
 		{"node target verifies", []Pair{{Destination: crypt}, node}, false, false},
+		{"kopia pair puts no constraint on rclone", []Pair{kopia, {Destination: crypt}}, false, true},
+		{"kopia beside plain still verifies", []Pair{kopia, {Destination: plain}}, false, false},
 		{"no pairs", nil, false, true},
 	}
 	for _, c := range cases {

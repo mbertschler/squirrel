@@ -45,6 +45,9 @@ func SyncNode(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volu
 		return rep, err
 	}
 	err = runNodeSession(ctx, s, rcl, vol, volID, node, opts, &rep)
+	if !opts.DryRun {
+		rep.Verification = peerVerification(&rep)
+	}
 	// runNodeSession's deferred finishRun has committed the run's
 	// terminal state by now, so the snapshot reflects this run's own row.
 	// Peer-sync takes the local snapshot only — there is no ride-along to

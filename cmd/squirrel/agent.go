@@ -184,6 +184,13 @@ func buildSchedulerSyncRunner(cfg *config.Config, s *store.Store, rcl *sync.Rclo
 		if err != nil {
 			return agent.SyncRunReport{Err: err}
 		}
+		// Per-kick because the kopia lookup belongs to the kicks that
+		// target a kopia destination: a host whose schedule never
+		// touches one runs fine without the binary installed.
+		tools, err := sync.ToolsFor(cfg, []sync.Pair{pair}, rcl)
+		if err != nil {
+			return agent.SyncRunReport{Err: err}
+		}
 		// Snapshot-on-sync fires on each node's scheduled syncs too (#75):
 		// this is the operating cadence the catalog churns on. Each kick is
 		// a single pair, so a fresh Snapshotter per kick is the right unit.
@@ -191,7 +198,7 @@ func buildSchedulerSyncRunner(cfg *config.Config, s *store.Store, rcl *sync.Rclo
 		if cfg.Backups.Enabled {
 			opts.Snapshot = sync.NewSnapshotter(s, rcl, snapshotConfig(cfg, s.Path()))
 		}
-		rep, runErr := sync.RunPair(ctx, s, rcl, pair, opts)
+		rep, runErr := sync.RunPair(ctx, s, tools, pair, opts)
 		return agent.SyncRunReport{RunID: rep.RunID, Status: rep.Status, Err: runErr}
 	}
 }

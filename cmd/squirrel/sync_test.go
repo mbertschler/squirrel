@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -46,6 +47,63 @@ func TestCLISyncUnknownDestinationFlag(t *testing.T) {
 	_, err := runCLIExpectErr(t, "--config", f.configPath, "sync", "pics", "--to", "ghost")
 	if !strings.Contains(err.Error(), "unknown destination") {
 		t.Fatalf("expected unknown-destination error, got %v", err)
+	}
+}
+
+// TestCLISyncKopiaDestination drives `squirrel sync` against a
+// kopia-typed destination through a fake kopia binary on PATH, pinning
+// the wiring end to end: PairsFor accepts the destination as a sync_to
+// target, the handler runs connect → snapshot create → verify, and the
+// per-pair output line renders the snapshot's own numbers.
+func TestCLISyncKopiaDestination(t *testing.T) {
+	requireRcloneCLI(t)
+	if runtime.GOOS == "windows" {
+		t.Skip("fake kopia shim is a POSIX shell script")
+	}
+	root := t.TempDir()
+	volumeDir := filepath.Join(root, "pics")
+	if err := os.MkdirAll(volumeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(volumeDir, "a.txt"), "alpha")
+
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	shim := "#!/bin/sh\n" + `case "$1 $2" in
+"repository connect"|"snapshot verify") exit 0 ;;
+"snapshot create") echo '{"id":"snap123","rootEntry":{"summ":{"size":5,"files":1}}}' ;;
+*) echo "unexpected kopia subcommand: $*" >&2; exit 64 ;;
+esac
+`
+	writeTestFile(t, filepath.Join(binDir, "kopia"), shim)
+	if err := os.Chmod(filepath.Join(binDir, "kopia"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	configPath := filepath.Join(root, "config.toml")
+	writeTestFile(t, configPath, `
+db = "`+filepath.Join(root, "index.db")+`"
+
+[destinations.mirror]
+type     = "kopia"
+root     = "`+filepath.Join(root, "repo")+`"
+password = "hunter2"
+
+[volumes.pics]
+path    = "`+volumeDir+`"
+sync_to = ["mirror"]
+`)
+
+	runCLI(t, "--config", configPath, "index", "pics")
+	out := runCLI(t, "--config", configPath, "sync", "pics")
+	if !strings.Contains(out, "pics → mirror") || !strings.Contains(out, "status=success") {
+		t.Fatalf("sync did not report success for the kopia pair:\n%s", out)
+	}
+	if !strings.Contains(out, "snapshot=snap123") || !strings.Contains(out, "verified=true") {
+		t.Fatalf("output missing the kopia snapshot summary:\n%s", out)
 	}
 }
 
