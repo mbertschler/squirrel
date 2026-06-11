@@ -237,6 +237,55 @@ sync_to = ["does-not-exist"]
 	}
 }
 
+// TestLoadOffloadRequires: the per-volume offload policy is parsed
+// verbatim, including names with no matching local destination or node
+// — durability evidence for such targets can be peer-pulled, and an
+// unknown name fails closed at the gate.
+func TestLoadOffloadRequires(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.scratch]
+type = "local"
+root = "/tmp/dst"
+
+[volumes.pictures]
+path = "/tmp/pictures"
+sync_to = ["scratch"]
+offload_requires = ["scratch", "peer-only-offsite"]
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got := cfg.Volumes["pictures"].OffloadRequires
+	if len(got) != 2 || got[0] != "scratch" || got[1] != "peer-only-offsite" {
+		t.Fatalf("OffloadRequires = %v, want [scratch peer-only-offsite]", got)
+	}
+}
+
+func TestLoadRejectsInvalidOffloadRequiresName(t *testing.T) {
+	p := writeConfig(t, `
+[volumes.pictures]
+path = "/tmp/pictures"
+offload_requires = ["has space"]
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "offload_requires entry") {
+		t.Fatalf("expected invalid offload_requires error, got %v", err)
+	}
+}
+
+func TestLoadRejectsDuplicateOffloadRequires(t *testing.T) {
+	p := writeConfig(t, `
+[volumes.pictures]
+path = "/tmp/pictures"
+offload_requires = ["nas", "nas"]
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "more than once") {
+		t.Fatalf("expected duplicate offload_requires error, got %v", err)
+	}
+}
+
 func TestLoadRejectsInvalidName(t *testing.T) {
 	// Names that wouldn't survive being a filesystem subfolder or an
 	// rclone.conf section are rejected at load time.

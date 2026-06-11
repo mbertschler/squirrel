@@ -69,6 +69,17 @@ type Volume struct {
 	Name   string
 	Path   string   // absolute, ~ expanded
 	SyncTo []string // destination names declared on this volume
+	// OffloadRequires is the volume's offload policy: the target names
+	// (destinations or peer nodes, the same flat namespace sync_to and
+	// runs.destination use) whose recorded durability must each cover a
+	// file's content before `squirrel offload` may delete its local
+	// bytes. An empty list means offload is refused for the volume —
+	// the policy is an explicit opt-in, there is no default target set.
+	// Entries may name targets beyond this config's destinations and
+	// nodes because durability evidence can arrive via a peer's
+	// durability pull about targets only that peer reaches; a name with
+	// no recorded evidence keeps the gate closed.
+	OffloadRequires []string
 	// SyncEvery is the agent-scheduler cadence for full syncs of this
 	// volume. Zero means "no scheduled sync" — the agent never auto-
 	// triggers a sync for this volume; manual `squirrel sync` still
@@ -222,11 +233,12 @@ type rawConfig struct {
 }
 
 type rawVolume struct {
-	Path       string         `toml:"path"`
-	SyncTo     []string       `toml:"sync_to"`
-	SyncEvery  string         `toml:"sync_every"`
-	IndexEvery string         `toml:"index_every"`
-	Hook       *rawVolumeHook `toml:"hook"`
+	Path            string         `toml:"path"`
+	SyncTo          []string       `toml:"sync_to"`
+	OffloadRequires []string       `toml:"offload_requires"`
+	SyncEvery       string         `toml:"sync_every"`
+	IndexEvery      string         `toml:"index_every"`
+	Hook            *rawVolumeHook `toml:"hook"`
 }
 
 type rawVolumeHook struct {
@@ -317,6 +329,9 @@ func resolveVolume(name string, raw rawVolume, dests map[string]*Destination, no
 		}
 		return nil, fmt.Errorf("sync_to references unknown destination or node %q", dst)
 	}
+	if err := validateOffloadRequires(raw.OffloadRequires); err != nil {
+		return nil, err
+	}
 	syncEvery, err := parseVolumeCadence("sync_every", raw.SyncEvery)
 	if err != nil {
 		return nil, err
@@ -337,13 +352,34 @@ func resolveVolume(name string, raw rawVolume, dests map[string]*Destination, no
 		return nil, err
 	}
 	return &Volume{
-		Name:       name,
-		Path:       abs,
-		SyncTo:     raw.SyncTo,
-		SyncEvery:  syncEvery,
-		IndexEvery: indexEvery,
-		Hook:       hook,
+		Name:            name,
+		Path:            abs,
+		SyncTo:          raw.SyncTo,
+		OffloadRequires: raw.OffloadRequires,
+		SyncEvery:       syncEvery,
+		IndexEvery:      indexEvery,
+		Hook:            hook,
 	}, nil
+}
+
+// validateOffloadRequires checks the offload policy entries
+// syntactically: each must be a well-formed target name and appear
+// once. Membership in this config's destinations/nodes is deliberately
+// looser than sync_to's (see Volume.OffloadRequires): a typo'd name is
+// still fail-safe because a target without recorded durability evidence
+// can never let the gate pass.
+func validateOffloadRequires(names []string) error {
+	seen := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		if !nameRE.MatchString(n) {
+			return fmt.Errorf("offload_requires entry %q is invalid (must match %s)", n, nameRE)
+		}
+		if _, dup := seen[n]; dup {
+			return fmt.Errorf("offload_requires lists %q more than once", n)
+		}
+		seen[n] = struct{}{}
+	}
+	return nil
 }
 
 // resolveVolumeHook validates an optional `[volumes.X.hook]` block. A nil
