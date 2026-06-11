@@ -1238,11 +1238,10 @@ func priorProvenance(r *store.FileRow) *store.Provenance {
 // preStageCopyFromExisting applies to its own destinations: Lstat,
 // then move any regular file into .squirrel-history/run-<receiverRunID>/.
 //
-// Unlike the copy-from-existing pre-stage there is no byte copy here
-// (rclone delivers the bytes after /plan returns) and no rollback set:
-// a failure aborts the plan with the already-moved files safely under
-// run-<id>/, recoverable by the operator, and the next /plan replans the
-// same Transfer.
+// This is a move-only pass (rclone delivers the bytes after /plan
+// returns), so a failure aborts the plan with the already-moved files
+// left under run-<id>/ — recoverable by the operator, and the next
+// /plan replans the same Transfer.
 func (r *peerSyncRouter) preStageTransfers(sess *peerSession) error {
 	histRoot := filepath.Join(sess.volume.Path, HistoryDirName, "run-"+strconv.FormatInt(sess.receiverRunID, 10))
 	for relPath, entry := range sess.dispositions {
