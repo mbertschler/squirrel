@@ -109,6 +109,38 @@ func TestOffloadFreshnessRefusesUnpushedTarget(t *testing.T) {
 	mustExist(t, filepath.Join(root, "a.txt"))
 }
 
+// TestOffloadPeerRelayedTargetNeedsLocalPush documents a deliberate
+// strictly-stricter consequence of the #115 freshness condition: the
+// watermark is in LOCAL run space, so a target whose evidence arrives
+// only by the peer durability pull (no local push to it) is refused
+// until a local whole-volume push covers the path. The laptop cannot
+// locally verify that a re-acquired path was re-pushed on a hop it never
+// performs, so the gate refuses rather than trust a stale pulled vector.
+func TestOffloadPeerRelayedTargetNeedsLocalPush(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), "alpha")
+	s := setupStore(t)
+	idx := indexVolume(t, s, root)
+	v := testVolume(t, s)
+	self := selfNode(t, s)
+
+	// Pulled vector covers the content with a content-verified method,
+	// but there is no local push run to this target.
+	seedVerifiedComponent(t, s, v.ID, "remote-archive", self.ID, idx.RunID)
+
+	rep, err := Offload(context.Background(), s, root, Options{
+		Name: volName, Paths: []string{"."}, Require: []string{"remote-archive"},
+	})
+	if err != nil {
+		t.Fatalf("Offload: %v", err)
+	}
+	res := oneResult(t, rep, "a.txt", OutcomeNotDurable)
+	if len(res.Reasons) != 1 || !strings.Contains(res.Reasons[0], "not freshly pushed") {
+		t.Fatalf("reasons = %v, want a freshness failure", res.Reasons)
+	}
+	mustExist(t, filepath.Join(root, "a.txt"))
+}
+
 // TestOffloadPresenceSizeHeldOutUntilFingerprint is the #109 fix: a
 // content-addressed component advanced with the presence+size method
 // does not gate on its own; once a verified scan-back fingerprint backs

@@ -330,9 +330,12 @@ func TestOffloadPeerOriginContent(t *testing.T) {
 }
 
 // TestOffloadPeerPulledEvidenceTarget: the policy may require a target
-// no local config declares — its evidence arrives via the peer
-// durability pull, which lands in destination_run_ids under the peer's
-// target name. The gate consumes those rows like any other.
+// whose vector component arrives via the peer durability pull, landing
+// in destination_run_ids under the target name. The gate consumes those
+// rows like any other — here the target was also pushed to locally
+// (seedVector records the push), so its freshness watermark is current.
+// The peer-relayed-only case (no local push) is held out; see
+// TestOffloadPeerRelayedTargetNeedsLocalPush.
 func TestOffloadPeerPulledEvidenceTarget(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "a.txt"), "alpha")
