@@ -113,6 +113,12 @@ type Report struct {
 	// .squirrel-history directory" so the user knows that content was
 	// silently filtered from the upload.
 	Warnings []string
+	// Fingerprints counts the provider checksums recorded for this run's
+	// freshly uploaded content-addressed objects (the scan-back
+	// fingerprint later `squirrel verify` passes compare against). Zero
+	// for other handler types; objects whose backend exposed no checksum
+	// surface in Warnings instead.
+	Fingerprints int64
 	// NodeReceiverRunID is set on a successful node-sync handshake and
 	// echoed in the CLI output so the operator can join the two halves
 	// of one logical sync against the receiver's `squirrel runs`
@@ -540,6 +546,7 @@ func buildRcloneArgs(vol *config.Volume, dest *config.Destination, runID int64, 
 		// back down on restore).
 		"--filter", "- /" + IndexDirName + "/**",
 	}
+	args = append(args, checkersArgs(dest)...)
 	if !EffectiveShallow(dest, opts.Shallow) {
 		args = append(args, "--checksum", "--hash", "blake3")
 	}
@@ -929,6 +936,7 @@ func buildRestoreArgs(vol *config.Volume, dest *config.Destination, runID int64,
 		args = append(args, "--filter", "- /"+RestoreHistoryDirName+"/**")
 		args = append(args, "--filter", "- /"+IndexDirName+"/**")
 	}
+	args = append(args, checkersArgs(dest)...)
 	if !EffectiveShallow(dest, opts.Shallow) {
 		args = append(args, "--checksum", "--hash", "blake3")
 	}

@@ -74,6 +74,138 @@ func TestRemoteObjectRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSetRemoteObjectChecksumFillsPendingPair: the scan-back pass fills
+// the NULL pair left by a fingerprint-pending upload, leaving the rest
+// of the row untouched.
+func TestSetRemoteObjectChecksumFillsPendingPair(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	contentID, runID := remoteObjectFixture(t, s)
+
+	if err := s.InsertRemoteObject(ctx, RemoteObject{
+		ContentID: contentID, Destination: "bucket-a", UploadedRunID: runID,
+	}); err != nil {
+		t.Fatalf("InsertRemoteObject: %v", err)
+	}
+	if err := s.SetRemoteObjectChecksum(ctx, contentID, "bucket-a", "sha256", "deadbeef"); err != nil {
+		t.Fatalf("SetRemoteObjectChecksum: %v", err)
+	}
+	got, err := s.GetRemoteObject(ctx, contentID, "bucket-a")
+	if err != nil {
+		t.Fatalf("GetRemoteObject: %v", err)
+	}
+	if got.ChecksumAlgo != nullStr("sha256") || got.Checksum != nullStr("deadbeef") {
+		t.Fatalf("pair = (%+v, %+v), want (sha256, deadbeef)", got.ChecksumAlgo, got.Checksum)
+	}
+	if got.UploadedRunID != runID || got.VerifiedAtNs.Valid {
+		t.Fatalf("row = %+v, want run %d and no verification stamp", got, runID)
+	}
+}
+
+// TestSetRemoteObjectChecksumRefusesOverwrite: a recorded fingerprint is
+// the comparison baseline for every later verification and must never be
+// silently replaced.
+func TestSetRemoteObjectChecksumRefusesOverwrite(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	contentID, runID := remoteObjectFixture(t, s)
+
+	if err := s.InsertRemoteObject(ctx, RemoteObject{
+		ContentID: contentID, Destination: "bucket-a", UploadedRunID: runID,
+		ChecksumAlgo: nullStr("sha256"), Checksum: nullStr("original"),
+	}); err != nil {
+		t.Fatalf("InsertRemoteObject: %v", err)
+	}
+	err := s.SetRemoteObjectChecksum(ctx, contentID, "bucket-a", "sha256", "tampered")
+	if err == nil {
+		t.Fatalf("overwrite of a recorded fingerprint succeeded")
+	}
+	got, err := s.GetRemoteObject(ctx, contentID, "bucket-a")
+	if err != nil {
+		t.Fatalf("GetRemoteObject: %v", err)
+	}
+	if got.Checksum != nullStr("original") {
+		t.Fatalf("checksum = %+v after refused overwrite, want original", got.Checksum)
+	}
+}
+
+func TestSetRemoteObjectChecksumUnknownPair(t *testing.T) {
+	s := openTestStore(t)
+	if err := s.SetRemoteObjectChecksum(context.Background(), 1, "bucket-a", "sha256", "x"); err == nil {
+		t.Fatalf("checksum for unrecorded upload succeeded, want error")
+	}
+}
+
+// TestListRemoteObjects: the listing joins the content hash in, filters
+// by destination, and orders by hash.
+func TestListRemoteObjects(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+	runID := makeRun(t, s, vID)
+	for i, b := range []byte{0xbb, 0xaa} {
+		path := []string{"b.txt", "a.txt"}[i]
+		if err := s.Upsert(ctx, FileRow{
+			VolumeID: vID, Path: path, Blake3: digest(b), SizeBytes: 1, MtimeNs: 1,
+			Status: StatusPresent, FirstSeenRunID: runID, LastSeenRunID: runID, IndexedAtNs: 1,
+		}, nil); err != nil {
+			t.Fatalf("Upsert %s: %v", path, err)
+		}
+		row, err := s.GetByPath(ctx, vID, path)
+		if err != nil {
+			t.Fatalf("GetByPath %s: %v", path, err)
+		}
+		if err := s.InsertRemoteObject(ctx, RemoteObject{
+			ContentID: row.ContentID, Destination: "bucket-a", UploadedRunID: runID,
+		}); err != nil {
+			t.Fatalf("InsertRemoteObject %s: %v", path, err)
+		}
+		if i == 0 {
+			if err := s.InsertRemoteObject(ctx, RemoteObject{
+				ContentID: row.ContentID, Destination: "bucket-b", UploadedRunID: runID,
+				ChecksumAlgo: nullStr("sha1"), Checksum: nullStr("ff"),
+			}); err != nil {
+				t.Fatalf("InsertRemoteObject bucket-b: %v", err)
+			}
+		}
+	}
+
+	got, err := s.ListRemoteObjects(ctx, "bucket-a")
+	if err != nil {
+		t.Fatalf("ListRemoteObjects: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want 2 (bucket-b row filtered out): %+v", len(got), got)
+	}
+	if string(got[0].Blake3) != string(digest(0xaa)) || string(got[1].Blake3) != string(digest(0xbb)) {
+		t.Fatalf("order = %x, %x; want ascending by hash", got[0].Blake3, got[1].Blake3)
+	}
+	if got[0].Destination != "bucket-a" || got[0].ChecksumAlgo.Valid {
+		t.Fatalf("row = %+v, want pending bucket-a record", got[0])
+	}
+}
+
+// TestBeginRemoteVerifyRun: the verification pass rides on a kind='audit'
+// run with no volume and no destination, finishable like any other run.
+func TestBeginRemoteVerifyRun(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	id, err := s.BeginRemoteVerifyRun(ctx)
+	if err != nil {
+		t.Fatalf("BeginRemoteVerifyRun: %v", err)
+	}
+	run, err := s.GetRun(ctx, id)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if run.Kind != RunKindAudit || run.VolumeID.Valid || run.Destination.Valid || run.Status != RunStatusRunning {
+		t.Fatalf("run = %+v, want a running audit run with NULL volume and destination", run)
+	}
+	if err := s.FinishRun(ctx, id, RunStatusSuccess, "", 3); err != nil {
+		t.Fatalf("FinishRun: %v", err)
+	}
+}
+
 // TestRemoteObjectInsertRefusesDuplicate: the fingerprint recorded at
 // upload time is what later verifications compare against, so a second
 // insert for the same (content, destination) must fail loudly instead

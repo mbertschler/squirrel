@@ -21,10 +21,17 @@ import (
 // fakeRcloneScript is the PATH-shim stand-in for the rclone binary,
 // mirroring the kopia shim: it logs every argv line to
 // $RCLONE_FAKE_LOG, then plays back the two subcommands the
-// content-addressed push drives. Remote URIs (`remote:path`) map onto
-// the local directory $RCLONE_FAKE_ROOT so tests can assert on what
-// landed; $RCLONE_FAKE_FAIL_GLOB injects per-destination copyto
-// failures.
+// content-addressed push and the verify pass drive. Remote URIs
+// (`remote:path`) map onto the local directory $RCLONE_FAKE_ROOT
+// (after stripping the $RCLONE_FAKE_STRIP prefix, so overlay and
+// underlying URIs land in the same tree); $RCLONE_FAKE_FAIL_GLOB
+// injects per-destination copyto failures. lsjson hashes are derived
+// from the file bytes via cksum, emitted under each requested
+// --hash-type (or md5+sha1 when none is requested), with
+// $RCLONE_FAKE_HASH_PREFIX simulating remote-side tampering,
+// $RCLONE_FAKE_HASH_VALUE forcing an exact value, and
+// $RCLONE_FAKE_NO_HASHES a backend that exposes no checksums;
+// $RCLONE_FAKE_EMPTY_LISTING a directory lsjson that returns no entries.
 const fakeRcloneScript = `#!/bin/sh
 {
   printf 'argv:'
@@ -32,27 +39,81 @@ const fakeRcloneScript = `#!/bin/sh
   printf '\n'
 } >> "$RCLONE_FAKE_LOG"
 if [ "$1" = "--config" ]; then shift 2; fi
+cmd=$1; shift
 resolve() {
   case "$1" in
-  *:*) printf '%s/%s' "$RCLONE_FAKE_ROOT" "${1#*:}" ;;
+  *:*)
+    p="${1#*:}"
+    case "$p" in
+    "${RCLONE_FAKE_STRIP:-//none//}"/*) p="${p#"${RCLONE_FAKE_STRIP}"/}" ;;
+    esac
+    printf '%s/%s' "$RCLONE_FAKE_ROOT" "$p" ;;
   *) printf '%s' "$1" ;;
   esac
 }
-case "$1" in
-copyto)
-  case "$3" in
-  ${RCLONE_FAKE_FAIL_GLOB:-//none//}) echo "fake copyto failure for $3" >&2; exit 1 ;;
+hashtypes="" includes="" stat=0 a1="" a2=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+  --stat) stat=1 ;;
+  --hash-type) shift; hashtypes="$hashtypes $1" ;;
+  --include) shift; includes="$includes $1" ;;
+  --checkers) shift ;;
+  --*) ;;
+  *) if [ -z "$a1" ]; then a1="$1"; else a2="$1"; fi ;;
   esac
-  dst=$(resolve "$3")
-  mkdir -p "$(dirname "$dst")" && cp "$(resolve "$2")" "$dst"
+  shift
+done
+hashes_json() {
+  [ -n "$RCLONE_FAKE_NO_HASHES" ] && return
+  v="$RCLONE_FAKE_HASH_VALUE"
+  [ -z "$v" ] && v="${RCLONE_FAKE_HASH_PREFIX}$(cksum < "$1" | cut -d' ' -f1)"
+  printf ',"Hashes":{'
+  sep=""
+  for t in ${hashtypes:-md5 sha1}; do
+    printf '%s"%s":"%s"' "$sep" "$t" "$v"
+    sep=","
+  done
+  printf '}'
+}
+entry_json() {
+  size=$(wc -c < "$1" | tr -d '[:space:]')
+  printf '{"Path":"%s","Name":"%s","Size":%s,"IsDir":false' "$(basename "$1")" "$(basename "$1")" "$size"
+  hashes_json "$1"
+  printf '}'
+}
+case "$cmd" in
+copyto)
+  case "$a2" in
+  ${RCLONE_FAKE_FAIL_GLOB:-//none//}) echo "fake copyto failure for $a2" >&2; exit 1 ;;
+  esac
+  dst=$(resolve "$a2")
+  mkdir -p "$(dirname "$dst")" && cp "$(resolve "$a1")" "$dst"
   ;;
 lsjson)
-  f=$(resolve "$3")
-  if [ ! -f "$f" ]; then echo "object not found: $3" >&2; exit 3; fi
-  size=$(wc -c < "$f" | tr -d '[:space:]')
-  printf '{"Path":"%s","Name":"%s","Size":%s,"IsDir":false}\n' "$(basename "$f")" "$(basename "$f")" "$size"
+  if [ "$stat" = 1 ]; then
+    f=$(resolve "$a1")
+    if [ ! -f "$f" ]; then echo "object not found: $a1" >&2; exit 3; fi
+    entry_json "$f"; printf '\n'
+  else
+    dir=$(resolve "$a1")
+    if [ ! -d "$dir" ]; then echo "directory not found: $a1" >&2; exit 3; fi
+    if [ -n "$RCLONE_FAKE_EMPTY_LISTING" ]; then printf '[]\n'; exit 0; fi
+    printf '['
+    sep=""
+    for f in "$dir"/*; do
+      [ -f "$f" ] || continue
+      name=$(basename "$f")
+      if [ -n "$includes" ]; then
+        m=0
+        for inc in $includes; do [ "$name" = "$inc" ] && m=1; done
+        [ "$m" = 1 ] || continue
+      fi
+      printf '%s' "$sep"; entry_json "$f"; sep=","
+    done
+    printf ']\n'
+  fi
   ;;
-*) echo "unexpected rclone subcommand: $*" >&2; exit 64 ;;
+*) echo "unexpected rclone subcommand: $cmd $*" >&2; exit 64 ;;
 esac
 `
 
@@ -71,6 +132,25 @@ type caFixture struct {
 
 func setupContentAddressedFixture(t *testing.T) *caFixture {
 	t.Helper()
+	return setupCAFixture(t, `[destinations.offsite]
+type   = "sftp"
+host   = "remote.invalid"
+user   = "u"
+root   = "/data"
+layout = "content-addressed"
+
+[destinations.offsite.crypt]
+password = "obscured-pw"
+`, "/data")
+}
+
+// setupCAFixture is the destination-configurable body of
+// setupContentAddressedFixture. destBlock declares the `offsite`
+// destination; strip is the destination root the shim removes from
+// underlying-remote URIs so they land in the same fake tree as the
+// crypt overlay's root-relative paths.
+func setupCAFixture(t *testing.T, destBlock, strip string) *caFixture {
+	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("fake rclone shim is a POSIX shell script")
 	}
@@ -84,6 +164,10 @@ func setupContentAddressedFixture(t *testing.T) *caFixture {
 	t.Setenv("RCLONE_FAKE_LOG", logPath)
 	t.Setenv("RCLONE_FAKE_ROOT", fakeRoot)
 	t.Setenv("RCLONE_FAKE_FAIL_GLOB", "")
+	t.Setenv("RCLONE_FAKE_STRIP", strip)
+	t.Setenv("RCLONE_FAKE_NO_HASHES", "")
+	t.Setenv("RCLONE_FAKE_HASH_VALUE", "")
+	t.Setenv("RCLONE_FAKE_HASH_PREFIX", "")
 
 	root := t.TempDir()
 	volPath := filepath.Join(root, "src")
@@ -100,16 +184,7 @@ func setupContentAddressedFixture(t *testing.T) *caFixture {
 	t.Cleanup(func() { s.Close() })
 
 	cfgPath := filepath.Join(root, "config.toml")
-	cfgBody := `[destinations.offsite]
-type   = "sftp"
-host   = "remote.invalid"
-user   = "u"
-root   = "/data"
-layout = "content-addressed"
-
-[destinations.offsite.crypt]
-password = "obscured-pw"
-
+	cfgBody := destBlock + `
 [volumes.pics]
 path    = "` + volPath + `"
 sync_to = ["offsite"]
@@ -266,8 +341,14 @@ func TestContentAddressedPushHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetRemoteObject: %v", err)
 	}
-	if obj.ChecksumAlgo.Valid || obj.Checksum.Valid || obj.UploadedRunID != rep.RunID {
-		t.Fatalf("remote object = %+v, want fingerprint-pending record for run %d", obj, rep.RunID)
+	if obj.UploadedRunID != rep.RunID || obj.ChecksumAlgo.String != "sha256" || !obj.Checksum.Valid {
+		t.Fatalf("remote object = %+v, want a sha256-fingerprinted record for run %d", obj, rep.RunID)
+	}
+	if obj.VerifiedAtNs.Valid {
+		t.Fatalf("fresh upload already verified: %+v", obj)
+	}
+	if rep.Fingerprints != 2 {
+		t.Fatalf("Fingerprints = %d, want 2", rep.Fingerprints)
 	}
 
 	vector, err := f.store.ListDestinationRunIDs(context.Background(), f.volumeID(t), "offsite")

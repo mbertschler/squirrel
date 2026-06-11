@@ -74,7 +74,7 @@ password2 = { env = "OFFSITE_CRYPT_SALT" }    # salt — optional but recommende
 Two properties to be aware of:
 
 - **Contents only.** File and directory names are stored in clear at the destination (`filename_encryption = off`, fixed by design) — the tree stays browsable and keeps the same layout as an unencrypted destination. If the names themselves are sensitive, this overlay does not hide them.
-- **Verification falls back to size+mtime.** rclone crypt remotes cannot expose content hashes, so the end-to-end BLAKE3 check (`--checksum --hash blake3`) cannot pass through the overlay. Transfers to and from an encrypted destination compare by size+mtime instead — the same comparison `--shallow` uses — and say so in the run output; the runs row records the transfer as shallow. Deeper verification of encrypted destinations is planned via provider-side ciphertext fingerprints.
+- **Verification falls back to size+mtime.** rclone crypt remotes cannot expose content hashes, so the end-to-end BLAKE3 check (`--checksum --hash blake3`) cannot pass through the overlay. Transfers to and from an encrypted destination compare by size+mtime instead — the same comparison `--shallow` uses — and say so in the run output; the runs row records the transfer as shallow. Content-addressed destinations regain deeper verification through provider-side ciphertext fingerprints — see [Offsite verification](#offsite-verification-squirrel-verify).
 
 ### Kopia destinations
 
@@ -121,10 +121,42 @@ Durability is **transactional per run**: the run only counts as successful — a
 
 Properties that differ from mirrored destinations:
 
-- **Verification is presence+size**, recorded as such: per-object transfers can't carry the end-to-end BLAKE3 check (and `crypt` remotes expose no hashes at all), so the runs row is recorded shallow and the push never claims content verification. Provider-side ciphertext fingerprints (recorded in the index per upload) are the planned upgrade.
+- **Verification is presence+size**, recorded as such: per-object transfers can't carry the end-to-end BLAKE3 check (and `crypt` remotes expose no hashes at all), so the runs row is recorded shallow and the push never claims content verification. On top of that, each upload's provider-side ciphertext fingerprint is recorded in the index and re-checked by [`squirrel verify`](#offsite-verification-squirrel-verify).
 - **Pick the layout when the destination is first used.** Switching an existing mirrored destination to `content-addressed` (or back) is not supported — point the new layout at a fresh destination or root. The push detects a mirrored history (a recorded successful sync without its manifest segment) and refuses.
 - **`squirrel restore` refuses the layout** for now; recovery tooling ships separately. The format is deliberately simple enough to recover without squirrel — see below.
 - `--dry-run` is not supported yet.
+
+#### Offsite verification (`squirrel verify`)
+
+Cold archive storage is exactly the copy you can't cheaply re-download and re-hash. Content-addressed destinations therefore get a metadata-only integrity check, the **scan-back fingerprint**: after each object upload is confirmed, squirrel reads the *provider's own checksum* of the stored bytes (the ciphertext, for `crypt` destinations) back from the remote via `rclone lsjson --hash` and records it in the index next to the upload. Verification then re-fetches the same metadata later and compares **provider value then vs provider value now** — squirrel never recomputes a provider checksum, so provider-specific composite forms are handled as opaque strings, and no object body is ever transferred.
+
+What gets recorded depends on the backend type:
+
+- **`s3`** — the object **ETag**, recorded as `etag-md5` (or `etag-md5-composite` for multipart-style values). Reading it is a listing/metadata operation, so it works on archive-tier objects without a restore.
+- **`sftp`** — the checksum computed server-side by the remote's hash command. Content-addressed sftp destinations default to **SHA-256** (`hash_algo = "sha256"`, rendered as rclone's sftp `hashes` option so the selection is explicit rather than rclone's md5/sha1 preference); set `hash_algo` if your server only offers another type.
+- **other backends** — whatever hash `rclone lsjson --hash` exposes, recorded under its rclone hash name (e.g. `sha1` on b2). A backend exposing no checksum leaves the fingerprint pending, with a warning in the sync output.
+
+Re-verify a destination (or all content-addressed destinations) at any time:
+
+```
+squirrel verify archive
+squirrel verify
+```
+
+The pass lists the destination's `objects/` directory once (batched, metadata-only), then per recorded object: a **match** stamps the object verified in the index; an object **without a fingerprint yet** (uploaded before this feature, or whose capture failed) gets one recorded and is counted separately; a **mismatch or missing object** prints one loud line per object and exits non-zero — that is potential offsite corruption or tampering, and squirrel deliberately leaves both the destination and the recorded fingerprint untouched for inspection. Each pass is recorded as an `audit` run, with the destination and counters in the run's audit trail.
+
+Because crypt encrypts with a random per-file nonce, the fingerprint is a property of the *uploaded ciphertext*, not of the content — which is exactly right here: the layout is append-only and each object is uploaded once, so the fingerprint is stable for the life of the object.
+
+Two related destination knobs (both optional):
+
+```toml
+[destinations.archive]
+# ...
+hash_algo = "sha256"  # sftp only: which server-side hash the fingerprint uses
+checkers  = 4         # cap rclone's concurrent checkers (providers that limit connections)
+```
+
+`checkers` flows into `--checkers` on the rclone invocations squirrel runs against that destination — useful when a provider caps simultaneous connections (server-side hashing typically uses one connection per concurrent check).
 
 #### Manifest segment format
 
@@ -272,6 +304,7 @@ squirrel        # bare invocation opens the TUI when stdin/stdout are a terminal
 ```
 squirrel index   <volume>            [--shallow] [--dry-run] [--workers N]
 squirrel sync    [<volume>]          [--to DEST] [--shallow] [--dry-run]
+squirrel verify  [<destination>]
 squirrel offload <volume> [path...]  [--older-than DUR] [--dry-run]
 squirrel query   <hash-or-path>      [--history]
 squirrel query   --duplicates
