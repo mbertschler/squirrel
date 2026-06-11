@@ -648,6 +648,25 @@ func (s *Store) LatestFinishedRun(ctx context.Context, kind string, volumeID int
 	return scanRun(row.Scan)
 }
 
+// LatestSuccessfulSyncRun returns the most recent kind='sync' run for
+// the (volume, destination) pair that finished in status 'success'.
+// The content-addressed push uses it as the destination's manifest
+// watermark: a success means that run's objects and segment were
+// confirmed landed, so the next delta starts after it; failed and
+// partial runs left no segment and must stay covered by the next delta.
+// Returns sql.ErrNoRows when the destination has no successful sync of
+// the volume yet.
+func (s *Store) LatestSuccessfulSyncRun(ctx context.Context, volumeID int64, destination string) (Run, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT `+runColumns+`
+		FROM runs
+		WHERE kind = 'sync' AND volume_id = ? AND destination = ?
+		  AND status = 'success'
+		ORDER BY id DESC LIMIT 1
+	`, volumeID, destination)
+	return scanRun(row.Scan)
+}
+
 // LatestSuccessfulRunsByVolumeAndKind returns the most recent success or
 // partial run for each (volume_id, kind) pair in one SQL pass, as a
 // nested map keyed first by volume id and then by run kind. Used by the
