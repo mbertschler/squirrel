@@ -340,10 +340,13 @@ func (r *Rclone) runPlain(ctx context.Context, args ...string) ([]byte, error) {
 
 // copyTo copies a single source file to a single destination path via
 // `rclone copyto`, creating intermediate directories as needed. Used by
-// the snapshot ride-along to land one .db file at a fixed destination
-// name (copy, by contrast, would treat the destination as a directory).
-func (r *Rclone) copyTo(ctx context.Context, src, dst string) error {
-	_, err := r.runPlain(ctx, "copyto", src, dst)
+// the snapshot ride-along and the content-addressed push to land one
+// file at a fixed destination name (copy, by contrast, would treat the
+// destination as a directory). extraArgs carries per-destination flags
+// such as the --checkers cap.
+func (r *Rclone) copyTo(ctx context.Context, src, dst string, extraArgs ...string) error {
+	args := append([]string{"copyto"}, extraArgs...)
+	_, err := r.runPlain(ctx, append(args, src, dst)...)
 	return err
 }
 
@@ -386,8 +389,9 @@ func (r *Rclone) deleteFile(ctx context.Context, fileURI string) error {
 // it compares directly against local byte counts. A missing object
 // surfaces as an error (rclone exits non-zero; defensively, a `null`
 // stat on a tolerant rclone build is mapped to the same outcome).
-func (r *Rclone) statRemote(ctx context.Context, uri string) (int64, error) {
-	out, err := r.runPlain(ctx, "lsjson", "--stat", uri)
+func (r *Rclone) statRemote(ctx context.Context, uri string, extraArgs ...string) (int64, error) {
+	args := append([]string{"lsjson", "--stat"}, extraArgs...)
+	out, err := r.runPlain(ctx, append(args, uri)...)
 	if err != nil {
 		return 0, err
 	}
@@ -406,6 +410,39 @@ func (r *Rclone) statRemote(ctx context.Context, uri string) (int64, error) {
 		return 0, fmt.Errorf("%s is a directory, expected a single object", uri)
 	}
 	return entry.Size, nil
+}
+
+// lsjsonEntry is one object from an `rclone lsjson` listing: its name,
+// size, and — when hashes were requested — the provider checksums keyed
+// by rclone hash name.
+type lsjsonEntry struct {
+	Name   string            `json:"Name"`
+	Size   int64             `json:"Size"`
+	IsDir  bool              `json:"IsDir"`
+	Hashes map[string]string `json:"Hashes"`
+}
+
+// listHashes runs `rclone lsjson --hash --files-only` over dirURI and
+// returns the entries with their provider checksums. hashTypes narrows
+// which hashes rclone computes (--hash-type, repeated); nil requests
+// every hash the backend exposes. extraArgs carries per-destination
+// flags such as the --checkers cap and --include filters scoping the
+// listing.
+func (r *Rclone) listHashes(ctx context.Context, dirURI string, hashTypes []string, extraArgs ...string) ([]lsjsonEntry, error) {
+	args := []string{"lsjson", "--hash", "--files-only"}
+	for _, ht := range hashTypes {
+		args = append(args, "--hash-type", ht)
+	}
+	args = append(args, extraArgs...)
+	out, err := r.runPlain(ctx, append(args, dirURI)...)
+	if err != nil {
+		return nil, err
+	}
+	var entries []lsjsonEntry
+	if err := json.Unmarshal(bytes.TrimSpace(out), &entries); err != nil {
+		return nil, fmt.Errorf("parse lsjson output for %s: %w", dirURI, err)
+	}
+	return entries, nil
 }
 
 // rcloneEvent captures the subset of rclone's JSON log we care about: the

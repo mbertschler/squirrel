@@ -166,12 +166,13 @@ func printSyncReport(w io.Writer, rep sync.Report, runErr error) {
 		)
 	case sync.VerifyMethodPresenceSize:
 		// Content-addressed pushes count objects, with skipped = hashes
-		// the destination already recorded and entries = manifest
-		// segment lines.
-		fmt.Fprintf(w, "%s → %s  status=%s objects=%d skipped=%d errors=%d bytes=%d entries=%d run=%d\n",
+		// the destination already recorded, entries = manifest segment
+		// lines, and fingerprints = provider checksums captured for the
+		// fresh uploads.
+		fmt.Fprintf(w, "%s → %s  status=%s objects=%d skipped=%d errors=%d bytes=%d entries=%d fingerprints=%d run=%d\n",
 			rep.Volume, rep.Destination, rep.Status,
 			r.Transferred, r.Checked, r.Errors, r.Bytes,
-			rep.Verification.Files, rep.RunID,
+			rep.Verification.Files, rep.Fingerprints, rep.RunID,
 		)
 	default:
 		fmt.Fprintf(w, "%s → %s  status=%s transferred=%d checked=%d errors=%d bytes=%d run=%d\n",

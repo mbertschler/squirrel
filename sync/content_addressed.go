@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 
 	"github.com/mbertschler/squirrel/config"
@@ -186,7 +187,7 @@ func (h *contentAddressedHandler) watermark(ctx context.Context, volID int64) (i
 		return 0, fmt.Errorf("lookup last successful sync of %s: %w", h.dest.Name, err)
 	}
 	segURI := h.segmentURI(last.ID)
-	if _, err := h.rcl.statRemote(ctx, segURI); err != nil {
+	if _, err := h.rcl.statRemote(ctx, segURI, checkersArgs(h.dest)...); err != nil {
 		return 0, fmt.Errorf("destination %q: the last successful sync (run %d) left no manifest segment at %s — its history does not look content-addressed; point the layout at a fresh destination or root instead of switching an existing one: %w", h.dest.Name, last.ID, segURI, err)
 	}
 	return last.ID, nil
@@ -201,6 +202,7 @@ func (h *contentAddressedHandler) watermark(ctx context.Context, volID int64) (i
 // and saves work on the retry — but any failure fails the run before
 // the segment is written.
 func (h *contentAddressedHandler) uploadObjects(ctx context.Context, rep *Report, runID int64, delta []store.PathDelta) error {
+	var confirmed []store.PathDelta
 	for _, d := range plannedUploads(delta) {
 		recorded, err := h.store.HasRemoteObject(ctx, d.ContentID, h.dest.Name)
 		if err != nil {
@@ -218,13 +220,60 @@ func (h *contentAddressedHandler) uploadObjects(ctx context.Context, rep *Report
 			}
 			continue
 		}
+		confirmed = append(confirmed, d)
 		rep.RcloneResult.Transferred++
 		rep.RcloneResult.Bytes += d.SizeBytes
 	}
+	h.captureFingerprints(ctx, rep, confirmed)
 	if rep.RcloneResult.Errors > 0 {
 		return fmt.Errorf("%d object(s) failed to land on %q; the manifest segment for run %d was not written and the durability vector did not advance", rep.RcloneResult.Errors, h.dest.Name, runID)
 	}
 	return nil
+}
+
+// fingerprintBatchSize caps how many freshly confirmed objects one
+// lsjson invocation covers, bounding argv growth from the per-object
+// --include filters.
+const fingerprintBatchSize = 200
+
+// captureFingerprints fills the pending checksum pair of every object
+// confirmed during this run with the provider checksum read back from
+// the underlying remote — batched into one `lsjson --hash` per chunk,
+// scoped by --include filters so the backend hashes only this run's
+// uploads. Capture problems are warnings, not failures: the upload is
+// already confirmed and recorded, and `squirrel verify` fills any
+// fingerprint left pending.
+func (h *contentAddressedHandler) captureFingerprints(ctx context.Context, rep *Report, confirmed []store.PathDelta) {
+	dirURI := underlyingObjectsURI(h.dest)
+	types := captureHashTypes(h.dest)
+	for batch := range slices.Chunk(confirmed, fingerprintBatchSize) {
+		extra := checkersArgs(h.dest)
+		for _, d := range batch {
+			extra = append(extra, "--include", hex.EncodeToString(d.Blake3))
+		}
+		entries, err := h.rcl.listHashes(ctx, dirURI, types, extra...)
+		if err != nil {
+			rep.Warnings = append(rep.Warnings, fmt.Sprintf("fingerprint capture on %q failed: %v — checksums stay pending until `squirrel verify`", h.dest.Name, err))
+			return
+		}
+		byName := make(map[string]map[string]string, len(entries))
+		for _, e := range entries {
+			byName[e.Name] = e.Hashes
+		}
+		for _, d := range batch {
+			hash := hex.EncodeToString(d.Blake3)
+			cs, ok := extractChecksum(h.dest, byName[hash])
+			if !ok {
+				rep.Warnings = append(rep.Warnings, fmt.Sprintf("object %s on %q: backend exposes no checksum; fingerprint stays pending", hash, h.dest.Name))
+				continue
+			}
+			if err := h.store.SetRemoteObjectChecksum(ctx, d.ContentID, h.dest.Name, cs.Algo, cs.Value); err != nil {
+				rep.Warnings = append(rep.Warnings, fmt.Sprintf("record fingerprint for %s: %v", hash, err))
+				continue
+			}
+			rep.Fingerprints++
+		}
+	}
 }
 
 // plannedUploads selects the delta rows that need a content object —
@@ -263,10 +312,10 @@ func (h *contentAddressedHandler) uploadOneObject(ctx context.Context, runID int
 	}
 	hash := hex.EncodeToString(d.Blake3)
 	uri := h.objectURI(hash)
-	if err := h.rcl.copyTo(ctx, src, uri); err != nil {
+	if err := h.rcl.copyTo(ctx, src, uri, checkersArgs(h.dest)...); err != nil {
 		return err
 	}
-	size, err := h.rcl.statRemote(ctx, uri)
+	size, err := h.rcl.statRemote(ctx, uri, checkersArgs(h.dest)...)
 	if err != nil {
 		return fmt.Errorf("confirm object %s after upload: %w", hash, err)
 	}
@@ -306,10 +355,10 @@ func (h *contentAddressedHandler) uploadSegment(ctx context.Context, delta []sto
 	}
 
 	uri := h.segmentURI(runID)
-	if err := h.rcl.copyTo(ctx, tmp.Name(), uri); err != nil {
+	if err := h.rcl.copyTo(ctx, tmp.Name(), uri, checkersArgs(h.dest)...); err != nil {
 		return fmt.Errorf("upload manifest segment to %s: %w", uri, err)
 	}
-	size, err := h.rcl.statRemote(ctx, uri)
+	size, err := h.rcl.statRemote(ctx, uri, checkersArgs(h.dest)...)
 	if err != nil {
 		return fmt.Errorf("confirm manifest segment at %s: %w", uri, err)
 	}
