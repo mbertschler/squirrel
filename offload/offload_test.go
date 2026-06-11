@@ -334,8 +334,8 @@ func TestOffloadPeerOriginContent(t *testing.T) {
 // in destination_run_ids under the target name. The gate consumes those
 // rows like any other — here the target was also pushed to locally
 // (seedVector records the push), so its freshness watermark is current.
-// The peer-relayed-only case (no local push) is held out; see
-// TestOffloadPeerRelayedTargetNeedsLocalPush.
+// The peer-relayed-only case (no local push, gated on pulled freshness)
+// is covered by TestOffloadPeerRelayedTargetGatesOnPulledFreshness.
 func TestOffloadPeerPulledEvidenceTarget(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "a.txt"), "alpha")
