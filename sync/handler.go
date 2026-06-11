@@ -25,6 +25,13 @@ const (
 	// VerifyMethodKopia is kopia's own repository consistency check
 	// (`kopia snapshot verify`).
 	VerifyMethodKopia = "kopia-verify"
+	// VerifyMethodPresenceSize is the content-addressed push's check:
+	// rclone reported every transfer succeeded, and a follow-up listing
+	// confirmed each object and the manifest segment present at the
+	// expected size. Presence evidence is weaker than a content check
+	// (crypt remotes expose no hashes), so results carrying it stay
+	// unverified until the provider-checksum fingerprint pass lands.
+	VerifyMethodPresenceSize = "presence+size"
 )
 
 // VerifyResult is the typed durability report of one handler push: how
@@ -111,6 +118,11 @@ func HandlerFor(s *store.Store, tools Tools, p Pair) (Handler, error) {
 			return nil, fmt.Errorf("destination %q: kopia wrapper is required (build Tools via ToolsFor)", p.Destination.Name)
 		}
 		return &kopiaHandler{store: s, kopia: tools.Kopia, vol: p.Volume, dest: p.Destination}, nil
+	case p.Destination.Layout == config.LayoutContentAddressed:
+		if tools.Rclone == nil {
+			return nil, fmt.Errorf("destination %q: rclone wrapper is required", p.Destination.Name)
+		}
+		return &contentAddressedHandler{store: s, rcl: tools.Rclone, vol: p.Volume, dest: p.Destination}, nil
 	default:
 		if tools.Rclone == nil {
 			return nil, fmt.Errorf("destination %q: rclone wrapper is required", p.Destination.Name)
@@ -150,6 +162,24 @@ func (h *peerHandler) Push(ctx context.Context, opts Options) (Report, error) {
 }
 
 func (h *peerHandler) sealed() {}
+
+// finishHandlerRun writes a handler-driven run's terminal state from
+// rep.Status, mirroring the rclone scaffold's finishRun contract: a
+// FinishRun failure lands on rep.FinishErr so the caller surfaces it
+// next to the push outcome. The kopia and content-addressed handlers
+// share it; their file counts ride on rep.Verification.Files.
+func finishHandlerRun(ctx context.Context, s *store.Store, rep *Report, runErr error) {
+	if rep.RunID == 0 {
+		return
+	}
+	errMsg := ""
+	if runErr != nil {
+		errMsg = runErr.Error()
+	}
+	if err := s.FinishRun(ctx, rep.RunID, rep.Status, errMsg, rep.Verification.Files); err != nil {
+		rep.FinishErr = err
+	}
+}
 
 // rcloneVerification derives the typed durability report for one rclone
 // bucket transfer: BLAKE3 end-to-end when the integrity flags were in

@@ -588,14 +588,19 @@ func EffectiveShallow(dest *config.Destination, shallow bool) bool {
 // rclone entirely without BLAKE3 verification: either the operator
 // passed --shallow, or every rclone-driven target is a crypt
 // destination that forces it. Kopia pairs are skipped — they drive the
-// kopia binary, so they put no constraint on rclone. Used to scope the
-// rclone version preflight to what the run will actually invoke.
+// kopia binary, so they put no constraint on rclone. Content-addressed
+// pairs are skipped for the same reason: their per-object copyto and
+// lsjson calls never pass --hash blake3. Used to scope the rclone
+// version preflight to what the run will actually invoke.
 func ShallowForPairs(pairs []Pair, shallow bool) bool {
 	if shallow {
 		return true
 	}
 	for _, p := range pairs {
 		if p.Destination != nil && p.Destination.Type == "kopia" {
+			continue
+		}
+		if p.Destination != nil && p.Destination.Layout == config.LayoutContentAddressed {
 			continue
 		}
 		if p.Destination == nil || p.Destination.Crypt == nil {
@@ -751,6 +756,9 @@ func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volum
 	rep = Report{Volume: vol.Name, Destination: dest.Name}
 	if dest.Type == "kopia" {
 		return rep, fmt.Errorf("destination %q is a kopia repository — restore from it with the kopia CLI (`kopia snapshot restore`)", dest.Name)
+	}
+	if dest.Layout == config.LayoutContentAddressed {
+		return rep, fmt.Errorf("destination %q uses the content-addressed layout — its restore tooling ships separately; the data is recoverable by replaying the manifest segments under %s/ against %s/ (see the README's manifest format)", dest.Name, ManifestDirName, ObjectsDirName)
 	}
 	if w := cryptVerificationWarning(dest, opts.Shallow); w != "" {
 		rep.Warnings = append(rep.Warnings, w)

@@ -757,6 +757,7 @@ func TestShallowForPairs(t *testing.T) {
 	plain.Crypt = nil
 	node := Pair{Node: &config.Node{Name: "peer"}}
 	kopia := Pair{Destination: &config.Destination{Name: "mirror", Type: "kopia", Root: "/tmp/repo"}}
+	contentAddressed := Pair{Destination: &config.Destination{Name: "archive", Type: "sftp", Root: "/data", Layout: config.LayoutContentAddressed}}
 	cases := []struct {
 		name    string
 		pairs   []Pair
@@ -769,6 +770,8 @@ func TestShallowForPairs(t *testing.T) {
 		{"node target verifies", []Pair{{Destination: crypt}, node}, false, false},
 		{"kopia pair puts no constraint on rclone", []Pair{kopia, {Destination: crypt}}, false, true},
 		{"kopia beside plain still verifies", []Pair{kopia, {Destination: plain}}, false, false},
+		{"content-addressed pair puts no constraint on rclone", []Pair{contentAddressed, {Destination: crypt}}, false, true},
+		{"content-addressed beside plain still verifies", []Pair{contentAddressed, {Destination: plain}}, false, false},
 		{"no pairs", nil, false, true},
 	}
 	for _, c := range cases {
