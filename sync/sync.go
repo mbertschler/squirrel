@@ -155,6 +155,14 @@ type Report struct {
 	// rewinds are mirrored into Warnings so the CLI surfaces them
 	// without special-casing this field.
 	DurabilityPull DurabilityPullReport
+	// durabilityAdvance is the origin-coordinate snapshot a handler
+	// captured from the volume's present set before its transfer.
+	// RunPair advances the destination vector to exactly these
+	// components after a verified success, so the advance reflects only
+	// what the push enumerated — never a live set re-read after the
+	// transfer. Handlers that advance the vector themselves (content-
+	// addressed, peer) leave it nil.
+	durabilityAdvance []store.OriginComponent
 }
 
 // RunPair is the single entry point for one sync invocation. It
@@ -195,8 +203,10 @@ func RunPair(ctx context.Context, s *store.Store, tools Tools, p Pair, opts Opti
 	}
 	// A failed advance surfaces as the command's error even though the
 	// runs row already closed as success: the bytes are on the
-	// destination, and the next verified push re-advances cheaply.
-	if aerr := s.AdvanceDestinationVector(ctx, vol.ID, p.TargetName()); aerr != nil {
+	// destination, and the next verified push re-advances cheaply. The
+	// advance reflects the snapshot the handler captured before its
+	// transfer, tagged with the verification method that backed it.
+	if aerr := s.AdvanceDestinationVectorTo(ctx, vol.ID, p.TargetName(), rep.Verification.Method, rep.durabilityAdvance); aerr != nil {
 		return rep, fmt.Errorf("advance durability vector for %s → %s: %w", rep.Volume, p.TargetName(), aerr)
 	}
 	return rep, nil
@@ -259,6 +269,12 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 		opts.OnRunID(runID)
 	}
 
+	if !opts.DryRun {
+		if rep.durabilityAdvance, err = captureDurabilityAdvance(ctx, s, volID); err != nil {
+			return rep, err
+		}
+	}
+
 	err = runRcloneOperation(ctx, s, rcl, opts.DryRun, runID, &rep, opts.Progress,
 		func(runID int64) ([]string, error) {
 			return buildRcloneArgs(vol, dest, runID, opts)
@@ -272,6 +288,25 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 	// Snapshotter no-ops on dry-run and on non-terminal-success states.
 	opts.Snapshot.afterSync(ctx, &rep, vol, dest)
 	return rep, err
+}
+
+// captureDurabilityAdvance snapshots the volume's present-set origin
+// maxima before a transfer begins. RunPair advances the destination
+// vector to exactly this snapshot on a verified success, so the advance
+// covers only content the push enumerated — the cross-kind run guard
+// keeps an index from committing new present rows during the push, and
+// pinning to the snapshot keeps even an out-of-band write from being
+// folded into the advance.
+func captureDurabilityAdvance(ctx context.Context, s *store.Store, volumeID int64) ([]store.OriginComponent, error) {
+	self, err := s.GetSelfNode(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("capture durability advance: self node: %w", err)
+	}
+	components, err := s.PresentOriginMaxima(ctx, volumeID, self.ID)
+	if err != nil {
+		return nil, fmt.Errorf("capture durability advance: %w", err)
+	}
+	return components, nil
 }
 
 // beginSyncRunGuarded is the sync-allocator the bucket and peer paths

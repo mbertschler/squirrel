@@ -365,6 +365,15 @@ func TestContentAddressedPushHappyPath(t *testing.T) {
 	if vector[0].OriginNodeID != self.ID || vector[0].OriginRunID == 0 {
 		t.Fatalf("vector component = %+v, want self node at the introduction run", vector[0])
 	}
+	// The content-addressed advance records presence+size, not a
+	// content-verified method: the offload gate holds this target out
+	// until a verified fingerprint backs the object (#109).
+	if vector[0].VerifyMethod != VerifyMethodPresenceSize {
+		t.Fatalf("verify method = %q, want %q", vector[0].VerifyMethod, VerifyMethodPresenceSize)
+	}
+	if store.ContentVerifiedMethod(vector[0].VerifyMethod) {
+		t.Fatalf("presence+size must not count as content-verified")
+	}
 
 	// Transfers and confirmations address the crypt overlay remote.
 	log, err := os.ReadFile(f.logPath)

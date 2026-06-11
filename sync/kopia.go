@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/mbertschler/squirrel/config"
@@ -130,10 +131,22 @@ func (k *Kopia) snapshotCreate(ctx context.Context, cfgFile, password, sourcePat
 	return snap, nil
 }
 
-// snapshotVerify runs kopia's own consistency check, scoped to the
-// given snapshot manifest id.
-func (k *Kopia) snapshotVerify(ctx context.Context, cfgFile, password, snapshotID string) error {
-	_, err := k.run(ctx, cfgFile, password, "snapshot", "verify", snapshotID)
+// DefaultVerifyFilesPercent is the fraction of snapshot file bytes
+// `kopia snapshot verify` reads back when a kopia destination does not
+// configure verify_files_percent. kopia's own default is 0 — manifest
+// and object-existence only, no file bytes — which would let a kopia
+// component gate offload on a check that read none of the content. A
+// non-zero default makes every kopia advance rest on a real, if
+// sampled, content read.
+const DefaultVerifyFilesPercent = 10
+
+// snapshotVerify runs kopia's own consistency check, scoped to the given
+// snapshot manifest id, reading back verifyFilesPercent of file bytes so
+// the verification covers real content rather than object existence
+// alone.
+func (k *Kopia) snapshotVerify(ctx context.Context, cfgFile, password, snapshotID string, verifyFilesPercent float64) error {
+	_, err := k.run(ctx, cfgFile, password, "snapshot", "verify",
+		"--verify-files-percent", strconv.FormatFloat(verifyFilesPercent, 'f', -1, 64), snapshotID)
 	return err
 }
 
@@ -175,6 +188,14 @@ func (h *kopiaHandler) Push(ctx context.Context, opts Options) (Report, error) {
 		opts.OnRunID(runID)
 	}
 
+	// Captured before the snapshot walk so RunPair advances the vector
+	// over the indexed present set this push was scoped to, not whatever
+	// kopia's independent live walk happened to include.
+	if rep.durabilityAdvance, err = captureDurabilityAdvance(ctx, h.store, volID); err != nil {
+		finishHandlerRun(ctx, h.store, &rep, err)
+		return rep, err
+	}
+
 	err = h.snapshotAndVerify(ctx, &rep)
 	finishHandlerRun(ctx, h.store, &rep, err)
 	// Local index snapshot only: the repository is kopia's own format,
@@ -185,6 +206,26 @@ func (h *kopiaHandler) Push(ctx context.Context, opts Options) (Report, error) {
 }
 
 func (h *kopiaHandler) sealed() {}
+
+// kopiaVerifyFilesPercent resolves the destination's verify_files_percent
+// param, falling back to DefaultVerifyFilesPercent when unset. The value
+// is a percentage in [0, 100]; a malformed or out-of-range value is a
+// configuration error rather than a silent fallback, since it governs how
+// much content a gating verification actually reads.
+func kopiaVerifyFilesPercent(dest *config.Destination) (float64, error) {
+	raw, ok := dest.Params["verify_files_percent"]
+	if !ok || raw == "" {
+		return DefaultVerifyFilesPercent, nil
+	}
+	pct, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, fmt.Errorf("destination %q: verify_files_percent %q is not a number", dest.Name, raw)
+	}
+	if pct < 0 || pct > 100 {
+		return 0, fmt.Errorf("destination %q: verify_files_percent %v is outside [0, 100]", dest.Name, pct)
+	}
+	return pct, nil
+}
 
 // snapshotAndVerify drives the kopia binary and derives rep.Status and
 // rep.Verification. Status starts failed and is promoted: success for a
@@ -198,6 +239,10 @@ func (h *kopiaHandler) snapshotAndVerify(ctx context.Context, rep *Report) error
 	if err := h.kopia.ensureRepository(ctx, cfgFile, password, h.dest.Root); err != nil {
 		return err
 	}
+	verifyFilesPercent, err := kopiaVerifyFilesPercent(h.dest)
+	if err != nil {
+		return err
+	}
 	snap, err := h.kopia.snapshotCreate(ctx, cfgFile, password, h.vol.Path)
 	if err != nil {
 		return err
@@ -209,7 +254,7 @@ func (h *kopiaHandler) snapshotAndVerify(ctx context.Context, rep *Report) error
 		Files:      summ.Files,
 		Bytes:      summ.Size,
 	}
-	if err := h.kopia.snapshotVerify(ctx, cfgFile, password, snap.ID); err != nil {
+	if err := h.kopia.snapshotVerify(ctx, cfgFile, password, snap.ID, verifyFilesPercent); err != nil {
 		return err
 	}
 	if summ.FatalErrors+summ.IgnoredErrors > 0 {
