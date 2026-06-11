@@ -27,6 +27,12 @@ func remoteObjectFixture(t *testing.T, s *Store) (contentID, runID int64) {
 	return row.ContentID, runID
 }
 
+// nullStr wraps a literal into a valid sql.NullString for fixture
+// brevity.
+func nullStr(s string) sql.NullString {
+	return sql.NullString{String: s, Valid: true}
+}
+
 // TestRemoteObjectRoundTrip: insert records the fingerprint verbatim,
 // Get returns it, and a verification pass stamps verified_at_ns.
 func TestRemoteObjectRoundTrip(t *testing.T) {
@@ -38,8 +44,8 @@ func TestRemoteObjectRoundTrip(t *testing.T) {
 		ContentID:     contentID,
 		Destination:   "bucket-a",
 		UploadedRunID: runID,
-		ChecksumAlgo:  "etag-md5",
-		Checksum:      "9e107d9d372bb6826bd81d3542a419d6",
+		ChecksumAlgo:  nullStr("etag-md5"),
+		Checksum:      nullStr("9e107d9d372bb6826bd81d3542a419d6"),
 	}
 	if err := s.InsertRemoteObject(ctx, obj); err != nil {
 		t.Fatalf("InsertRemoteObject: %v", err)
@@ -79,12 +85,12 @@ func TestRemoteObjectInsertRefusesDuplicate(t *testing.T) {
 
 	obj := RemoteObject{
 		ContentID: contentID, Destination: "bucket-a", UploadedRunID: runID,
-		ChecksumAlgo: "etag-md5", Checksum: "aaaa",
+		ChecksumAlgo: nullStr("etag-md5"), Checksum: nullStr("aaaa"),
 	}
 	if err := s.InsertRemoteObject(ctx, obj); err != nil {
 		t.Fatalf("first insert: %v", err)
 	}
-	obj.Checksum = "bbbb"
+	obj.Checksum = nullStr("bbbb")
 	if err := s.InsertRemoteObject(ctx, obj); err == nil {
 		t.Fatalf("duplicate insert succeeded; fingerprint silently replaced")
 	}
@@ -92,8 +98,69 @@ func TestRemoteObjectInsertRefusesDuplicate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetRemoteObject: %v", err)
 	}
-	if got.Checksum != "aaaa" {
-		t.Fatalf("checksum = %q after refused duplicate, want original %q", got.Checksum, "aaaa")
+	if got.Checksum != nullStr("aaaa") {
+		t.Fatalf("checksum = %+v after refused duplicate, want original %q", got.Checksum, "aaaa")
+	}
+}
+
+// TestRemoteObjectFingerprintPending: the content-addressed push
+// records the upload with the checksum pair NULL; the record gates
+// upload-once dedup (HasRemoteObject) until the scan-back pass fills
+// the fingerprint in.
+func TestRemoteObjectFingerprintPending(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	contentID, runID := remoteObjectFixture(t, s)
+
+	has, err := s.HasRemoteObject(ctx, contentID, "bucket-a")
+	if err != nil || has {
+		t.Fatalf("HasRemoteObject before insert = (%t, %v), want (false, nil)", has, err)
+	}
+	if err := s.InsertRemoteObject(ctx, RemoteObject{
+		ContentID: contentID, Destination: "bucket-a", UploadedRunID: runID,
+	}); err != nil {
+		t.Fatalf("InsertRemoteObject (pending fingerprint): %v", err)
+	}
+	got, err := s.GetRemoteObject(ctx, contentID, "bucket-a")
+	if err != nil {
+		t.Fatalf("GetRemoteObject: %v", err)
+	}
+	if got.ChecksumAlgo.Valid || got.Checksum.Valid {
+		t.Fatalf("pending upload carries a fingerprint: %+v", got)
+	}
+	has, err = s.HasRemoteObject(ctx, contentID, "bucket-a")
+	if err != nil || !has {
+		t.Fatalf("HasRemoteObject after insert = (%t, %v), want (true, nil)", has, err)
+	}
+}
+
+// TestRemoteObjectChecksumPairEnforced: a checksum without its
+// algorithm (or vice versa) is uninterpretable, refused by both the Go
+// validation and the schema CHECK.
+func TestRemoteObjectChecksumPairEnforced(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	contentID, runID := remoteObjectFixture(t, s)
+
+	if err := s.InsertRemoteObject(ctx, RemoteObject{
+		ContentID: contentID, Destination: "bucket-a", UploadedRunID: runID,
+		ChecksumAlgo: nullStr("etag-md5"),
+	}); err == nil {
+		t.Fatalf("algo without checksum accepted")
+	}
+	if err := s.InsertRemoteObject(ctx, RemoteObject{
+		ContentID: contentID, Destination: "bucket-a", UploadedRunID: runID,
+		Checksum: nullStr("aaaa"),
+	}); err == nil {
+		t.Fatalf("checksum without algo accepted")
+	}
+	// The schema CHECK is the backstop when a write bypasses
+	// InsertRemoteObject's validation.
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO remote_objects (content_id, destination, uploaded_run_id, checksum_algo, checksum)
+		VALUES (?, 'bucket-a', ?, 'etag-md5', NULL)
+	`, contentID, runID); err == nil {
+		t.Fatalf("schema CHECK accepted a half-set checksum pair")
 	}
 }
 
@@ -107,13 +174,13 @@ func TestRemoteObjectFKsEnforced(t *testing.T) {
 
 	if err := s.InsertRemoteObject(ctx, RemoteObject{
 		ContentID: 99999, Destination: "bucket-a", UploadedRunID: runID,
-		ChecksumAlgo: "etag-md5", Checksum: "aaaa",
+		ChecksumAlgo: nullStr("etag-md5"), Checksum: nullStr("aaaa"),
 	}); err == nil {
 		t.Fatalf("bogus content id accepted; FK not enforced")
 	}
 	if err := s.InsertRemoteObject(ctx, RemoteObject{
 		ContentID: contentID, Destination: "bucket-a", UploadedRunID: 99999,
-		ChecksumAlgo: "etag-md5", Checksum: "aaaa",
+		ChecksumAlgo: nullStr("etag-md5"), Checksum: nullStr("aaaa"),
 	}); err == nil {
 		t.Fatalf("bogus run id accepted; FK not enforced")
 	}

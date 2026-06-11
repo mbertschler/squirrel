@@ -10,7 +10,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 16
+const SchemaVersion = 17
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -52,6 +52,7 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 14, up: migrateV13ToV14},
 		{version: 15, up: migrateV14ToV15},
 		{version: 16, up: migrateV15ToV16},
+		{version: 17, up: migrateV16ToV17},
 	}
 }
 
@@ -1638,6 +1639,54 @@ func migrateV15ToV16(ctx context.Context, db *sql.DB) error {
 	for _, q := range stmts {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("v15→v16: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// --- v16 → v17 ---
+
+// migrateV16ToV17 relaxes remote_objects so the upload record and the
+// fingerprint are two separate facts: the content-addressed offsite
+// push records the upload immediately (checksum_algo and checksum both
+// NULL — uploaded, fingerprint pending) and a later scan-back pass
+// fills the provider checksum in. A CHECK keeps the pair atomic — a
+// checksum without its algorithm (or vice versa) is uninterpretable.
+//
+// remote_objects is a leaf table (nothing references it), so the
+// rebuild needs no FK-off recipe: the staged table is populated while
+// the old one still satisfies every constraint, then swapped in.
+// Existing rows carry over verbatim.
+func migrateV16ToV17(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`CREATE TABLE remote_objects_v17 (
+			content_id      INTEGER NOT NULL REFERENCES contents(id),
+			destination     TEXT NOT NULL,
+			uploaded_run_id INTEGER NOT NULL REFERENCES runs(id),
+			checksum_algo   TEXT,
+			checksum        TEXT,
+			verified_at_ns  INTEGER,
+			PRIMARY KEY (content_id, destination),
+			CHECK ((checksum_algo IS NULL) = (checksum IS NULL))
+		)`,
+		`INSERT INTO remote_objects_v17 (
+			content_id, destination, uploaded_run_id, checksum_algo, checksum, verified_at_ns
+		)
+		SELECT content_id, destination, uploaded_run_id, checksum_algo, checksum, verified_at_ns
+		FROM remote_objects`,
+		`DROP TABLE remote_objects`,
+		`ALTER TABLE remote_objects_v17 RENAME TO remote_objects`,
+		`INSERT INTO schema_version (version) VALUES (17)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("v16→v17: %w", err)
 		}
 	}
 	return tx.Commit()
