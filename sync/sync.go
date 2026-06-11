@@ -158,6 +158,10 @@ type Report struct {
 // for tests and for callers that already have the typed destination in
 // hand.
 //
+// A verified successful bucket push (BLAKE3 for rclone, repository
+// verify for kopia) advances the destination's durability vector;
+// peer pushes advance it inside the handshake's close phase instead.
+//
 // Concurrency: every handler allocates the 'running' kind='sync' row
 // via store.BeginSyncRunIfClear, which does the check + insert
 // atomically inside a BEGIN IMMEDIATE transaction. Two concurrent
@@ -174,7 +178,22 @@ func RunPair(ctx context.Context, s *store.Store, tools Tools, p Pair, opts Opti
 		}
 		return rep, err
 	}
-	return h.Push(ctx, opts)
+	rep, err := h.Push(ctx, opts)
+	if err != nil || opts.DryRun || p.IsNode() || rep.FinishErr != nil ||
+		rep.Status != store.RunStatusSuccess || !rep.Verification.Verified() {
+		return rep, err
+	}
+	vol, verr := s.GetVolumeByName(ctx, rep.Volume)
+	if verr != nil {
+		return rep, fmt.Errorf("advance durability vector: resolve volume %q: %w", rep.Volume, verr)
+	}
+	// A failed advance surfaces as the command's error even though the
+	// runs row already closed as success: the bytes are on the
+	// destination, and the next verified push re-advances cheaply.
+	if aerr := s.AdvanceDestinationVector(ctx, vol.ID, p.TargetName()); aerr != nil {
+		return rep, fmt.Errorf("advance durability vector for %s → %s: %w", rep.Volume, p.TargetName(), aerr)
+	}
+	return rep, nil
 }
 
 // alreadyRunningErr formats the diagnostic returned when a sync is
