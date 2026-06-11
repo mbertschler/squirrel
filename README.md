@@ -95,7 +95,7 @@ Like rclone, the kopia binary is driven as an opaque child process with squirrel
 
 Properties that differ from rclone destinations:
 
-- **kopia verifies its own content hashes**, so the runs row is always recorded as fully verified (never shallow), and `--shallow` has no effect on kopia pairs. `--dry-run` is refused — kopia has no equivalent.
+- **kopia verifies its own content hashes**, so the runs row is never recorded as shallow and `--shallow` has no effect on kopia pairs; whether a given run counts as verified comes from kopia itself (a clean snapshot plus a passing `snapshot verify`). `--dry-run` is refused — kopia has no equivalent.
 - **A `crypt` block is rejected**: kopia encrypts its repository itself. Keep the repository password safe; the repository is unreadable without it.
 - **Restore goes through the kopia CLI** (`kopia snapshot restore`), since the repository is kopia's own format. `squirrel restore` refuses kopia destinations and says so.
 

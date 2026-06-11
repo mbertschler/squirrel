@@ -43,13 +43,28 @@ func (k *Kopia) configFile(destName string) string {
 	return filepath.Join(k.ConfigDir, "kopia-"+destName+".config")
 }
 
+// environWithout returns the process environment with every entry for
+// key removed, so a single appended override is the one value the child
+// sees regardless of what the parent shell exported.
+func environWithout(key string) []string {
+	env := os.Environ()
+	out := env[:0]
+	prefix := key + "="
+	for _, e := range env {
+		if !strings.HasPrefix(e, prefix) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 // run executes one kopia subcommand against the given config file,
 // returning captured stdout. Stderr is folded into the error on failure
 // for diagnostics.
 func (k *Kopia) run(ctx context.Context, cfgFile, password string, args ...string) ([]byte, error) {
 	full := append(append([]string(nil), args...), "--config-file", cfgFile)
 	cmd := exec.CommandContext(ctx, k.Binary, full...)
-	cmd.Env = append(os.Environ(), "KOPIA_PASSWORD="+password)
+	cmd.Env = append(environWithout("KOPIA_PASSWORD"), "KOPIA_PASSWORD="+password)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -135,6 +150,9 @@ func (h *kopiaHandler) TargetName() string { return h.dest.Name }
 
 func (h *kopiaHandler) Push(ctx context.Context, opts Options) (Report, error) {
 	rep := Report{Volume: h.vol.Name, Destination: h.dest.Name}
+	// Stamped up front so output renderers key kopia formatting off the
+	// method even when the push fails before a snapshot exists.
+	rep.Verification.Method = VerifyMethodKopia
 	if opts.DryRun {
 		return rep, fmt.Errorf("destination %q: kopia has no dry-run mode — run without --dry-run", h.dest.Name)
 	}

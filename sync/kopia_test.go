@@ -156,6 +156,9 @@ func readCallLog(t *testing.T, logPath string) (argv, env []string) {
 
 func TestKopiaPushHappyPath(t *testing.T) {
 	logPath := installFakeKopia(t)
+	// A stale parent-shell export must not shadow the configured
+	// password: the wrapper strips it before appending its own.
+	t.Setenv("KOPIA_PASSWORD", "stale-parent-value")
 	f := setupKopiaFixture(t)
 
 	rep, err := RunPair(context.Background(), f.store, f.tools, f.pair, Options{})
@@ -242,6 +245,9 @@ func TestKopiaCreateFailureRecordsFailedRun(t *testing.T) {
 	}
 	if rep.Status != store.RunStatusFailed {
 		t.Fatalf("Status = %q, want failed", rep.Status)
+	}
+	if rep.Verification.Method != VerifyMethodKopia {
+		t.Fatalf("Method = %q on early failure, want %q so output renders kopia-shaped", rep.Verification.Method, VerifyMethodKopia)
 	}
 	run, getErr := f.store.GetRun(context.Background(), rep.RunID)
 	if getErr != nil {
