@@ -43,15 +43,25 @@ var destSchemas = map[string]destSchema{
 		// an rclone backend param for the local case.
 	},
 	"sftp": {
+		// known_hosts_file points rclone at a known_hosts file so it
+		// validates the server's host key before transferring; absent, rclone
+		// accepts whatever host key the server presents. host_key_algorithms
+		// pins the accepted host-key algorithms (rclone's space-separated
+		// list). Both map straight to the rclone sftp options of the same
+		// name. The unknown-field check confines them to this type.
 		rcloneType:     "sftp",
 		requiredString: []string{"host", "user"},
-		optionalString: []string{"port", "key_file"},
+		optionalString: []string{"port", "key_file", "known_hosts_file", "host_key_algorithms"},
 		secretFields:   []string{"password"},
 	},
 	"s3": {
+		// storage_class maps to rclone's s3 storage_class config key; its
+		// accepted values are whatever the backend supports (commonly
+		// STANDARD and various archive tiers). The unknown-field check
+		// confines it to this type.
 		rcloneType:     "s3",
 		requiredString: []string{"provider", "bucket"},
-		optionalString: []string{"region", "endpoint"},
+		optionalString: []string{"region", "endpoint", "storage_class"},
 		secretFields:   []string{"access_key_id", "secret_access_key"},
 	},
 	"b2": {

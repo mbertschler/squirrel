@@ -405,6 +405,103 @@ root   = "/p"
 	}
 }
 
+// TestLoadDestinationS3StorageClass parses the optional s3 storage_class and
+// confirms it renders verbatim into the s3 section.
+func TestLoadDestinationS3StorageClass(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.archive]
+type          = "s3"
+provider      = "AWS"
+bucket        = "squirrel"
+root          = "/p"
+storage_class = "DEEP_ARCHIVE"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	d := cfg.Destinations["archive"]
+	if d.Params["storage_class"] != "DEEP_ARCHIVE" {
+		t.Fatalf("storage_class not resolved: %v", d.Params)
+	}
+	if !strings.Contains(d.RcloneSection(), "storage_class = DEEP_ARCHIVE") {
+		t.Fatalf("section missing storage_class:\n%s", d.RcloneSection())
+	}
+}
+
+// TestLoadRejectsStorageClassOnNonS3 confirms storage_class is confined to
+// the s3 type by the unknown-field check — it has no meaning on an sftp
+// destination.
+func TestLoadRejectsStorageClassOnNonS3(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.nas]
+type          = "sftp"
+host          = "h"
+user          = "u"
+root          = "/r"
+storage_class = "GLACIER"
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), `unknown field "storage_class"`) {
+		t.Fatalf("expected storage_class rejected on sftp, got %v", err)
+	}
+}
+
+// TestLoadDestinationSFTPHostKeyValidation parses the optional sftp
+// known_hosts_file and host_key_algorithms params and confirms both render
+// verbatim into the sftp section. Pointing rclone at a known_hosts file is
+// what turns on server host-key validation; absent, rclone accepts any host
+// key the server presents.
+func TestLoadDestinationSFTPHostKeyValidation(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.nas]
+type                = "sftp"
+host                = "h"
+user                = "u"
+root                = "/r"
+password            = "p"
+known_hosts_file    = "~/.ssh/known_hosts"
+host_key_algorithms = "ssh-ed25519 ssh-rsa"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	d := cfg.Destinations["nas"]
+	if d.Params["known_hosts_file"] != "~/.ssh/known_hosts" {
+		t.Fatalf("known_hosts_file not resolved: %v", d.Params)
+	}
+	if d.Params["host_key_algorithms"] != "ssh-ed25519 ssh-rsa" {
+		t.Fatalf("host_key_algorithms not resolved: %v", d.Params)
+	}
+	section := d.RcloneSection()
+	for _, want := range []string{
+		"known_hosts_file = ~/.ssh/known_hosts",
+		"host_key_algorithms = ssh-ed25519 ssh-rsa",
+	} {
+		if !strings.Contains(section, want) {
+			t.Fatalf("section missing %q:\n%s", want, section)
+		}
+	}
+}
+
+// TestLoadRejectsKnownHostsFileOnNonSFTP confirms the host-key params are
+// confined to the sftp type by the unknown-field check.
+func TestLoadRejectsKnownHostsFileOnNonSFTP(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.s3]
+type             = "s3"
+provider         = "AWS"
+bucket           = "squirrel"
+root             = "/p"
+known_hosts_file = "~/.ssh/known_hosts"
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), `unknown field "known_hosts_file"`) {
+		t.Fatalf("expected known_hosts_file rejected on s3, got %v", err)
+	}
+}
+
 // TestLoadDestinationCrypt parses a crypt block with one env-resolved and
 // one literal password, the same secret forms destination credentials
 // accept.

@@ -57,6 +57,30 @@ root              = "/squirrel"
 
 Supported destination types: `local`, `sftp`, `s3`, `b2`, `gcs` (rclone-backed), and `kopia` (see [kopia destinations](#kopia-destinations)). Secrets accept either a literal string or an inline `{ env = "VAR_NAME" }` table that is resolved at load time. Unknown fields, missing required fields, and unset env vars are rejected immediately — squirrel will not invoke rclone with a misconfigured destination.
 
+Some optional params are specific to one backend type and rejected on the others (as an unknown field):
+
+- **`sftp` host-key validation** — `known_hosts_file` points rclone at a known_hosts file so it validates the server's host key before transferring; `host_key_algorithms` is rclone's space-separated list pinning the accepted host-key algorithms. Both map to the rclone sftp options of the same name. **Without `known_hosts_file`, rclone does not validate the server's host key** and will connect to whatever host answers — set it (recommended) so a redirected or impersonated server is rejected.
+
+  ```toml
+  [destinations.nas]
+  type                = "sftp"
+  host                = "nas.local"
+  user                = "martin"
+  password            = { env = "NAS_PASSWORD" }
+  root                = "/volume1/squirrel"
+  known_hosts_file    = "~/.ssh/known_hosts"      # validate the server host key (recommended)
+  host_key_algorithms = "ssh-ed25519 ssh-rsa"     # optional: pin accepted host-key algorithms
+  ```
+
+- **`s3` storage class** — `storage_class` maps to rclone's s3 `storage_class` config key and accepts whatever value the chosen s3-compatible backend supports (typically a default tier plus one or more cheaper archive/cold tiers); absent, the backend's default class is used. Use the exact value string your provider documents.
+
+  ```toml
+  [destinations.offsite]
+  type          = "s3"
+  # ...
+  storage_class = "<provider archive tier>"   # archive tiers cost less to store, more to read
+  ```
+
 Squirrel writes its own `rclone.conf` next to the config (`~/.squirrel/rclone.conf`, mode 0600) on every sync invocation. You do not run `rclone config` and you should not edit `rclone.conf` by hand.
 
 ### Encrypted destinations
