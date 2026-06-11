@@ -184,3 +184,109 @@ func TestSetCorrelatedRunID(t *testing.T) {
 		t.Fatalf("expected no-such-run error")
 	}
 }
+
+// TestGetOrCreateOriginNode covers the three name-resolution outcomes
+// the verbatim origin-propagation path needs: an unknown name creates a
+// placeholder-endpoint row (a forwarded origin may name a node this
+// host has never peered with), a known peer row is returned as-is, and
+// the self name resolves to the self-row rather than colliding with it.
+func TestGetOrCreateOriginNode(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := OpenWithOptions(dsn, OpenOptions{NodeName: "local"})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	created, err := s.GetOrCreateOriginNode(ctx, "far-away")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode(far-away): %v", err)
+	}
+	if !created.Endpoint.Valid || created.Endpoint.String != "peer://far-away" {
+		t.Fatalf("created endpoint = %+v, want the peer://far-away placeholder", created.Endpoint)
+	}
+	again, err := s.GetOrCreateOriginNode(ctx, "far-away")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode(far-away) again: %v", err)
+	}
+	if again.ID != created.ID {
+		t.Fatalf("second resolve created a new row: %d → %d", created.ID, again.ID)
+	}
+
+	peer, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.example")
+	if err != nil {
+		t.Fatalf("GetOrCreatePeerNode: %v", err)
+	}
+	byOrigin, err := s.GetOrCreateOriginNode(ctx, "nas")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode(nas): %v", err)
+	}
+	if byOrigin.ID != peer.ID || byOrigin.Endpoint.String != "https://nas.example" {
+		t.Fatalf("origin resolve of a peer = %+v, want the existing peer row %+v", byOrigin, peer)
+	}
+
+	self, _ := s.GetSelfNode(ctx)
+	bySelfName, err := s.GetOrCreateOriginNode(ctx, "local")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode(local): %v", err)
+	}
+	if bySelfName.ID != self.ID {
+		t.Fatalf("self name resolved to row %d, want the self-row %d", bySelfName.ID, self.ID)
+	}
+}
+
+// TestGetOrCreateOriginNodeRejectsInvalidName pins that the node-name
+// rule guards origin creation too — a wire-supplied name that fails
+// nodeNameRE must not land a row. ValidNodeName is the predicate the
+// protocol layer uses to refuse such names up front.
+func TestGetOrCreateOriginNodeRejectsInvalidName(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, _ := Open(dsn)
+	defer s.Close()
+
+	if ValidNodeName("../etc") {
+		t.Fatalf("ValidNodeName accepted a traversal-shaped name")
+	}
+	if !ValidNodeName("node-a_2") {
+		t.Fatalf("ValidNodeName rejected a compliant name")
+	}
+	if _, err := s.GetOrCreateOriginNode(context.Background(), "../etc"); err == nil {
+		t.Fatalf("invalid origin node name accepted, want error")
+	}
+}
+
+// TestGetOrCreatePeerNodeUpgradesPlaceholder: a row created from a
+// name-only context (a forwarded origin, or a durability pull before
+// any sync) carries the peer:// placeholder; the first real handshake
+// presenting an actual endpoint upgrades it in place instead of
+// refusing the collision. Real-endpoint mismatches stay refused.
+func TestGetOrCreatePeerNodeUpgradesPlaceholder(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, _ := Open(dsn)
+	defer s.Close()
+	ctx := context.Background()
+
+	seeded, err := s.GetOrCreateOriginNode(ctx, "nas")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode: %v", err)
+	}
+	upgraded, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.example:8443")
+	if err != nil {
+		t.Fatalf("GetOrCreatePeerNode after placeholder: %v", err)
+	}
+	if upgraded.ID != seeded.ID {
+		t.Fatalf("upgrade created a new row: %d → %d", seeded.ID, upgraded.ID)
+	}
+	if upgraded.Endpoint.String != "https://nas.example:8443" {
+		t.Fatalf("endpoint = %q, want the upgraded real endpoint", upgraded.Endpoint.String)
+	}
+	persisted, _ := s.GetNodeByName(ctx, "nas")
+	if persisted.Endpoint.String != "https://nas.example:8443" {
+		t.Fatalf("persisted endpoint = %q, want the upgrade written through", persisted.Endpoint.String)
+	}
+
+	if _, err := s.GetOrCreatePeerNode(ctx, "nas", "https://other.example"); err == nil {
+		t.Fatalf("real-endpoint mismatch accepted, want refusal")
+	}
+}

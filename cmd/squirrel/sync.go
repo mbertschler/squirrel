@@ -166,6 +166,10 @@ func printSyncReport(w io.Writer, rep sync.Report, runErr error) {
 		for _, m := range rep.NodeVerify.Mismatched {
 			fmt.Fprintf(w, "    mismatched %s: expected %s, actual %s\n", m.Path, m.ExpectedHex, m.ActualHex)
 		}
+		if rep.DurabilityPull.Fetched > 0 {
+			fmt.Fprintf(w, "  durability: applied %d/%d peer components\n",
+				rep.DurabilityPull.Applied, rep.DurabilityPull.Fetched)
+		}
 	}
 	for _, c := range rep.NodeConflicts {
 		fmt.Fprintf(w, "  conflict %s: %s — was %s, now %s\n",

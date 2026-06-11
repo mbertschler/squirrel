@@ -138,6 +138,12 @@ type Report struct {
 	// so the operator can distinguish source-side warnings from
 	// receiver-side ones.
 	NodePendingWarnings []string
+	// DurabilityPull summarises the automatic post-close durability
+	// metadata pull from the peer. Zero-valued for bucket syncs and
+	// for node syncs that didn't reach a successful close. Refused
+	// rewinds are mirrored into Warnings so the CLI surfaces them
+	// without special-casing this field.
+	DurabilityPull DurabilityPullReport
 }
 
 // RunPair is the single entry point for one sync invocation. It

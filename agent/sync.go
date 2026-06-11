@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -92,6 +93,14 @@ type sessionEntry struct {
 	blake3      []byte
 	size        int64
 	mtimeNs     int64
+	// originNode + originRun are the content's global origin
+	// coordinate as declared on the wire (node name + origin-space
+	// run id), recorded verbatim on the contents row at /close. Both
+	// empty when the initiator predates the origin exchange; /close
+	// then falls back to attributing the content to the initiator at
+	// its declared sync run.
+	originNode string
+	originRun  int64
 	// priorRow is the receiver's pre-stage view of the row at this
 	// path. Populated for supersede and conflict; nil otherwise.
 	priorRow *store.FileRow
@@ -120,8 +129,8 @@ func newPeerSyncRouter(srv *Server, volumes map[string]*config.Volume) *peerSync
 	}
 }
 
-// register attaches the four /v1/sync/* routes to mux. Health and
-// the placeholder /v1/plan stay where buildHandler put them; this
+// register attaches the /v1/sync/* routes to mux. Health and the
+// placeholder /v1/plan stay where buildHandler put them; this
 // function is the only place new routes land.
 func (r *peerSyncRouter) register(mux *http.ServeMux) {
 	mux.Handle("POST /v1/sync/begin", r.srv.requireBearer(http.HandlerFunc(r.handleBegin)))
@@ -129,6 +138,7 @@ func (r *peerSyncRouter) register(mux *http.ServeMux) {
 	mux.Handle("POST /v1/sync/plan-folders", r.srv.requireBearer(http.HandlerFunc(r.handlePlanFolders)))
 	mux.Handle("POST /v1/sync/verify", r.srv.requireBearer(http.HandlerFunc(r.handleVerify)))
 	mux.Handle("POST /v1/sync/close", r.srv.requireBearer(http.HandlerFunc(r.handleClose)))
+	mux.Handle("POST /v1/sync/durability", r.srv.requireBearer(http.HandlerFunc(r.handleDurability)))
 }
 
 // acquireVolumeLock takes the per-volume lock or returns false. The
@@ -410,7 +420,13 @@ func (r *peerSyncRouter) planSession(ctx context.Context, sess *peerSession, ent
 		if err != nil || len(digest) != 32 {
 			return syncproto.PlanResponse{}, fmt.Errorf("invalid blake3 hex %q for path %q", e.Blake3Hex, e.Path)
 		}
-		entry := &sessionEntry{blake3: digest, size: e.SizeBytes, mtimeNs: e.MtimeNs}
+		if err := validateEntryOrigin(e); err != nil {
+			return syncproto.PlanResponse{}, fmt.Errorf("path %q: %w", e.Path, err)
+		}
+		entry := &sessionEntry{
+			blake3: digest, size: e.SizeBytes, mtimeNs: e.MtimeNs,
+			originNode: e.OriginNode, originRun: e.OriginRun,
+		}
 		disp, err := r.classify(ctx, sess, e.Path, entry)
 		if err != nil {
 			return syncproto.PlanResponse{}, fmt.Errorf("classify %q: %w", e.Path, err)
@@ -598,6 +614,25 @@ func validateRelPath(p string) error {
 	return nil
 }
 
+// validateEntryOrigin rejects malformed content-origin declarations at
+// /plan so they never reach the /close commit: the pair must be set
+// together, the run id must be a positive origin-space id, and the name
+// must satisfy the node-name rule (it becomes a local nodes row on
+// commit). An entry with neither field is a pre-origin-exchange
+// initiator and is accepted.
+func validateEntryOrigin(e syncproto.IndexEntry) error {
+	if e.OriginNode == "" && e.OriginRun == 0 {
+		return nil
+	}
+	if e.OriginNode == "" || e.OriginRun <= 0 {
+		return fmt.Errorf("origin_node %q and origin_run %d must be set together with a positive run id", e.OriginNode, e.OriginRun)
+	}
+	if !store.ValidNodeName(e.OriginNode) {
+		return fmt.Errorf("origin_node %q is not a valid node name", e.OriginNode)
+	}
+	return nil
+}
+
 // collectConflicts builds the wire-format conflict list from the
 // post-pre-stage session entries in the order the initiator sent
 // them. Iterating sess.conflictOrder (a slice) instead of
@@ -674,20 +709,23 @@ func (r *peerSyncRouter) classifyMissingPath(ctx context.Context, sess *peerSess
 	return syncproto.DispositionCopyFromExisting, nil
 }
 
-// dispositionForExisting is the provenance check that distinguishes
+// dispositionForExisting is the delivery check that distinguishes
 // supersede from conflict (per CLAUDE.md "check authoritative state
-// first"). Rules:
+// first"). The deciding question is who *delivered* the receiver's row
+// — the local run that first materialised it (first_seen_run_id and
+// its runs row's peer linkage) — not the content's origin:
+// contents.origin_* carries the global introduction coordinate
+// verbatim across hops, so a row forwarded along a chain names a node
+// that never spoke to this receiver directly. Rules:
 //
-//   - origin_node_id IS NULL → content introduced locally on the
-//     receiver → conflict.
-//   - origin_node_id != this initiator → another peer introduced it →
-//     conflict.
-//   - origin_node_id == this initiator → supersede, provided the
-//     content's correlated initiator run-id is ≤ the per-(volume, peer)
-//     watermark. Translating the content's local origin_run_id back into
-//     the initiator's id space requires looking up the receiver-side
-//     runs row and reading its correlated_run_id (the two columns are
-//     in different id spaces — receiver-local vs. initiator-local).
+//   - delivery run has no peer linkage → the row was written by a
+//     local index/audit run on the receiver → conflict.
+//   - delivery run's peer != this initiator → another peer delivered
+//     it → conflict.
+//   - delivered by this initiator → supersede, provided the delivery
+//     run's correlated initiator run-id is ≤ the per-(volume, peer)
+//     watermark (the two run columns are in different id spaces —
+//     receiver-local vs. initiator-local).
 //
 // All three branches can fire in the multi-writer flow: the
 // receiver may have local writes (a NAS web app dropped a file in,
@@ -695,10 +733,14 @@ func (r *peerSyncRouter) classifyMissingPath(ctx context.Context, sess *peerSess
 // it may carry rows from a different peer that haven't synced
 // through us yet.
 func (r *peerSyncRouter) dispositionForExisting(ctx context.Context, sess *peerSession, existing store.FileRow) (string, string) {
-	if !existing.OriginNodeID.Valid {
+	deliveryRun, err := r.srv.store.GetRun(ctx, existing.FirstSeenRunID)
+	if err != nil {
+		return syncproto.DispositionConflict, fmt.Sprintf("delivery run lookup error: %v", err)
+	}
+	if !deliveryRun.PeerNodeID.Valid {
 		return syncproto.DispositionConflict, "local write on receiver"
 	}
-	if existing.OriginNodeID.Int64 != sess.peerNodeID {
+	if deliveryRun.PeerNodeID.Int64 != sess.peerNodeID {
 		return syncproto.DispositionConflict, "sourced from a different peer"
 	}
 	state, err := r.srv.store.GetPeerSyncState(ctx, sess.volumeID, sess.peerNodeID)
@@ -706,23 +748,16 @@ func (r *peerSyncRouter) dispositionForExisting(ctx context.Context, sess *peerS
 		return syncproto.DispositionConflict, fmt.Sprintf("peer_sync_state lookup error: %v", err)
 	}
 	// No watermark yet (first sync with this peer): the only way a
-	// peer-sourced row materialised is via a prior /close, so trust
+	// peer-delivered row materialised is via a prior /close, so trust
 	// it and treat as supersede.
 	if !state.LastSharedRunID.Valid {
 		return syncproto.DispositionSupersede, ""
 	}
-	if !existing.OriginRunID.Valid {
-		return syncproto.DispositionConflict, "peer-sourced row has no run attribution"
+	if !deliveryRun.CorrelatedRunID.Valid {
+		return syncproto.DispositionConflict, "delivery run has no correlated initiator id"
 	}
-	sourceRun, err := r.srv.store.GetRun(ctx, existing.OriginRunID.Int64)
-	if err != nil {
-		return syncproto.DispositionConflict, fmt.Sprintf("source run lookup error: %v", err)
-	}
-	if !sourceRun.CorrelatedRunID.Valid {
-		return syncproto.DispositionConflict, "source run has no correlated initiator id"
-	}
-	if sourceRun.CorrelatedRunID.Int64 > state.LastSharedRunID.Int64 {
-		return syncproto.DispositionConflict, "peer attribution newer than the last shared watermark"
+	if deliveryRun.CorrelatedRunID.Int64 > state.LastSharedRunID.Int64 {
+		return syncproto.DispositionConflict, "peer delivery newer than the last shared watermark"
 	}
 	return syncproto.DispositionSupersede, ""
 }
@@ -1021,9 +1056,13 @@ func (r *peerSyncRouter) preStageConflicts(ctx context.Context, sess *peerSessio
 // index-recorded blake3, relabels entry.priorRow (the single source of
 // truth the wire response also reads) to the digest/size actually on
 // disk so the preserved content is described truthfully everywhere.
-// When the file has already vanished the index values are used
-// unchanged: there is nothing to re-hash, and the row still records the
-// loser's identity so the prior blake3 stays queryable.
+// Drifted bytes are an out-of-band local write, so the relabelled row
+// drops the prior content's origin — a fresh contents row for them
+// records a local introduction, keeping the durability vector honest
+// (the prior origin's coordinate belongs to bytes that no longer
+// exist here). When the file has already vanished the index values
+// are used unchanged: there is nothing to re-hash, and the row still
+// records the loser's identity so the prior blake3 stays queryable.
 func (r *peerSyncRouter) conflictRowForPreStage(sess *peerSession, path, srcAbs, preservedRel string, entry *sessionEntry) (store.FileRow, error) {
 	state, err := rehashSource(srcAbs, entry.priorRow.Blake3)
 	if err != nil {
@@ -1033,6 +1072,8 @@ func (r *peerSyncRouter) conflictRowForPreStage(sess *peerSession, path, srcAbs,
 		relabelled := *entry.priorRow
 		relabelled.Blake3 = state.digest
 		relabelled.SizeBytes = state.size
+		relabelled.OriginNodeID = sql.NullInt64{}
+		relabelled.OriginRunID = sql.NullInt64{}
 		entry.priorRow = &relabelled
 	}
 	return store.FileRow{
@@ -1245,12 +1286,16 @@ func (r *peerSyncRouter) finalizeFailedClose(ctx context.Context, runID int64, c
 // Returns the number of file rows the function wrote, distinct from
 // the original plan size when some paths were dropped due to verify
 // mismatch.
+//
+// Each committed row carries its entry's declared content origin —
+// the wire-carried (node name, origin-space run) pair mapped to a
+// local nodes row — so a forwarded origin survives every hop verbatim.
 func (r *peerSyncRouter) closeSession(ctx context.Context, sess *peerSession, status string, failedPaths []string) (int, error) {
 	skip := make(map[string]struct{}, len(failedPaths))
 	for _, p := range failedPaths {
 		skip[p] = struct{}{}
 	}
-	prov := &store.Provenance{NodeID: sess.peerNodeID, RunID: sess.receiverRunID}
+	origins := newOriginResolver(r.srv.store, sess)
 	committed := 0
 	for path, entry := range sess.dispositions {
 		if !materializesAtPath(entry.disposition) {
@@ -1258,6 +1303,10 @@ func (r *peerSyncRouter) closeSession(ctx context.Context, sess *peerSession, st
 		}
 		if _, dropped := skip[path]; dropped {
 			continue
+		}
+		prov, err := origins.provenance(ctx, entry)
+		if err != nil {
+			return committed, fmt.Errorf("resolve origin for %s: %w", path, err)
 		}
 		row := store.FileRow{
 			VolumeID:       sess.volumeID,
@@ -1288,6 +1337,40 @@ func (r *peerSyncRouter) closeSession(ctx context.Context, sess *peerSession, st
 		return committed, fmt.Errorf("finish run: %w", err)
 	}
 	return committed, nil
+}
+
+// originResolver maps wire-carried origin node names to local nodes
+// rows for one /close commit, caching get-or-create lookups so a plan
+// full of same-origin entries costs one row resolution.
+type originResolver struct {
+	store *store.Store
+	sess  *peerSession
+	ids   map[string]int64
+}
+
+func newOriginResolver(s *store.Store, sess *peerSession) *originResolver {
+	return &originResolver{store: s, sess: sess, ids: make(map[string]int64)}
+}
+
+// provenance returns the contents-origin attribution for one entry:
+// the declared origin verbatim when the wire carried one, else the
+// pre-origin-exchange fallback — the initiator itself at its declared
+// sync run (correlatedRunID is in the initiator's run space, the same
+// coordinate system declared origins use).
+func (o *originResolver) provenance(ctx context.Context, entry *sessionEntry) (*store.Provenance, error) {
+	if entry.originNode == "" {
+		return &store.Provenance{NodeID: o.sess.peerNodeID, RunID: o.sess.correlatedRunID}, nil
+	}
+	id, ok := o.ids[entry.originNode]
+	if !ok {
+		node, err := o.store.GetOrCreateOriginNode(ctx, entry.originNode)
+		if err != nil {
+			return nil, err
+		}
+		id = node.ID
+		o.ids[entry.originNode] = id
+	}
+	return &store.Provenance{NodeID: id, RunID: entry.originRun}, nil
 }
 
 // decodeJSON parses the request body with strict field handling so

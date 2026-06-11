@@ -82,10 +82,116 @@ func (s *Store) ListDestinationRunIDs(ctx context.Context, volumeID int64, desti
 		scanDestinationRunID, volumeID, destination)
 }
 
+// ListVolumeDestinationRunIDs returns every recorded vector component
+// for the volume across all destinations, ordered by destination then
+// origin node id. The peer durability endpoint serves this listing so
+// a peer can hold offline evidence about destinations only this node
+// can see.
+func (s *Store) ListVolumeDestinationRunIDs(ctx context.Context, volumeID int64) ([]DestinationRunID, error) {
+	return queryRows(ctx, s.db,
+		`SELECT volume_id, destination, origin_node_id, origin_run_id, updated_at_ns
+		 FROM destination_run_ids
+		 WHERE volume_id = ?
+		 ORDER BY destination, origin_node_id`,
+		scanDestinationRunID, volumeID)
+}
+
 func scanDestinationRunID(s rowScanner) (DestinationRunID, error) {
 	var d DestinationRunID
 	err := s.Scan(&d.VolumeID, &d.Destination, &d.OriginNodeID, &d.OriginRunID, &d.UpdatedAtNs)
 	return d, err
+}
+
+// AdvanceDestinationVector advances the destination's durability vector
+// to cover the volume's current present set: one component per origin
+// node, valued at the highest origin-space run among that node's
+// present content. Locally-introduced content (contents.origin_* NULL)
+// counts under this node's self row at its introduction run — the
+// content's earliest first_seen_run_id in the volume, the same
+// coordinate the peer-sync sender materialises on the wire — so a
+// duplicate path observed later never advances the component past the
+// coordinates actually in circulation. Rows under the reserved sync
+// subtrees are excluded — they never travel to a destination, so they
+// must not advance its evidence.
+//
+// Callers invoke it only once the destination has verifiably landed the
+// volume's full present set (a successful whole-volume sync); each
+// component routes through UpsertDestinationRunID so the advance is
+// monotonic and history-logged. A component already recorded above the
+// computed value is left in place: destinations are append-only, so the
+// higher recorded floor still holds (componentwise max, like a version-
+// vector join). This is the single advancement path for the vector —
+// destination handlers and the peer-sync initiator both call it rather
+// than writing components directly.
+func (s *Store) AdvanceDestinationVector(ctx context.Context, volumeID int64, destination string) error {
+	self, err := s.GetSelfNode(ctx)
+	if err != nil {
+		return fmt.Errorf("advance destination vector: self node: %w", err)
+	}
+	components, err := s.presentOriginMaxima(ctx, volumeID, self.ID)
+	if err != nil {
+		return err
+	}
+	for _, c := range components {
+		err := s.UpsertDestinationRunID(ctx, volumeID, destination, c.OriginNodeID, c.OriginRunID, false)
+		if errors.Is(err, ErrWatermarkRewind) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// originComponent is one (origin node, max origin run) pair computed
+// over a volume's present rows by presentOriginMaxima.
+type originComponent struct {
+	OriginNodeID int64
+	OriginRunID  int64
+}
+
+// presentOriginMaxima computes the per-origin-node maximum origin run
+// over the volume's present files, deduplicated to one coordinate per
+// content. Content whose origin is NULL (or partially NULL — degraded
+// the same way the conflict pre-stage treats partial provenance) maps
+// to selfNodeID at its introduction run, mirroring
+// ContentIntroductionRunID (the introduction MIN spans every
+// observation of the content, any status). The reserved sync subtrees
+// are excluded from the present set for the reason documented on
+// AdvanceDestinationVector.
+func (s *Store) presentOriginMaxima(ctx context.Context, volumeID, selfNodeID int64) ([]originComponent, error) {
+	return queryRows(ctx, s.db, `
+		WITH present_contents AS (
+			SELECT DISTINCT f.content_id, c.origin_node_id, c.origin_run_id
+			FROM files f
+			JOIN folders fo ON fo.id = f.folder_id
+			JOIN contents c ON c.id = f.content_id
+			WHERE fo.volume_id = ? AND f.status = 'present'
+			  AND fo.path != '.squirrel-history'         AND fo.path NOT LIKE '.squirrel-history/%'
+			  AND fo.path != '.squirrel-conflicts'       AND fo.path NOT LIKE '.squirrel-conflicts/%'
+			  AND fo.path != '.squirrel-restore-history' AND fo.path NOT LIKE '.squirrel-restore-history/%'
+			  AND fo.path != '.squirrel-index'           AND fo.path NOT LIKE '.squirrel-index/%'
+		)
+		SELECT
+			CASE WHEN pc.origin_node_id IS NULL OR pc.origin_run_id IS NULL
+			     THEN ? ELSE pc.origin_node_id END AS origin_node,
+			MAX(CASE WHEN pc.origin_node_id IS NULL OR pc.origin_run_id IS NULL
+			     THEN (SELECT MIN(f2.first_seen_run_id)
+			           FROM files f2
+			           JOIN folders fo2 ON fo2.id = f2.folder_id
+			           WHERE fo2.volume_id = ? AND f2.content_id = pc.content_id)
+			     ELSE pc.origin_run_id END) AS origin_run
+		FROM present_contents pc
+		GROUP BY origin_node
+		ORDER BY origin_node
+	`, scanOriginComponent, volumeID, selfNodeID, volumeID)
+}
+
+func scanOriginComponent(s rowScanner) (originComponent, error) {
+	var c originComponent
+	err := s.Scan(&c.OriginNodeID, &c.OriginRunID)
+	return c, err
 }
 
 // UpsertDestinationRunID advances one component of a destination's
