@@ -257,14 +257,20 @@ func (h *contentAddressedHandler) captureFingerprints(ctx context.Context, rep *
 			return
 		}
 		byName := make(map[string]map[string]string, len(entries))
+		present := make(map[string]bool, len(entries))
 		for _, e := range entries {
 			byName[e.Name] = e.Hashes
+			present[e.Name] = true
 		}
 		for _, d := range batch {
 			hash := hex.EncodeToString(d.Blake3)
+			if !present[hash] {
+				rep.Warnings = append(rep.Warnings, fmt.Sprintf("object %s on %q: not yet returned by the remote listing; fingerprint stays pending", hash, h.dest.Name))
+				continue
+			}
 			cs, ok := extractChecksum(h.dest, byName[hash])
 			if !ok {
-				rep.Warnings = append(rep.Warnings, fmt.Sprintf("object %s on %q: backend exposes no checksum; fingerprint stays pending", hash, h.dest.Name))
+				rep.Warnings = append(rep.Warnings, fmt.Sprintf("object %s on %q: remote exposes no usable checksum (e.g. a multipart object whose ETag rclone does not surface as a hash); fingerprint stays pending", hash, h.dest.Name))
 				continue
 			}
 			if err := h.store.SetRemoteObjectChecksum(ctx, d.ContentID, h.dest.Name, cs.Algo, cs.Value); err != nil {

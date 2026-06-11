@@ -11,12 +11,17 @@ import (
 )
 
 // Checksum algo labels recorded in remote_objects.checksum_algo for the
-// s3 backend, whose provider checksum is the object ETag (surfaced by
-// rclone as the md5 hash). The value is recorded opaquely and compared
-// verbatim on verification — squirrel never recomputes a provider
-// checksum, which is what makes the multipart composite form (md5 of
-// part md5s, "<hex>-<parts>") usable as a fingerprint at all. Every
-// other backend records the plain rclone hash name (sha256, sha1, …).
+// s3 backend, whose provider checksum is the object ETag. rclone surfaces
+// the ETag in the md5 hash slot only for objects it can treat as an MD5 —
+// single-part uploads, or multipart objects that carry an MD5 in their
+// metadata. A multipart object without that metadata exposes no md5 hash
+// through lsjson, so its fingerprint stays pending (see the capture path).
+// Recorded values are compared verbatim on verification — squirrel never
+// recomputes a provider checksum. Every other backend records the plain
+// rclone hash name (sha256, sha1, …).
+//
+// The exact reach of ETag capture against a live multipart-splitting
+// backend still needs confirmation — see the follow-up issue.
 const (
 	AlgoEtagMD5          = "etag-md5"
 	AlgoEtagMD5Composite = "etag-md5-composite"
@@ -69,8 +74,9 @@ func extractChecksum(dest *config.Destination, hashes map[string]string) (remote
 	}
 }
 
-// etagFlavor labels an s3 ETag value: the multipart composite form
-// carries a "-<parts>" suffix, a plain upload's ETag is the object md5.
+// etagFlavor labels an s3 ETag value by shape: a "-<parts>" suffix marks
+// the multipart composite form, otherwise the value is a whole-object md5.
+// The label is descriptive only — both are stored and compared verbatim.
 func etagFlavor(v string) string {
 	if strings.Contains(v, "-") {
 		return AlgoEtagMD5Composite

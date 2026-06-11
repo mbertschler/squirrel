@@ -116,14 +116,15 @@ func printVerifyReport(out, errOut io.Writer, rep sync.RemoteVerifyReport, runEr
 		fmt.Fprintf(errOut, "error: object %s on %q: recorded %s %s, remote now reports %s — possible corruption or tampering\n",
 			m.Hash, rep.Destination, m.Algo, m.Recorded, m.Actual)
 	}
-	if rep.Objects == 0 {
-		fmt.Fprintf(out, "verify %s: no recorded objects\n", rep.Destination)
-	} else {
-		fmt.Fprintf(out, "verify %s: run=%d objects=%d verified=%d fingerprinted=%d pending=%d mismatched=%d missing=%d unrecorded=%d\n",
-			rep.Destination, rep.RunID, rep.Objects, rep.Verified, rep.Populated, rep.Pending,
-			len(rep.Mismatched), len(rep.Missing), rep.Unrecorded)
-	}
 	if runErr != nil {
 		fmt.Fprintf(errOut, "verify %s: %v\n", rep.Destination, runErr)
+		return
 	}
+	if rep.Objects == 0 {
+		fmt.Fprintf(out, "verify %s: no recorded objects\n", rep.Destination)
+		return
+	}
+	fmt.Fprintf(out, "verify %s: run=%d objects=%d verified=%d fingerprinted=%d pending=%d mismatched=%d missing=%d unrecorded=%d\n",
+		rep.Destination, rep.RunID, rep.Objects, rep.Verified, rep.Populated, rep.Pending,
+		len(rep.Mismatched), len(rep.Missing), rep.Unrecorded)
 }

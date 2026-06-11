@@ -30,7 +30,8 @@ import (
 // --hash-type (or md5+sha1 when none is requested), with
 // $RCLONE_FAKE_HASH_PREFIX simulating remote-side tampering,
 // $RCLONE_FAKE_HASH_VALUE forcing an exact value, and
-// $RCLONE_FAKE_NO_HASHES a backend that exposes no checksums.
+// $RCLONE_FAKE_NO_HASHES a backend that exposes no checksums;
+// $RCLONE_FAKE_EMPTY_LISTING a directory lsjson that returns no entries.
 const fakeRcloneScript = `#!/bin/sh
 {
   printf 'argv:'
@@ -96,6 +97,7 @@ lsjson)
   else
     dir=$(resolve "$a1")
     if [ ! -d "$dir" ]; then echo "directory not found: $a1" >&2; exit 3; fi
+    if [ -n "$RCLONE_FAKE_EMPTY_LISTING" ]; then printf '[]\n'; exit 0; fi
     printf '['
     sep=""
     for f in "$dir"/*; do

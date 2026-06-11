@@ -227,6 +227,38 @@ func TestCaptureNoChecksumWarns(t *testing.T) {
 	}
 }
 
+// TestCaptureMissingFromListingStaysPending: an object the remote
+// listing does not return yet leaves the pair pending with a distinct
+// "not yet returned" advisory — separate from a returned-but-no-hash
+// object — and the push still succeeds.
+func TestCaptureMissingFromListingStaysPending(t *testing.T) {
+	f := setupContentAddressedFixture(t)
+	t.Setenv("RCLONE_FAKE_EMPTY_LISTING", "1")
+	f.write(t, "a.txt", "alpha")
+	f.index(t)
+
+	rep, err := f.sync(t)
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if rep.Status != store.RunStatusSuccess || rep.Fingerprints != 0 {
+		t.Fatalf("rep = status=%q fingerprints=%d, want success with none recorded", rep.Status, rep.Fingerprints)
+	}
+	var warned bool
+	for _, w := range rep.Warnings {
+		if strings.Contains(w, "not yet returned by the remote listing") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Fatalf("Warnings = %v, want a not-yet-listed advisory distinct from no-checksum", rep.Warnings)
+	}
+	obj := f.remoteObject(t, "a.txt")
+	if obj.ChecksumAlgo.Valid || obj.Checksum.Valid {
+		t.Fatalf("remote object = %+v, want a pending pair", obj)
+	}
+}
+
 // TestCheckersCapInArgv: a destination's checkers cap reaches every
 // rclone invocation the content-addressed push and the verify pass run
 // against it.
