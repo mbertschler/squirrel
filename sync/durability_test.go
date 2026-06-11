@@ -58,6 +58,8 @@ func seedReceiverFreshness(t *testing.T, f *nodeFixture, coords map[string]int64
 func TestPullDurabilityMergesFreshness(t *testing.T) {
 	f := setupNodeFixtureNoRclone(t)
 	ctx := context.Background()
+	f.initVol.OffloadRequires = []string{"offsite-a"}
+	f.initVol.SyncTo = []string{"offsite-b"}
 	originName := seedReceiverFreshness(t, f, map[string]int64{
 		"offsite-a": 12,
 		"offsite-b": 5,
@@ -98,6 +100,8 @@ func TestPullDurabilityMergesFreshness(t *testing.T) {
 func TestPullDurabilityCopiesComponents(t *testing.T) {
 	f := setupNodeFixtureNoRclone(t)
 	ctx := context.Background()
+	f.initVol.OffloadRequires = []string{"offsite-a"}
+	f.initVol.SyncTo = []string{"offsite-b"}
 	originName := seedReceiverDurability(t, f, map[string]int64{
 		"offsite-a": 12,
 		"offsite-b": 5,
@@ -130,12 +134,63 @@ func TestPullDurabilityCopiesComponents(t *testing.T) {
 	}
 }
 
+// TestPullDurabilityDropsUnconfiguredDestinations: the pull merges
+// components for destinations the volume references (one via
+// offload_requires, one via sync_to) and drops one for an unconfigured
+// destination — counted and reported, never stored, and without
+// aborting the merge of the legitimate components.
+func TestPullDurabilityDropsUnconfiguredDestinations(t *testing.T) {
+	f := setupNodeFixtureNoRclone(t)
+	ctx := context.Background()
+	f.initVol.OffloadRequires = []string{"offload-target"}
+	f.initVol.SyncTo = []string{"sync-target"}
+	originName := seedReceiverDurability(t, f, map[string]int64{
+		"offload-target": 12,
+		"sync-target":    5,
+		"junk":           99,
+	})
+
+	v, err := f.initStore.CreateVolume(ctx, f.initVol.Name, f.initVol.Path)
+	if err != nil {
+		t.Fatalf("CreateVolume on initiator: %v", err)
+	}
+	rep, err := PullDurability(ctx, f.initStore, f.initVol, f.node, false)
+	if err != nil {
+		t.Fatalf("PullDurability: %v", err)
+	}
+	if rep.Fetched != 3 || rep.Applied != 2 || rep.Dropped != 1 || len(rep.Rewinds) != 0 {
+		t.Fatalf("report = %+v, want fetched=3 applied=2 dropped=1 no rewinds", rep)
+	}
+	if len(rep.Drops) != 1 || rep.Drops[0].Destination != "junk" || rep.Drops[0].Kind != "component" {
+		t.Fatalf("drops = %+v, want one component drop for junk", rep.Drops)
+	}
+
+	origin, err := f.initStore.GetNodeByName(ctx, originName)
+	if err != nil {
+		t.Fatalf("origin node %q was not created locally: %v", originName, err)
+	}
+	for dest, want := range map[string]int64{"offload-target": 12, "sync-target": 5} {
+		got, err := f.initStore.GetDestinationRunID(ctx, v.ID, dest, origin.ID)
+		if err != nil {
+			t.Fatalf("GetDestinationRunID %s: %v", dest, err)
+		}
+		if got.OriginRunID != want {
+			t.Fatalf("%s component = %d, want %d", dest, got.OriginRunID, want)
+		}
+	}
+	if _, err := f.initStore.GetDestinationRunID(ctx, v.ID, "junk", origin.ID); err == nil {
+		t.Fatal("junk component was stored, want it dropped")
+	}
+}
+
 // TestPullDurabilityRefusesRewind: a peer component below the locally
 // recorded value is refused and reported, leaving the local value in
 // place; the allow-rewind opt-in accepts it.
 func TestPullDurabilityRefusesRewind(t *testing.T) {
 	f := setupNodeFixtureNoRclone(t)
 	ctx := context.Background()
+	f.initVol.OffloadRequires = []string{"offsite-a"}
+	f.initVol.SyncTo = []string{"offsite-b"}
 	originName := seedReceiverDurability(t, f, map[string]int64{
 		"offsite-a": 12,
 		"offsite-b": 5,

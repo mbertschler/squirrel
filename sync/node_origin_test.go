@@ -238,7 +238,9 @@ func TestNodeSyncAdvancesVectorAndPullsDurabilityAtClose(t *testing.T) {
 	f := setupNodeFixture(t)
 	ctx := context.Background()
 
-	// The peer knows about a destination only it can see.
+	// The peer knows about a destination only it can see; the volume
+	// requires it for offload, so the pull accepts the peer's evidence.
+	f.initVol.OffloadRequires = []string{"offsite-x"}
 	recvSelfName := seedReceiverDurability(t, f, map[string]int64{"offsite-x": 7})
 
 	// Initiator: one forwarded-origin file seeded before indexing (a

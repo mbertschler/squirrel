@@ -682,7 +682,7 @@ func (d *nodeSyncDriver) phaseClose() error {
 // succeeded, and the pull can be retried any time via the standalone
 // `peer-sync pull-durability` command.
 func (d *nodeSyncDriver) pullPeerDurability() {
-	rep, err := pullDurability(d.ctx, d.store, d.client, d.vol.Name, d.volID, d.node.Name, false)
+	rep, err := pullDurability(d.ctx, d.store, d.client, d.vol.Name, d.volID, d.node.Name, acceptedDestinations(d.vol), false)
 	d.report.DurabilityPull = rep
 	if err != nil {
 		d.report.Warnings = append(d.report.Warnings,
@@ -692,6 +692,10 @@ func (d *nodeSyncDriver) pullPeerDurability() {
 	for _, rw := range rep.Rewinds {
 		d.report.Warnings = append(d.report.Warnings,
 			fmt.Sprintf("durability pull from %s refused rewind: %s", d.node.Name, rw))
+	}
+	for _, dr := range rep.Drops {
+		d.report.Warnings = append(d.report.Warnings,
+			fmt.Sprintf("durability pull from %s dropped %s", d.node.Name, dr))
 	}
 }
 

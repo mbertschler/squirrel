@@ -12,15 +12,35 @@ import (
 
 // DurabilityPullReport summarises one durability metadata pull from a
 // peer: how many vector components were fetched, how many landed in
-// the local destination_run_ids (advanced or re-confirmed), and which
-// were refused as rewinds. Every fetched component lands in exactly
-// one of the two buckets.
+// the local destination_run_ids (advanced or re-confirmed), how many
+// were refused as rewinds, and how many were dropped because the peer
+// named a destination outside this volume's accepted target set. Every
+// fetched component lands in exactly one of the applied / rewind /
+// dropped buckets.
 type DurabilityPullReport struct {
 	Volume  string
 	Peer    string
 	Fetched int
 	Applied int
+	Dropped int
 	Rewinds []DurabilityRewind
+	Drops   []DurabilityDrop
+}
+
+// DurabilityDrop is one pulled entry the merge discarded because its
+// destination falls outside the volume's accepted target set
+// (offload_requires ∪ sync_to). Drops are counted and listed so a peer
+// asserting evidence for destinations this node uses for neither offload
+// nor sync stays observable.
+type DurabilityDrop struct {
+	Destination string
+	OriginNode  string
+	Kind        string // "component" or "freshness"
+}
+
+func (d DurabilityDrop) String() string {
+	return fmt.Sprintf("%s for unconfigured destination %s origin %s",
+		d.Kind, d.Destination, d.OriginNode)
 }
 
 // DurabilityRewind is one component the pull refused because the peer
@@ -47,6 +67,12 @@ func (r DurabilityRewind) String() string {
 // watermark store, refused rewinds are reported on the result (not
 // applied), and allowRewind is the explicit recovery override.
 //
+// The merge is scoped to destinations this volume actually references
+// (offload_requires ∪ sync_to); evidence for any other destination is
+// dropped, so a buggy or compromised peer cannot pollute the local
+// vector with rows for destinations this node neither requires for
+// offload nor syncs to.
+//
 // The standalone `peer-sync pull-durability` command and the automatic
 // post-close pull share this implementation.
 func PullDurability(ctx context.Context, s *store.Store, vol *config.Volume, node *config.Node, allowRewind bool) (DurabilityPullReport, error) {
@@ -57,12 +83,29 @@ func PullDurability(ctx context.Context, s *store.Store, vol *config.Volume, nod
 		}
 		return DurabilityPullReport{}, fmt.Errorf("lookup volume %q: %w", vol.Name, err)
 	}
-	return pullDurability(ctx, s, newNodeClient(node), vol.Name, v.ID, node.Name, allowRewind)
+	return pullDurability(ctx, s, newNodeClient(node), vol.Name, v.ID, node.Name, acceptedDestinations(vol), allowRewind)
+}
+
+// acceptedDestinations is the set of destination names this volume
+// references: the union of its offload_requires and sync_to entries.
+// A pulled durability entry for any name outside this set has no bearing
+// on the volume's local decisions and is dropped by the pull.
+func acceptedDestinations(vol *config.Volume) map[string]struct{} {
+	accepted := make(map[string]struct{}, len(vol.OffloadRequires)+len(vol.SyncTo))
+	for _, name := range vol.OffloadRequires {
+		accepted[name] = struct{}{}
+	}
+	for _, name := range vol.SyncTo {
+		accepted[name] = struct{}{}
+	}
+	return accepted
 }
 
 // pullDurability is the transport-injected body of PullDurability,
 // shared with the node-sync driver (which already holds a client).
-func pullDurability(ctx context.Context, s *store.Store, client *nodeClient, volumeName string, volumeID int64, peerName string, allowRewind bool) (DurabilityPullReport, error) {
+// accepted scopes which destinations the merge will store (see
+// acceptedDestinations).
+func pullDurability(ctx context.Context, s *store.Store, client *nodeClient, volumeName string, volumeID int64, peerName string, accepted map[string]struct{}, allowRewind bool) (DurabilityPullReport, error) {
 	rep := DurabilityPullReport{Volume: volumeName, Peer: peerName}
 	resp, err := client.durability(ctx, syncproto.DurabilityRequest{Volume: volumeName})
 	if err != nil {
@@ -84,6 +127,15 @@ func pullDurability(ctx context.Context, s *store.Store, client *nodeClient, vol
 	for _, c := range resp.Components {
 		if err := validateComponent(c); err != nil {
 			return rep, fmt.Errorf("component %+v: %w", c, err)
+		}
+		if _, ok := accepted[c.Destination]; !ok {
+			rep.Dropped++
+			rep.Drops = append(rep.Drops, DurabilityDrop{
+				Destination: c.Destination,
+				OriginNode:  c.OriginNode,
+				Kind:        "component",
+			})
+			continue
 		}
 		nodeID, err := resolveOrigin(c.OriginNode)
 		if err != nil {
@@ -108,6 +160,15 @@ func pullDurability(ctx context.Context, s *store.Store, client *nodeClient, vol
 	for _, f := range resp.Freshness {
 		if err := validateFreshness(f); err != nil {
 			return rep, fmt.Errorf("freshness %+v: %w", f, err)
+		}
+		if _, ok := accepted[f.Destination]; !ok {
+			rep.Dropped++
+			rep.Drops = append(rep.Drops, DurabilityDrop{
+				Destination: f.Destination,
+				OriginNode:  f.OriginNode,
+				Kind:        "freshness",
+			})
+			continue
 		}
 		nodeID, err := resolveOrigin(f.OriginNode)
 		if err != nil {
