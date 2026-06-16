@@ -435,8 +435,15 @@ func (d *Destination) RcloneSection() string {
 			fmt.Fprintf(&b, "%s = %s\n", key, v)
 		}
 	}
-	if d.Type == "sftp" && d.HashAlgo != "" {
-		fmt.Fprintf(&b, "hashes = %s\n", d.HashAlgo)
+	if d.Type == "sftp" {
+		// rclone's sftp backend only autodetects md5sum/sha1sum, so BLAKE3
+		// must be named explicitly or squirrel's `--hash blake3` syncs abort
+		// with "hash type not supported". b3sum is the canonical BLAKE3 CLI
+		// and must be on the remote's PATH.
+		fmt.Fprintf(&b, "blake3sum_command = b3sum\n")
+		if d.HashAlgo != "" {
+			fmt.Fprintf(&b, "hashes = %s\n", d.HashAlgo)
+		}
 	}
 	for _, key := range sortedSubset(schema.secretFields) {
 		if v, ok := d.Params[key]; ok {
