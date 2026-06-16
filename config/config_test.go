@@ -560,6 +560,7 @@ password2 = "obscured-salt"
 type = sftp
 host = host.example
 user = u
+blake3sum_command = b3sum
 password = transport-pw
 
 [offsite-crypt]
@@ -572,6 +573,36 @@ password2 = obscured-salt
 `
 	if got := cfg.Destinations["offsite"].RcloneSection(); got != want {
 		t.Fatalf("RcloneSection:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestRcloneSectionSFTPEmitsBlake3sumCommand pins that every sftp section
+// carries a blake3sum_command. rclone never autodetects one, so without it
+// squirrel's `--hash blake3` syncs fail with "hash type not supported". The
+// line is sftp-only: backends with a fixed provider checksum must not get it.
+func TestRcloneSectionSFTPEmitsBlake3sumCommand(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.nas]
+type = "sftp"
+host = "h"
+user = "u"
+root = "/r"
+
+[destinations.s3]
+type     = "s3"
+provider = "AWS"
+bucket   = "b"
+root     = "/r"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Destinations["nas"].RcloneSection(); !strings.Contains(got, "blake3sum_command = b3sum") {
+		t.Fatalf("sftp section missing blake3sum_command:\n%s", got)
+	}
+	if got := cfg.Destinations["s3"].RcloneSection(); strings.Contains(got, "blake3sum_command") {
+		t.Fatalf("non-sftp section should not carry blake3sum_command:\n%s", got)
 	}
 }
 

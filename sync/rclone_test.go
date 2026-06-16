@@ -325,6 +325,7 @@ password2 = "obscured-salt"
 type = sftp
 host = host.example
 user = u
+blake3sum_command = b3sum
 password = transport-pw
 
 [offsite-crypt]
