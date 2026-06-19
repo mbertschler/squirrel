@@ -16,6 +16,13 @@ import (
 // destinations cannot blow up the report or the output that renders it.
 const maxDurabilityDropSamples = 16
 
+// maxOriginNodesPerPull bounds how many distinct origin-node names one
+// durability pull will resolve (and so, for novel names, create as local
+// nodes rows). A real volume's content originates on a handful of nodes;
+// the cap is deliberately generous and exists only to convert a runaway
+// peer into a loud refusal rather than to police a legitimate topology.
+const maxOriginNodesPerPull = 256
+
 // DurabilityPullReport summarises one durability metadata pull from a
 // peer: how many entries (vector components and freshness coordinates)
 // were fetched, how many components landed in the local
@@ -135,6 +142,15 @@ func pullDurability(ctx context.Context, s *store.Store, client *nodeClient, vol
 		if id, ok := originIDs[name]; ok {
 			return id, nil
 		}
+		// GetOrCreateOriginNode creates a local nodes row for any name
+		// not seen before. Bound how many distinct origins one pull will
+		// resolve so a peer bug (or hostile peer) flooding novel names
+		// cannot grow the local nodes table without limit — a real
+		// volume references only a handful of origins. Fails the pull
+		// rather than truncating, so the cap is observable.
+		if len(originIDs) >= maxOriginNodesPerPull {
+			return 0, fmt.Errorf("durability pull names more than %d distinct origin nodes; refusing to create unbounded node rows from one pull", maxOriginNodesPerPull)
+		}
 		node, err := s.GetOrCreateOriginNode(ctx, name)
 		if err != nil {
 			return 0, fmt.Errorf("resolve origin node %q: %w", name, err)
@@ -192,7 +208,14 @@ func pullDurability(ctx context.Context, s *store.Store, client *nodeClient, vol
 
 // validateComponent guards the wire-supplied component before it
 // touches the local vector: destination and origin names are
-// identities, the run id must be a positive origin-space id.
+// identities, the run id must be a positive origin-space id, and the
+// verify method must be empty or a method this build recognises. The
+// method check is defence-in-depth, not a trust boundary (the peer is
+// trusted to assert its own durability — see SAFETY-AUDIT.md D1): the
+// gate already refuses to offload on an unrecognised method, so the
+// only effect of an unknown non-empty method reaching the store is a
+// silently-inert row. Refusing it here turns a peer bug or a
+// version-skew method string into a loud error at the pull instead.
 func validateComponent(c syncproto.DurabilityComponent) error {
 	if c.Destination == "" {
 		return errors.New("destination must be non-empty")
@@ -202,6 +225,9 @@ func validateComponent(c syncproto.DurabilityComponent) error {
 	}
 	if c.OriginRun <= 0 {
 		return fmt.Errorf("origin_run %d must be positive", c.OriginRun)
+	}
+	if c.VerifyMethod != "" && !store.KnownVerifyMethod(c.VerifyMethod) {
+		return fmt.Errorf("verify_method %q is not a recognised verification method", c.VerifyMethod)
 	}
 	return nil
 }
