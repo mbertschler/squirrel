@@ -1022,6 +1022,143 @@ when restoreFromNode lands.
 
 ---
 
+## Durability evidence & offsite verification (offload-v1)
+
+Findings specific to the offload-v1 feature set — the durability version
+vectors that gate `offload`, the peer durability pull that carries
+evidence between nodes, and the content-addressed offsite push. These
+are framed for the intended deployment: a **single operator** whose
+nodes (laptop, NAS) are all machines they control and hold the only
+credentials to. Under that model the adversary is overwhelmingly
+*entropy and bugs*, not a hostile peer; the findings are sized
+accordingly.
+
+### D1: Durability-pull trust boundary (relayed offsite evidence)
+
+**Severity:** Medium (defence-in-depth) • **Likelihood:** N/A
+(documented assumption, not a live defect).
+
+**Where**
+
+- `sync/durability.go` — `PullDurability` / `pullDurability`,
+  `validateComponent`, `validateFreshness`.
+- `offload/gate.go` — `check`, `methodVerified`, `freshnessFailure`.
+- `store/nodes.go` — `GetOrCreateOriginNode`.
+
+**The boundary**
+
+A durability component is recorded one of two ways, and they differ in
+what they trust:
+
+- **Direct, self-verified.** When this node pushes to a target itself —
+  the NAS via peer sync (`sync/node.go`, tagged `peer-blake3` after the
+  receiver re-hashes every path) or a bucket via rclone (`sync/sync.go`)
+  — it writes the component into its **own** store from its **own**
+  confirmed transfer (`AdvanceDestinationVectorTo`). No peer is trusted.
+- **Relayed, peer-asserted.** For a target this node never pushes to (an
+  offsite only the NAS reaches), the only evidence is what the NAS
+  reports over the durability pull (`UpsertDestinationRunIDVerified`,
+  reached only from `pullDurability`). Putting such a target in a
+  volume's `offload_requires` means the local delete decision trusts the
+  NAS's recorded `(origin, run, method)` assertion. The pull validates
+  shape (positive run, valid origin name, recognised method) and is
+  monotonic, but carries **no proof of possession** — a peer that
+  asserts an inflated run for a destination in the accepted set would be
+  believed.
+
+**Decision (intended):** the relayed-evidence trust is **accepted**. The
+NAS is in the same trust domain as the laptop; a NAS that lies about
+durability is a compromised-or-broken NAS, in which case the archive it
+holds is already in question and `offload` is a footnote. The gate fails
+*closed* on absent evidence, so a peer can only ever *withhold*
+offload-eligibility, and the redundancy decision (gate on **all** copies
+via `offload_requires`, not the fewest-trusted subset) is what protects
+against data loss — see the offload section of `README.md`.
+
+**Defence-in-depth implemented in this branch** (cheap; turns *bugs*
+into loud failures, not a security control):
+
+- **Verify-method allow-list at the pull boundary** — `validateComponent`
+  refuses a non-empty `verify_method` that isn't one this build defines
+  (`store.KnownVerifyMethod`). Previously an unknown method was stored
+  and then silently treated as unverified by the gate; now a peer bug or
+  version-skew string is rejected at receipt. Empty (legitimately
+  "unverified") still passes.
+- **Origin-node creation cap** — `pullDurability` refuses a pull that
+  names more than `maxOriginNodesPerPull` (256) distinct origins, so a
+  runaway peer cannot grow the local `nodes` table without bound via
+  `GetOrCreateOriginNode`. A real volume references a handful of origins;
+  the cap only converts a flood into an observable refusal.
+
+**Not done (deliberately):** no proof-of-possession protocol, no
+laptop-side independent verification of relayed offsites. Those defend
+against a malicious NAS, which is out of model. The random per-file
+nonce in the rclone crypt overlay also makes "the NAS proves the stored
+ciphertext decrypts to the right content" impractical without either a
+content-derived nonce or the laptop downloading and decrypting the
+object — neither warranted here.
+
+**Issue:** `durability: document the relayed-evidence trust boundary; add verify-method allow-list and origin-node cap as defence-in-depth` (implemented in this branch)
+
+### D2: Content-addressed offsite push proves presence+size, not decrypt-correctness
+
+**Severity:** Medium • **Likelihood:** Low (requires a transfer-time
+corruption that preserves decrypted size, or the documented
+re-hash→read TOCTOU window to fire).
+
+**Where**
+
+- `sync/content_addressed.go` — `uploadOneObject` (re-hash → `copyTo` →
+  `statRemote` size check), `captureFingerprints`.
+- `sync/verify_remote.go` — `VerifyRemote` (scan-back re-check).
+
+**What it does / doesn't establish**
+
+At upload the push: (1) re-hashes the **local plaintext** and refuses on
+drift, so the encryption input is the right content; (2) confirms the
+object is **present** and its **decrypted size** (stat is through the
+crypt overlay) matches the index; (3) records the provider's checksum of
+the ciphertext as the scan-back baseline. The underlying backend's own
+transfer integrity (e.g. S3 Content-MD5 on PUT) covers "the ciphertext
+rclone sent is the ciphertext stored."
+
+It does **not** confirm that the stored ciphertext *decrypts back* to the
+indexed hash — there is no post-upload decrypt-and-rehash. The
+unguarded slivers are the documented fork/exec window between the
+re-hash and rclone's open (`uploadOneObject` "Residual:" comment) and a
+hypothetical crypt bug that produces a right-decrypted-size, wrong
+content object. Ongoing bitrot is caught by the scan-back re-verify; a
+*wrong-at-upload* object is the gap.
+
+**Proposed mitigation (opt-in, NAS-local — sketch, not built):**
+
+- Add a `--verify` mode to the content-addressed push that, after an
+  object lands, downloads it back **through the crypt overlay**,
+  BLAKE3s the plaintext, and compares to the indexed hash. This is the
+  only check that closes decrypt-correctness, and it lives entirely on
+  the pushing node (which holds the plaintext) with no protocol or
+  laptop change.
+- Scope it to the **initial upload** of each content hash (or a sampled
+  subset), not every run — the object is append-only and immutable, so
+  one read-back per object is sufficient. Cost is one download per
+  verified object (egress), so it must be opt-in and never run against
+  cold-tier targets (e.g. Glacier Deep Archive, where a read needs a
+  restore).
+- Tightening the re-hash→read TOCTOU window further (snapshot/lock the
+  source) is **not** recommended — the window is one fork/exec, the
+  indexer and scrub already surface drift, and chasing it is
+  disproportionate.
+
+**Acceptance**
+
+- With `--verify`, a seeded object whose stored ciphertext decrypts to
+  the wrong content is caught and the run fails before the durability
+  vector advances; without it, behaviour is unchanged.
+
+**Issue:** `sync: optional read-back-decrypt-rehash verification for content-addressed uploads`
+
+---
+
 ## Cross-cutting recommendations
 
 ### Tests we should add now

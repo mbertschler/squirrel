@@ -48,6 +48,24 @@ func ContentVerifiedMethod(method string) bool {
 	}
 }
 
+// KnownVerifyMethod reports whether method is one of the defined
+// verification-method identifiers above. It exists for the wire
+// boundary: a pulled durability component carries its origin's
+// VerifyMethod verbatim, and the offload gate later switches on it
+// (ContentVerifiedMethod), so an unrecognised non-empty method should be
+// refused on receipt rather than stored and silently ignored. The empty
+// method (a pre-v19 row, or one whose provenance is unknown) is a
+// legitimate "unverified" state and is deliberately excluded here;
+// callers that accept it test for "" explicitly.
+func KnownVerifyMethod(method string) bool {
+	switch method {
+	case VerifyMethodBlake3, VerifyMethodSizeMtime, VerifyMethodPeer, VerifyMethodKopia, VerifyMethodPresenceSize:
+		return true
+	default:
+		return false
+	}
+}
+
 // DestinationRunID is one component of a destination's durability
 // version vector: the highest origin-space run id of OriginNodeID's
 // content known durable on Destination for VolumeID. Destination is the

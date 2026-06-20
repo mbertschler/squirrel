@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/mbertschler/squirrel/store"
+	"github.com/mbertschler/squirrel/syncproto"
 )
 
 // seedReceiverDurability records vector components on the receiver so
@@ -311,5 +314,67 @@ func TestPullDurabilityRequiresLocalVolume(t *testing.T) {
 	_, err := PullDurability(context.Background(), f.initStore, f.initVol, f.node, false)
 	if err == nil || !strings.Contains(err.Error(), "no local index row") {
 		t.Fatalf("err = %v, want the no-local-index-row guard", err)
+	}
+}
+
+// TestValidateComponentVerifyMethod: the wire-boundary guard accepts the
+// empty method (a legitimate "unverified" state) and every method this
+// build defines, and refuses an unrecognised non-empty method so a peer
+// bug or version-skew string is loud at the pull rather than a
+// silently-inert local row (SAFETY-AUDIT.md D1). Freshness carries no
+// method and is unaffected.
+func TestValidateComponentVerifyMethod(t *testing.T) {
+	base := syncproto.DurabilityComponent{Destination: "offsite-a", OriginNode: "laptop", OriginRun: 5}
+	for _, method := range []string{
+		"",
+		store.VerifyMethodBlake3,
+		store.VerifyMethodSizeMtime,
+		store.VerifyMethodPeer,
+		store.VerifyMethodKopia,
+		store.VerifyMethodPresenceSize,
+	} {
+		c := base
+		c.VerifyMethod = method
+		if err := validateComponent(c); err != nil {
+			t.Errorf("validateComponent(method=%q) = %v, want nil", method, err)
+		}
+	}
+	c := base
+	c.VerifyMethod = "totally-bogus"
+	if err := validateComponent(c); err == nil || !strings.Contains(err.Error(), "recognised verification method") {
+		t.Fatalf("validateComponent(unknown method) = %v, want the unrecognised-method refusal", err)
+	}
+}
+
+// TestPullDurabilityCapsOriginNodeCreation: a pull that names more than
+// maxOriginNodesPerPull distinct origins is refused before it grows the
+// local nodes table without bound (SAFETY-AUDIT.md D1). Seeds cap+1
+// distinct-origin components on the receiver, all on one accepted
+// destination, and asserts the pull fails with the cap message.
+func TestPullDurabilityCapsOriginNodeCreation(t *testing.T) {
+	f := setupNodeFixtureNoRclone(t)
+	ctx := context.Background()
+	f.initVol.OffloadRequires = []string{"offsite-a"}
+
+	rv, err := f.recvStore.CreateVolume(ctx, f.recvVol.Name, f.recvVol.Path)
+	if err != nil {
+		t.Fatalf("CreateVolume on receiver: %v", err)
+	}
+	for i := 0; i <= maxOriginNodesPerPull; i++ {
+		origin, err := f.recvStore.GetOrCreateOriginNode(ctx, fmt.Sprintf("origin-%04d", i))
+		if err != nil {
+			t.Fatalf("seed origin %d: %v", i, err)
+		}
+		if err := f.recvStore.UpsertDestinationRunID(ctx, rv.ID, "offsite-a", origin.ID, int64(i+1), false); err != nil {
+			t.Fatalf("seed component %d: %v", i, err)
+		}
+	}
+
+	if _, err := f.initStore.CreateVolume(ctx, f.initVol.Name, f.initVol.Path); err != nil {
+		t.Fatalf("CreateVolume on initiator: %v", err)
+	}
+	_, err = PullDurability(ctx, f.initStore, f.initVol, f.node, false)
+	if err == nil || !strings.Contains(err.Error(), "distinct origin nodes") {
+		t.Fatalf("PullDurability = %v, want the origin-node cap refusal", err)
 	}
 }
