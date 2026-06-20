@@ -89,12 +89,11 @@ type peerSession struct {
 	volumeID      int64
 	peerNodeID    int64
 	// initiatorNodeName is the caller identity declared at /begin,
-	// recorded so a phase call can be bound back to the node that
-	// opened the session. Under the single shared agent token there is
-	// no per-request authenticated identity to compare it against yet
-	// (see #110d); lookupSession is the chokepoint where that
-	// comparison lands once per-peer tokens make a caller identity
-	// recoverable.
+	// recorded so a later phase call is bound back to the node that
+	// opened the session. lookupSession compares it against the caller's
+	// authenticated identity when per-peer tokens make one recoverable
+	// (#110a); a shared-token caller carries no identity (#110d) and the
+	// comparison is skipped.
 	initiatorNodeName string
 	correlatedRunID   int64
 	// dedupStrategy is the initiator-supplied preference applied by
@@ -228,13 +227,12 @@ var errSessionCallerMismatch = errors.New("caller node does not own this session
 
 // lookupSession resolves the session for receiverRunID and binds it to
 // the caller. A non-empty callerNode must equal the initiator name
-// recorded at /begin, so a second node holding the shared token cannot
-// drive another node's in-flight session. callerNode is empty today
-// because the single shared agent token carries no per-request identity
-// (#110d): the comparison is a no-op until per-peer tokens make a caller
-// identity recoverable, at which point this is the single place it is
-// enforced. ok is false when no session exists; err is non-nil only on a
-// caller mismatch.
+// recorded at /begin, so a node authenticated as one identity cannot
+// drive another node's in-flight session (#110a). callerNode is "" for a
+// shared-token caller (no recoverable identity, #110d); the comparison
+// then yields verbatim, leaving the session unbound for that caller. This
+// is the single place the binding is enforced. ok is false when no
+// session exists; err is non-nil only on a caller mismatch.
 func (r *peerSyncRouter) lookupSession(receiverRunID int64, callerNode string) (sess *peerSession, ok bool, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -248,12 +246,27 @@ func (r *peerSyncRouter) lookupSession(receiverRunID int64, callerNode string) (
 	return sess, true, nil
 }
 
-// callerNodeName returns the authenticated initiator identity for a
-// phase request, or "" when none is recoverable. The single shared
-// agent token authenticates every peer identically, so no per-request
-// identity exists yet (#110d); this returns "" until per-peer tokens
-// land, keeping the lookupSession binding point in one spot.
-func callerNodeName(*http.Request) string { return "" }
+// callerNodeContextKey types the request-context slot requireBearer
+// stamps with the authenticated caller's node name.
+type callerNodeContextKey struct{}
+
+// withCallerNode returns req carrying node as its authenticated caller
+// identity. An empty node (the shared-token case, which carries no
+// recoverable identity) is stored verbatim so callerNodeName reads it
+// back as "" and the session binding stays a no-op for that caller.
+func withCallerNode(req *http.Request, node string) *http.Request {
+	return req.WithContext(context.WithValue(req.Context(), callerNodeContextKey{}, node))
+}
+
+// callerNodeName returns the authenticated initiator identity requireBearer
+// stamped on the request, or "" when none is recoverable. A per-peer token
+// resolves to its node name; the single shared token authenticates without
+// an identity (#110d), so this returns "" and lookupSession leaves the
+// session unbound for that caller.
+func callerNodeName(req *http.Request) string {
+	node, _ := req.Context().Value(callerNodeContextKey{}).(string)
+	return node
+}
 
 // handleBegin implements POST /v1/sync/begin. The handler is the
 // thin HTTP shell over beginSession, which carries the actual flow.
@@ -263,7 +276,7 @@ func (r *peerSyncRouter) handleBegin(w http.ResponseWriter, req *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	resp, status, err := r.beginSession(req.Context(), body)
+	resp, status, err := r.beginSession(req.Context(), body, callerNodeName(req))
 	if err != nil {
 		writeError(w, status, err.Error())
 		return
@@ -277,9 +290,12 @@ func (r *peerSyncRouter) handleBegin(w http.ResponseWriter, req *http.Request) {
 // The lock is acquired before any DB row insertion that would need
 // rollback on a later failure; releasing it lives in the per-phase
 // guard.
-func (r *peerSyncRouter) beginSession(ctx context.Context, body syncproto.BeginRequest) (syncproto.BeginResponse, int, error) {
+func (r *peerSyncRouter) beginSession(ctx context.Context, body syncproto.BeginRequest, callerNode string) (syncproto.BeginResponse, int, error) {
 	if body.Volume == "" || body.InitiatorNodeName == "" || body.InitiatorRunID == 0 {
 		return syncproto.BeginResponse{}, http.StatusBadRequest, errors.New("volume, initiator_node_name, and initiator_run_id are required")
+	}
+	if callerNode != "" && callerNode != body.InitiatorNodeName {
+		return syncproto.BeginResponse{}, http.StatusForbidden, fmt.Errorf("authenticated node %q may not open a session as %q", callerNode, body.InitiatorNodeName)
 	}
 	strategy, err := normalizeDedupStrategy(body.DedupStrategy)
 	if err != nil {

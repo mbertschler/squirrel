@@ -63,6 +63,15 @@ type Config struct {
 	// Token is the resolved bearer token compared (in constant time)
 	// against the Authorization header on every authenticated request.
 	Token string
+	// PeerTokens optionally maps a per-peer bearer token to the node
+	// name that presents it. When non-empty, requireBearer recovers the
+	// caller's authenticated node identity and the sync handlers bind
+	// each in-flight session to it (#110a); a token absent from the map
+	// still authenticates if it equals Token but carries no identity.
+	// Empty (the default) preserves the single-shared-token behaviour:
+	// every caller authenticates identically and no session binding is
+	// enforced.
+	PeerTokens map[string]string
 	// TLSCert and TLSKey are filesystem paths to a PEM-encoded certificate
 	// and matching private key. When both are empty the agent serves
 	// plain HTTP; when both are set it terminates TLS natively.
@@ -208,27 +217,64 @@ func (s *Server) buildHandler() http.Handler {
 
 // requireBearer is the auth middleware. The Authorization header must
 // parse as `<scheme> <token>` with scheme matching "Bearer" case-
-// insensitively (per RFC 7235 §2.1) and token matching the configured
-// value. We hash both sides to a fixed-length SHA-256 digest before
-// subtle.ConstantTimeCompare so the comparison time is independent of
-// the attacker-controlled token length (subtle.ConstantTimeCompare
-// short-circuits on len mismatch, which would otherwise leak length).
-// The configured token is non-empty (enforced by validateConfig).
+// insensitively (per RFC 7235 §2.1). The token authenticates when it
+// matches the shared token or any configured per-peer token; a per-peer
+// match attaches that node's identity to the request context so the sync
+// handlers can bind a session to its caller (#110a).
 func (s *Server) requireBearer(next http.Handler) http.Handler {
-	expectedHash := sha256.Sum256([]byte(s.cfg.Token))
+	auth := newAuthenticator(s.cfg.Token, s.cfg.PeerTokens)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token, ok := extractBearerToken(r.Header.Get("Authorization"))
 		if !ok {
 			writeError(w, http.StatusUnauthorized, "missing bearer token")
 			return
 		}
-		gotHash := sha256.Sum256([]byte(token))
-		if subtle.ConstantTimeCompare(gotHash[:], expectedHash[:]) != 1 {
+		caller, ok := auth.authenticate(token)
+		if !ok {
 			writeError(w, http.StatusUnauthorized, "invalid bearer token")
 			return
 		}
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, withCallerNode(r, caller))
 	})
+}
+
+// authenticator resolves a presented bearer token to an authenticated
+// caller. The shared token and every per-peer token are pre-hashed to a
+// fixed-length SHA-256 digest so the comparison time is independent of
+// the attacker-controlled token length (subtle.ConstantTimeCompare
+// short-circuits on a length mismatch, which would otherwise leak it).
+// The per-peer set is keyed by digest rather than by the raw secret, so
+// the map probe never compares attacker bytes against a stored secret
+// directly.
+type authenticator struct {
+	sharedHash [32]byte
+	peerNodes  map[[32]byte]string
+}
+
+func newAuthenticator(sharedToken string, peerTokens map[string]string) authenticator {
+	a := authenticator{sharedHash: sha256.Sum256([]byte(sharedToken))}
+	if len(peerTokens) > 0 {
+		a.peerNodes = make(map[[32]byte]string, len(peerTokens))
+		for token, node := range peerTokens {
+			a.peerNodes[sha256.Sum256([]byte(token))] = node
+		}
+	}
+	return a
+}
+
+// authenticate returns the caller's authenticated node name and whether
+// the token is valid. A per-peer token yields its node name; the shared
+// token authenticates with an empty name (no recoverable identity, the
+// single-token case #110d leaves unbound).
+func (a authenticator) authenticate(token string) (string, bool) {
+	gotHash := sha256.Sum256([]byte(token))
+	if node, ok := a.peerNodes[gotHash]; ok {
+		return node, true
+	}
+	if subtle.ConstantTimeCompare(gotHash[:], a.sharedHash[:]) == 1 {
+		return "", true
+	}
+	return "", false
 }
 
 // extractBearerToken parses `<scheme> <token>` from an Authorization

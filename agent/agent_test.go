@@ -199,6 +199,49 @@ func TestSyncBeginRejectsBearerWithLengthDifference(t *testing.T) {
 	}
 }
 
+// TestAuthenticatorResolvesCaller (#110a/#110d): a per-peer token
+// resolves to its node name; the shared token authenticates with an
+// empty identity; an unknown token is rejected. The empty-identity case
+// is what keeps the session binding a no-op for shared-token callers.
+func TestAuthenticatorResolvesCaller(t *testing.T) {
+	auth := newAuthenticator("shared", map[string]string{
+		"laptop-token": "laptop",
+		"nas-token":    "nas",
+	})
+	cases := []struct {
+		token    string
+		wantNode string
+		wantOK   bool
+	}{
+		{"laptop-token", "laptop", true},
+		{"nas-token", "nas", true},
+		{"shared", "", true},
+		{"unknown", "", false},
+	}
+	for _, c := range cases {
+		t.Run(c.token, func(t *testing.T) {
+			node, ok := auth.authenticate(c.token)
+			if node != c.wantNode || ok != c.wantOK {
+				t.Fatalf("authenticate(%q) = (%q, %v), want (%q, %v)", c.token, node, ok, c.wantNode, c.wantOK)
+			}
+		})
+	}
+}
+
+// TestAuthenticatorNoPeerTokensSharedOnly: with no per-peer tokens the
+// authenticator behaves exactly as the single-shared-token agent did —
+// the shared token authenticates (empty identity), everything else is
+// rejected.
+func TestAuthenticatorNoPeerTokensSharedOnly(t *testing.T) {
+	auth := newAuthenticator("only-shared", nil)
+	if node, ok := auth.authenticate("only-shared"); !ok || node != "" {
+		t.Fatalf("shared token = (%q, %v), want (\"\", true)", node, ok)
+	}
+	if _, ok := auth.authenticate("nope"); ok {
+		t.Fatalf("unknown token authenticated, want rejection")
+	}
+}
+
 func TestServePlainHTTP(t *testing.T) {
 	srv := newTestServer(t, Config{})
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
