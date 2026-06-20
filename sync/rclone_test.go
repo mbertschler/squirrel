@@ -72,6 +72,37 @@ func TestParseJSONLogCapturesObjectlessErrors(t *testing.T) {
 	}
 }
 
+// TestParseJSONLogDetectsHashFallback: rclone's no-common-hash notice is
+// emitted at NOTICE level, which the error filter drops; parseJSONLog
+// still flags it so a flags-set, exit-0 run that silently degraded to a
+// size comparison is not later recorded as content-verified.
+func TestParseJSONLogDetectsHashFallback(t *testing.T) {
+	stream := strings.Join([]string{
+		`{"level":"notice","msg":"--checksum is in use but the source and destination have no hashes in common; falling back to --size-only","source":"x"}`,
+		`{"stats":{"errors":0,"fatalError":false,"totalTransfers":2,"totalChecks":0,"bytes":10}}`,
+	}, "\n")
+	var r RunResult
+	parseJSONLog(strings.NewReader(stream), &r, nil)
+
+	if !r.HashFallback {
+		t.Fatalf("HashFallback = false, want true (no-common-hash notice should be detected)")
+	}
+	if len(r.FailedFiles) != 0 {
+		t.Fatalf("FailedFiles = %+v, want none (the notice is not a per-file error)", r.FailedFiles)
+	}
+}
+
+// TestParseJSONLogNoFalseHashFallback: an ordinary run never trips the
+// fallback flag.
+func TestParseJSONLogNoFalseHashFallback(t *testing.T) {
+	stream := `{"stats":{"errors":0,"fatalError":false,"totalTransfers":2,"totalChecks":1,"bytes":10}}`
+	var r RunResult
+	parseJSONLog(strings.NewReader(stream), &r, nil)
+	if r.HashFallback {
+		t.Fatalf("HashFallback = true on a clean run, want false")
+	}
+}
+
 func TestIsRetrySummary(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -159,6 +190,61 @@ password = "p"
 	}
 }
 
+// TestWriteRcloneConfigRendersSFTPHostKeyValidation confirms the optional
+// sftp host-key params reach the written rclone.conf: known_hosts_file is
+// what enables server host-key validation, and host_key_algorithms pins the
+// accepted algorithms. Absent these, rclone does no host-key validation.
+func TestWriteRcloneConfigRendersSFTPHostKeyValidation(t *testing.T) {
+	cfg := writeFakeConfig(t, `
+[destinations.nas]
+type                = "sftp"
+host                = "nas.local"
+user                = "martin"
+root                = "/data"
+password            = "p"
+known_hosts_file    = "~/.ssh/known_hosts"
+host_key_algorithms = "ssh-ed25519 ssh-rsa"
+`)
+	r := &Rclone{}
+	target := filepath.Join(t.TempDir(), "rclone.conf")
+	if _, err := r.WriteRcloneConfig(target, cfg.Destinations); err != nil {
+		t.Fatalf("WriteRcloneConfig: %v", err)
+	}
+	body, _ := os.ReadFile(target)
+	for _, want := range []string{
+		"known_hosts_file = ~/.ssh/known_hosts",
+		"host_key_algorithms = ssh-ed25519 ssh-rsa",
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("rclone.conf missing %q:\n%s", want, body)
+		}
+	}
+}
+
+// TestWriteRcloneConfigRendersS3StorageClass confirms the optional s3
+// storage_class reaches the written rclone.conf.
+func TestWriteRcloneConfigRendersS3StorageClass(t *testing.T) {
+	cfg := writeFakeConfig(t, `
+[destinations.archive]
+type              = "s3"
+provider          = "AWS"
+bucket            = "squirrel"
+root              = "/p"
+storage_class     = "DEEP_ARCHIVE"
+access_key_id     = "AK"
+secret_access_key = "sk"
+`)
+	r := &Rclone{}
+	target := filepath.Join(t.TempDir(), "rclone.conf")
+	if _, err := r.WriteRcloneConfig(target, cfg.Destinations); err != nil {
+		t.Fatalf("WriteRcloneConfig: %v", err)
+	}
+	body, _ := os.ReadFile(target)
+	if !strings.Contains(string(body), "storage_class = DEEP_ARCHIVE") {
+		t.Fatalf("rclone.conf missing storage_class:\n%s", body)
+	}
+}
+
 // TestWriteRcloneConfigTightensExistingPermissions exercises the chmod
 // path. OpenFile's perm argument is only honored on create, so a file
 // that already exists with looser perms (e.g., 0644 from a previous
@@ -207,6 +293,51 @@ root = "/tmp/scratch"
 	body, _ := os.ReadFile(target)
 	if strings.Contains(string(body), "scratch") {
 		t.Fatalf("local destination should not appear in rclone.conf:\n%s", body)
+	}
+}
+
+// TestWriteRcloneConfigRendersCryptOverlay is the file-level golden for a
+// crypt destination: the underlying remote section exactly as without
+// crypt, then the overlay section wrapping it at the destination root.
+func TestWriteRcloneConfigRendersCryptOverlay(t *testing.T) {
+	cfg := writeFakeConfig(t, `
+[destinations.offsite]
+type = "sftp"
+host = "host.example"
+user = "u"
+root = "/data"
+password = "transport-pw"
+
+[destinations.offsite.crypt]
+password  = "obscured-pw"
+password2 = "obscured-salt"
+`)
+	r := &Rclone{}
+	target := filepath.Join(t.TempDir(), "rclone.conf")
+	if _, err := r.WriteRcloneConfig(target, cfg.Destinations); err != nil {
+		t.Fatalf("WriteRcloneConfig: %v", err)
+	}
+	body, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read rclone.conf: %v", err)
+	}
+	want := `[offsite]
+type = sftp
+host = host.example
+user = u
+blake3sum_command = b3sum
+password = transport-pw
+
+[offsite-crypt]
+type = crypt
+remote = offsite:/data
+filename_encryption = off
+directory_name_encryption = false
+password = obscured-pw
+password2 = obscured-salt
+`
+	if string(body) != want {
+		t.Fatalf("rclone.conf:\n%s\nwant:\n%s", body, want)
 	}
 }
 

@@ -232,6 +232,12 @@ type RunResult struct {
 	// FatalError is true when the run failed in a way that did not produce
 	// per-file errors — e.g. source root missing, auth failure.
 	FatalError bool
+	// HashFallback is true when rclone reported that --checksum could not
+	// use the requested hash because source and destination share none,
+	// and silently fell back to a size-based comparison. A run that asked
+	// for BLAKE3 verification but hit this path was not content-verified,
+	// however rclone exited, so the caller must not record it as verified.
+	HashFallback bool
 }
 
 // FailedFile is one per-object error from the JSON log. Object may be
@@ -340,10 +346,13 @@ func (r *Rclone) runPlain(ctx context.Context, args ...string) ([]byte, error) {
 
 // copyTo copies a single source file to a single destination path via
 // `rclone copyto`, creating intermediate directories as needed. Used by
-// the snapshot ride-along to land one .db file at a fixed destination
-// name (copy, by contrast, would treat the destination as a directory).
-func (r *Rclone) copyTo(ctx context.Context, src, dst string) error {
-	_, err := r.runPlain(ctx, "copyto", src, dst)
+// the snapshot ride-along and the content-addressed push to land one
+// file at a fixed destination name (copy, by contrast, would treat the
+// destination as a directory). extraArgs carries per-destination flags
+// such as the --checkers cap.
+func (r *Rclone) copyTo(ctx context.Context, src, dst string, extraArgs ...string) error {
+	args := append([]string{"copyto"}, extraArgs...)
+	_, err := r.runPlain(ctx, append(args, src, dst)...)
 	return err
 }
 
@@ -379,6 +388,69 @@ func (r *Rclone) deleteFile(ctx context.Context, fileURI string) error {
 	return err
 }
 
+// statRemote returns the size of the single object at uri via
+// `rclone lsjson --stat`. The content-addressed push uses it to confirm
+// presence and size of each uploaded object and manifest segment;
+// through a crypt overlay the reported size is the decrypted length, so
+// it compares directly against local byte counts. A missing object
+// surfaces as an error (rclone exits non-zero; defensively, a `null`
+// stat on a tolerant rclone build is mapped to the same outcome).
+func (r *Rclone) statRemote(ctx context.Context, uri string, extraArgs ...string) (int64, error) {
+	args := append([]string{"lsjson", "--stat"}, extraArgs...)
+	out, err := r.runPlain(ctx, append(args, uri)...)
+	if err != nil {
+		return 0, err
+	}
+	trimmed := bytes.TrimSpace(out)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return 0, fmt.Errorf("rclone lsjson: no object at %s", uri)
+	}
+	var entry struct {
+		Size  int64 `json:"Size"`
+		IsDir bool  `json:"IsDir"`
+	}
+	if err := json.Unmarshal(trimmed, &entry); err != nil {
+		return 0, fmt.Errorf("parse lsjson --stat output for %s: %w", uri, err)
+	}
+	if entry.IsDir {
+		return 0, fmt.Errorf("%s is a directory, expected a single object", uri)
+	}
+	return entry.Size, nil
+}
+
+// lsjsonEntry is one object from an `rclone lsjson` listing: its name,
+// size, and — when hashes were requested — the provider checksums keyed
+// by rclone hash name.
+type lsjsonEntry struct {
+	Name   string            `json:"Name"`
+	Size   int64             `json:"Size"`
+	IsDir  bool              `json:"IsDir"`
+	Hashes map[string]string `json:"Hashes"`
+}
+
+// listHashes runs `rclone lsjson --hash --files-only` over dirURI and
+// returns the entries with their provider checksums. hashTypes narrows
+// which hashes rclone computes (--hash-type, repeated); nil requests
+// every hash the backend exposes. extraArgs carries per-destination
+// flags such as the --checkers cap and --include filters scoping the
+// listing.
+func (r *Rclone) listHashes(ctx context.Context, dirURI string, hashTypes []string, extraArgs ...string) ([]lsjsonEntry, error) {
+	args := []string{"lsjson", "--hash", "--files-only"}
+	for _, ht := range hashTypes {
+		args = append(args, "--hash-type", ht)
+	}
+	args = append(args, extraArgs...)
+	out, err := r.runPlain(ctx, append(args, dirURI)...)
+	if err != nil {
+		return nil, err
+	}
+	var entries []lsjsonEntry
+	if err := json.Unmarshal(bytes.TrimSpace(out), &entries); err != nil {
+		return nil, fmt.Errorf("parse lsjson output for %s: %w", dirURI, err)
+	}
+	return entries, nil
+}
+
 // rcloneEvent captures the subset of rclone's JSON log we care about: the
 // level (for error filtering), the per-object message and object name (for
 // failed-file lists), and the stats object that rclone emits at the end of
@@ -408,6 +480,16 @@ var retrySummaryRE = regexp.MustCompile(`^Attempt \d+/\d+ failed`)
 
 func isRetrySummary(msg string) bool { return retrySummaryRE.MatchString(msg) }
 
+// hashFallbackRE matches rclone's notice that --checksum has no common
+// hash to compare with and is degrading to a size-based check, e.g.
+// "--checksum is in use but the source and destination have no hashes in
+// common; falling back to --size-only". The trailing verb has varied
+// across rclone versions ("falling back"/"failing back") so the match
+// keys on the stable phrase "no hashes in common", at any log level.
+var hashFallbackRE = regexp.MustCompile(`no hashes in common`)
+
+func isHashFallback(msg string) bool { return hashFallbackRE.MatchString(msg) }
+
 // parseJSONLog reads JSON-per-line events from r and updates result in
 // place. Non-JSON lines (e.g. an early startup notice on an older rclone)
 // are skipped — we cannot make decisions on them and surfacing them as
@@ -424,6 +506,12 @@ func parseJSONLog(r io.Reader, result *RunResult, onProgress func(runevents.Prog
 		var ev rcloneEvent
 		if err := json.Unmarshal(line, &ev); err != nil {
 			continue
+		}
+		if isHashFallback(ev.Msg) {
+			// Emitted at NOTICE level (which the level filter below drops),
+			// so it is detected here before that filter: a run that asked
+			// for BLAKE3 but lost the hash must not be recorded as verified.
+			result.HashFallback = true
 		}
 		if ev.Stats != nil {
 			result.Transferred = ev.Stats.TotalTransfers

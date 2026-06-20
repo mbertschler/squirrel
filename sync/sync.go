@@ -98,6 +98,11 @@ type Report struct {
 	RunID        int64
 	RcloneResult RunResult
 	Status       string // success / partial / failed
+	// Verification is the handler's typed durability report for this
+	// push: which comparison backed it, what the tool counted, and —
+	// via Verified() — whether the destination's copy was
+	// content-verified. Zero for restores and dry runs.
+	Verification VerifyResult
 	// FinishErr captures a failure to write the runs row's terminal state.
 	// It is independent of rclone success — the bytes may have transferred
 	// correctly but the audit-trail row got stuck in 'running'. Callers
@@ -108,6 +113,12 @@ type Report struct {
 	// .squirrel-history directory" so the user knows that content was
 	// silently filtered from the upload.
 	Warnings []string
+	// Fingerprints counts the provider checksums recorded for this run's
+	// freshly uploaded content-addressed objects (the scan-back
+	// fingerprint later `squirrel verify` passes compare against). Zero
+	// for other handler types; objects whose backend exposed no checksum
+	// surface in Warnings instead.
+	Fingerprints int64
 	// NodeReceiverRunID is set on a successful node-sync handshake and
 	// echoed in the CLI output so the operator can join the two halves
 	// of one logical sync against the receiver's `squirrel runs`
@@ -138,27 +149,67 @@ type Report struct {
 	// so the operator can distinguish source-side warnings from
 	// receiver-side ones.
 	NodePendingWarnings []string
+	// DurabilityPull summarises the automatic post-close durability
+	// metadata pull from the peer. Zero-valued for bucket syncs and
+	// for node syncs that didn't reach a successful close. Refused
+	// rewinds are mirrored into Warnings so the CLI surfaces them
+	// without special-casing this field.
+	DurabilityPull DurabilityPullReport
+	// durabilityAdvance is the origin-coordinate snapshot a handler
+	// captured from the volume's present set before its transfer.
+	// RunPair advances the destination vector to exactly these
+	// components after a verified success, so the advance reflects only
+	// what the push enumerated — never a live set re-read after the
+	// transfer. Handlers that advance the vector themselves (content-
+	// addressed, peer) leave it nil.
+	durabilityAdvance []store.OriginComponent
 }
 
 // RunPair is the single entry point for one sync invocation. It
-// dispatches between bucket-destination and node-destination flows
-// based on which slot of the Pair is populated. CLI callers use it
-// directly so the per-Pair printing loop is a one-liner; the
-// per-flavour functions (Sync, SyncNode) remain exported for tests
-// and for callers that already have the typed destination in hand.
+// resolves the curated Handler for the pair's target type and runs its
+// Push. CLI callers use it directly so the per-Pair printing loop is a
+// one-liner; the per-flavour functions (Sync, SyncNode) remain exported
+// for tests and for callers that already have the typed destination in
+// hand.
 //
-// Concurrency: both flows allocate the 'running' kind='sync' row via
-// store.BeginSyncRunIfClear, which does the check + insert atomically
-// inside a BEGIN IMMEDIATE transaction. Two concurrent RunPair calls
-// against the same (volume, target) cannot both win — the loser sees
-// the winner's row and returns the "already running" diagnostic from
-// alreadyRunningErr. Stale 'running' rows from crashed runs keep
-// blocking here until cleared by `squirrel runs fail` (#37).
-func RunPair(ctx context.Context, s *store.Store, rcl *Rclone, p Pair, opts Options) (Report, error) {
-	if p.IsNode() {
-		return SyncNode(ctx, s, rcl, p.Volume, p.Node, opts)
+// A verified successful bucket push (BLAKE3 for rclone, repository
+// verify for kopia) advances the destination's durability vector;
+// peer pushes advance it inside the handshake's close phase instead.
+//
+// Concurrency: every handler allocates the 'running' kind='sync' row
+// via store.BeginSyncRunIfClear, which does the check + insert
+// atomically inside a BEGIN IMMEDIATE transaction. Two concurrent
+// RunPair calls against the same (volume, target) cannot both win — the
+// loser sees the winner's row and returns the "already running"
+// diagnostic from alreadyRunningErr. Stale 'running' rows from crashed
+// runs keep blocking here until cleared by `squirrel runs fail` (#37).
+func RunPair(ctx context.Context, s *store.Store, tools Tools, p Pair, opts Options) (Report, error) {
+	h, err := HandlerFor(s, tools, p)
+	if err != nil {
+		rep := Report{Destination: p.TargetName()}
+		if p.Volume != nil {
+			rep.Volume = p.Volume.Name
+		}
+		return rep, err
 	}
-	return Sync(ctx, s, rcl, p.Volume, p.Destination, opts)
+	rep, err := h.Push(ctx, opts)
+	if err != nil || opts.DryRun || p.IsNode() || rep.FinishErr != nil ||
+		rep.Status != store.RunStatusSuccess || !rep.Verification.Verified() {
+		return rep, err
+	}
+	vol, verr := s.GetVolumeByName(ctx, rep.Volume)
+	if verr != nil {
+		return rep, fmt.Errorf("advance durability vector: resolve volume %q: %w", rep.Volume, verr)
+	}
+	// A failed advance surfaces as the command's error even though the
+	// runs row already closed as success: the bytes are on the
+	// destination, and the next verified push re-advances cheaply. The
+	// advance reflects the snapshot the handler captured before its
+	// transfer, tagged with the verification method that backed it.
+	if aerr := s.AdvanceDestinationVectorTo(ctx, vol.ID, p.TargetName(), rep.Verification.Method, rep.durabilityAdvance); aerr != nil {
+		return rep, fmt.Errorf("advance durability vector for %s → %s: %w", rep.Volume, p.TargetName(), aerr)
+	}
+	return rep, nil
 }
 
 // alreadyRunningErr formats the diagnostic returned when a sync is
@@ -184,6 +235,9 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 	if w := historyDirInSourceWarning(vol); w != "" {
 		rep.Warnings = append(rep.Warnings, w)
 	}
+	if w := cryptVerificationWarning(dest, opts.Shallow); w != "" {
+		rep.Warnings = append(rep.Warnings, w)
+	}
 
 	volID, err := requireIndexedVolume(ctx, s, vol)
 	if err != nil {
@@ -206,7 +260,7 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 	runID, err := beginSyncRunGuarded(ctx, s, opts.DryRun, store.SyncRunSpec{
 		VolumeID:    volID,
 		Destination: dest.Name,
-		Shallow:     opts.Shallow,
+		Shallow:     EffectiveShallow(dest, opts.Shallow),
 	}, vol.Name)
 	if err != nil {
 		return rep, err
@@ -215,16 +269,51 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 		opts.OnRunID(runID)
 	}
 
+	if !opts.DryRun {
+		if rep.durabilityAdvance, err = captureDurabilityAdvance(ctx, s, volID); err != nil {
+			// The runs row is already allocated; close it as failed so a
+			// capture error (context cancel, transient DB) before rclone
+			// starts cannot leave it stuck in 'running'.
+			rep.RunID = runID
+			rep.RcloneResult.FatalError = true
+			rep.RcloneResult.FailedFiles = []FailedFile{{Message: err.Error()}}
+			finishRun(ctx, s, opts.DryRun, runID, &rep)
+			return rep, err
+		}
+	}
+
 	err = runRcloneOperation(ctx, s, rcl, opts.DryRun, runID, &rep, opts.Progress,
 		func(runID int64) ([]string, error) {
 			return buildRcloneArgs(vol, dest, runID, opts)
 		})
+	if !opts.DryRun {
+		rep.Verification = rcloneVerification(dest, opts, &rep)
+	}
 	// runRcloneOperation's deferred finishRun has committed the run's
 	// terminal state by now, so the snapshot reflects this run's own row.
 	// Destination syncs are eligible for the cloud ride-along; the
 	// Snapshotter no-ops on dry-run and on non-terminal-success states.
 	opts.Snapshot.afterSync(ctx, &rep, vol, dest)
 	return rep, err
+}
+
+// captureDurabilityAdvance snapshots the volume's present-set origin
+// maxima before a transfer begins. RunPair advances the destination
+// vector to exactly this snapshot on a verified success, so the advance
+// covers only content the push enumerated — the cross-kind run guard
+// keeps an index from committing new present rows during the push, and
+// pinning to the snapshot keeps even an out-of-band write from being
+// folded into the advance.
+func captureDurabilityAdvance(ctx context.Context, s *store.Store, volumeID int64) ([]store.OriginComponent, error) {
+	self, err := s.GetSelfNode(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("capture durability advance: self node: %w", err)
+	}
+	components, err := s.PresentOriginMaxima(ctx, volumeID, self.ID)
+	if err != nil {
+		return nil, fmt.Errorf("capture durability advance: %w", err)
+	}
+	return components, nil
 }
 
 // beginSyncRunGuarded is the sync-allocator the bucket and peer paths
@@ -293,6 +382,13 @@ func runRcloneOperation(
 // least one success-or-partial index run exists for it. Sync of an
 // unindexed volume is refused: without an index, we have no record of
 // what should be at the destination after the run.
+//
+// The DB row's recorded path must equal the config-declared path. A
+// handler enumerates the config path's tree while the durability advance
+// covers the rows the DB volume holds; if the two paths disagree (a stale
+// volumes.path) the push would claim durability for one tree while
+// transferring another. Offload and restore already make this
+// cross-check; the push handlers share it through this gate.
 func requireIndexedVolume(ctx context.Context, s *store.Store, vol *config.Volume) (int64, error) {
 	v, err := s.GetVolumeByName(ctx, vol.Name)
 	if err != nil {
@@ -300,6 +396,9 @@ func requireIndexedVolume(ctx context.Context, s *store.Store, vol *config.Volum
 			return 0, fmt.Errorf("volume %q has never been indexed — run `squirrel index %s` first", vol.Name, vol.Name)
 		}
 		return 0, fmt.Errorf("lookup volume %q: %w", vol.Name, err)
+	}
+	if v.Path != vol.Path {
+		return 0, fmt.Errorf("volume %q is at %q in the DB but config says %q — resolve the conflict before syncing", vol.Name, v.Path, vol.Path)
 	}
 	if _, err := s.LatestSuccessfulIndexRun(ctx, v.ID); err != nil {
 		if store.IsNotFound(err) {
@@ -499,7 +598,8 @@ func buildRcloneArgs(vol *config.Volume, dest *config.Destination, runID int64, 
 		// back down on restore).
 		"--filter", "- /" + IndexDirName + "/**",
 	}
-	if !opts.Shallow {
+	args = append(args, checkersArgs(dest)...)
+	if !EffectiveShallow(dest, opts.Shallow) {
 		args = append(args, "--checksum", "--hash", "blake3")
 	}
 	if opts.DryRun {
@@ -519,17 +619,25 @@ func withTrailingSlash(p string) string {
 	return p + "/"
 }
 
-// destinationVolumeURI returns the rclone destination spec for the given
-// volume under dest. For type=local this is an absolute filesystem path;
-// for other types it is "<name>:<root>/<volume>/".
-func destinationVolumeURI(dest *config.Destination, volumeName string) string {
-	switch dest.Type {
-	case "local":
-		return filepath.ToSlash(filepath.Join(dest.Root, volumeName)) + "/"
+// remoteSubpathURI returns the rclone URI for subpath under dest's root.
+// type=local is an absolute filesystem path; a crypt destination is
+// addressed through its overlay remote, whose remote line already carries
+// the root; plain remotes prefix the root themselves.
+func remoteSubpathURI(dest *config.Destination, subpath string) string {
+	switch {
+	case dest.Type == "local":
+		return filepath.ToSlash(filepath.Join(dest.Root, subpath))
+	case dest.Crypt != nil:
+		return dest.CryptRemoteName() + ":" + subpath
 	default:
-		joined := path.Join(dest.Root, volumeName)
-		return dest.Name + ":" + joined + "/"
+		return dest.Name + ":" + path.Join(dest.Root, subpath)
 	}
+}
+
+// destinationVolumeURI returns the rclone destination spec for the given
+// volume under dest.
+func destinationVolumeURI(dest *config.Destination, volumeName string) string {
+	return remoteSubpathURI(dest, volumeName) + "/"
 }
 
 // backupDirURI returns the destination spec for rclone's --backup-dir for
@@ -541,13 +649,54 @@ func backupDirURI(dest *config.Destination, volumeName string, runID int64, dryR
 	if dryRun || runID == 0 {
 		id = "dry-run"
 	}
-	subpath := path.Join(volumeName, HistoryDirName, "run-"+id)
-	switch dest.Type {
-	case "local":
-		return filepath.ToSlash(filepath.Join(dest.Root, subpath))
-	default:
-		return dest.Name + ":" + path.Join(dest.Root, subpath)
+	return remoteSubpathURI(dest, path.Join(volumeName, HistoryDirName, "run-"+id))
+}
+
+// EffectiveShallow reports whether a transfer to dest runs without BLAKE3
+// verification. A crypt destination forces shallow: rclone crypt remotes
+// expose no content hashes, so --checksum --hash blake3 cannot pass
+// through the overlay and rclone falls back to its size+mtime comparison.
+// The result is what the runs row records, keeping the audit trail honest
+// about which transfers were content-verified.
+func EffectiveShallow(dest *config.Destination, shallow bool) bool {
+	return shallow || dest.Crypt != nil
+}
+
+// ShallowForPairs reports whether an invocation covering pairs runs
+// rclone entirely without BLAKE3 verification: either the operator
+// passed --shallow, or every rclone-driven target is a crypt
+// destination that forces it. Kopia pairs are skipped — they drive the
+// kopia binary, so they put no constraint on rclone. Content-addressed
+// pairs are skipped for the same reason: their per-object copyto and
+// lsjson calls never pass --hash blake3. Used to scope the rclone
+// version preflight to what the run will actually invoke.
+func ShallowForPairs(pairs []Pair, shallow bool) bool {
+	if shallow {
+		return true
 	}
+	for _, p := range pairs {
+		if p.Destination != nil && p.Destination.Type == "kopia" {
+			continue
+		}
+		if p.Destination != nil && p.Destination.Layout == config.LayoutContentAddressed {
+			continue
+		}
+		if p.Destination == nil || p.Destination.Crypt == nil {
+			return false
+		}
+	}
+	return true
+}
+
+// cryptVerificationWarning returns the advisory for a non-shallow transfer
+// to a crypt destination, where EffectiveShallow downgrades verification
+// without the operator having asked for --shallow. An explicit --shallow
+// run already gets the CLI's shallow warning, so this stays empty then.
+func cryptVerificationWarning(dest *config.Destination, shallow bool) string {
+	if dest.Crypt == nil || shallow {
+		return ""
+	}
+	return fmt.Sprintf("destination %q is encrypted (crypt): BLAKE3 verification cannot pass through the crypt overlay — comparing by size+mtime for this run, recorded as shallow", dest.Name)
 }
 
 // EnsureMinVersion checks the installed rclone against MinRcloneVersion.
@@ -683,6 +832,15 @@ type RestoreOptions struct {
 // unless they explicitly intend to restore in place.
 func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, dest *config.Destination, opts RestoreOptions) (rep Report, err error) {
 	rep = Report{Volume: vol.Name, Destination: dest.Name}
+	if dest.Type == "kopia" {
+		return rep, fmt.Errorf("destination %q is a kopia repository — restore from it with the kopia CLI (`kopia snapshot restore`)", dest.Name)
+	}
+	if dest.Layout == config.LayoutContentAddressed {
+		return rep, fmt.Errorf("destination %q uses the content-addressed layout — its restore tooling ships separately; the data is recoverable by replaying the manifest segments under %s/%s/ against the destination-root %s/ (see the README's manifest format)", dest.Name, vol.Name, ManifestDirName, ObjectsDirName)
+	}
+	if w := cryptVerificationWarning(dest, opts.Shallow); w != "" {
+		rep.Warnings = append(rep.Warnings, w)
+	}
 
 	// "In-place" is the dangerous direction: writing into the live
 	// volume path. Unsetting ToPath is the canonical request, but a
@@ -734,7 +892,7 @@ func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volum
 		return rep, err
 	}
 
-	runID, err := beginRestoreRun(ctx, s, opts.DryRun, v.ID, dest.Name, opts.Shallow)
+	runID, err := beginRestoreRun(ctx, s, opts.DryRun, v.ID, dest.Name, EffectiveShallow(dest, opts.Shallow))
 	if err != nil {
 		return rep, err
 	}
@@ -830,7 +988,8 @@ func buildRestoreArgs(vol *config.Volume, dest *config.Destination, runID int64,
 		args = append(args, "--filter", "- /"+RestoreHistoryDirName+"/**")
 		args = append(args, "--filter", "- /"+IndexDirName+"/**")
 	}
-	if !opts.Shallow {
+	args = append(args, checkersArgs(dest)...)
+	if !EffectiveShallow(dest, opts.Shallow) {
 		args = append(args, "--checksum", "--hash", "blake3")
 	}
 	if opts.DryRun {

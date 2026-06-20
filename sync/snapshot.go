@@ -180,24 +180,21 @@ func (sn *Snapshotter) rotateCloud(ctx context.Context, dirURI string) error {
 }
 
 // indexDirURI returns the rclone URI of the per-volume .squirrel-index/
-// directory under dest, mirroring backupDirURI: an absolute filesystem
-// path for type=local, "<name>:<root>/<volume>/.squirrel-index" otherwise.
+// directory under dest, addressed the same way the data transfer is
+// (through the crypt overlay when the destination has one).
 func indexDirURI(dest *config.Destination, volumeName string) string {
-	subpath := path.Join(volumeName, IndexDirName)
-	switch dest.Type {
-	case "local":
-		return filepath.ToSlash(filepath.Join(dest.Root, subpath))
-	default:
-		return dest.Name + ":" + path.Join(dest.Root, subpath)
-	}
+	return remoteSubpathURI(dest, path.Join(volumeName, IndexDirName))
 }
 
-// rotateSnapshots deletes the oldest snapshots in dir until only keep
-// remain, mirroring the CLI's `db backup --keep` rotation. Files are
-// matched by the index-/pre-migration- prefixes squirrel writes — the
-// snapshot-on-sync directory defaults to the same backups/ dir the store
-// and CLI use, so both prefixes share the bound. Unknown files are left
-// untouched. keep<=0 means "no rotation".
+// rotateSnapshots deletes the oldest snapshot-on-sync files in dir until
+// only keep remain. Only the index-* files this routine writes are in the
+// pool: the snapshot-on-sync directory defaults to the same backups/ dir
+// the migration runner writes pre-migration-* snapshots to, and those are
+// a buggy migration's only rollback surface — at the default keep=7 a
+// sync cadence could rotate one away within days of a schema upgrade, so
+// they are exempt here and only an explicit `db backup --keep` retention
+// ever removes them. Unknown files are left untouched. keep<=0 means "no
+// rotation".
 func rotateSnapshots(dir string, keep int) ([]string, error) {
 	if keep <= 0 {
 		return nil, nil
@@ -219,7 +216,7 @@ func rotateSnapshots(dir string, keep int) ([]string, error) {
 			continue
 		}
 		name := e.Name()
-		if !strings.HasPrefix(name, snapshotPrefix) && !strings.HasPrefix(name, "pre-migration-") {
+		if !strings.HasPrefix(name, snapshotPrefix) {
 			continue
 		}
 		info, err := e.Info()

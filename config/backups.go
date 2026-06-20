@@ -23,8 +23,10 @@ type Backups struct {
 	// rather than here.
 	Dir string
 	// Keep bounds the local snapshot directory: after writing, the oldest
-	// snapshots are rotated away until at most Keep remain. Zero means no
-	// rotation.
+	// index-* snapshots are rotated away until at most Keep remain. Zero
+	// means no rotation. Pre-migration snapshots in the same directory are
+	// exempt from this sync-time rotation — only an explicit `db backup
+	// --keep` retention removes them.
 	Keep int
 	// Cloud gates the destination ride-along. Ignored when Enabled is
 	// false (no snapshot is taken to upload).

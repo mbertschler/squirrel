@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/zeebo/blake3"
+
 	"github.com/mbertschler/squirrel/store"
 	"github.com/mbertschler/squirrel/volmark"
 )
@@ -123,28 +125,28 @@ func TestCLIRestoreInfersDestinationWhenUnambiguous(t *testing.T) {
 
 // TestCLIRestoreFromNodeFiltersByAttribution covers the issue-#15
 // acceptance criterion: a receiver-side restore with --from <peer>
-// produces a tree containing only that peer's source-attributed
-// paths, even when other peers / local writes share the volume. The
-// fixture indexes three local files, then re-stamps two of them with
-// distinct peer provenance via Upsert(prov). Restoring with
-// --from peer-a should land only the from-a path in the target tree.
+// produces a tree containing only the paths whose content originates
+// at that peer, even when other peers / local writes share the volume.
+// The fixture indexes one local file, introduces two peer-origin files
+// via Upsert(prov) (origin is recorded on the contents row at first
+// introduction), and syncs the tree. Restoring with --from peer-a
+// should land only the from-a path in the target tree.
 func TestCLIRestoreFromNodeFiltersByAttribution(t *testing.T) {
 	requireRcloneCLI(t)
 	f := writeSyncFixture(t)
-	writeTestFile(t, filepath.Join(f.volumeDir, "from-a.txt"), "alpha")
-	writeTestFile(t, filepath.Join(f.volumeDir, "from-b.txt"), "beta")
 	writeTestFile(t, filepath.Join(f.volumeDir, "local.txt"), "local")
 
 	runCLI(t, "--config", f.configPath, "index", f.volumeName)
-	runCLI(t, "--config", f.configPath, "sync", "pics")
 
-	// Inject peer attribution onto the from-* paths. The destination
-	// tree was just written by sync, so the rclone-side content is
-	// unchanged — restore will pull only the path subset we ask for
-	// via --files-from-raw. The store handle is closed before the
-	// subsequent runCLI so there's exactly one process holding the
-	// SQLite file when the CLI runs.
+	// Introduce the from-* files as peer-origin content before sync
+	// pushes the tree to the destination. The store handle is closed
+	// before the subsequent runCLI so there's exactly one process
+	// holding the SQLite file when the CLI runs.
+	writeTestFile(t, filepath.Join(f.volumeDir, "from-a.txt"), "alpha")
+	writeTestFile(t, filepath.Join(f.volumeDir, "from-b.txt"), "beta")
 	stampPeerProvenance(t, f.dbPath)
+
+	runCLI(t, "--config", f.configPath, "sync", "pics")
 
 	target := filepath.Join(t.TempDir(), "recovered")
 	out := runCLI(t, "--config", f.configPath, "restore", "pics", "--from", "peer-a", "--to", target)
@@ -163,9 +165,9 @@ func TestCLIRestoreFromNodeFiltersByAttribution(t *testing.T) {
 }
 
 // stampPeerProvenance opens the index DB at dbPath, creates peer-a /
-// peer-b nodes plus a sync-kind run for each, then promotes the
-// from-{a,b}.txt rows (already indexed under the "pics" volume) to
-// the respective peer's source attribution via Upsert. The store
+// peer-b nodes plus a sync-kind run for each, then records the
+// on-disk from-{a,b}.txt files under the "pics" volume as content
+// introduced by the respective peer via Upsert(prov). The store
 // handle is closed before returning so the next CLI invocation has
 // no concurrent SQLite connection from this process.
 func stampPeerProvenance(t *testing.T, dbPath string) {
@@ -204,17 +206,23 @@ func stampPeerProvenance(t *testing.T, dbPath string) {
 		t.Fatalf("FinishRun b: %v", err)
 	}
 	for _, c := range []struct {
-		path string
-		prov *store.Provenance
+		path  string
+		runID int64
+		prov  *store.Provenance
 	}{
-		{"from-a.txt", &store.Provenance{NodeID: peerA.ID, RunID: runA}},
-		{"from-b.txt", &store.Provenance{NodeID: peerB.ID, RunID: runB}},
+		{"from-a.txt", runA, &store.Provenance{NodeID: peerA.ID, RunID: runA}},
+		{"from-b.txt", runB, &store.Provenance{NodeID: peerB.ID, RunID: runB}},
 	} {
-		row, err := s.GetByPath(ctx, vol.ID, c.path)
+		data, err := os.ReadFile(filepath.Join(vol.Path, c.path))
 		if err != nil {
-			t.Fatalf("GetByPath %s: %v", c.path, err)
+			t.Fatalf("read %s: %v", c.path, err)
 		}
-		if err := s.Upsert(ctx, row, c.prov); err != nil {
+		digest := blake3.Sum256(data)
+		if err := s.Upsert(ctx, store.FileRow{
+			VolumeID: vol.ID, Path: c.path, Blake3: digest[:],
+			SizeBytes: int64(len(data)), MtimeNs: 1, Status: store.StatusPresent,
+			FirstSeenRunID: c.runID, LastSeenRunID: c.runID, IndexedAtNs: 1,
+		}, c.prov); err != nil {
 			t.Fatalf("Upsert %s: %v", c.path, err)
 		}
 	}

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -37,6 +38,35 @@ const HistoryDirName = ".squirrel-history"
 // (conflicts) without parsing run-id semantics.
 const ConflictsDirName = ".squirrel-conflicts"
 
+// RestoreHistoryDirName and IndexDirName mirror sync.RestoreHistoryDirName
+// and sync.IndexDirName at the agent side (lowercase-duplicated for the
+// same reason as HistoryDirName). The receiver never writes into either
+// itself, but a peer's wire path can name them; the path validators
+// reject them so the initiator-side reserved filter
+// (sync.isReservedSyncPath / isReservedFolderPath) and the receiver
+// allow-list cover the same four names. A wire path under
+// .squirrel-restore-history could otherwise overwrite the receiver's
+// only pre-restore backup.
+const (
+	RestoreHistoryDirName = ".squirrel-restore-history"
+	IndexDirName          = ".squirrel-index"
+)
+
+// maxPlanBodyBytes caps a decoded request body. decodeJSON applies it to
+// every sync endpoint's body (begin/plan/verify/close/durability); plan
+// bodies are the largest, carrying one IndexEntry per differing file at a
+// few hundred bytes each, so 256 MiB is a generous ceiling for even a
+// full-volume flat plan while still refusing the unbounded body a
+// token-holding peer could otherwise stream to OOM the agent (#110c). A
+// var so tests can drive the boundary without a 256 MiB payload.
+var maxPlanBodyBytes int64 = 256 << 20
+
+// maxPlanEntries caps len(PlanRequest.Entries) so a single /plan can't
+// pin an unbounded slice in memory even within the byte ceiling. One
+// million entries is far above any realistic differing-folder slice the
+// Merkle walk produces and still bounds the worst case.
+var maxPlanEntries = 1 << 20
+
 // peerSyncRouter holds per-server state shared by all peer-sync
 // endpoints: the volume-level lock map (one in-flight session per
 // volume) and the session table (transient state between /begin and
@@ -54,11 +84,19 @@ type peerSyncRouter struct {
 // drops all in-flight sessions (acceptable for v1 — the next sync
 // replans from scratch).
 type peerSession struct {
-	receiverRunID   int64
-	volume          *config.Volume
-	volumeID        int64
-	peerNodeID      int64
-	correlatedRunID int64
+	receiverRunID int64
+	volume        *config.Volume
+	volumeID      int64
+	peerNodeID    int64
+	// initiatorNodeName is the caller identity declared at /begin,
+	// recorded so a phase call can be bound back to the node that
+	// opened the session. Under the single shared agent token there is
+	// no per-request authenticated identity to compare it against yet
+	// (see #110d); lookupSession is the chokepoint where that
+	// comparison lands once per-peer tokens make a caller identity
+	// recoverable.
+	initiatorNodeName string
+	correlatedRunID   int64
 	// dedupStrategy is the initiator-supplied preference applied by
 	// classify: "copy" enables the CopyFromExisting branch, "off"
 	// disables it (every missing path stays a Transfer). Validated at
@@ -92,6 +130,14 @@ type sessionEntry struct {
 	blake3      []byte
 	size        int64
 	mtimeNs     int64
+	// originNode + originRun are the content's global origin
+	// coordinate as declared on the wire (node name + origin-space
+	// run id), recorded verbatim on the contents row at /close. Both
+	// empty when the initiator predates the origin exchange; /close
+	// then falls back to attributing the content to the initiator at
+	// its declared sync run.
+	originNode string
+	originRun  int64
 	// priorRow is the receiver's pre-stage view of the row at this
 	// path. Populated for supersede and conflict; nil otherwise.
 	priorRow *store.FileRow
@@ -120,8 +166,8 @@ func newPeerSyncRouter(srv *Server, volumes map[string]*config.Volume) *peerSync
 	}
 }
 
-// register attaches the four /v1/sync/* routes to mux. Health and
-// the placeholder /v1/plan stay where buildHandler put them; this
+// register attaches the /v1/sync/* routes to mux. Health and the
+// placeholder /v1/plan stay where buildHandler put them; this
 // function is the only place new routes land.
 func (r *peerSyncRouter) register(mux *http.ServeMux) {
 	mux.Handle("POST /v1/sync/begin", r.srv.requireBearer(http.HandlerFunc(r.handleBegin)))
@@ -129,6 +175,7 @@ func (r *peerSyncRouter) register(mux *http.ServeMux) {
 	mux.Handle("POST /v1/sync/plan-folders", r.srv.requireBearer(http.HandlerFunc(r.handlePlanFolders)))
 	mux.Handle("POST /v1/sync/verify", r.srv.requireBearer(http.HandlerFunc(r.handleVerify)))
 	mux.Handle("POST /v1/sync/close", r.srv.requireBearer(http.HandlerFunc(r.handleClose)))
+	mux.Handle("POST /v1/sync/durability", r.srv.requireBearer(http.HandlerFunc(r.handleDurability)))
 }
 
 // acquireVolumeLock takes the per-volume lock or returns false. The
@@ -155,28 +202,64 @@ func (r *peerSyncRouter) storeSession(s *peerSession) {
 	r.sessions[s.receiverRunID] = s
 }
 
-func (r *peerSyncRouter) takeSession(receiverRunID int64) *peerSession {
+// takeSession resolves and removes the session for receiverRunID,
+// binding it to the caller the same way lookupSession does: a non-empty
+// callerNode that doesn't match the begin-recorded initiator leaves the
+// session in place and returns errSessionCallerMismatch, so a foreign
+// token-holder cannot /close (and thereby abort) another node's session.
+// ok is false when no session exists.
+func (r *peerSyncRouter) takeSession(receiverRunID int64, callerNode string) (sess *peerSession, ok bool, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	s, ok := r.sessions[receiverRunID]
+	sess, ok = r.sessions[receiverRunID]
 	if !ok {
-		return nil
+		return nil, false, nil
+	}
+	if callerNode != "" && callerNode != sess.initiatorNodeName {
+		return nil, true, errSessionCallerMismatch
 	}
 	delete(r.sessions, receiverRunID)
-	return s
+	return sess, true, nil
 }
 
-func (r *peerSyncRouter) lookupSession(receiverRunID int64) *peerSession {
+// errSessionCallerMismatch is returned when a phase call presents a
+// caller identity that differs from the node that opened the session.
+var errSessionCallerMismatch = errors.New("caller node does not own this session")
+
+// lookupSession resolves the session for receiverRunID and binds it to
+// the caller. A non-empty callerNode must equal the initiator name
+// recorded at /begin, so a second node holding the shared token cannot
+// drive another node's in-flight session. callerNode is empty today
+// because the single shared agent token carries no per-request identity
+// (#110d): the comparison is a no-op until per-peer tokens make a caller
+// identity recoverable, at which point this is the single place it is
+// enforced. ok is false when no session exists; err is non-nil only on a
+// caller mismatch.
+func (r *peerSyncRouter) lookupSession(receiverRunID int64, callerNode string) (sess *peerSession, ok bool, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.sessions[receiverRunID]
+	sess, ok = r.sessions[receiverRunID]
+	if !ok {
+		return nil, false, nil
+	}
+	if callerNode != "" && callerNode != sess.initiatorNodeName {
+		return nil, true, errSessionCallerMismatch
+	}
+	return sess, true, nil
 }
+
+// callerNodeName returns the authenticated initiator identity for a
+// phase request, or "" when none is recoverable. The single shared
+// agent token authenticates every peer identically, so no per-request
+// identity exists yet (#110d); this returns "" until per-peer tokens
+// land, keeping the lookupSession binding point in one spot.
+func callerNodeName(*http.Request) string { return "" }
 
 // handleBegin implements POST /v1/sync/begin. The handler is the
 // thin HTTP shell over beginSession, which carries the actual flow.
 func (r *peerSyncRouter) handleBegin(w http.ResponseWriter, req *http.Request) {
 	var body syncproto.BeginRequest
-	if err := decodeJSON(req, &body); err != nil {
+	if err := decodeJSON(w, req, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -259,7 +342,7 @@ func (r *peerSyncRouter) ensureVolumeRow(ctx context.Context, name, absPath stri
 // insertion, in-memory session registration. The caller releases the
 // volume lock on any non-nil error.
 func (r *peerSyncRouter) finishBegin(ctx context.Context, body syncproto.BeginRequest, vol *config.Volume, v store.Volume, dedupStrategy string) (syncproto.BeginResponse, int, error) {
-	peer, err := r.srv.store.GetOrCreatePeerNode(ctx, body.InitiatorNodeName, peerEndpoint(body))
+	peer, err := r.srv.store.GetOrCreatePeerNode(ctx, body.InitiatorNodeName, peerEndpoint(body), false)
 	if err != nil {
 		return syncproto.BeginResponse{}, http.StatusConflict, err
 	}
@@ -277,14 +360,15 @@ func (r *peerSyncRouter) finishBegin(ctx context.Context, body syncproto.BeginRe
 	}
 	protocol := negotiateProtocol(body.ProtocolVersion)
 	r.storeSession(&peerSession{
-		receiverRunID:   runID,
-		volume:          vol,
-		volumeID:        v.ID,
-		peerNodeID:      peer.ID,
-		correlatedRunID: body.InitiatorRunID,
-		dedupStrategy:   dedupStrategy,
-		protocolVersion: protocol,
-		dispositions:    make(map[string]*sessionEntry),
+		receiverRunID:     runID,
+		volume:            vol,
+		volumeID:          v.ID,
+		peerNodeID:        peer.ID,
+		initiatorNodeName: body.InitiatorNodeName,
+		correlatedRunID:   body.InitiatorRunID,
+		dedupStrategy:     dedupStrategy,
+		protocolVersion:   protocol,
+		dispositions:      make(map[string]*sessionEntry),
 	})
 	return syncproto.BeginResponse{
 		ReceiverRunID:    runID,
@@ -355,14 +439,14 @@ func (r *peerSyncRouter) collectDriftWarnings(ctx context.Context, volumeName st
 }
 
 // peerEndpoint resolves the endpoint string to store on the peer
-// nodes row. Single-writer initiators don't expose an agent of their
-// own, so the empty case yields a stable name-derived placeholder
-// that satisfies the "non-empty endpoint" invariant without leaking a
-// real URL onto the wire.
+// nodes row at /begin. It always yields the stable name-derived
+// "peer://<name>" placeholder rather than the wire-supplied
+// InitiatorEndpoint: that field is unauthenticated, and binding it to a
+// node row would let a peer point an arbitrary node-name's dial-back URL
+// at an attacker address (latent until peer-initiated pulls land, an
+// SSRF/redirect then). A real endpoint is bound only by operator
+// configuration through the initiator-side GetOrCreatePeerNode upgrade.
 func peerEndpoint(body syncproto.BeginRequest) string {
-	if body.InitiatorEndpoint != "" {
-		return body.InitiatorEndpoint
-	}
 	return "peer://" + body.InitiatorNodeName
 }
 
@@ -370,12 +454,20 @@ func peerEndpoint(body syncproto.BeginRequest) string {
 // slice against the receiver's store and pre-move the supersede paths.
 func (r *peerSyncRouter) handlePlan(w http.ResponseWriter, req *http.Request) {
 	var body syncproto.PlanRequest
-	if err := decodeJSON(req, &body); err != nil {
+	if err := decodeJSON(w, req, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	sess := r.lookupSession(body.ReceiverRunID)
-	if sess == nil {
+	if len(body.Entries) > maxPlanEntries {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("plan carries %d entries, exceeding the %d cap", len(body.Entries), maxPlanEntries))
+		return
+	}
+	sess, ok, err := r.lookupSession(body.ReceiverRunID, callerNodeName(req))
+	if err != nil {
+		writeError(w, http.StatusForbidden, err.Error())
+		return
+	}
+	if !ok {
 		writeError(w, http.StatusNotFound, "no session for receiver_run_id")
 		return
 	}
@@ -402,6 +494,10 @@ func (r *peerSyncRouter) handlePlan(w http.ResponseWriter, req *http.Request) {
 // only ever move bytes off paths the initiator is overwriting, never
 // onto paths the dedup branch needs.
 func (r *peerSyncRouter) planSession(ctx context.Context, sess *peerSession, entries []syncproto.IndexEntry) (syncproto.PlanResponse, error) {
+	self, err := r.srv.store.GetSelfNode(ctx)
+	if err != nil {
+		return syncproto.PlanResponse{}, fmt.Errorf("look up self node: %w", err)
+	}
 	for _, e := range entries {
 		if err := validateRelPath(e.Path); err != nil {
 			return syncproto.PlanResponse{}, fmt.Errorf("path %q: %w", e.Path, err)
@@ -410,7 +506,13 @@ func (r *peerSyncRouter) planSession(ctx context.Context, sess *peerSession, ent
 		if err != nil || len(digest) != 32 {
 			return syncproto.PlanResponse{}, fmt.Errorf("invalid blake3 hex %q for path %q", e.Blake3Hex, e.Path)
 		}
-		entry := &sessionEntry{blake3: digest, size: e.SizeBytes, mtimeNs: e.MtimeNs}
+		if err := validateEntryOrigin(e, self.Name, sess.receiverRunID); err != nil {
+			return syncproto.PlanResponse{}, fmt.Errorf("path %q: %w", e.Path, err)
+		}
+		entry := &sessionEntry{
+			blake3: digest, size: e.SizeBytes, mtimeNs: e.MtimeNs,
+			originNode: e.OriginNode, originRun: e.OriginRun,
+		}
 		disp, err := r.classify(ctx, sess, e.Path, entry)
 		if err != nil {
 			return syncproto.PlanResponse{}, fmt.Errorf("classify %q: %w", e.Path, err)
@@ -436,6 +538,12 @@ func (r *peerSyncRouter) planSession(ctx context.Context, sess *peerSession, ent
 	}
 	if err := r.preStageConflicts(ctx, sess); err != nil {
 		return syncproto.PlanResponse{}, fmt.Errorf("pre-stage conflicts: %w", err)
+	}
+	// A failure here can leave already-preserved out-of-band files under
+	// .squirrel-history/run-<id>/; that history is recoverable, so the
+	// pre-stage is intentionally not rolled back on a later planning error.
+	if err := r.preStageTransfers(sess); err != nil {
+		return syncproto.PlanResponse{}, fmt.Errorf("pre-stage transfers: %w", err)
 	}
 	resp := syncproto.PlanResponse{
 		Dispositions: make([]syncproto.PlanDisposition, 0, len(entries)),
@@ -468,12 +576,16 @@ func (r *peerSyncRouter) planSession(ctx context.Context, sess *peerSession, ent
 // abort the whole walk.
 func (r *peerSyncRouter) handlePlanFolders(w http.ResponseWriter, req *http.Request) {
 	var body syncproto.PlanFoldersRequest
-	if err := decodeJSON(req, &body); err != nil {
+	if err := decodeJSON(w, req, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	sess := r.lookupSession(body.ReceiverRunID)
-	if sess == nil {
+	sess, ok, err := r.lookupSession(body.ReceiverRunID, callerNodeName(req))
+	if err != nil {
+		writeError(w, http.StatusForbidden, err.Error())
+		return
+	}
+	if !ok {
 		writeError(w, http.StatusNotFound, "no session for receiver_run_id")
 		return
 	}
@@ -562,8 +674,7 @@ func validateFolderPath(p string) error {
 	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
 		return errors.New("path escapes the volume root")
 	}
-	if cleaned == HistoryDirName || strings.HasPrefix(cleaned, HistoryDirName+"/") ||
-		cleaned == ConflictsDirName || strings.HasPrefix(cleaned, ConflictsDirName+"/") {
+	if isReservedSyncDir(cleaned) {
 		return errors.New("path is under a reserved sync directory")
 	}
 	return nil
@@ -591,9 +702,58 @@ func validateRelPath(p string) error {
 	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
 		return errors.New("path escapes the volume root")
 	}
-	if cleaned == HistoryDirName || strings.HasPrefix(cleaned, HistoryDirName+"/") ||
-		cleaned == ConflictsDirName || strings.HasPrefix(cleaned, ConflictsDirName+"/") {
+	if isReservedSyncDir(cleaned) {
 		return errors.New("path is under a reserved sync directory")
+	}
+	return nil
+}
+
+// isReservedSyncDir reports whether a cleaned, slash-separated path is
+// one of the four reserved sync directories or lives under one. The
+// allow-list matches the initiator-side filter
+// (sync.isReservedSyncPath / isReservedFolderPath) so the receiver
+// can't be made to write where the initiator would never publish —
+// including .squirrel-restore-history, whose contents are the
+// receiver's only pre-restore backup.
+func isReservedSyncDir(cleaned string) bool {
+	for _, dir := range []string{HistoryDirName, ConflictsDirName, RestoreHistoryDirName, IndexDirName} {
+		if cleaned == dir || strings.HasPrefix(cleaned, dir+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// validateEntryOrigin rejects malformed or self-attributed content-origin
+// declarations at /plan so they never reach the /close commit: the pair
+// must be set together, the run id must be a positive origin-space id, and
+// the name must satisfy the node-name rule (it becomes a local nodes row
+// on commit). An entry with neither field is a pre-origin-exchange
+// initiator and is accepted.
+//
+// An origin naming the receiver's own self node is refused: a peer is
+// never authoritative about the receiver's own introductions, so it must
+// re-introduce locally with a NULL origin. selfRunCeiling bounds a
+// self-named run to the receiver's latest allocated local run id (the
+// run committing this session): a legitimate self introduction is a prior
+// local run, so a self-named run beyond the ceiling is a forged
+// origin-space coordinate that would poison the self component of the
+// durability vector. Mirrors GetOrCreatePeerNode's self-name refusal.
+func validateEntryOrigin(e syncproto.IndexEntry, selfName string, selfRunCeiling int64) error {
+	if e.OriginNode == "" && e.OriginRun == 0 {
+		return nil
+	}
+	if e.OriginNode == "" || e.OriginRun <= 0 {
+		return fmt.Errorf("origin_node %q and origin_run %d must be set together with a positive run id", e.OriginNode, e.OriginRun)
+	}
+	if !store.ValidNodeName(e.OriginNode) {
+		return fmt.Errorf("origin_node %q is not a valid node name", e.OriginNode)
+	}
+	if e.OriginNode == selfName {
+		if e.OriginRun > selfRunCeiling {
+			return fmt.Errorf("origin_run %d for the receiver's own node %q exceeds the latest local run id %d", e.OriginRun, selfName, selfRunCeiling)
+		}
+		return fmt.Errorf("origin_node %q is the receiver's own node; a peer must re-introduce locally with a NULL origin", selfName)
 	}
 	return nil
 }
@@ -674,19 +834,23 @@ func (r *peerSyncRouter) classifyMissingPath(ctx context.Context, sess *peerSess
 	return syncproto.DispositionCopyFromExisting, nil
 }
 
-// dispositionForExisting is the provenance check that distinguishes
+// dispositionForExisting is the delivery check that distinguishes
 // supersede from conflict (per CLAUDE.md "check authoritative state
-// first"). Rules:
+// first"). The deciding question is who *delivered* the receiver's row
+// — the local run that first materialised it (first_seen_run_id and
+// its runs row's peer linkage) — not the content's origin:
+// contents.origin_* carries the global introduction coordinate
+// verbatim across hops, so a row forwarded along a chain names a node
+// that never spoke to this receiver directly. Rules:
 //
-//   - source_node_id IS NULL → local write on receiver → conflict.
-//   - source_node_id != this initiator → another peer wrote it →
-//     conflict.
-//   - source_node_id == this initiator → supersede, provided the
-//     row's correlated initiator run-id is ≤ the per-(volume, peer)
-//     watermark. Translating the row's local source_run_id back into
-//     the initiator's id space requires looking up the receiver-side
-//     runs row and reading its correlated_run_id (the two columns are
-//     in different id spaces — receiver-local vs. initiator-local).
+//   - delivery run has no peer linkage → the row was written by a
+//     local index/audit run on the receiver → conflict.
+//   - delivery run's peer != this initiator → another peer delivered
+//     it → conflict.
+//   - delivered by this initiator → supersede, provided the delivery
+//     run's correlated initiator run-id is ≤ the per-(volume, peer)
+//     watermark (the two run columns are in different id spaces —
+//     receiver-local vs. initiator-local).
 //
 // All three branches can fire in the multi-writer flow: the
 // receiver may have local writes (a NAS web app dropped a file in,
@@ -694,10 +858,14 @@ func (r *peerSyncRouter) classifyMissingPath(ctx context.Context, sess *peerSess
 // it may carry rows from a different peer that haven't synced
 // through us yet.
 func (r *peerSyncRouter) dispositionForExisting(ctx context.Context, sess *peerSession, existing store.FileRow) (string, string) {
-	if !existing.SourceNodeID.Valid {
+	deliveryRun, err := r.srv.store.GetRun(ctx, existing.FirstSeenRunID)
+	if err != nil {
+		return syncproto.DispositionConflict, fmt.Sprintf("delivery run lookup error: %v", err)
+	}
+	if !deliveryRun.PeerNodeID.Valid {
 		return syncproto.DispositionConflict, "local write on receiver"
 	}
-	if existing.SourceNodeID.Int64 != sess.peerNodeID {
+	if deliveryRun.PeerNodeID.Int64 != sess.peerNodeID {
 		return syncproto.DispositionConflict, "sourced from a different peer"
 	}
 	state, err := r.srv.store.GetPeerSyncState(ctx, sess.volumeID, sess.peerNodeID)
@@ -705,23 +873,16 @@ func (r *peerSyncRouter) dispositionForExisting(ctx context.Context, sess *peerS
 		return syncproto.DispositionConflict, fmt.Sprintf("peer_sync_state lookup error: %v", err)
 	}
 	// No watermark yet (first sync with this peer): the only way a
-	// peer-sourced row materialised is via a prior /close, so trust
+	// peer-delivered row materialised is via a prior /close, so trust
 	// it and treat as supersede.
 	if !state.LastSharedRunID.Valid {
 		return syncproto.DispositionSupersede, ""
 	}
-	if !existing.SourceRunID.Valid {
-		return syncproto.DispositionConflict, "peer-sourced row has no run attribution"
+	if !deliveryRun.CorrelatedRunID.Valid {
+		return syncproto.DispositionConflict, "delivery run has no correlated initiator id"
 	}
-	sourceRun, err := r.srv.store.GetRun(ctx, existing.SourceRunID.Int64)
-	if err != nil {
-		return syncproto.DispositionConflict, fmt.Sprintf("source run lookup error: %v", err)
-	}
-	if !sourceRun.CorrelatedRunID.Valid {
-		return syncproto.DispositionConflict, "source run has no correlated initiator id"
-	}
-	if sourceRun.CorrelatedRunID.Int64 > state.LastSharedRunID.Int64 {
-		return syncproto.DispositionConflict, "peer attribution newer than the last shared watermark"
+	if deliveryRun.CorrelatedRunID.Int64 > state.LastSharedRunID.Int64 {
+		return syncproto.DispositionConflict, "peer delivery newer than the last shared watermark"
 	}
 	return syncproto.DispositionSupersede, ""
 }
@@ -1020,9 +1181,13 @@ func (r *peerSyncRouter) preStageConflicts(ctx context.Context, sess *peerSessio
 // index-recorded blake3, relabels entry.priorRow (the single source of
 // truth the wire response also reads) to the digest/size actually on
 // disk so the preserved content is described truthfully everywhere.
-// When the file has already vanished the index values are used
-// unchanged: there is nothing to re-hash, and the row still records the
-// loser's identity so the prior blake3 stays queryable.
+// Drifted bytes are an out-of-band local write, so the relabelled row
+// drops the prior content's origin — a fresh contents row for them
+// records a local introduction, keeping the durability vector honest
+// (the prior origin's coordinate belongs to bytes that no longer
+// exist here). When the file has already vanished the index values
+// are used unchanged: there is nothing to re-hash, and the row still
+// records the loser's identity so the prior blake3 stays queryable.
 func (r *peerSyncRouter) conflictRowForPreStage(sess *peerSession, path, srcAbs, preservedRel string, entry *sessionEntry) (store.FileRow, error) {
 	state, err := rehashSource(srcAbs, entry.priorRow.Blake3)
 	if err != nil {
@@ -1032,6 +1197,8 @@ func (r *peerSyncRouter) conflictRowForPreStage(sess *peerSession, path, srcAbs,
 		relabelled := *entry.priorRow
 		relabelled.Blake3 = state.digest
 		relabelled.SizeBytes = state.size
+		relabelled.OriginNodeID = sql.NullInt64{}
+		relabelled.OriginRunID = sql.NullInt64{}
 		entry.priorRow = &relabelled
 	}
 	return store.FileRow{
@@ -1047,28 +1214,82 @@ func (r *peerSyncRouter) conflictRowForPreStage(sess *peerSession, path, srcAbs,
 	}, nil
 }
 
-// priorProvenance lifts the prior row's (source_node_id, source_run_id)
-// into a *store.Provenance the way Upsert expects: nil for a local
-// write (both NULLs), pointer-carrying for peer-sourced rows. Either
-// half being NULL is treated as "local write" — partial provenance is
-// a schema-impossible state today, but degrading gracefully here keeps
-// the conflict path open if a future migration ever ends up with one.
+// priorProvenance lifts the prior row's (origin_node_id, origin_run_id)
+// into a *store.Provenance the way Upsert expects: nil for locally
+// introduced content (both NULLs), pointer-carrying for peer-sourced
+// rows. Either half being NULL is treated as "introduced locally" —
+// partial provenance is a schema-impossible state today, but degrading
+// gracefully here keeps the conflict path open if a future migration
+// ever ends up with one.
 func priorProvenance(r *store.FileRow) *store.Provenance {
-	if r == nil || !r.SourceNodeID.Valid || !r.SourceRunID.Valid {
+	if r == nil || !r.OriginNodeID.Valid || !r.OriginRunID.Valid {
 		return nil
 	}
-	return &store.Provenance{NodeID: r.SourceNodeID.Int64, RunID: r.SourceRunID.Int64}
+	return &store.Provenance{NodeID: r.OriginNodeID.Int64, RunID: r.OriginRunID.Int64}
+}
+
+// preStageTransfers preserves out-of-band bytes that rclone is about to
+// overwrite at a Transfer destination. classify chose Transfer because
+// the receiver has no live (present) index row at the path, yet a
+// regular file can still exist there (dropped in by a web app, scp, or
+// created since the last index). Without this move the upcoming rclone
+// copy — which runs with no --backup-dir for node syncs — would destroy
+// those bytes with no history. The guard mirrors the one
+// preStageCopyFromExisting applies to its own destinations: Lstat,
+// then move any regular file into .squirrel-history/run-<receiverRunID>/.
+//
+// This is a move-only pass (rclone delivers the bytes after /plan
+// returns), so a failure aborts the plan with the already-moved files
+// left under run-<id>/ — recoverable by the operator, and the next
+// /plan replans the same Transfer.
+func (r *peerSyncRouter) preStageTransfers(sess *peerSession) error {
+	histRoot := filepath.Join(sess.volume.Path, HistoryDirName, "run-"+strconv.FormatInt(sess.receiverRunID, 10))
+	for relPath, entry := range sess.dispositions {
+		if entry.disposition != syncproto.DispositionTransfer {
+			continue
+		}
+		dstAbs := filepath.Join(sess.volume.Path, relPath)
+		info, err := os.Lstat(dstAbs)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("stat transfer dst %s: %w", relPath, err)
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		histDst := filepath.Join(histRoot, relPath)
+		if err := os.MkdirAll(filepath.Dir(histDst), 0o755); err != nil {
+			return fmt.Errorf("mkdir history for %s: %w", relPath, err)
+		}
+		if err := os.Rename(dstAbs, histDst); err != nil {
+			// Tolerate a concurrent unlink between Lstat and Rename: the
+			// file we wanted to preserve is gone, so the Transfer can
+			// proceed against the now-empty destination. Mirrors the same
+			// race handling in preStageCopyFromExisting and preMoveSupersedes.
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("preserve out-of-band %s → %s: %w", relPath, histDst, err)
+		}
+	}
+	return nil
 }
 
 // handleVerify implements POST /v1/sync/verify.
 func (r *peerSyncRouter) handleVerify(w http.ResponseWriter, req *http.Request) {
 	var body syncproto.VerifyRequest
-	if err := decodeJSON(req, &body); err != nil {
+	if err := decodeJSON(w, req, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	sess := r.lookupSession(body.ReceiverRunID)
-	if sess == nil {
+	sess, ok, err := r.lookupSession(body.ReceiverRunID, callerNodeName(req))
+	if err != nil {
+		writeError(w, http.StatusForbidden, err.Error())
+		return
+	}
+	if !ok {
 		writeError(w, http.StatusNotFound, "no session for receiver_run_id")
 		return
 	}
@@ -1190,12 +1411,16 @@ func rehashSource(srcAbs string, expected []byte) (onDiskState, error) {
 // handleClose implements POST /v1/sync/close.
 func (r *peerSyncRouter) handleClose(w http.ResponseWriter, req *http.Request) {
 	var body syncproto.CloseRequest
-	if err := decodeJSON(req, &body); err != nil {
+	if err := decodeJSON(w, req, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	sess := r.takeSession(body.ReceiverRunID)
-	if sess == nil {
+	sess, ok, err := r.takeSession(body.ReceiverRunID, callerNodeName(req))
+	if err != nil {
+		writeError(w, http.StatusForbidden, err.Error())
+		return
+	}
+	if !ok {
 		writeError(w, http.StatusNotFound, "no session for receiver_run_id")
 		return
 	}
@@ -1243,12 +1468,16 @@ func (r *peerSyncRouter) finalizeFailedClose(ctx context.Context, runID int64, c
 // Returns the number of file rows the function wrote, distinct from
 // the original plan size when some paths were dropped due to verify
 // mismatch.
+//
+// Each committed row carries its entry's declared content origin —
+// the wire-carried (node name, origin-space run) pair mapped to a
+// local nodes row — so a forwarded origin survives every hop verbatim.
 func (r *peerSyncRouter) closeSession(ctx context.Context, sess *peerSession, status string, failedPaths []string) (int, error) {
 	skip := make(map[string]struct{}, len(failedPaths))
 	for _, p := range failedPaths {
 		skip[p] = struct{}{}
 	}
-	prov := &store.Provenance{NodeID: sess.peerNodeID, RunID: sess.receiverRunID}
+	origins := newOriginResolver(r.srv.store, sess)
 	committed := 0
 	for path, entry := range sess.dispositions {
 		if !materializesAtPath(entry.disposition) {
@@ -1256,6 +1485,10 @@ func (r *peerSyncRouter) closeSession(ctx context.Context, sess *peerSession, st
 		}
 		if _, dropped := skip[path]; dropped {
 			continue
+		}
+		prov, err := origins.provenance(ctx, entry)
+		if err != nil {
+			return committed, fmt.Errorf("resolve origin for %s: %w", path, err)
 		}
 		row := store.FileRow{
 			VolumeID:       sess.volumeID,
@@ -1288,11 +1521,48 @@ func (r *peerSyncRouter) closeSession(ctx context.Context, sess *peerSession, st
 	return committed, nil
 }
 
+// originResolver maps wire-carried origin node names to local nodes
+// rows for one /close commit, caching get-or-create lookups so a plan
+// full of same-origin entries costs one row resolution.
+type originResolver struct {
+	store *store.Store
+	sess  *peerSession
+	ids   map[string]int64
+}
+
+func newOriginResolver(s *store.Store, sess *peerSession) *originResolver {
+	return &originResolver{store: s, sess: sess, ids: make(map[string]int64)}
+}
+
+// provenance returns the contents-origin attribution for one entry:
+// the declared origin verbatim when the wire carried one, else the
+// pre-origin-exchange fallback — the initiator itself at its declared
+// sync run (correlatedRunID is in the initiator's run space, the same
+// coordinate system declared origins use).
+func (o *originResolver) provenance(ctx context.Context, entry *sessionEntry) (*store.Provenance, error) {
+	if entry.originNode == "" {
+		return &store.Provenance{NodeID: o.sess.peerNodeID, RunID: o.sess.correlatedRunID}, nil
+	}
+	id, ok := o.ids[entry.originNode]
+	if !ok {
+		node, err := o.store.GetOrCreateOriginNode(ctx, entry.originNode)
+		if err != nil {
+			return nil, err
+		}
+		id = node.ID
+		o.ids[entry.originNode] = id
+	}
+	return &store.Provenance{NodeID: id, RunID: entry.originRun}, nil
+}
+
 // decodeJSON parses the request body with strict field handling so
 // initiator typos surface as 400 rather than as a silently-ignored
-// field.
-func decodeJSON(req *http.Request, v any) error {
-	dec := json.NewDecoder(req.Body)
+// field. The body is wrapped in http.MaxBytesReader at maxPlanBodyBytes
+// so a token-holding peer can't OOM the agent with one huge body
+// (#110c); a body over the cap surfaces as a decode error the handler
+// returns as 400.
+func decodeJSON(w http.ResponseWriter, req *http.Request, v any) error {
+	dec := json.NewDecoder(http.MaxBytesReader(w, req.Body, maxPlanBodyBytes))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		return fmt.Errorf("decode body: %w", err)

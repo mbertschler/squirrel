@@ -27,6 +27,12 @@ const (
 	// trusting the live, overwrite-in-place runs.correlated_run_id column
 	// (SAFETY-AUDIT H6).
 	TransitionSetCorrelatedRunID = "set-correlated-run-id"
+	// TransitionVerifyDestination records a remote-object verification
+	// pass against its kind='audit' run (see BeginRemoteVerifyRun). The
+	// note carries the destination name and the pass counters — the runs
+	// CHECK keeps destination NULL on audit rows, so this entry is where
+	// the audit trail names the verified destination.
+	TransitionVerifyDestination = "verify-destination"
 )
 
 // RunAudit is one row of the insert-only runs_audit log: a single

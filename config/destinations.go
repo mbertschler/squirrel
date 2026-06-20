@@ -10,14 +10,16 @@ import (
 
 // destSchema declares the parameter schema for one destination type. The
 // schema drives validation (required/optional fields, secret handling) and
-// the rclone.conf rendering — every param key here that resolves to a
-// non-empty value is written verbatim to rclone.conf, except for "root"
-// which is squirrel's own concept (we use it to compose the destination URI
-// passed to rclone, not as an rclone backend param).
+// the rclone.conf rendering — for rclone-backed types, every param key here
+// that resolves to a non-empty value is written verbatim to rclone.conf,
+// except for "root" which is squirrel's own concept (we use it to compose
+// the destination URI passed to rclone, not as an rclone backend param).
+// Types with an empty rcloneType render no section, so their params stay
+// out of rclone.conf entirely.
 type destSchema struct {
 	// rcloneType is the value written as `type = ...` in rclone.conf for
-	// this destination. Empty means "no rclone remote" (used by the local
-	// backend, which is addressed by absolute path).
+	// this destination. Empty means "no rclone remote" (the local backend
+	// is addressed by absolute path; kopia drives its own binary).
 	rcloneType string
 	// requiredString fields must be present as plain strings and non-empty.
 	requiredString []string
@@ -26,6 +28,9 @@ type destSchema struct {
 	// secretFields accept either a string literal or an inline table
 	// { env = "VAR" }. The resolved literal is written to rclone.conf.
 	secretFields []string
+	// requiredSecret fields accept the same forms as secretFields but
+	// must resolve to a non-empty value.
+	requiredSecret []string
 }
 
 // destSchemas registers every supported destination type. Adding a new type
@@ -38,15 +43,25 @@ var destSchemas = map[string]destSchema{
 		// an rclone backend param for the local case.
 	},
 	"sftp": {
+		// known_hosts_file points rclone at a known_hosts file so it
+		// validates the server's host key before transferring; absent, rclone
+		// accepts whatever host key the server presents. host_key_algorithms
+		// pins the accepted host-key algorithms (rclone's space-separated
+		// list). Both map straight to the rclone sftp options of the same
+		// name. The unknown-field check confines them to this type.
 		rcloneType:     "sftp",
 		requiredString: []string{"host", "user"},
-		optionalString: []string{"port", "key_file"},
+		optionalString: []string{"port", "key_file", "known_hosts_file", "host_key_algorithms"},
 		secretFields:   []string{"password"},
 	},
 	"s3": {
+		// storage_class maps to rclone's s3 storage_class config key; its
+		// accepted values are whatever the backend supports (commonly
+		// STANDARD and various archive tiers). The unknown-field check
+		// confines it to this type.
 		rcloneType:     "s3",
 		requiredString: []string{"provider", "bucket"},
-		optionalString: []string{"region", "endpoint"},
+		optionalString: []string{"region", "endpoint", "storage_class"},
 		secretFields:   []string{"access_key_id", "secret_access_key"},
 	},
 	"b2": {
@@ -60,11 +75,23 @@ var destSchemas = map[string]destSchema{
 		optionalString: []string{"service_account_file"},
 		secretFields:   []string{"service_account_credentials"},
 	},
+	"kopia": {
+		// root is the local filesystem path of the kopia repository.
+		// The password unlocks the repository (and creates it on first
+		// use); kopia encrypts the repository contents itself, which is
+		// also why a crypt block is rejected for this type.
+		// verify_files_percent is the fraction of snapshot file bytes
+		// `kopia snapshot verify` reads back when this destination gates
+		// offload (default applied by the kopia handler when unset).
+		rcloneType:     "",
+		optionalString: []string{"verify_files_percent"},
+		requiredSecret: []string{"password"},
+	},
 }
 
 // SupportedTypes returns the sorted list of destination types squirrel
-// knows how to render into rclone.conf. Used by error messages so users
-// see what they could have typed.
+// supports. Used by error messages so users see what they could have
+// typed.
 func SupportedTypes() []string {
 	out := make([]string, 0, len(destSchemas))
 	for t := range destSchemas {
@@ -94,11 +121,176 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 	if !ok || root == "" {
 		return nil, errors.New("root must be a non-empty string")
 	}
+	crypt, err := resolveCrypt(raw, typ)
+	if err != nil {
+		return nil, err
+	}
+	layout, err := resolveLayout(raw, typ)
+	if err != nil {
+		return nil, err
+	}
+	hashAlgo, err := resolveHashAlgo(raw, typ, layout)
+	if err != nil {
+		return nil, err
+	}
+	checkers, err := resolveCheckers(raw, typ)
+	if err != nil {
+		return nil, err
+	}
 	params, err := validateAndResolveParams(schema, raw)
 	if err != nil {
 		return nil, err
 	}
-	return &Destination{Name: name, Type: typ, Root: root, Params: params}, nil
+	return &Destination{
+		Name: name, Type: typ, Root: root, Layout: layout, Params: params,
+		Crypt: crypt, HashAlgo: hashAlgo, Checkers: checkers,
+	}, nil
+}
+
+// sftpHashAlgos are the checksum types rclone's sftp backend can read
+// via a server-side sum command, the valid values for `hash_algo`.
+var sftpHashAlgos = map[string]bool{
+	"md5": true, "sha1": true, "sha256": true, "crc32": true,
+	"blake3": true, "xxh3": true, "xxh128": true,
+}
+
+// resolveHashAlgo validates the optional `hash_algo` key. sftp is the
+// one backend where rclone must be told which server-side hash command
+// to run; every other type exposes a fixed checksum, so the key is
+// rejected there. Content-addressed sftp destinations default to
+// "sha256" so scan-back fingerprints get a strong checksum without
+// relying on rclone's md5/sha1 preference.
+func resolveHashAlgo(raw map[string]any, typ, layout string) (string, error) {
+	v, err := optionalString(raw, "hash_algo")
+	if err != nil {
+		return "", err
+	}
+	if v == "" {
+		if typ == "sftp" && layout == LayoutContentAddressed {
+			return "sha256", nil
+		}
+		return "", nil
+	}
+	if typ != "sftp" {
+		return "", fmt.Errorf(`hash_algo is only supported on type "sftp" destinations; type %q exposes a fixed checksum`, typ)
+	}
+	if !sftpHashAlgos[v] {
+		return "", fmt.Errorf("unknown hash_algo %q (supported: %v)", v, sortedKeys(sftpHashAlgos))
+	}
+	return v, nil
+}
+
+// resolveCheckers validates the optional `checkers` key: a positive
+// integer cap on rclone's concurrent checkers for this destination.
+func resolveCheckers(raw map[string]any, typ string) (int, error) {
+	v, ok := raw["checkers"]
+	if !ok {
+		return 0, nil
+	}
+	switch typ {
+	case "local", "kopia":
+		return 0, fmt.Errorf("checkers requires an rclone-remote destination type, not %q", typ)
+	}
+	n, isInt := v.(int64)
+	if !isInt || n <= 0 {
+		return 0, errors.New("checkers must be a positive integer")
+	}
+	return int(n), nil
+}
+
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// resolveLayout validates the optional `layout` key of a destination. An
+// absent key resolves to LayoutMirror. LayoutContentAddressed drives
+// per-object rclone transfers, so it requires an rclone-remote type:
+// type "local" is addressed by filesystem path, and "kopia" repositories
+// already use kopia's own content-addressed format.
+func resolveLayout(raw map[string]any, typ string) (string, error) {
+	v, err := optionalString(raw, "layout")
+	if err != nil {
+		return "", err
+	}
+	switch v {
+	case "", LayoutMirror:
+		return LayoutMirror, nil
+	case LayoutContentAddressed:
+		switch typ {
+		case "local":
+			return "", fmt.Errorf(`layout %q requires an rclone-remote destination; type "local" is addressed by filesystem path`, LayoutContentAddressed)
+		case "kopia":
+			return "", fmt.Errorf(`layout %q requires an rclone-remote destination; type "kopia" repositories are content-addressed by kopia itself`, LayoutContentAddressed)
+		}
+		return LayoutContentAddressed, nil
+	default:
+		return "", fmt.Errorf("unknown layout %q (supported: %q, %q)", v, LayoutMirror, LayoutContentAddressed)
+	}
+}
+
+// resolveCrypt validates the optional `crypt` sub-table of a destination.
+// A missing key yields nil (no encryption overlay). The two password
+// fields go through the same secret resolution as destination credentials;
+// password is required, password2 (the salt) is optional.
+func resolveCrypt(raw map[string]any, typ string) (*Crypt, error) {
+	v, ok := raw["crypt"]
+	if !ok {
+		return nil, nil
+	}
+	switch typ {
+	case "local":
+		return nil, errors.New(`crypt requires an rclone-remote destination; type "local" is addressed by filesystem path`)
+	case "kopia":
+		return nil, errors.New(`crypt requires an rclone-remote destination; type "kopia" repositories are encrypted by kopia itself`)
+	}
+	table, ok := v.(map[string]any)
+	if !ok {
+		return nil, errors.New("crypt must be a table, e.g. [destinations.<name>.crypt]")
+	}
+	password, err := resolveSecret(table, "password")
+	if err != nil {
+		return nil, fmt.Errorf("crypt: %w", err)
+	}
+	if password == "" {
+		return nil, errors.New("crypt.password is required (rclone-obscured; generate with `rclone obscure`)")
+	}
+	password2, err := resolveSecret(table, "password2")
+	if err != nil {
+		return nil, fmt.Errorf("crypt: %w", err)
+	}
+	for k := range table {
+		if k != "password" && k != "password2" {
+			return nil, fmt.Errorf("crypt: unknown field %q", k)
+		}
+	}
+	return &Crypt{Password: password, Password2: password2}, nil
+}
+
+// validateCryptRemoteNames rejects a config where one destination's crypt
+// remote name is itself a declared destination — both would render an
+// rclone.conf section under the same name, and rclone would resolve the
+// shared name to whichever section comes last.
+func validateCryptRemoteNames(dests map[string]*Destination) error {
+	names := make([]string, 0, len(dests))
+	for name := range dests {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		d := dests[name]
+		if d.Crypt == nil {
+			continue
+		}
+		if _, clash := dests[d.CryptRemoteName()]; clash {
+			return fmt.Errorf("destinations.%s: crypt remote name %q is already taken by another destination — rename one of them", name, d.CryptRemoteName())
+		}
+	}
+	return nil
 }
 
 // validateAndResolveParams walks the schema, pulling each declared field
@@ -108,7 +300,10 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 // silently disabling a field at rclone time.
 func validateAndResolveParams(schema destSchema, raw map[string]any) (map[string]string, error) {
 	out := make(map[string]string)
-	seen := map[string]bool{"type": true, "root": true}
+	seen := map[string]bool{
+		"type": true, "root": true, "crypt": true, "layout": true,
+		"hash_algo": true, "checkers": true,
+	}
 	for _, key := range schema.requiredString {
 		v, err := requireString(raw, key)
 		if err != nil {
@@ -135,6 +330,17 @@ func validateAndResolveParams(schema destSchema, raw map[string]any) (map[string
 		if v != "" {
 			out[key] = v
 		}
+		seen[key] = true
+	}
+	for _, key := range schema.requiredSecret {
+		v, err := resolveSecret(raw, key)
+		if err != nil {
+			return nil, err
+		}
+		if v == "" {
+			return nil, fmt.Errorf("%s is required", key)
+		}
+		out[key] = v
 		seen[key] = true
 	}
 	for k := range raw {
@@ -205,7 +411,10 @@ func resolveSecret(raw map[string]any, key string) (string, error) {
 // RcloneSection returns the rclone.conf section body for this destination,
 // or the empty string for type=local (which doesn't need a named remote —
 // rclone treats absolute paths as local-filesystem destinations directly).
-// The returned bytes do not include a trailing newline.
+// A destination with a crypt block renders two sections: the underlying
+// remote exactly as without crypt, then the crypt overlay wrapping it.
+// Each rendered section ends with a trailing newline, so sections
+// concatenate directly into a valid rclone.conf.
 func (d *Destination) RcloneSection() string {
 	schema := destSchemas[d.Type]
 	if schema.rcloneType == "" {
@@ -226,10 +435,49 @@ func (d *Destination) RcloneSection() string {
 			fmt.Fprintf(&b, "%s = %s\n", key, v)
 		}
 	}
+	if d.Type == "sftp" {
+		// rclone's sftp backend only autodetects md5sum/sha1sum, so BLAKE3
+		// must be named explicitly or squirrel's `--hash blake3` syncs abort
+		// with "hash type not supported". b3sum is the canonical BLAKE3 CLI
+		// and must be on the remote's PATH.
+		fmt.Fprintf(&b, "blake3sum_command = b3sum\n")
+		if d.HashAlgo != "" {
+			fmt.Fprintf(&b, "hashes = %s\n", d.HashAlgo)
+		}
+	}
 	for _, key := range sortedSubset(schema.secretFields) {
 		if v, ok := d.Params[key]; ok {
 			fmt.Fprintf(&b, "%s = %s\n", key, v)
 		}
+	}
+	if d.Crypt != nil {
+		b.WriteString("\n")
+		b.WriteString(d.cryptSection())
+	}
+	return b.String()
+}
+
+// CryptRemoteName is the rclone.conf section name of the crypt overlay
+// stacked on this destination. Meaningful only when Crypt is non-nil.
+func (d *Destination) CryptRemoteName() string {
+	return d.Name + "-crypt"
+}
+
+// cryptSection renders the crypt overlay remote. Its remote line bakes the
+// destination root in, so transfers through the overlay address
+// volume-relative paths directly. filename_encryption is fixed off: the
+// overlay encrypts file contents only, and the destination keeps the same
+// browsable tree layout as an unencrypted destination.
+func (d *Destination) cryptSection() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "[%s]\n", d.CryptRemoteName())
+	b.WriteString("type = crypt\n")
+	fmt.Fprintf(&b, "remote = %s:%s\n", d.Name, d.Root)
+	b.WriteString("filename_encryption = off\n")
+	b.WriteString("directory_name_encryption = false\n")
+	fmt.Fprintf(&b, "password = %s\n", d.Crypt.Password)
+	if d.Crypt.Password2 != "" {
+		fmt.Fprintf(&b, "password2 = %s\n", d.Crypt.Password2)
 	}
 	return b.String()
 }

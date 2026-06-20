@@ -45,6 +45,9 @@ func SyncNode(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volu
 		return rep, err
 	}
 	err = runNodeSession(ctx, s, rcl, vol, volID, node, opts, &rep)
+	if !opts.DryRun {
+		rep.Verification = peerVerification(&rep)
+	}
 	// runNodeSession's deferred finishRun has committed the run's
 	// terminal state by now, so the snapshot reflects this run's own row.
 	// Peer-sync takes the local snapshot only — there is no ride-along to
@@ -115,6 +118,90 @@ type nodeSyncDriver struct {
 	// /begin. Defaults to ProtocolVersionFlat so a missing field in
 	// the receiver's response (older agent) keeps today's behaviour.
 	protocolVersion int
+	// selfNodeName caches the self-row's name for origin
+	// materialisation; filled lazily by selfName.
+	selfNodeName string
+	// originNodeNames caches local node id → name lookups so a plan
+	// full of same-origin entries resolves each origin node once.
+	originNodeNames map[int64]string
+	// durabilityAdvance is the present-set origin maxima captured before
+	// the transfer. phaseClose advances the peer's durability vector to
+	// exactly this snapshot, so a row committed between enumeration and
+	// close is never claimed durable — matching the bucket, content-
+	// addressed, and kopia handlers.
+	durabilityAdvance []store.OriginComponent
+}
+
+// selfName returns this node's name — the identity locally-introduced
+// content travels under. Cached after the first lookup.
+func (d *nodeSyncDriver) selfName() (string, error) {
+	if d.selfNodeName != "" {
+		return d.selfNodeName, nil
+	}
+	self, err := d.store.GetSelfNode(d.ctx)
+	if err != nil {
+		return "", fmt.Errorf("look up self node: %w", err)
+	}
+	d.selfNodeName = self.Name
+	return d.selfNodeName, nil
+}
+
+// entryOrigin materialises one row's content-origin coordinate for the
+// wire. Content with a recorded origin forwards it verbatim — origin
+// node id resolved to its name (names are the cross-node identity;
+// local ids differ per node), run id untranslated. Locally-introduced
+// content (origin NULLs, or the degraded partial-NULL state) is
+// materialised as (this node's name, the content's introduction run in
+// this volume).
+func (d *nodeSyncDriver) entryOrigin(row store.FileRow) (string, int64, error) {
+	if !row.OriginNodeID.Valid || !row.OriginRunID.Valid {
+		name, err := d.selfName()
+		if err != nil {
+			return "", 0, err
+		}
+		intro, err := d.store.ContentIntroductionRunID(d.ctx, d.volID, row.ContentID)
+		if err != nil {
+			return "", 0, fmt.Errorf("introduction run for %s: %w", row.Path, err)
+		}
+		return name, intro, nil
+	}
+	name, err := d.originNodeName(row.OriginNodeID.Int64)
+	if err != nil {
+		return "", 0, err
+	}
+	return name, row.OriginRunID.Int64, nil
+}
+
+func (d *nodeSyncDriver) originNodeName(nodeID int64) (string, error) {
+	if name, ok := d.originNodeNames[nodeID]; ok {
+		return name, nil
+	}
+	node, err := d.store.GetNodeByID(d.ctx, nodeID)
+	if err != nil {
+		return "", fmt.Errorf("resolve origin node %d: %w", nodeID, err)
+	}
+	if d.originNodeNames == nil {
+		d.originNodeNames = make(map[int64]string)
+	}
+	d.originNodeNames[nodeID] = node.Name
+	return node.Name, nil
+}
+
+// indexEntryForRow converts one local index row to its wire form,
+// attaching the materialised content origin.
+func (d *nodeSyncDriver) indexEntryForRow(row store.FileRow) (syncproto.IndexEntry, error) {
+	originNode, originRun, err := d.entryOrigin(row)
+	if err != nil {
+		return syncproto.IndexEntry{}, err
+	}
+	return syncproto.IndexEntry{
+		Path:       row.Path,
+		Blake3Hex:  hex.EncodeToString(row.Blake3),
+		SizeBytes:  row.SizeBytes,
+		MtimeNs:    row.MtimeNs,
+		OriginNode: originNode,
+		OriginRun:  originRun,
+	}, nil
 }
 
 func (d *nodeSyncDriver) run() error {
@@ -130,6 +217,13 @@ func (d *nodeSyncDriver) run() error {
 	// the original path is empty, so rclone treats the entry like a
 	// fresh transfer.
 	d.report.NodeConflicts = plan.Conflicts
+	if !d.opts.DryRun {
+		advance, err := captureDurabilityAdvance(d.ctx, d.store, d.volID)
+		if err != nil {
+			return d.abortWithError("capture durability advance", err)
+		}
+		d.durabilityAdvance = advance
+	}
 	if err := d.phaseTransfer(plan); err != nil {
 		return d.abortWithError("transfer", err)
 	}
@@ -150,7 +244,7 @@ func (d *nodeSyncDriver) run() error {
 // invocations against the same (volume, peer) can't both proceed —
 // the loser surfaces the same diagnostic the bucket path does.
 func (d *nodeSyncDriver) phaseBegin() error {
-	peer, err := d.store.GetOrCreatePeerNode(d.ctx, d.node.Name, d.node.Endpoint.String())
+	peer, err := d.store.GetOrCreatePeerNode(d.ctx, d.node.Name, d.node.Endpoint.String(), true)
 	if err != nil {
 		return fmt.Errorf("record peer node: %w", err)
 	}
@@ -386,12 +480,11 @@ func (d *nodeSyncDriver) entriesFromFolders(folderIDs []int64) ([]syncproto.Inde
 			if isReservedSyncPath(row.Path) {
 				continue
 			}
-			entries = append(entries, syncproto.IndexEntry{
-				Path:      row.Path,
-				Blake3Hex: hex.EncodeToString(row.Blake3),
-				SizeBytes: row.SizeBytes,
-				MtimeNs:   row.MtimeNs,
-			})
+			entry, err := d.indexEntryForRow(row)
+			if err != nil {
+				return nil, err
+			}
+			entries = append(entries, entry)
 		}
 	}
 	return entries, nil
@@ -420,12 +513,11 @@ func (d *nodeSyncDriver) collectIndexEntries() ([]syncproto.IndexEntry, error) {
 		if err != nil {
 			return nil, fmt.Errorf("lookup %s: %w", p, err)
 		}
-		entries = append(entries, syncproto.IndexEntry{
-			Path:      row.Path,
-			Blake3Hex: hex.EncodeToString(row.Blake3),
-			SizeBytes: row.SizeBytes,
-			MtimeNs:   row.MtimeNs,
-		})
+		entry, err := d.indexEntryForRow(row)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
 	}
 	return entries, nil
 }
@@ -552,13 +644,83 @@ func (d *nodeSyncDriver) phaseVerify() error {
 // verify report's failing paths as 'failed_paths' so the receiver
 // skips them on commit — they'll be picked up by the next sync's
 // /plan when their on-disk content reappears.
+//
+// On a verified successful close (status success acknowledged by the
+// receiver; never dry-run) the initiator records the durability
+// consequence: the peer is a destination in the flat target namespace,
+// so the vector advances over the present-set origin maxima captured
+// before the transfer (tagged peer-blake3 — the receiver re-hashed every
+// delivered path). Pinning to that snapshot keeps a row committed between
+// enumeration and close from being claimed durable, matching the other
+// handlers. A failed advance fails the run — the bytes are on the peer
+// but the evidence isn't recorded, and the next sync re-plans (everything
+// already-correct) and re-advances cheaply. The durability pull that
+// follows is metadata-only and merely warns on failure.
 func (d *nodeSyncDriver) phaseClose() error {
 	failed := failingPaths(d.report.NodeVerify)
-	return d.client.close(d.ctx, syncproto.CloseRequest{
+	err := d.client.close(d.ctx, syncproto.CloseRequest{
 		ReceiverRunID: d.receiverRunID,
 		Status:        d.report.Status,
 		FailedPaths:   failed,
 	})
+	if err != nil {
+		return err
+	}
+	if d.report.Status != store.RunStatusSuccess || d.opts.DryRun {
+		return nil
+	}
+	if err := d.store.AdvanceDestinationVectorTo(d.ctx, d.volID, d.node.Name, store.VerifyMethodPeer, d.durabilityAdvance); err != nil {
+		return fmt.Errorf("advance destination vector for %s: %w", d.node.Name, err)
+	}
+	d.pullPeerDurability()
+	return nil
+}
+
+// pullPeerDurability fetches the peer's destination vectors and merges
+// them into the local store. Failures, refused rewinds, and components
+// dropped for unconfigured destinations surface as report warnings
+// rather than failing the run: the sync itself succeeded, and the pull
+// can be retried any time via the standalone `peer-sync pull-durability`
+// command.
+func (d *nodeSyncDriver) pullPeerDurability() {
+	rep, err := pullDurability(d.ctx, d.store, d.client, d.vol.Name, d.volID, d.node.Name, acceptedDestinations(d.vol), false)
+	d.report.DurabilityPull = rep
+	if err != nil {
+		d.report.Warnings = append(d.report.Warnings,
+			fmt.Sprintf("durability pull from %s: %v", d.node.Name, err))
+		return
+	}
+	for _, rw := range rep.Rewinds {
+		d.report.Warnings = append(d.report.Warnings,
+			fmt.Sprintf("durability pull from %s refused rewind: %s", d.node.Name, rw))
+	}
+	if rep.Dropped > 0 {
+		d.report.Warnings = append(d.report.Warnings,
+			fmt.Sprintf("durability pull from %s dropped %d entr%s for unconfigured destinations (e.g. %s)",
+				d.node.Name, rep.Dropped, plural(rep.Dropped, "y", "ies"), dropSample(rep.Drops)))
+	}
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
+// dropSample renders the sampled destinations from a drop list as a
+// compact, deduplicated, comma-separated string for one summary line.
+func dropSample(drops []DurabilityDrop) string {
+	seen := make(map[string]struct{}, len(drops))
+	var names []string
+	for _, d := range drops {
+		if _, ok := seen[d.Destination]; ok {
+			continue
+		}
+		seen[d.Destination] = struct{}{}
+		names = append(names, d.Destination)
+	}
+	return strings.Join(names, ", ")
 }
 
 func (d *nodeSyncDriver) abortWithError(phase string, err error) error {
@@ -646,6 +808,11 @@ func (c *nodeClient) verify(ctx context.Context, body syncproto.VerifyRequest) (
 
 func (c *nodeClient) close(ctx context.Context, body syncproto.CloseRequest) error {
 	return c.do(ctx, "/v1/sync/close", body, nil)
+}
+
+func (c *nodeClient) durability(ctx context.Context, body syncproto.DurabilityRequest) (syncproto.DurabilityResponse, error) {
+	var resp syncproto.DurabilityResponse
+	return resp, c.do(ctx, "/v1/sync/durability", body, &resp)
 }
 
 // do is the shared "POST JSON, decode JSON" implementation. The URL

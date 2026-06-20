@@ -10,7 +10,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 13
+const SchemaVersion = 21
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -49,6 +49,14 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 11, up: migrateV10ToV11},
 		{version: 12, up: migrateV11ToV12},
 		{version: 13, up: migrateV12ToV13},
+		{version: 14, up: migrateV13ToV14},
+		{version: 15, up: migrateV14ToV15},
+		{version: 16, up: migrateV15ToV16},
+		{version: 17, up: migrateV16ToV17},
+		{version: 18, up: migrateV17ToV18},
+		{version: 19, up: migrateV18ToV19},
+		{version: 20, up: migrateV19ToV20},
+		{version: 21, up: migrateV20ToV21},
 	}
 }
 
@@ -1373,4 +1381,491 @@ func migrateV12ToV13(ctx context.Context, db *sql.DB) error {
 		}
 	}
 	return tx.Commit()
+}
+
+// --- v13 → v14 ---
+
+// migrateV13ToV14 splits the files table into `contents` (the content
+// entity: one row per distinct blake3, carrying size and origin) and a
+// reshaped `files` (the path↔content observation, keyed on content_id
+// instead of blake3). The files status CHECK gains 'offloaded' — a
+// sibling of 'missing' for content intentionally removed from local
+// disk while it stays durable elsewhere.
+//
+// Backfill mapping: each distinct blake3 becomes one contents row whose
+// size_bytes and (origin_node_id, origin_run_id) come from the files
+// row with the earliest first_seen_run_id for that hash. The old
+// source_* columns recorded per-observation sender attribution while
+// origin_* is content-level first-introduction provenance, so the
+// earliest observation is the closest available approximation.
+//
+// The files_blake3_immutable trigger is dropped and not recreated: the
+// id↔blake3 binding on contents is immutable by construction (blake3 is
+// UNIQUE and contents rows are never updated), so a trigger guarding
+// in-place hash rewrites has nothing left to guard.
+//
+// FK enforcement is disabled across the rebuild (files references
+// folders, runs, and now contents; the old table is dropped
+// mid-migration) with the usual foreign_key_check verification before
+// commit.
+func migrateV13ToV14(ctx context.Context, db *sql.DB) error {
+	conn, restore, err := disableForeignKeys(ctx, db)
+	if err != nil {
+		return err
+	}
+	defer restore()
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := createAndSeedContentsV14(ctx, tx); err != nil {
+		return err
+	}
+	if err := rebuildFilesV14(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (14)`); err != nil {
+		return fmt.Errorf("record schema v14: %w", err)
+	}
+	if err := verifyForeignKeysClean(ctx, tx, "v13→v14"); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// createAndSeedContentsV14 creates the contents table and inserts one
+// row per distinct blake3 in the old files table. The seed row per hash
+// is chosen by (first_seen_run_id, rowid) ascending so the backfill is
+// deterministic when several rows share the earliest run.
+func createAndSeedContentsV14(ctx context.Context, tx *sql.Tx) error {
+	stmts := []string{
+		// origin_run_id is in the origin node's run space (NULL together
+		// with origin_node_id means "introduced locally"), so it is
+		// deliberately not a FK to the local runs table.
+		`CREATE TABLE contents (
+			id             INTEGER PRIMARY KEY,
+			blake3         BLOB NOT NULL UNIQUE CHECK (length(blake3) = 32),
+			size_bytes     INTEGER NOT NULL,
+			origin_node_id INTEGER REFERENCES nodes(id),
+			origin_run_id  INTEGER
+		)`,
+		`INSERT INTO contents (blake3, size_bytes, origin_node_id, origin_run_id)
+		 SELECT f.blake3, f.size_bytes, f.source_node_id, f.source_run_id
+		 FROM files f
+		 WHERE f.rowid = (
+		     SELECT f2.rowid FROM files f2 WHERE f2.blake3 = f.blake3
+		     ORDER BY f2.first_seen_run_id, f2.rowid LIMIT 1
+		 )`,
+		// Partial index backing "find content introduced by node X"
+		// (ListPresentByOrigin); excluding the local-origin majority keeps
+		// the index sized to the peer-sourced subset, the same trade the
+		// old idx_files_source_node made.
+		`CREATE INDEX idx_contents_origin_node ON contents(origin_node_id)
+		 WHERE origin_node_id IS NOT NULL`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("create contents: %w", err)
+		}
+	}
+	return nil
+}
+
+// rebuildFilesV14 stages the reshaped files table, copies every old row
+// with its blake3 resolved to the freshly seeded contents id, and swaps
+// the new table into place. blake3↔content_id is one-to-one, so the PK
+// widening from (folder_id, name, blake3) to (folder_id, name,
+// content_id) is conflict-free and row counts are preserved.
+func rebuildFilesV14(ctx context.Context, tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE files_v14 (
+			folder_id         INTEGER NOT NULL REFERENCES folders(id),
+			name              TEXT NOT NULL,
+			content_id        INTEGER NOT NULL REFERENCES contents(id),
+			mtime_ns          INTEGER NOT NULL,
+			status            TEXT NOT NULL CHECK (status IN ('present','missing','superseded','offloaded')),
+			first_seen_run_id INTEGER NOT NULL REFERENCES runs(id),
+			last_seen_run_id  INTEGER NOT NULL REFERENCES runs(id),
+			indexed_at_ns     INTEGER NOT NULL,
+			PRIMARY KEY (folder_id, name, content_id)
+		)`,
+		`INSERT INTO files_v14 (
+			folder_id, name, content_id, mtime_ns, status,
+			first_seen_run_id, last_seen_run_id, indexed_at_ns
+		)
+		SELECT f.folder_id, f.name, c.id, f.mtime_ns, f.status,
+		       f.first_seen_run_id, f.last_seen_run_id, f.indexed_at_ns
+		FROM files f JOIN contents c ON c.blake3 = f.blake3`,
+		`DROP TABLE files`,
+		`ALTER TABLE files_v14 RENAME TO files`,
+		`CREATE INDEX idx_files_content ON files(content_id)`,
+		`CREATE INDEX idx_files_missing ON files(folder_id, name) WHERE status = 'missing'`,
+		`CREATE UNIQUE INDEX uniq_files_live_per_path ON files(folder_id, name) WHERE status != 'superseded'`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("rebuild files: %w", err)
+		}
+	}
+	return nil
+}
+
+// --- v14 → v15 ---
+
+// migrateV14ToV15 rebuilds the runs table to add 'offload' to the kind
+// CHECK. An offload run records the local "delete on-disk bytes whose
+// content is durable elsewhere" operation, so it joins index and audit
+// in the destination-NULL branch of the kind↔destination coupling.
+// Same FK-off rebuild recipe as v6→v7 (runs is referenced by files and
+// hook_runs).
+func migrateV14ToV15(ctx context.Context, db *sql.DB) error {
+	conn, restore, err := disableForeignKeys(ctx, db)
+	if err != nil {
+		return err
+	}
+	defer restore()
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := rebuildRunsTableV15(ctx, tx); err != nil {
+		return err
+	}
+	if err := verifyForeignKeysClean(ctx, tx, "v14→v15"); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func rebuildRunsTableV15(ctx context.Context, tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE runs_v15 (
+			id            INTEGER PRIMARY KEY,
+			kind          TEXT NOT NULL CHECK (kind IN ('index','sync','restore','audit','offload')),
+			volume_id     INTEGER REFERENCES volumes(id),
+			destination   TEXT,
+			started_at_ns INTEGER NOT NULL,
+			ended_at_ns   INTEGER,
+			status        TEXT NOT NULL CHECK (status IN ('running','success','failed','partial')),
+			error         TEXT,
+			file_count    INTEGER NOT NULL DEFAULT 0,
+			peer_node_id      INTEGER REFERENCES nodes(id),
+			correlated_run_id INTEGER,
+			shallow INTEGER CHECK (shallow IS NULL OR shallow IN (0, 1)),
+			CHECK (
+				(kind IN ('index','audit','offload') AND destination IS NULL) OR
+				(kind IN ('sync','restore') AND destination IS NOT NULL AND destination != '')
+			)
+		)`,
+		`INSERT INTO runs_v15 (
+			id, kind, volume_id, destination, started_at_ns, ended_at_ns,
+			status, error, file_count, peer_node_id, correlated_run_id, shallow
+		)
+		SELECT id, kind, volume_id, destination, started_at_ns, ended_at_ns,
+		       status, error, file_count, peer_node_id, correlated_run_id, shallow
+		FROM runs`,
+		`DROP TABLE runs`,
+		`ALTER TABLE runs_v15 RENAME TO runs`,
+		`CREATE INDEX idx_runs_volume_started ON runs(volume_id, started_at_ns)`,
+		`CREATE INDEX idx_runs_destination ON runs(destination) WHERE destination IS NOT NULL`,
+		`INSERT INTO schema_version (version) VALUES (15)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("rebuild runs: %w", err)
+		}
+	}
+	return nil
+}
+
+// --- v15 → v16 ---
+
+// migrateV15ToV16 adds the offload substrate tables, all additive:
+//
+//   - destination_run_ids: the per-destination durability version
+//     vector. One row per (volume, destination, origin node) carrying
+//     the highest origin-space run id known durable on that
+//     destination. `destination` is the unified target name — a bucket
+//     destination or a peer node name, matching what runs.destination
+//     already stores. origin_run_id is in the origin node's run space,
+//     so like contents.origin_run_id it is not a local FK.
+//   - destination_run_ids_history: append-only log of every vector
+//     advance, written in the same transaction as the live-row upsert
+//     (the same recoverability contract peer_sync_state_history gives
+//     the peer-sync watermark).
+//   - remote_objects: per-(content, destination) upload fingerprints
+//     for destinations that can't be cheaply re-read — the provider's
+//     stored checksum recorded at upload time and compared verbatim on
+//     later verification passes.
+func migrateV15ToV16(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`CREATE TABLE destination_run_ids (
+			volume_id      INTEGER NOT NULL REFERENCES volumes(id),
+			destination    TEXT NOT NULL,
+			origin_node_id INTEGER NOT NULL REFERENCES nodes(id),
+			origin_run_id  INTEGER NOT NULL,
+			updated_at_ns  INTEGER NOT NULL,
+			PRIMARY KEY (volume_id, destination, origin_node_id)
+		)`,
+		`CREATE TABLE destination_run_ids_history (
+			id             INTEGER PRIMARY KEY,
+			volume_id      INTEGER NOT NULL,
+			destination    TEXT NOT NULL,
+			origin_node_id INTEGER NOT NULL,
+			origin_run_id  INTEGER NOT NULL,
+			at_ns          INTEGER NOT NULL
+		)`,
+		`CREATE INDEX idx_destination_run_ids_history
+		 ON destination_run_ids_history(volume_id, destination)`,
+		`CREATE TABLE remote_objects (
+			content_id      INTEGER NOT NULL REFERENCES contents(id),
+			destination     TEXT NOT NULL,
+			uploaded_run_id INTEGER NOT NULL REFERENCES runs(id),
+			checksum_algo   TEXT NOT NULL,
+			checksum        TEXT NOT NULL,
+			verified_at_ns  INTEGER,
+			PRIMARY KEY (content_id, destination)
+		)`,
+		`INSERT INTO schema_version (version) VALUES (16)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("v15→v16: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// --- v16 → v17 ---
+
+// migrateV16ToV17 relaxes remote_objects so the upload record and the
+// fingerprint are two separate facts: the content-addressed offsite
+// push records the upload immediately (checksum_algo and checksum both
+// NULL — uploaded, fingerprint pending) and a later scan-back pass
+// fills the provider checksum in. A CHECK keeps the pair atomic — a
+// checksum without its algorithm (or vice versa) is uninterpretable.
+//
+// remote_objects is a leaf table (nothing references it), so the
+// rebuild needs no FK-off recipe: the staged table is populated while
+// the old one still satisfies every constraint, then swapped in.
+// Existing rows carry over verbatim.
+func migrateV16ToV17(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`CREATE TABLE remote_objects_v17 (
+			content_id      INTEGER NOT NULL REFERENCES contents(id),
+			destination     TEXT NOT NULL,
+			uploaded_run_id INTEGER NOT NULL REFERENCES runs(id),
+			checksum_algo   TEXT,
+			checksum        TEXT,
+			verified_at_ns  INTEGER,
+			PRIMARY KEY (content_id, destination),
+			CHECK ((checksum_algo IS NULL) = (checksum IS NULL))
+		)`,
+		`INSERT INTO remote_objects_v17 (
+			content_id, destination, uploaded_run_id, checksum_algo, checksum, verified_at_ns
+		)
+		SELECT content_id, destination, uploaded_run_id, checksum_algo, checksum, verified_at_ns
+		FROM remote_objects`,
+		`DROP TABLE remote_objects`,
+		`ALTER TABLE remote_objects_v17 RENAME TO remote_objects`,
+		`INSERT INTO schema_version (version) VALUES (17)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("v16→v17: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// --- v17 → v18 ---
+
+// migrateV17ToV18 adds files.status_changed_run_id: the run during
+// which the row last changed status. last_seen_run_id can't answer
+// "what changed since run W" — it advances on every observation of a
+// present row and freezes at the last-alive run on supersession — so
+// the per-destination manifest delta needs a stamp that moves exactly
+// when status does. Every status writer maintains it from v18 on:
+// inserts stamp their first_seen run, supersession/missing flips stamp
+// the flipping run, and re-observations leave it alone.
+//
+// The backfill approximates history the old columns retain: a present
+// row last changed status when it was inserted (first_seen_run_id;
+// re-flips to present weren't recorded), and a superseded/missing row's
+// last_seen_run_id is the closest recorded coordinate to its flip (the
+// flip stamp for missing rows, the last-alive run for superseded ones).
+// The approximation only affects pre-v18 history; no content-addressed
+// destination can have synced before v18 exists, so every first delta
+// is computed against watermark 0 and reads the full live state anyway.
+func migrateV17ToV18(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`ALTER TABLE files ADD COLUMN status_changed_run_id INTEGER REFERENCES runs(id)`,
+		`UPDATE files SET status_changed_run_id = CASE
+			WHEN status = 'present' THEN first_seen_run_id
+			ELSE last_seen_run_id
+		END`,
+		`INSERT INTO schema_version (version) VALUES (18)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("v17→v18: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// --- v18 → v19 ---
+
+// migrateV18ToV19 adds the verification-method provenance the offload
+// gate needs to tell a content-verified durability component apart from
+// a presence-only one. destination_run_ids.verify_method records the
+// method that advanced a live component (blake3, peer-blake3,
+// kopia-verify, or presence+size); destination_run_ids_history.verify_method
+// records it per advance so the audit log keeps the same fact.
+//
+// Both columns are additive and nullable. Existing components are left
+// NULL: the gate reads a NULL method as "not content-verified" and holds
+// the target out until a fresh verified push re-stamps it. That is the
+// strictly-stricter reading — a pre-v19 component can only ever start
+// refusing offload, never start permitting it — and is harmless because
+// a verified push re-advances the component cheaply.
+func migrateV18ToV19(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`ALTER TABLE destination_run_ids ADD COLUMN verify_method TEXT`,
+		`ALTER TABLE destination_run_ids_history ADD COLUMN verify_method TEXT`,
+		`INSERT INTO schema_version (version) VALUES (19)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("v18→v19: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// --- v19 → v20 ---
+
+// migrateV19ToV20 adds destination_push_freshness: the per-origin-node
+// maxima of the present set captured at a destination's most recent
+// successful whole-volume push, in origin-space coordinates. The offload
+// gate's freshness condition reads it for a target the local node does
+// not push to directly (a peer-relayed offsite, named in offload_requires
+// but absent from the local sync_to). The local-run-space watermark
+// LastSuccessfulWholeVolumePushRunID is always 0 for such a target, so the
+// freshness condition would refuse every file forever; this table lets a
+// pulled-evidence target satisfy freshness from the pushing node's own
+// determination, expressed in the origin coordinates the gate already
+// holds for the gated content.
+//
+// origin_run_id is the snapshot maxima of the *latest* push — overwritten
+// per push (non-monotonic), distinct from destination_run_ids.origin_run_id
+// which is the monotonic durability vector. A push removing content from
+// the pushing node's present set lowers the freshness maxima even though
+// the append-only target still holds the bytes (the monotonic vector keeps
+// covering them), so a relayed file above the freshness watermark is held
+// out — the safe direction.
+//
+// The table is empty after migration: only a successful whole-volume push
+// writes a row. A target with no row yields no freshness evidence, which
+// the gate reads as "refuse" for a relayed target.
+func migrateV19ToV20(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`CREATE TABLE destination_push_freshness (
+			volume_id      INTEGER NOT NULL REFERENCES volumes(id),
+			destination    TEXT NOT NULL,
+			origin_node_id INTEGER NOT NULL REFERENCES nodes(id),
+			origin_run_id  INTEGER NOT NULL,
+			updated_at_ns  INTEGER NOT NULL,
+			PRIMARY KEY (volume_id, destination, origin_node_id)
+		)`,
+		`INSERT INTO schema_version (version) VALUES (20)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("v19→v20: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// --- v20 → v21 ---
+
+// migrateV20ToV21 restores schema-level immutability for the contents
+// table. contents is the append-only content entity: one row per BLAKE3,
+// carrying its size and origin. The id↔blake3 binding is already immutable
+// by construction (blake3 is UNIQUE), but the v13→v14 reshape dropped the
+// files_blake3_immutable trigger without installing an equivalent guard on
+// the new table, so a future bug could UPDATE a row's size_bytes/origin_*
+// in place or DELETE a row whose hash other rows still reference.
+//
+// Two triggers re-assert the guarantee the append-only contract implies:
+// any UPDATE or DELETE on a contents row aborts. The sanctioned way to
+// record different content at a path is to supersede the files row and
+// insert a new one (see Upsert), which leaves the contents row untouched.
+func migrateV20ToV21(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	for _, q := range append(contentsImmutableTriggers(), `INSERT INTO schema_version (version) VALUES (21)`) {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("v20→v21: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// contentsImmutableTriggers returns the DDL for the two triggers that make
+// the contents table append-only at the schema level: a row's size and
+// origin are fixed once written, and a row is never removed. Shared with
+// any future fresh-baseline so the guarantee survives a schema rebase.
+func contentsImmutableTriggers() []string {
+	return []string{
+		`CREATE TRIGGER contents_no_update BEFORE UPDATE ON contents
+		 BEGIN
+		     SELECT RAISE(ABORT, 'contents is append-only; supersede the files row and insert new content instead of updating');
+		 END`,
+		`CREATE TRIGGER contents_no_delete BEFORE DELETE ON contents
+		 BEGIN
+		     SELECT RAISE(ABORT, 'contents is append-only; a content row is never deleted');
+		 END`,
+	}
 }

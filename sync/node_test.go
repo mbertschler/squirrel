@@ -183,18 +183,42 @@ func TestNodeSyncTransfersFiles(t *testing.T) {
 		}
 	}
 
-	// Receiver-side index reflects the new rows.
+	// Receiver-side index reflects the new rows, each carrying the
+	// content's origin coordinate: the initiator's node name (mapped
+	// to the receiver's row for it) and the initiator-side run that
+	// introduced the content — not the receiver's own run.
 	v, err := f.recvStore.GetVolumeByName(context.Background(), "pics")
 	if err != nil {
 		t.Fatalf("GetVolumeByName on receiver: %v", err)
+	}
+	initSelfPre, err := f.initStore.GetSelfNode(context.Background())
+	if err != nil {
+		t.Fatalf("GetSelfNode on initiator: %v", err)
+	}
+	initVolRow, err := f.initStore.GetVolumeByName(context.Background(), "pics")
+	if err != nil {
+		t.Fatalf("GetVolumeByName on initiator: %v", err)
+	}
+	originNode, err := f.recvStore.GetNodeByName(context.Background(), initSelfPre.Name)
+	if err != nil {
+		t.Fatalf("receiver has no nodes row named %q: %v", initSelfPre.Name, err)
 	}
 	for name := range files {
 		row, err := f.recvStore.GetByPath(context.Background(), v.ID, name)
 		if err != nil {
 			t.Fatalf("GetByPath %s on receiver: %v", name, err)
 		}
-		if !row.SourceNodeID.Valid {
-			t.Fatalf("%s row has NULL source_node_id; want initiator attribution", name)
+		if !row.OriginNodeID.Valid || row.OriginNodeID.Int64 != originNode.ID {
+			t.Fatalf("%s OriginNodeID = %+v, want %d (the initiator's row by name)",
+				name, row.OriginNodeID, originNode.ID)
+		}
+		initRow, err := f.initStore.GetByPath(context.Background(), initVolRow.ID, name)
+		if err != nil {
+			t.Fatalf("GetByPath %s on initiator: %v", name, err)
+		}
+		if !row.OriginRunID.Valid || row.OriginRunID.Int64 != initRow.FirstSeenRunID {
+			t.Fatalf("%s OriginRunID = %+v, want the initiator's introduction run %d",
+				name, row.OriginRunID, initRow.FirstSeenRunID)
 		}
 	}
 
@@ -366,8 +390,8 @@ func TestNodeSyncResolvesConflictOnLocalWriteOnReceiver(t *testing.T) {
 	if hex.EncodeToString(liveRow.Blake3) == hex.EncodeToString(receiverDigest) {
 		t.Fatalf("live row still carries the prior blake3; want initiator's")
 	}
-	if !liveRow.SourceNodeID.Valid {
-		t.Fatalf("live doc.md row has NULL source_node_id; want initiator attribution")
+	if !liveRow.OriginNodeID.Valid {
+		t.Fatalf("live doc.md row has NULL origin; want the initiator-introduced content's origin")
 	}
 	preservedRow, err := f.recvStore.GetByPath(ctx, v.ID, preservedRel)
 	if err != nil {
@@ -377,9 +401,9 @@ func TestNodeSyncResolvesConflictOnLocalWriteOnReceiver(t *testing.T) {
 		t.Fatalf("preserved row blake3 = %x, want %x (the prior content)",
 			preservedRow.Blake3, receiverDigest)
 	}
-	if preservedRow.SourceNodeID.Valid {
+	if preservedRow.OriginNodeID.Valid {
 		t.Fatalf("preserved row source_node_id = %d, want NULL (prior was a local write)",
-			preservedRow.SourceNodeID.Int64)
+			preservedRow.OriginNodeID.Int64)
 	}
 
 	// Loser is reachable by hash too — `squirrel query <prior>`
@@ -508,12 +532,6 @@ func TestVerifyReportsMismatch(t *testing.T) {
 	f := setupNodeFixture(t)
 	ctx := context.Background()
 
-	// Plant a file on disk at the receiver. This represents bytes
-	// that arrived after a (mocked) rclone transfer.
-	if err := os.WriteFile(filepath.Join(f.recvVol.Path, "a.txt"), []byte("not-what-initiator-claims"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
 	initSelf, _ := f.initStore.GetSelfNode(ctx)
 	client := newNodeClient(f.node)
 	begin, err := client.begin(ctx, syncproto.BeginRequest{
@@ -540,6 +558,14 @@ func TestVerifyReportsMismatch(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("/plan: %v", err)
+	}
+	// Plant a file on disk at the receiver after /plan: this represents
+	// the bytes a (mocked) rclone transfer delivered to the Transfer
+	// destination, with content that doesn't match the initiator's claim.
+	// Planting it post-plan keeps it clear of the Transfer pre-stage,
+	// which moves any out-of-band pre-existing file aside.
+	if err := os.WriteFile(filepath.Join(f.recvVol.Path, "a.txt"), []byte("not-what-initiator-claims"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 	v, err := client.verify(ctx, syncproto.VerifyRequest{ReceiverRunID: begin.ReceiverRunID})
 	if err != nil {
@@ -601,13 +627,13 @@ func TestPlanResponseContainsAllDispositions(t *testing.T) {
 	// Receiver-side: prepare three pre-existing rows under one
 	// volume, three dispositions ahead of /plan:
 	//   - "same.txt"      → same blake3 ⇒ already-correct
-	//   - "evolved.txt"   → different blake3 sourced from initiator
-	//                       (we plant peer_sync_state to make the
-	//                       provenance trace back to the initiator
-	//                       at run ≤ watermark) ⇒ supersede
+	//   - "evolved.txt"   → different blake3 delivered by the
+	//                       initiator (its first-seen run is a
+	//                       peer-sync run correlated at ≤ the
+	//                       watermark) ⇒ supersede
 	//   - "novel.txt"     → no receiver-side row ⇒ transfer
-	//   - "local.txt"     → different blake3, source_node_id NULL
-	//                       ⇒ conflict
+	//   - "local.txt"     → different blake3, first seen by a local
+	//                       index run (no peer linkage) ⇒ conflict
 	v, err := f.recvStore.CreateVolume(ctx, f.recvVol.Name, f.recvVol.Path)
 	if err != nil {
 		t.Fatalf("seed receiver volume: %v", err)
@@ -632,13 +658,20 @@ func TestPlanResponseContainsAllDispositions(t *testing.T) {
 		t.Fatalf("BeginPeerSyncRun: %v", err)
 	}
 	_ = f.recvStore.FinishRun(ctx, priorRun, store.RunStatusSuccess, "", 1)
+	// A receiver-local index run: rows first seen by it have no peer
+	// linkage, which is what makes local.txt a conflict.
+	localRun, err := f.recvStore.BeginIndexRun(ctx, store.RunKindIndex, v.ID, false)
+	if err != nil {
+		t.Fatalf("BeginIndexRun: %v", err)
+	}
+	_ = f.recvStore.FinishRun(ctx, localRun, store.RunStatusSuccess, "", 1)
 
-	mustUpsert := func(path string, digest []byte, prov *store.Provenance) {
+	mustUpsert := func(path string, digest []byte, firstSeen int64, prov *store.Provenance) {
 		t.Helper()
 		if err := f.recvStore.Upsert(ctx, store.FileRow{
 			VolumeID: v.ID, Path: path, Blake3: digest,
 			SizeBytes: 1, MtimeNs: 1, Status: store.StatusPresent,
-			FirstSeenRunID: priorRun, LastSeenRunID: priorRun, IndexedAtNs: 1,
+			FirstSeenRunID: firstSeen, LastSeenRunID: firstSeen, IndexedAtNs: 1,
 		}, prov); err != nil {
 			t.Fatalf("upsert receiver %s: %v", path, err)
 		}
@@ -649,19 +682,20 @@ func TestPlanResponseContainsAllDispositions(t *testing.T) {
 	// (supersede) and local.txt (conflict) both get re-hashed before
 	// their bytes are moved, so their recorded digests must match what's
 	// on disk — a real receiver indexes its own content; a synthetic
-	// digest would look like out-of-band drift. The three files share the
-	// same "seed" bytes, so one digest serves both. same.txt is
-	// already-correct and never re-hashed, so a synthetic digest is fine.
+	// digest would look like out-of-band drift. same.txt is
+	// already-correct and never re-hashed, so a synthetic digest is
+	// fine.
 	for _, p := range []string{"same.txt", "evolved.txt", "local.txt"} {
-		if err := os.WriteFile(filepath.Join(f.recvVol.Path, p), []byte("seed"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(f.recvVol.Path, p), []byte("seed-"+p), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	seedDigest := hashFile(t, filepath.Join(f.recvVol.Path, "evolved.txt"))
+	evolvedDigest := hashFile(t, filepath.Join(f.recvVol.Path, "evolved.txt"))
+	localDigest := hashFile(t, filepath.Join(f.recvVol.Path, "local.txt"))
 
-	mustUpsert("same.txt", bytesDigest(0xAA), nil)
-	mustUpsert("evolved.txt", seedDigest, &store.Provenance{NodeID: peer.ID, RunID: priorRun})
-	mustUpsert("local.txt", seedDigest, nil)
+	mustUpsert("same.txt", bytesDigest(0xAA), priorRun, nil)
+	mustUpsert("evolved.txt", evolvedDigest, priorRun, &store.Provenance{NodeID: peer.ID, RunID: priorInitiatorRunID})
+	mustUpsert("local.txt", localDigest, localRun, nil)
 
 	// peer_sync_state watermark (in initiator-id space) high enough
 	// to cover the prior row's correlated id.
@@ -739,8 +773,8 @@ func TestPlanResponseContainsAllDispositions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetByPath %s: %v", plan.Conflicts[0].PreservedAtPath, err)
 	}
-	if hex.EncodeToString(conflictRow.Blake3) != hex.EncodeToString(seedDigest) {
-		t.Fatalf("conflict-path row blake3 = %x, want the prior on-disk digest %x", conflictRow.Blake3, seedDigest)
+	if hex.EncodeToString(conflictRow.Blake3) != hex.EncodeToString(localDigest) {
+		t.Fatalf("conflict-path row blake3 = %x, want the prior on-disk digest %x", conflictRow.Blake3, localDigest)
 	}
 }
 
@@ -789,9 +823,9 @@ func TestNodeSyncEndToEndConflictAfterAgentSideIndex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetByPath before round 2: %v", err)
 	}
-	if beforeRound2.SourceNodeID.Valid {
+	if beforeRound2.OriginNodeID.Valid {
 		t.Fatalf("post-index row has source_node_id %d; want NULL (local write)",
-			beforeRound2.SourceNodeID.Int64)
+			beforeRound2.OriginNodeID.Int64)
 	}
 
 	// Round 2: initiator writes Z and re-syncs. The receiver's row
@@ -873,16 +907,21 @@ func TestNodeSyncConflictWhenPriorRowFromDifferentPeer(t *testing.T) {
 		t.Fatalf("BeginPeerSyncRun: %v", err)
 	}
 	_ = f.recvStore.FinishRun(ctx, priorRun, store.RunStatusSuccess, "", 1)
-	priorDigest := bytesDigest(0x77)
-	if err := f.recvStore.Upsert(ctx, store.FileRow{
-		VolumeID: v.ID, Path: "shared.md", Blake3: priorDigest,
-		SizeBytes: 1, MtimeNs: 1, Status: store.StatusPresent,
-		FirstSeenRunID: priorRun, LastSeenRunID: priorRun, IndexedAtNs: 1,
-	}, &store.Provenance{NodeID: otherPeer.ID, RunID: priorRun}); err != nil {
-		t.Fatalf("seed third-party row: %v", err)
-	}
+	// Write the bytes first and record their real digest: the conflict
+	// pre-stage re-hashes before moving, and a synthetic digest would
+	// look like out-of-band drift (which deliberately drops the prior
+	// origin). The recorded origin is the third party's own coordinate
+	// (its node row + a run id in *its* run space), carried verbatim.
 	if err := os.WriteFile(filepath.Join(f.recvVol.Path, "shared.md"), []byte("from-third-party"), 0o644); err != nil {
 		t.Fatal(err)
+	}
+	priorDigest := hashFile(t, filepath.Join(f.recvVol.Path, "shared.md"))
+	if err := f.recvStore.Upsert(ctx, store.FileRow{
+		VolumeID: v.ID, Path: "shared.md", Blake3: priorDigest,
+		SizeBytes: int64(len("from-third-party")), MtimeNs: 1, Status: store.StatusPresent,
+		FirstSeenRunID: priorRun, LastSeenRunID: priorRun, IndexedAtNs: 1,
+	}, &store.Provenance{NodeID: otherPeer.ID, RunID: 7}); err != nil {
+		t.Fatalf("seed third-party row: %v", err)
 	}
 
 	// Initiator writes a *different* blake3.
@@ -913,9 +952,9 @@ func TestNodeSyncConflictWhenPriorRowFromDifferentPeer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetByPath %s: %v", rep.NodeConflicts[0].PreservedAtPath, err)
 	}
-	if !preservedRow.SourceNodeID.Valid || preservedRow.SourceNodeID.Int64 != otherPeer.ID {
+	if !preservedRow.OriginNodeID.Valid || preservedRow.OriginNodeID.Int64 != otherPeer.ID {
 		t.Fatalf("preserved row source_node_id = %+v, want %d (third-party)",
-			preservedRow.SourceNodeID, otherPeer.ID)
+			preservedRow.OriginNodeID, otherPeer.ID)
 	}
 }
 
@@ -1338,8 +1377,8 @@ func TestNodeSyncCopyFromExistingDedup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetByPath pets/a.jpg: %v", err)
 	}
-	if !newRow.SourceNodeID.Valid {
-		t.Fatalf("pets/a.jpg row has NULL source_node_id; want initiator attribution")
+	if !newRow.OriginNodeID.Valid {
+		t.Fatalf("pets/a.jpg row has NULL origin; want the initiator-introduced content's origin")
 	}
 }
 
@@ -1550,7 +1589,7 @@ func TestPlanSupersedeWinsOverDedup(t *testing.T) {
 	// watermark that puts the target row's provenance "at or before"
 	// the shared watermark.
 	initSelf, _ := f.initStore.GetSelfNode(ctx)
-	peer, err := f.recvStore.GetOrCreatePeerNode(ctx, initSelf.Name, "peer://"+initSelf.Name)
+	peer, err := f.recvStore.GetOrCreatePeerNode(ctx, initSelf.Name, "peer://"+initSelf.Name, false)
 	if err != nil {
 		t.Fatalf("GetOrCreatePeerNode: %v", err)
 	}

@@ -41,7 +41,7 @@ func newSyncCmd() *cobra.Command {
 	cmd.Flags().StringVar(&to, "to", "", "limit to this destination name (default: every destination declared on the volume)")
 	cmd.Flags().BoolVar(&shallow, "shallow", false, "skip BLAKE3 verification; trust rclone's default size+mtime comparison")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview rclone actions without transferring; no runs row is written")
-	cmd.Flags().BoolVar(&initDst, "init", false, "bootstrap a .squirrel-volume marker at the destination on first sync (refused subsequently if the marker mismatches)")
+	cmd.Flags().BoolVar(&initDst, "init", false, "authorise first-use destination bootstrap: write a .squirrel-volume marker, or create a kopia repository when connect finds none (refused without --init so a typo or outage can't mint a fresh empty target)")
 	return cmd
 }
 
@@ -64,11 +64,15 @@ func runSync(cmd *cobra.Command, volumeName, destinationName string, opts sync.O
 	if err != nil {
 		return err
 	}
+	tools, err := sync.ToolsFor(cfg, pairs, rcl)
+	if err != nil {
+		return err
+	}
 	out := cmd.OutOrStdout()
 	if opts.Shallow {
 		fmt.Fprintln(out, shallowSyncWarning)
 	}
-	if err := sync.EnsureMinVersion(cmd.Context(), rcl, out, opts.Shallow); err != nil {
+	if err := sync.EnsureMinVersion(cmd.Context(), rcl, out, sync.ShallowForPairs(pairs, opts.Shallow)); err != nil {
 		return err
 	}
 	if err := writeRcloneConfigLogged(out, rcl, cfg); err != nil {
@@ -84,7 +88,7 @@ func runSync(cmd *cobra.Command, volumeName, destinationName string, opts sync.O
 
 	var anyFailed bool
 	for _, p := range pairs {
-		rep, err := sync.RunPair(cmd.Context(), s, rcl, p, opts)
+		rep, err := sync.RunPair(cmd.Context(), s, tools, p, opts)
 		printSyncReport(out, rep, err)
 		if err != nil || rep.Status != "success" {
 			anyFailed = true
@@ -151,10 +155,31 @@ func printSyncReport(w io.Writer, rep sync.Report, runErr error) {
 	for _, msg := range rep.NodePendingWarnings {
 		fmt.Fprintf(w, "warning: peer reports %s\n", msg)
 	}
-	fmt.Fprintf(w, "%s → %s  status=%s transferred=%d checked=%d errors=%d bytes=%d run=%d\n",
-		rep.Volume, rep.Destination, rep.Status,
-		r.Transferred, r.Checked, r.Errors, r.Bytes, rep.RunID,
-	)
+	switch rep.Verification.Method {
+	case sync.VerifyMethodKopia:
+		// Kopia pushes have no rclone counters; render the snapshot's
+		// own numbers instead.
+		fmt.Fprintf(w, "%s → %s  status=%s files=%d bytes=%d snapshot=%s verified=%t run=%d\n",
+			rep.Volume, rep.Destination, rep.Status,
+			rep.Verification.Files, rep.Verification.Bytes,
+			rep.Verification.SnapshotID, rep.Verification.Verified(), rep.RunID,
+		)
+	case sync.VerifyMethodPresenceSize:
+		// Content-addressed pushes count objects, with skipped = hashes
+		// the destination already recorded, entries = manifest segment
+		// lines, and fingerprints = provider checksums captured for the
+		// fresh uploads.
+		fmt.Fprintf(w, "%s → %s  status=%s objects=%d skipped=%d errors=%d bytes=%d entries=%d fingerprints=%d run=%d\n",
+			rep.Volume, rep.Destination, rep.Status,
+			r.Transferred, r.Checked, r.Errors, r.Bytes,
+			rep.Verification.Files, rep.Fingerprints, rep.RunID,
+		)
+	default:
+		fmt.Fprintf(w, "%s → %s  status=%s transferred=%d checked=%d errors=%d bytes=%d run=%d\n",
+			rep.Volume, rep.Destination, rep.Status,
+			r.Transferred, r.Checked, r.Errors, r.Bytes, rep.RunID,
+		)
+	}
 	if rep.NodeReceiverRunID != 0 {
 		fmt.Fprintf(w, "  receiver_run=%d matched=%d mismatched=%d missing=%d conflicts=%d\n",
 			rep.NodeReceiverRunID,
@@ -165,6 +190,15 @@ func printSyncReport(w io.Writer, rep sync.Report, runErr error) {
 		)
 		for _, m := range rep.NodeVerify.Mismatched {
 			fmt.Fprintf(w, "    mismatched %s: expected %s, actual %s\n", m.Path, m.ExpectedHex, m.ActualHex)
+		}
+		if rep.DurabilityPull.Fetched > 0 {
+			fmt.Fprintf(w, "  durability: applied %d/%d peer entries",
+				rep.DurabilityPull.Applied, rep.DurabilityPull.Fetched)
+			if rep.DurabilityPull.Dropped > 0 {
+				fmt.Fprintf(w, " (dropped %d for unconfigured destinations)",
+					rep.DurabilityPull.Dropped)
+			}
+			fmt.Fprintln(w)
 		}
 	}
 	for _, c := range rep.NodeConflicts {

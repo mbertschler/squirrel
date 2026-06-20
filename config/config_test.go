@@ -237,6 +237,55 @@ sync_to = ["does-not-exist"]
 	}
 }
 
+// TestLoadOffloadRequires: the per-volume offload policy is parsed
+// verbatim, including names with no matching local destination or node
+// — durability evidence for such targets can be peer-pulled, and an
+// unknown name fails closed at the gate.
+func TestLoadOffloadRequires(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.scratch]
+type = "local"
+root = "/tmp/dst"
+
+[volumes.pictures]
+path = "/tmp/pictures"
+sync_to = ["scratch"]
+offload_requires = ["scratch", "peer-only-offsite"]
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got := cfg.Volumes["pictures"].OffloadRequires
+	if len(got) != 2 || got[0] != "scratch" || got[1] != "peer-only-offsite" {
+		t.Fatalf("OffloadRequires = %v, want [scratch peer-only-offsite]", got)
+	}
+}
+
+func TestLoadRejectsInvalidOffloadRequiresName(t *testing.T) {
+	p := writeConfig(t, `
+[volumes.pictures]
+path = "/tmp/pictures"
+offload_requires = ["has space"]
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "offload_requires entry") {
+		t.Fatalf("expected invalid offload_requires error, got %v", err)
+	}
+}
+
+func TestLoadRejectsDuplicateOffloadRequires(t *testing.T) {
+	p := writeConfig(t, `
+[volumes.pictures]
+path = "/tmp/pictures"
+offload_requires = ["nas", "nas"]
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "more than once") {
+		t.Fatalf("expected duplicate offload_requires error, got %v", err)
+	}
+}
+
 func TestLoadRejectsInvalidName(t *testing.T) {
 	// Names that wouldn't survive being a filesystem subfolder or an
 	// rclone.conf section are rejected at load time.
@@ -353,6 +402,310 @@ root   = "/p"
 				}
 			}
 		})
+	}
+}
+
+// TestLoadDestinationS3StorageClass parses the optional s3 storage_class and
+// confirms it renders verbatim into the s3 section.
+func TestLoadDestinationS3StorageClass(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.archive]
+type          = "s3"
+provider      = "AWS"
+bucket        = "squirrel"
+root          = "/p"
+storage_class = "DEEP_ARCHIVE"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	d := cfg.Destinations["archive"]
+	if d.Params["storage_class"] != "DEEP_ARCHIVE" {
+		t.Fatalf("storage_class not resolved: %v", d.Params)
+	}
+	if !strings.Contains(d.RcloneSection(), "storage_class = DEEP_ARCHIVE") {
+		t.Fatalf("section missing storage_class:\n%s", d.RcloneSection())
+	}
+}
+
+// TestLoadRejectsStorageClassOnNonS3 confirms storage_class is confined to
+// the s3 type by the unknown-field check — it has no meaning on an sftp
+// destination.
+func TestLoadRejectsStorageClassOnNonS3(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.nas]
+type          = "sftp"
+host          = "h"
+user          = "u"
+root          = "/r"
+storage_class = "GLACIER"
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), `unknown field "storage_class"`) {
+		t.Fatalf("expected storage_class rejected on sftp, got %v", err)
+	}
+}
+
+// TestLoadDestinationSFTPHostKeyValidation parses the optional sftp
+// known_hosts_file and host_key_algorithms params and confirms both render
+// verbatim into the sftp section. Pointing rclone at a known_hosts file is
+// what turns on server host-key validation; absent, rclone accepts any host
+// key the server presents.
+func TestLoadDestinationSFTPHostKeyValidation(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.nas]
+type                = "sftp"
+host                = "h"
+user                = "u"
+root                = "/r"
+password            = "p"
+known_hosts_file    = "~/.ssh/known_hosts"
+host_key_algorithms = "ssh-ed25519 ssh-rsa"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	d := cfg.Destinations["nas"]
+	if d.Params["known_hosts_file"] != "~/.ssh/known_hosts" {
+		t.Fatalf("known_hosts_file not resolved: %v", d.Params)
+	}
+	if d.Params["host_key_algorithms"] != "ssh-ed25519 ssh-rsa" {
+		t.Fatalf("host_key_algorithms not resolved: %v", d.Params)
+	}
+	section := d.RcloneSection()
+	for _, want := range []string{
+		"known_hosts_file = ~/.ssh/known_hosts",
+		"host_key_algorithms = ssh-ed25519 ssh-rsa",
+	} {
+		if !strings.Contains(section, want) {
+			t.Fatalf("section missing %q:\n%s", want, section)
+		}
+	}
+}
+
+// TestLoadRejectsKnownHostsFileOnNonSFTP confirms the host-key params are
+// confined to the sftp type by the unknown-field check.
+func TestLoadRejectsKnownHostsFileOnNonSFTP(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.s3]
+type             = "s3"
+provider         = "AWS"
+bucket           = "squirrel"
+root             = "/p"
+known_hosts_file = "~/.ssh/known_hosts"
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), `unknown field "known_hosts_file"`) {
+		t.Fatalf("expected known_hosts_file rejected on s3, got %v", err)
+	}
+}
+
+// TestLoadDestinationCrypt parses a crypt block with one env-resolved and
+// one literal password, the same secret forms destination credentials
+// accept.
+func TestLoadDestinationCrypt(t *testing.T) {
+	t.Setenv("CRYPT_PASSWORD", "obscured-pw")
+	p := writeConfig(t, `
+[destinations.offsite]
+type = "sftp"
+host = "host.example"
+user = "u"
+root = "/data"
+password = "transport-pw"
+
+[destinations.offsite.crypt]
+password  = { env = "CRYPT_PASSWORD" }
+password2 = "obscured-salt"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	d := cfg.Destinations["offsite"]
+	if d.Crypt == nil {
+		t.Fatalf("Crypt not parsed: %+v", d)
+	}
+	if d.Crypt.Password != "obscured-pw" || d.Crypt.Password2 != "obscured-salt" {
+		t.Fatalf("Crypt = %+v, want resolved password + literal salt", d.Crypt)
+	}
+	if d.CryptRemoteName() != "offsite-crypt" {
+		t.Fatalf("CryptRemoteName = %q, want offsite-crypt", d.CryptRemoteName())
+	}
+}
+
+// TestRcloneSectionCryptStacked pins the exact two-section render for a
+// crypt destination: the underlying remote exactly as without crypt, then
+// the overlay wrapping it at the destination root with the fixed
+// filename-encryption settings.
+func TestRcloneSectionCryptStacked(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.offsite]
+type = "sftp"
+host = "host.example"
+user = "u"
+root = "/data"
+password = "transport-pw"
+
+[destinations.offsite.crypt]
+password  = "obscured-pw"
+password2 = "obscured-salt"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := `[offsite]
+type = sftp
+host = host.example
+user = u
+blake3sum_command = b3sum
+password = transport-pw
+
+[offsite-crypt]
+type = crypt
+remote = offsite:/data
+filename_encryption = off
+directory_name_encryption = false
+password = obscured-pw
+password2 = obscured-salt
+`
+	if got := cfg.Destinations["offsite"].RcloneSection(); got != want {
+		t.Fatalf("RcloneSection:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestRcloneSectionSFTPEmitsBlake3sumCommand pins that every sftp section
+// carries a blake3sum_command. rclone never autodetects one, so without it
+// squirrel's `--hash blake3` syncs fail with "hash type not supported". The
+// line is sftp-only: backends with a fixed provider checksum must not get it.
+func TestRcloneSectionSFTPEmitsBlake3sumCommand(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.nas]
+type = "sftp"
+host = "h"
+user = "u"
+root = "/r"
+
+[destinations.s3]
+type     = "s3"
+provider = "AWS"
+bucket   = "b"
+root     = "/r"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Destinations["nas"].RcloneSection(); !strings.Contains(got, "blake3sum_command = b3sum") {
+		t.Fatalf("sftp section missing blake3sum_command:\n%s", got)
+	}
+	if got := cfg.Destinations["s3"].RcloneSection(); strings.Contains(got, "blake3sum_command") {
+		t.Fatalf("non-sftp section should not carry blake3sum_command:\n%s", got)
+	}
+}
+
+// TestRcloneSectionCryptOmitsEmptySalt: password2 is optional, mirroring
+// rclone's own crypt config, and an absent salt renders no password2 line.
+func TestRcloneSectionCryptOmitsEmptySalt(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.offsite]
+type = "sftp"
+host = "h"
+user = "u"
+root = "/data"
+
+[destinations.offsite.crypt]
+password = "obscured-pw"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	section := cfg.Destinations["offsite"].RcloneSection()
+	if strings.Contains(section, "password2") {
+		t.Fatalf("section has a password2 line for an absent salt:\n%s", section)
+	}
+	if !strings.Contains(section, "password = obscured-pw") {
+		t.Fatalf("section missing crypt password:\n%s", section)
+	}
+}
+
+func TestLoadDestinationCryptMissingPassword(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.offsite]
+type = "sftp"
+host = "h"
+user = "u"
+root = "/r"
+
+[destinations.offsite.crypt]
+password2 = "salt-only"
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "crypt.password is required") {
+		t.Fatalf("expected crypt.password-required error, got %v", err)
+	}
+}
+
+func TestLoadRejectsCryptOnLocalDestination(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.scratch]
+type = "local"
+root = "/tmp/scratch"
+
+[destinations.scratch.crypt]
+password = "obscured-pw"
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), `type "local"`) {
+		t.Fatalf("expected crypt-on-local rejection, got %v", err)
+	}
+}
+
+// TestLoadRejectsUnknownCryptField doubles as the "filename encryption is
+// fixed, not configurable" pin: a user trying to switch it on gets a
+// load-time error.
+func TestLoadRejectsUnknownCryptField(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.offsite]
+type = "sftp"
+host = "h"
+user = "u"
+root = "/r"
+
+[destinations.offsite.crypt]
+password            = "obscured-pw"
+filename_encryption = "standard"
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), `unknown field "filename_encryption"`) {
+		t.Fatalf("expected unknown-crypt-field error, got %v", err)
+	}
+}
+
+// TestLoadRejectsCryptRemoteNameCollision: the overlay's rclone.conf
+// section is named <dest>-crypt, so a sibling destination already holding
+// that name would render two sections under one header.
+func TestLoadRejectsCryptRemoteNameCollision(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.offsite]
+type = "sftp"
+host = "h"
+user = "u"
+root = "/r"
+
+[destinations.offsite.crypt]
+password = "obscured-pw"
+
+[destinations.offsite-crypt]
+type = "local"
+root = "/tmp/x"
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), `crypt remote name "offsite-crypt"`) {
+		t.Fatalf("expected crypt-name collision error, got %v", err)
 	}
 }
 

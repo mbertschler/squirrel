@@ -3,11 +3,15 @@
 Squirrel indexes **content** (BLAKE3 hashes), not paths. A hash ever observed
 must stay retrievable. Paths are observations of content; content is the entity.
 
-So `Upsert` never rewrites a row's `blake3` in place: when content at a path
-changes it marks the prior row `superseded` and inserts a new one, keeping at
-most one live (non-`superseded`) row per path. The schema enforces this on
-`files` — the `files_blake3_immutable` trigger and the `uniq_files_live_per_path`
-partial unique index (`store/migrations.go`).
+The schema makes this literal: `contents` is the append-only content entity
+(one row per BLAKE3, with size and origin), and `files` rows are path↔content
+observations referencing it. `Upsert` never rewrites a row's `content_id` in
+place: when content at a path changes it marks the prior row `superseded` and
+inserts a new one, keeping at most one live (non-`superseded`) row per path —
+enforced by the `uniq_files_live_per_path` partial unique index
+(`store/migrations.go`); the id↔hash binding itself is immutable by
+construction (`contents.blake3` is UNIQUE and contents rows are never
+updated).
 
 The `runs` table follows the same no-loss spirit by policy, not schema: squirrel
 never auto-prunes runs — they're an audit trail, and any retention is explicit

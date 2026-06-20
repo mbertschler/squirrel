@@ -290,6 +290,43 @@ func TestLocalRotationBoundsDir(t *testing.T) {
 	}
 }
 
+// TestRotationExemptsPreMigrationSnapshots is the #112 guard: routine
+// snapshot-on-sync rotation must never delete a pre-migration snapshot,
+// even when far more than keep sync-time rotations run, because it is a
+// buggy migration's only rollback surface. index-* snapshots still rotate.
+func TestRotationExemptsPreMigrationSnapshots(t *testing.T) {
+	dir := t.TempDir()
+	preMig := "pre-migration-v5-to-v6-20260101T000000.000Z.db"
+	if err := os.WriteFile(filepath.Join(dir, preMig), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Many more index-* snapshots than keep, written after the pre-migration
+	// one so by modtime they would sort newer — the pre-migration snapshot
+	// must survive on prefix, not on age.
+	for i := 0; i < 5; i++ {
+		name := fmt.Sprintf("index-2026020%dT000000.000Z-run-%d.db", i, i)
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	removed, err := rotateSnapshots(dir, 2)
+	if err != nil {
+		t.Fatalf("rotateSnapshots: %v", err)
+	}
+	for _, r := range removed {
+		if strings.HasPrefix(filepath.Base(r), "pre-migration-") {
+			t.Fatalf("rotation removed a pre-migration snapshot: %s", r)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, preMig)); err != nil {
+		t.Fatalf("pre-migration snapshot was deleted by sync-time rotation: %v", err)
+	}
+	left, _ := filepath.Glob(filepath.Join(dir, "index-*.db"))
+	if len(left) != 2 {
+		t.Fatalf("index-* files left = %d, want 2 (keep): %v", len(left), left)
+	}
+}
+
 // TestSyncFiltersOutIndexDirFromSource is the reserved-path guard for
 // sync: a .squirrel-index dir that incidentally exists in the source
 // volume must not be uploaded.

@@ -131,6 +131,45 @@ func TestFinishHookRunUnknownID(t *testing.T) {
 	}
 }
 
+// TestFinishHookRunRefusesTerminalRow: the first terminal write wins. A
+// second finish is refused with ErrAlreadyFinished and leaves the
+// recorded status, exit code, and end timestamp untouched (#114) — the
+// same first-write-wins guard FinishRun has.
+func TestFinishHookRunRefusesTerminalRow(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	vol, _ := s.CreateVolume(ctx, "v", "/tmp/v")
+	id, err := s.BeginHookRun(ctx, HookRunSpec{VolumeID: vol.ID, Trigger: HookTriggerInterval})
+	if err != nil {
+		t.Fatalf("BeginHookRun: %v", err)
+	}
+
+	firstExit := sql.NullInt64{Int64: 0, Valid: true}
+	if err := s.FinishHookRun(ctx, id, HookStatusSuccess, firstExit, ""); err != nil {
+		t.Fatalf("first FinishHookRun: %v", err)
+	}
+	before, err := s.hookRunByID(ctx, id)
+	if err != nil {
+		t.Fatalf("read back after first finish: %v", err)
+	}
+
+	err = s.FinishHookRun(ctx, id, HookStatusFailed, sql.NullInt64{Int64: 7, Valid: true}, "second finish")
+	if !errors.Is(err, ErrAlreadyFinished) {
+		t.Fatalf("second FinishHookRun err = %v, want ErrAlreadyFinished", err)
+	}
+
+	after, err := s.hookRunByID(ctx, id)
+	if err != nil {
+		t.Fatalf("read back after refused finish: %v", err)
+	}
+	if after.Status != HookStatusSuccess {
+		t.Fatalf("status = %q after refused second finish, want success", after.Status)
+	}
+	if after.ExitCode != before.ExitCode || after.EndedAtNs != before.EndedAtNs || after.Error != before.Error {
+		t.Fatalf("terminal row mutated by refused finish: before=%+v after=%+v", before, after)
+	}
+}
+
 func TestListHookRuns(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

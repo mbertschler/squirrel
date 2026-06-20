@@ -10,32 +10,44 @@ import (
 	"strings"
 )
 
-// FileRow is a single indexed file. Path is the file's volume-relative path
-// — reconstructed from the underlying (folder_id, name) storage on every
-// read. VolumeID references volumes(id). FirstSeenRunID is the run that
-// first inserted this row and is never overwritten on subsequent updates;
-// LastSeenRunID advances on every observation. SourceNodeID and SourceRunID
-// record provenance for peer-syncs (NULL means "local write" — today's only
-// path). They are populated on read for inspection; writes go through Upsert
-// with an explicit *Provenance.
+// FileRow is a single indexed file: one path↔content observation joined
+// with its contents row. Path is the file's volume-relative path —
+// reconstructed from the underlying (folder_id, name) storage on every
+// read. VolumeID references volumes(id). ContentID, Blake3, SizeBytes,
+// OriginNodeID, and OriginRunID come from the joined contents row;
+// origin is where the bytes first entered the system (NULL means
+// "introduced locally"), with OriginRunID in the origin node's run
+// space. FirstSeenRunID is the run that first inserted this row and is
+// never overwritten on subsequent updates; LastSeenRunID advances on
+// every observation. Writes go through Upsert, which resolves Blake3 +
+// SizeBytes to a contents row (creating one, with the supplied
+// *Provenance as its origin, on first contact) and ignores ContentID.
 type FileRow struct {
-	VolumeID       int64
-	Path           string
-	Blake3         []byte // raw 32-byte BLAKE3-256 digest
-	SizeBytes      int64
-	MtimeNs        int64
-	Status         string
-	FirstSeenRunID int64
-	LastSeenRunID  int64
-	IndexedAtNs    int64
-	SourceNodeID   sql.NullInt64
-	SourceRunID    sql.NullInt64
+	VolumeID           int64
+	Path               string
+	ContentID          int64
+	Blake3             []byte // raw 32-byte BLAKE3-256 digest
+	SizeBytes          int64
+	MtimeNs            int64
+	Status             string
+	FirstSeenRunID     int64
+	LastSeenRunID      int64
+	IndexedAtNs        int64
+	OriginNodeID       sql.NullInt64
+	OriginRunID        sql.NullInt64
+	StatusChangedRunID sql.NullInt64
 }
 
-// Provenance carries the "who wrote this row" attribution that Upsert
-// records on a peer-sourced write. NodeID references nodes(id) and RunID
-// references runs(id) on the receiver's side. A nil *Provenance to Upsert
-// records NULLs, the convention for local writes (today's only path).
+// Provenance carries the "where did this content first enter the
+// system" attribution that Upsert records as (origin_node_id,
+// origin_run_id) when a write creates a new contents row. NodeID
+// references nodes(id); RunID is in the origin node's run space — the
+// run at which that node introduced the content — so it is not a local
+// runs FK. The pair is propagated verbatim across peer hops, never
+// relabelled to the immediate sender. A nil *Provenance records NULLs,
+// the convention for locally introduced content. Content that already
+// has a contents row keeps its recorded origin — origin is content-
+// level first-introduction provenance, not per-observation attribution.
 type Provenance struct {
 	NodeID int64
 	RunID  int64
@@ -48,22 +60,31 @@ type FileWithVolume struct {
 	Volume Volume
 }
 
+// File statuses. 'present' and 'missing' describe whether the live
+// content was found on disk; 'offloaded' is the intentional sibling of
+// 'missing' — the content is the path's current content but its local
+// bytes were deliberately removed after being secured elsewhere, so
+// indexing and audit treat the on-disk absence as expected. 'superseded'
+// rows are the append-only content history of a path.
 const (
 	StatusPresent    = "present"
 	StatusMissing    = "missing"
 	StatusSuperseded = "superseded"
+	StatusOffloaded  = "offloaded"
 )
 
 // fileSelectColumns is the projection used by every files read. The path
-// column is reconstructed from the joined folders row so callers see the
-// same FileRow shape as in v7 even though storage is keyed off
-// (folder_id, name). Pair every new SELECT with this list and the
-// fileFromJoin clause below so columns stay in lockstep with scanDests.
-const fileSelectColumns = `fo.volume_id, ` + pathFromFolderAndName + `, f.blake3, f.size_bytes, f.mtime_ns, f.status, f.first_seen_run_id, f.last_seen_run_id, f.indexed_at_ns, f.source_node_id, f.source_run_id`
+// column is reconstructed from the joined folders row, and the content
+// columns (blake3, size, origin) from the joined contents row, so callers
+// see one flat FileRow even though storage is split. Pair every new
+// SELECT with this list and the fileFromJoin clause below so columns stay
+// in lockstep with scanDests.
+const fileSelectColumns = `fo.volume_id, ` + pathFromFolderAndName + `, f.content_id, c.blake3, c.size_bytes, f.mtime_ns, f.status, f.first_seen_run_id, f.last_seen_run_id, f.indexed_at_ns, c.origin_node_id, c.origin_run_id, f.status_changed_run_id`
 
 // fileFromJoin is the FROM clause every file read uses. files is the inner
-// table; folders is joined for volume_id + path reconstruction.
-const fileFromJoin = `files f JOIN folders fo ON fo.id = f.folder_id`
+// table; folders is joined for volume_id + path reconstruction and
+// contents for the content columns.
+const fileFromJoin = `files f JOIN folders fo ON fo.id = f.folder_id JOIN contents c ON c.id = f.content_id`
 
 // joinedColumns extends fileSelectColumns with the volume row for SELECTs
 // that pre-resolve the user-facing filesystem path. The volumes JOIN is
@@ -88,9 +109,9 @@ func (r *FileRow) scanFrom(s rowScanner) error {
 // pointers on top so files-half scanning still has one source of truth.
 func (r *FileRow) scanDests() []any {
 	return []any{
-		&r.VolumeID, &r.Path, &r.Blake3, &r.SizeBytes, &r.MtimeNs,
+		&r.VolumeID, &r.Path, &r.ContentID, &r.Blake3, &r.SizeBytes, &r.MtimeNs,
 		&r.Status, &r.FirstSeenRunID, &r.LastSeenRunID, &r.IndexedAtNs,
-		&r.SourceNodeID, &r.SourceRunID,
+		&r.OriginNodeID, &r.OriginRunID, &r.StatusChangedRunID,
 	}
 }
 
@@ -128,9 +149,10 @@ func queryRows[T any](ctx context.Context, db *sql.DB, query string, scan func(r
 }
 
 // GetByPath returns the currently-live row for (volumeID, relPath) — i.e.
-// the row with status='present' or status='missing'. Superseded rows
-// (historical content at this path) are skipped; use ListHistoryByPath to
-// see them. Returns sql.ErrNoRows when no live row exists for the path.
+// the row with status 'present', 'missing', or 'offloaded'. Superseded
+// rows (historical content at this path) are skipped; use
+// ListHistoryByPath to see them. Returns sql.ErrNoRows when no live row
+// exists for the path.
 //
 // The path-level invariant (at most one non-superseded row per
 // (folder_id, name)) is enforced by Upsert and the uniq_files_live_per_path
@@ -261,7 +283,7 @@ func relPathUnder(base, abs string) (string, bool) {
 func (s *Store) GetPresentByBlake3InVolume(ctx context.Context, volumeID int64, digest []byte) (FileRow, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT `+fileSelectColumns+` FROM `+fileFromJoin+`
-		 WHERE f.blake3 = ? AND fo.volume_id = ? AND f.status = 'present'
+		 WHERE c.blake3 = ? AND fo.volume_id = ? AND f.status = 'present'
 		   AND fo.path != '.squirrel-history'   AND fo.path NOT LIKE '.squirrel-history/%'
 		   AND fo.path != '.squirrel-conflicts' AND fo.path NOT LIKE '.squirrel-conflicts/%'
 		   AND fo.path != '.squirrel-restore-history' AND fo.path NOT LIKE '.squirrel-restore-history/%'
@@ -272,46 +294,69 @@ func (s *Store) GetPresentByBlake3InVolume(ctx context.Context, volumeID int64, 
 	return r, err
 }
 
+// ContentIntroductionRunID returns the earliest first_seen_run_id among
+// every files row (any status) observing contentID in volumeID — the
+// local run at which the content was introduced to the volume. This is
+// the origin-run coordinate the peer-sync sender materialises for
+// locally-introduced content (contents.origin_* NULL). Returns
+// sql.ErrNoRows when the content has never been observed in the volume.
+func (s *Store) ContentIntroductionRunID(ctx context.Context, volumeID, contentID int64) (int64, error) {
+	var run sql.NullInt64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT MIN(f.first_seen_run_id) FROM files f
+		 JOIN folders fo ON fo.id = f.folder_id
+		 WHERE fo.volume_id = ? AND f.content_id = ?`,
+		volumeID, contentID).Scan(&run)
+	if err != nil {
+		return 0, fmt.Errorf("content introduction run: %w", err)
+	}
+	if !run.Valid {
+		return 0, sql.ErrNoRows
+	}
+	return run.Int64, nil
+}
+
 // GetByBlake3 returns all rows matching the given BLAKE3 digest (raw 32 bytes),
 // joined with their volume.
 func (s *Store) GetByBlake3(ctx context.Context, digest []byte) ([]FileWithVolume, error) {
 	return queryRows(ctx, s.db, `
 		SELECT `+joinedColumns+`
 		FROM `+fileFromJoin+` JOIN volumes v ON v.id = fo.volume_id
-		WHERE f.blake3 = ?
+		WHERE c.blake3 = ?
 		ORDER BY v.name, `+pathFromFolderAndName+`
 	`, scanFileWithVolume, digest)
 }
 
 // Upsert records an observation of content at a path. It is the only
 // supported write path for the files table because it enforces the
-// "never overwrite a hash" rule: blake3 on an existing row is immutable.
+// "never overwrite a hash" rule: a row's content_id is immutable.
 //
-// There are three cases, all handled atomically in a single transaction:
+// The row's Blake3 + SizeBytes are first resolved to a contents row,
+// creating one when the hash has never been seen (with prov as its
+// origin). Then there are three cases, all handled atomically in a
+// single transaction:
 //
-//  1. A row with the exact (folder_id, name, blake3) already exists and is
-//     the live row — update its mutable fields (touch / restore from
-//     missing). first_seen_run_id is preserved.
-//  2. A row with the exact (folder_id, name, blake3) exists but is
+//  1. A row with the exact (folder_id, name, content_id) already exists
+//     and is the live row — update its mutable fields (touch / restore
+//     from missing or offloaded). first_seen_run_id is preserved.
+//  2. A row with the exact (folder_id, name, content_id) exists but is
 //     superseded (content has reverted to a previously-seen value) — flip
 //     the currently-live row at this path to 'superseded' and revive the
 //     matched row to the requested status (first_seen_run_id preserved).
-//  3. No row exists at (folder_id, name, blake3) — flip the currently-live
-//     row at (folder_id, name), if any, to 'superseded' and insert the new
-//     row.
+//  3. No row exists at (folder_id, name, content_id) — flip the
+//     currently-live row at (folder_id, name), if any, to 'superseded'
+//     and insert the new row.
 //
-// In all cases, blake3 is never rewritten in place; content history at a
-// path grows append-only. After the row write succeeds, the affected
+// In all cases, content_id is never rewritten in place; content history
+// at a path grows append-only. After the row write succeeds, the affected
 // folder's shallow + deep hashes and every ancestor's deep hash are
 // recomputed inside the same transaction so the folder Merkle stays
 // consistent with the live file set (#44).
 //
-// prov carries the per-write provenance recorded as (source_node_id,
-// source_run_id) on the affected row. A nil *Provenance records NULLs —
-// "local write", today's only path. The provenance reflects the current
-// observation: cases 1 and 2 rewrite the live row's source columns to the
-// new prov (the previous attribution is preserved on the superseded
-// row in case 2).
+// prov is recorded as the new contents row's (origin_node_id,
+// origin_run_id) when this write introduces the content; a nil
+// *Provenance records NULLs — "introduced locally". Content that already
+// has a contents row keeps its recorded origin.
 func (s *Store) Upsert(ctx context.Context, r FileRow, prov *Provenance) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -350,33 +395,37 @@ func upsertRowInTx(ctx context.Context, tx *sql.Tx, r FileRow, prov *Provenance)
 	if err != nil {
 		return 0, err
 	}
+	contentID, err := getOrCreateContentTx(ctx, tx, r.Blake3, r.SizeBytes, prov)
+	if err != nil {
+		return 0, err
+	}
 
 	var existingStatus string
 	err = tx.QueryRowContext(ctx,
-		`SELECT status FROM files WHERE folder_id = ? AND name = ? AND blake3 = ?`,
-		folderID, name, r.Blake3).Scan(&existingStatus)
+		`SELECT status FROM files WHERE folder_id = ? AND name = ? AND content_id = ?`,
+		folderID, name, contentID).Scan(&existingStatus)
 
 	switch {
 	case err == nil && existingStatus != StatusSuperseded:
 		// Case 1: exact row exists and is live — touch it.
-		if err := updateLiveRow(ctx, tx, folderID, name, r, prov); err != nil {
+		if err := updateLiveRow(ctx, tx, folderID, name, contentID, r); err != nil {
 			return 0, err
 		}
 	case err == nil && existingStatus == StatusSuperseded:
 		// Case 2: content revert — supersede whatever is live now, then
 		// revive the matched (formerly superseded) row.
-		if err := supersedeLiveRow(ctx, tx, folderID, name); err != nil {
+		if err := supersedeLiveRow(ctx, tx, folderID, name, r.LastSeenRunID); err != nil {
 			return 0, err
 		}
-		if err := updateLiveRow(ctx, tx, folderID, name, r, prov); err != nil {
+		if err := updateLiveRow(ctx, tx, folderID, name, contentID, r); err != nil {
 			return 0, err
 		}
 	case errors.Is(err, sql.ErrNoRows):
 		// Case 3: brand new content at this path (possibly first-ever).
-		if err := supersedeLiveRow(ctx, tx, folderID, name); err != nil {
+		if err := supersedeLiveRow(ctx, tx, folderID, name, r.LastSeenRunID); err != nil {
 			return 0, err
 		}
-		if err := insertNewRow(ctx, tx, folderID, name, r, prov); err != nil {
+		if err := insertNewRow(ctx, tx, folderID, name, contentID, r); err != nil {
 			return 0, err
 		}
 	default:
@@ -385,10 +434,10 @@ func upsertRowInTx(ctx context.Context, tx *sql.Tx, r FileRow, prov *Provenance)
 	return folderID, nil
 }
 
-// provColumns returns the (source_node_id, source_run_id) pair as
-// sql.NullInt64 so callers can splat them into UPDATE/INSERT bind lists.
-// A nil *Provenance yields two invalid NullInt64 — the binding renders as
-// NULL columns, the "local write" convention.
+// provColumns returns the (origin_node_id, origin_run_id) pair as
+// sql.NullInt64 so callers can splat them into INSERT bind lists. A nil
+// *Provenance yields two invalid NullInt64 — the binding renders as NULL
+// columns, the "introduced locally" convention.
 func provColumns(p *Provenance) (sql.NullInt64, sql.NullInt64) {
 	if p == nil {
 		return sql.NullInt64{}, sql.NullInt64{}
@@ -397,15 +446,77 @@ func provColumns(p *Provenance) (sql.NullInt64, sql.NullInt64) {
 		sql.NullInt64{Int64: p.RunID, Valid: true}
 }
 
+// getOrCreateContentTx resolves a blake3 digest to its contents row id,
+// inserting the row on first contact with this content. The insert
+// records sizeBytes and the supplied provenance as the content's origin;
+// a digest that already has a row keeps its stored size and origin (the
+// contents table is append-only and rows are immutable). A stored size
+// that disagrees with sizeBytes surfaces as an error.
+func getOrCreateContentTx(ctx context.Context, tx *sql.Tx, digest []byte, sizeBytes int64, prov *Provenance) (int64, error) {
+	id, err := lookupContentTx(ctx, tx, digest, sizeBytes)
+	if err == nil {
+		return id, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+	originNode, originRun := provColumns(prov)
+	res, err := tx.ExecContext(ctx,
+		`INSERT INTO contents (blake3, size_bytes, origin_node_id, origin_run_id)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(blake3) DO NOTHING`,
+		digest, sizeBytes, originNode, originRun)
+	if err != nil {
+		return 0, fmt.Errorf("insert content: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("insert content rows: %w", err)
+	}
+	if n == 1 {
+		id, err = res.LastInsertId()
+		if err != nil {
+			return 0, fmt.Errorf("content last insert id: %w", err)
+		}
+		return id, nil
+	}
+	// The digest landed via a concurrent writer between lookup and insert.
+	id, err = lookupContentTx(ctx, tx, digest, sizeBytes)
+	if err != nil {
+		return 0, fmt.Errorf("re-lookup content after conflict: %w", err)
+	}
+	return id, nil
+}
+
+// lookupContentTx returns the contents row id for digest. A stored
+// size_bytes that disagrees with sizeBytes means index corruption or a
+// mis-hashing caller, so it surfaces loudly instead of returning the row.
+func lookupContentTx(ctx context.Context, tx *sql.Tx, digest []byte, sizeBytes int64) (int64, error) {
+	var id, storedSize int64
+	err := tx.QueryRowContext(ctx,
+		`SELECT id, size_bytes FROM contents WHERE blake3 = ?`, digest).Scan(&id, &storedSize)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+	if err != nil {
+		return 0, fmt.Errorf("lookup content: %w", err)
+	}
+	if storedSize != sizeBytes {
+		return 0, fmt.Errorf("content %x: stored size %d disagrees with observed size %d", digest, storedSize, sizeBytes)
+	}
+	return id, nil
+}
+
 // supersedeLiveRow flips the single non-superseded row at (folderID, name)
-// (if any) to status='superseded'. A no-op when there is no live row, e.g.
-// the very first observation of a path. last_seen_run_id stays frozen at the
+// (if any) to status='superseded', stamping runID as the row's
+// status-change run. A no-op when there is no live row, e.g. the very
+// first observation of a path. last_seen_run_id stays frozen at the
 // value it had — that is the run during which the row was last seen alive.
-func supersedeLiveRow(ctx context.Context, tx *sql.Tx, folderID int64, name string) error {
+func supersedeLiveRow(ctx context.Context, tx *sql.Tx, folderID int64, name string, runID int64) error {
 	_, err := tx.ExecContext(ctx, `
-		UPDATE files SET status = 'superseded'
+		UPDATE files SET status = 'superseded', status_changed_run_id = ?
 		WHERE folder_id = ? AND name = ? AND status != 'superseded'
-	`, folderID, name)
+	`, runID, folderID, name)
 	if err != nil {
 		return fmt.Errorf("supersede live row: %w", err)
 	}
@@ -414,10 +525,12 @@ func supersedeLiveRow(ctx context.Context, tx *sql.Tx, folderID int64, name stri
 
 // RecordConflictPreStage atomically supersedes the live row at
 // originalPath and inserts a new 'present' row at conflictRow.Path
-// carrying the prior blake3 and the supplied provenance. The two
-// updates run inside one transaction so an agent crash between them
-// rolls both back rather than leaving the receiver in a state where
-// the prior content is reachable only by path or only by hash.
+// carrying the prior content. prov becomes the content's origin only
+// when the conflict carries bytes never seen before (an out-of-band
+// drift); known content keeps its recorded origin. The two updates run
+// inside one transaction so an agent crash between them rolls both back
+// rather than leaving the receiver in a state where the prior content
+// is reachable only by path or only by hash.
 //
 // The on-disk rename that moves the bytes from originalPath to
 // conflictRow.Path is NOT part of this transaction (the filesystem
@@ -442,7 +555,7 @@ func (s *Store) RecordConflictPreStage(ctx context.Context, volumeID int64, orig
 	if err != nil {
 		return err
 	}
-	if err := supersedeLiveRow(ctx, tx, origFolderID, origName); err != nil {
+	if err := supersedeLiveRow(ctx, tx, origFolderID, origName, conflictRow.LastSeenRunID); err != nil {
 		return err
 	}
 
@@ -451,7 +564,11 @@ func (s *Store) RecordConflictPreStage(ctx context.Context, volumeID int64, orig
 	if err != nil {
 		return err
 	}
-	if err := insertNewRow(ctx, tx, conflictFolderID, conflictName, conflictRow, prov); err != nil {
+	conflictContentID, err := getOrCreateContentTx(ctx, tx, conflictRow.Blake3, conflictRow.SizeBytes, prov)
+	if err != nil {
+		return err
+	}
+	if err := insertNewRow(ctx, tx, conflictFolderID, conflictName, conflictContentID, conflictRow); err != nil {
 		return err
 	}
 
@@ -467,36 +584,36 @@ func (s *Store) RecordConflictPreStage(ctx context.Context, volumeID int64, orig
 }
 
 // updateLiveRow refreshes the mutable fields on an existing row matching
-// (folder_id, name, blake3). blake3 and first_seen_run_id are never touched.
-// The (source_node_id, source_run_id) provenance pair is rewritten to the
-// caller-supplied prov so the row tracks the most recent attribution.
-func updateLiveRow(ctx context.Context, tx *sql.Tx, folderID int64, name string, r FileRow, prov *Provenance) error {
-	srcNode, srcRun := provColumns(prov)
+// (folder_id, name, content_id). content_id and first_seen_run_id are
+// never touched. status_changed_run_id advances exactly when the write
+// changes the row's status (the CASE reads the pre-update status, per
+// SQL UPDATE semantics), covering the revive transitions Case 2 routes
+// through here.
+func updateLiveRow(ctx context.Context, tx *sql.Tx, folderID int64, name string, contentID int64, r FileRow) error {
 	_, err := tx.ExecContext(ctx, `
 		UPDATE files SET
-			size_bytes = ?, mtime_ns = ?, status = ?,
-			last_seen_run_id = ?, indexed_at_ns = ?,
-			source_node_id = ?, source_run_id = ?
-		WHERE folder_id = ? AND name = ? AND blake3 = ?
-	`, r.SizeBytes, r.MtimeNs, r.Status, r.LastSeenRunID, r.IndexedAtNs,
-		srcNode, srcRun,
-		folderID, name, r.Blake3)
+			mtime_ns = ?,
+			status_changed_run_id = CASE WHEN status = ? THEN status_changed_run_id ELSE ? END,
+			status = ?,
+			last_seen_run_id = ?, indexed_at_ns = ?
+		WHERE folder_id = ? AND name = ? AND content_id = ?
+	`, r.MtimeNs, r.Status, r.LastSeenRunID, r.Status, r.LastSeenRunID, r.IndexedAtNs,
+		folderID, name, contentID)
 	if err != nil {
 		return fmt.Errorf("update live row: %w", err)
 	}
 	return nil
 }
 
-func insertNewRow(ctx context.Context, tx *sql.Tx, folderID int64, name string, r FileRow, prov *Provenance) error {
-	srcNode, srcRun := provColumns(prov)
+func insertNewRow(ctx context.Context, tx *sql.Tx, folderID int64, name string, contentID int64, r FileRow) error {
 	_, err := tx.ExecContext(ctx,
-		`INSERT INTO files (folder_id, name, blake3, size_bytes, mtime_ns,
+		`INSERT INTO files (folder_id, name, content_id, mtime_ns,
 			status, first_seen_run_id, last_seen_run_id, indexed_at_ns,
-			source_node_id, source_run_id)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		folderID, name, r.Blake3, r.SizeBytes, r.MtimeNs,
+			status_changed_run_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		folderID, name, contentID, r.MtimeNs,
 		r.Status, r.FirstSeenRunID, r.LastSeenRunID, r.IndexedAtNs,
-		srcNode, srcRun)
+		r.FirstSeenRunID)
 	if err != nil {
 		return fmt.Errorf("insert new row: %w", err)
 	}
@@ -558,9 +675,11 @@ func touchSeenRowInTx(ctx context.Context, tx *sql.Tx, volumeID int64, relPath s
 		return 0, fmt.Errorf("lookup folder: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE files SET last_seen_run_id = ?, status = 'present'
+		`UPDATE files SET last_seen_run_id = ?,
+			status_changed_run_id = CASE WHEN status = 'present' THEN status_changed_run_id ELSE ? END,
+			status = 'present'
 		 WHERE folder_id = ? AND name = ? AND status != 'superseded'`,
-		runID, folderID, name); err != nil {
+		runID, runID, folderID, name); err != nil {
 		return 0, fmt.Errorf("touch seen: %w", err)
 	}
 	return folderID, nil
@@ -648,9 +767,12 @@ func (s *Store) ApplyIndexBatch(ctx context.Context, runID int64, entries []Inde
 // MarkMissing flips every row in the given volume that was not touched by the
 // given run (last_seen_run_id != currentRunID) and is currently 'present' to
 // 'missing', stamping last_seen_run_id with the current run as part of the
-// flip. The stamp captures the audit run that *observed* the absence so
-// drift surfacing (#17) can count "files newly missing during run N" via
-// CountMissingFilesByRun without any audit-specific schema column.
+// flip. Only 'present' rows are eligible: an 'offloaded' row's on-disk
+// absence is intentional, so it keeps its status and stays out of the
+// drift counts. The stamp captures the audit run that *observed* the
+// absence so drift surfacing (#17) can count "files newly missing during
+// run N" via CountMissingFilesByRun without any audit-specific schema
+// column.
 //
 // The caller is responsible for only invoking this after the run has fully
 // scanned the volume: any path the run failed to visit (per-file error,
@@ -697,11 +819,11 @@ func (s *Store) MarkMissing(ctx context.Context, volumeID int64, currentRunID in
 	affRows.Close()
 
 	res, err := tx.ExecContext(ctx, `
-		UPDATE files SET status = 'missing', last_seen_run_id = ?
+		UPDATE files SET status = 'missing', last_seen_run_id = ?, status_changed_run_id = ?
 		WHERE status = 'present' AND folder_id IN (
 			SELECT id FROM folders WHERE volume_id = ?
 		) AND last_seen_run_id != ?
-	`, currentRunID, volumeID, currentRunID)
+	`, currentRunID, currentRunID, volumeID, currentRunID)
 	if err != nil {
 		return 0, fmt.Errorf("mark missing: %w", err)
 	}
@@ -720,18 +842,62 @@ func (s *Store) MarkMissing(ctx context.Context, volumeID int64, currentRunID in
 	return n, nil
 }
 
-// ListDuplicates returns rows whose blake3 digest appears at more than one
+// MarkOffloaded flips the live 'present' row at (volumeID, relPath)
+// carrying contentID to status='offloaded', stamping last_seen_run_id
+// with the offload run that removed the bytes. Matching on the exact
+// content id is part of the offload safety contract: the caller
+// verified the on-disk bytes against this content immediately before
+// unlinking, so a row whose content or status changed underfoot matches
+// nothing here and surfaces as an error instead of mislabelling a
+// different observation. The folder Merkle and ancestor chain are
+// recomputed in the same transaction because the flip removes the file
+// from the live set, mirroring MarkMissing.
+func (s *Store) MarkOffloaded(ctx context.Context, volumeID int64, relPath string, contentID, runID int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin mark offloaded: %w", err)
+	}
+	defer tx.Rollback()
+
+	folderPath, name := splitFilePath(relPath)
+	var folderID int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id FROM folders WHERE volume_id = ? AND path = ?`,
+		volumeID, folderPath).Scan(&folderID); err != nil {
+		return fmt.Errorf("mark offloaded %s: lookup folder: %w", relPath, err)
+	}
+	res, err := tx.ExecContext(ctx, `
+		UPDATE files SET status = 'offloaded', last_seen_run_id = ?, status_changed_run_id = ?
+		WHERE folder_id = ? AND name = ? AND content_id = ? AND status = 'present'
+	`, runID, runID, folderID, name, contentID)
+	if err != nil {
+		return fmt.Errorf("mark offloaded %s: %w", relPath, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mark offloaded rows %s: %w", relPath, err)
+	}
+	if n != 1 {
+		return fmt.Errorf("mark offloaded %s: no live 'present' row with content id %d", relPath, contentID)
+	}
+	if err := recomputeFolderAndAncestors(ctx, tx, folderID, runID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ListDuplicates returns rows whose content appears at more than one
 // (volume_id, path), joined with their volume.
 func (s *Store) ListDuplicates(ctx context.Context) ([]FileWithVolume, error) {
 	return queryRows(ctx, s.db, `
 		SELECT `+joinedColumns+`
 		FROM `+fileFromJoin+` JOIN volumes v ON v.id = fo.volume_id
-		WHERE f.blake3 IN (
-			SELECT blake3 FROM files WHERE status = 'present'
-			GROUP BY blake3 HAVING COUNT(*) > 1
+		WHERE f.content_id IN (
+			SELECT content_id FROM files WHERE status = 'present'
+			GROUP BY content_id HAVING COUNT(*) > 1
 		)
 		AND f.status = 'present'
-		ORDER BY f.blake3, v.name, `+pathFromFolderAndName+`
+		ORDER BY c.blake3, v.name, `+pathFromFolderAndName+`
 	`, scanFileWithVolume)
 }
 
@@ -770,19 +936,19 @@ func (s *Store) ListPresentFilesInFolder(ctx context.Context, folderID int64) ([
 		scanFileRow, folderID)
 }
 
-// ListPresentBySource yields every present row in volumeID whose
-// source_node_id matches nodeID. A valid nodeID matches that node id
-// and exploits idx_files_source_node (the partial index on
-// (source_node_id) WHERE status='present' AND source_node_id IS NOT
-// NULL); a zero NullInt64 filters to rows with source_node_id IS NULL —
-// the "local write" convention — and falls back to a status-scoped scan
-// because the partial index excludes those rows by construction.
+// ListPresentByOrigin yields every present row in volumeID whose
+// content's origin_node_id matches nodeID. A valid nodeID matches that
+// node id and exploits idx_contents_origin_node (the partial index on
+// contents(origin_node_id) WHERE origin_node_id IS NOT NULL); a zero
+// NullInt64 filters to content with origin_node_id IS NULL — the
+// "introduced locally" convention — and falls back to a status-scoped
+// scan because the partial index excludes those rows by construction.
 //
 // Yielded in path order so a caller streaming to `rclone --files-from`
 // produces a stable, diffable listing. iter.Seq2 is used so large
 // volumes don't materialise the whole row set in memory before the
 // caller starts consuming it.
-func (s *Store) ListPresentBySource(ctx context.Context, volumeID int64, nodeID sql.NullInt64) iter.Seq2[FileRow, error] {
+func (s *Store) ListPresentByOrigin(ctx context.Context, volumeID int64, nodeID sql.NullInt64) iter.Seq2[FileRow, error] {
 	return func(yield func(FileRow, error) bool) {
 		var (
 			rows *sql.Rows
@@ -791,25 +957,25 @@ func (s *Store) ListPresentBySource(ctx context.Context, volumeID int64, nodeID 
 		if nodeID.Valid {
 			rows, err = s.db.QueryContext(ctx,
 				`SELECT `+fileSelectColumns+` FROM `+fileFromJoin+`
-				 WHERE fo.volume_id = ? AND f.status = 'present' AND f.source_node_id = ?
+				 WHERE fo.volume_id = ? AND f.status = 'present' AND c.origin_node_id = ?
 				 ORDER BY `+pathFromFolderAndName,
 				volumeID, nodeID.Int64)
 		} else {
 			rows, err = s.db.QueryContext(ctx,
 				`SELECT `+fileSelectColumns+` FROM `+fileFromJoin+`
-				 WHERE fo.volume_id = ? AND f.status = 'present' AND f.source_node_id IS NULL
+				 WHERE fo.volume_id = ? AND f.status = 'present' AND c.origin_node_id IS NULL
 				 ORDER BY `+pathFromFolderAndName,
 				volumeID)
 		}
 		if err != nil {
-			yield(FileRow{}, fmt.Errorf("query present by source: %w", err))
+			yield(FileRow{}, fmt.Errorf("query present by origin: %w", err))
 			return
 		}
 		defer rows.Close()
 		for rows.Next() {
 			var r FileRow
 			if err := r.scanFrom(rows); err != nil {
-				yield(FileRow{}, fmt.Errorf("scan present by source: %w", err))
+				yield(FileRow{}, fmt.Errorf("scan present by origin: %w", err))
 				return
 			}
 			if !yield(r, nil) {

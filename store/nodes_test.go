@@ -49,11 +49,11 @@ func TestGetOrCreatePeerNodeIdempotent(t *testing.T) {
 	defer s.Close()
 	ctx := context.Background()
 
-	first, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.local")
+	first, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.local", true)
 	if err != nil {
 		t.Fatalf("first: %v", err)
 	}
-	again, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.local")
+	again, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.local", true)
 	if err != nil {
 		t.Fatalf("second: %v", err)
 	}
@@ -71,10 +71,10 @@ func TestGetOrCreatePeerNodeRejectsEndpointMismatch(t *testing.T) {
 	defer s.Close()
 	ctx := context.Background()
 
-	if _, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.local"); err != nil {
+	if _, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.local", true); err != nil {
 		t.Fatalf("first: %v", err)
 	}
-	_, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.different")
+	_, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.different", true)
 	if err == nil || !strings.Contains(err.Error(), "already has endpoint") {
 		t.Fatalf("error = %v, want collision-message", err)
 	}
@@ -92,7 +92,7 @@ func TestGetOrCreatePeerNodeRefusesSelfNameCollision(t *testing.T) {
 	defer s.Close()
 	ctx := context.Background()
 
-	_, err = s.GetOrCreatePeerNode(ctx, "me", "http://attacker.example")
+	_, err = s.GetOrCreatePeerNode(ctx, "me", "http://attacker.example", true)
 	if err == nil || !strings.Contains(err.Error(), "self-row") {
 		t.Fatalf("error = %v, want self-row refusal", err)
 	}
@@ -107,7 +107,7 @@ func TestPeerSyncStateUpsertRoundtrip(t *testing.T) {
 	ctx := context.Background()
 
 	vID := makeVolume(t, s, "/v")
-	peer, _ := s.GetOrCreatePeerNode(ctx, "nas", "http://nas.example")
+	peer, _ := s.GetOrCreatePeerNode(ctx, "nas", "http://nas.example", true)
 
 	if err := s.UpsertPeerSyncState(ctx, vID, peer.ID, 7, false); err != nil {
 		t.Fatalf("first upsert: %v", err)
@@ -139,7 +139,7 @@ func TestBeginPeerSyncRunStampsLinkage(t *testing.T) {
 	ctx := context.Background()
 
 	vID := makeVolume(t, s, "/v")
-	peer, _ := s.GetOrCreatePeerNode(ctx, "nas", "http://nas.example")
+	peer, _ := s.GetOrCreatePeerNode(ctx, "nas", "http://nas.example", true)
 
 	id, err := s.BeginPeerSyncRun(ctx, vID, peer.ID, 99, "nas")
 	if err != nil {
@@ -170,7 +170,7 @@ func TestSetCorrelatedRunID(t *testing.T) {
 	ctx := context.Background()
 
 	vID := makeVolume(t, s, "/v")
-	peer, _ := s.GetOrCreatePeerNode(ctx, "nas", "http://nas.example")
+	peer, _ := s.GetOrCreatePeerNode(ctx, "nas", "http://nas.example", true)
 	id, _ := s.BeginPeerSyncRun(ctx, vID, peer.ID, 0, "nas")
 
 	if err := s.SetCorrelatedRunID(ctx, id, 1234); err != nil {
@@ -182,5 +182,144 @@ func TestSetCorrelatedRunID(t *testing.T) {
 	}
 	if err := s.SetCorrelatedRunID(ctx, 99999, 1); err == nil {
 		t.Fatalf("expected no-such-run error")
+	}
+}
+
+// TestGetOrCreateOriginNode covers the three name-resolution outcomes
+// the verbatim origin-propagation path needs: an unknown name creates a
+// placeholder-endpoint row (a forwarded origin may name a node this
+// host has never peered with), a known peer row is returned as-is, and
+// the self name resolves to the self-row rather than colliding with it.
+func TestGetOrCreateOriginNode(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, err := OpenWithOptions(dsn, OpenOptions{NodeName: "local"})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	created, err := s.GetOrCreateOriginNode(ctx, "far-away")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode(far-away): %v", err)
+	}
+	if !created.Endpoint.Valid || created.Endpoint.String != "peer://far-away" {
+		t.Fatalf("created endpoint = %+v, want the peer://far-away placeholder", created.Endpoint)
+	}
+	again, err := s.GetOrCreateOriginNode(ctx, "far-away")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode(far-away) again: %v", err)
+	}
+	if again.ID != created.ID {
+		t.Fatalf("second resolve created a new row: %d → %d", created.ID, again.ID)
+	}
+
+	peer, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.example", true)
+	if err != nil {
+		t.Fatalf("GetOrCreatePeerNode: %v", err)
+	}
+	byOrigin, err := s.GetOrCreateOriginNode(ctx, "nas")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode(nas): %v", err)
+	}
+	if byOrigin.ID != peer.ID || byOrigin.Endpoint.String != "https://nas.example" {
+		t.Fatalf("origin resolve of a peer = %+v, want the existing peer row %+v", byOrigin, peer)
+	}
+
+	self, _ := s.GetSelfNode(ctx)
+	bySelfName, err := s.GetOrCreateOriginNode(ctx, "local")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode(local): %v", err)
+	}
+	if bySelfName.ID != self.ID {
+		t.Fatalf("self name resolved to row %d, want the self-row %d", bySelfName.ID, self.ID)
+	}
+}
+
+// TestGetOrCreateOriginNodeRejectsInvalidName pins that the node-name
+// rule guards origin creation too — a wire-supplied name that fails
+// nodeNameRE must not land a row. ValidNodeName is the predicate the
+// protocol layer uses to refuse such names up front.
+func TestGetOrCreateOriginNodeRejectsInvalidName(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, _ := Open(dsn)
+	defer s.Close()
+
+	if ValidNodeName("../etc") {
+		t.Fatalf("ValidNodeName accepted a traversal-shaped name")
+	}
+	if !ValidNodeName("node-a_2") {
+		t.Fatalf("ValidNodeName rejected a compliant name")
+	}
+	if _, err := s.GetOrCreateOriginNode(context.Background(), "../etc"); err == nil {
+		t.Fatalf("invalid origin node name accepted, want error")
+	}
+}
+
+// TestGetOrCreatePeerNodeUpgradesPlaceholder: a row created from a
+// name-only context (a forwarded origin, or a durability pull before
+// any sync) carries the peer:// placeholder; an operator-configured
+// (trusted) caller presenting an actual endpoint upgrades it in place
+// instead of refusing the collision. Real-endpoint mismatches stay
+// refused.
+func TestGetOrCreatePeerNodeUpgradesPlaceholder(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, _ := Open(dsn)
+	defer s.Close()
+	ctx := context.Background()
+
+	seeded, err := s.GetOrCreateOriginNode(ctx, "nas")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode: %v", err)
+	}
+	upgraded, err := s.GetOrCreatePeerNode(ctx, "nas", "https://nas.example:8443", true)
+	if err != nil {
+		t.Fatalf("GetOrCreatePeerNode after placeholder: %v", err)
+	}
+	if upgraded.ID != seeded.ID {
+		t.Fatalf("upgrade created a new row: %d → %d", seeded.ID, upgraded.ID)
+	}
+	if upgraded.Endpoint.String != "https://nas.example:8443" {
+		t.Fatalf("endpoint = %q, want the upgraded real endpoint", upgraded.Endpoint.String)
+	}
+	persisted, _ := s.GetNodeByName(ctx, "nas")
+	if persisted.Endpoint.String != "https://nas.example:8443" {
+		t.Fatalf("persisted endpoint = %q, want the upgrade written through", persisted.Endpoint.String)
+	}
+
+	if _, err := s.GetOrCreatePeerNode(ctx, "nas", "https://other.example", true); err == nil {
+		t.Fatalf("real-endpoint mismatch accepted, want refusal")
+	}
+}
+
+// TestGetOrCreatePeerNodeUntrustedKeepsPlaceholder is the #110b guard:
+// an untrusted caller (allowEndpointUpgrade=false, the receiver-side
+// /begin path whose endpoint derives from wire input) must not rebind a
+// placeholder row to a presented endpoint. The placeholder stays put so
+// a peer cannot point an arbitrary node-name's dial-back URL at an
+// attacker address; the existing row is returned unchanged.
+func TestGetOrCreatePeerNodeUntrustedKeepsPlaceholder(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	s, _ := Open(dsn)
+	defer s.Close()
+	ctx := context.Background()
+
+	seeded, err := s.GetOrCreateOriginNode(ctx, "nas")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode: %v", err)
+	}
+	got, err := s.GetOrCreatePeerNode(ctx, "nas", "https://attacker.example:8443", false)
+	if err != nil {
+		t.Fatalf("GetOrCreatePeerNode untrusted: %v", err)
+	}
+	if got.ID != seeded.ID {
+		t.Fatalf("untrusted call created a new row: %d → %d", seeded.ID, got.ID)
+	}
+	if got.Endpoint.String != "peer://nas" {
+		t.Fatalf("returned endpoint = %q, want the untouched peer://nas placeholder", got.Endpoint.String)
+	}
+	persisted, _ := s.GetNodeByName(ctx, "nas")
+	if persisted.Endpoint.String != "peer://nas" {
+		t.Fatalf("persisted endpoint = %q, want the placeholder left in place", persisted.Endpoint.String)
 	}
 }

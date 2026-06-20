@@ -69,6 +69,17 @@ type Volume struct {
 	Name   string
 	Path   string   // absolute, ~ expanded
 	SyncTo []string // destination names declared on this volume
+	// OffloadRequires is the volume's offload policy: the target names
+	// (destinations or peer nodes, the same flat namespace sync_to and
+	// runs.destination use) whose recorded durability must each cover a
+	// file's content before `squirrel offload` may delete its local
+	// bytes. An empty list means offload is refused for the volume —
+	// the policy is an explicit opt-in, there is no default target set.
+	// Entries may name targets beyond this config's destinations and
+	// nodes because durability evidence can arrive via a peer's
+	// durability pull about targets only that peer reaches; a name with
+	// no recorded evidence keeps the gate closed.
+	OffloadRequires []string
 	// SyncEvery is the agent-scheduler cadence for full syncs of this
 	// volume. Zero means "no scheduled sync" — the agent never auto-
 	// triggers a sync for this volume; manual `squirrel sync` still
@@ -123,16 +134,73 @@ type VolumeHook struct {
 // skipped rather than stacked.
 const DefaultHookTimeout = time.Hour
 
-// Destination is one rclone-backed remote. Type drives which Params are
-// required and how the destination is rendered into rclone.conf.
+// Destination is one sync target driven by a curated external tool. Type
+// selects the handler and drives which Params are required: the rclone
+// types (local, sftp, s3, b2, gcs) render into rclone.conf, while
+// type=kopia drives the kopia binary against a local repository.
 type Destination struct {
 	Name string
-	Type string // local, sftp, s3, b2, gcs
-	Root string // remote-side base directory for syncing volumes into
-	// Params are type-specific rclone backend parameters with any
-	// { env = "VAR" } references already resolved to literal strings.
-	// Empty for type=local (no rclone remote needed).
+	Type string // local, sftp, s3, b2, gcs, kopia
+	Root string // remote-side base directory; for kopia, the repository path
+	// Layout selects how the destination stores a volume's data:
+	// LayoutMirror replicates the volume's tree, LayoutContentAddressed
+	// stores append-only content objects plus per-run manifest segments.
+	// Resolved at load time to one of the Layout* constants; an absent
+	// `layout` key resolves to LayoutMirror.
+	Layout string
+	// Params are type-specific parameters with any { env = "VAR" }
+	// references already resolved to literal strings: rclone backend
+	// parameters for the rclone types, the repository password for
+	// kopia. Empty for type=local (no rclone remote needed).
 	Params map[string]string
+	// Crypt is non-nil when the destination declares a
+	// [destinations.<name>.crypt] block: client-side encryption through
+	// rclone's crypt overlay. Transfers then address the overlay remote
+	// (CryptRemoteName) instead of the underlying remote.
+	Crypt *Crypt
+	// HashAlgo is the provider checksum type (rclone hash name, e.g.
+	// "sha256") that scan-back fingerprints record for this destination.
+	// Settable on sftp destinations only — the one backend where rclone
+	// must be told which server-side hash command to run (rendered as
+	// the sftp `hashes` option). Defaults to "sha256" for
+	// content-addressed sftp destinations; empty otherwise.
+	HashAlgo string
+	// Checkers caps rclone's concurrent checkers (--checkers) on
+	// invocations against this destination, for providers that cap
+	// simultaneous connections. Zero leaves rclone's default in force.
+	Checkers int
+}
+
+// Destination layout values. The layout shapes what sync writes under
+// the destination's per-volume directory; it never changes how the
+// local volume is indexed.
+const (
+	// LayoutMirror is the default: the destination holds a tree shaped
+	// like the local volume, with overwrites preserved under
+	// .squirrel-history/run-<id>/.
+	LayoutMirror = "mirror"
+	// LayoutContentAddressed stores one immutable object per BLAKE3
+	// content hash under objects/ plus one manifest segment per sync
+	// run under index/, an append-only archive layout where a local
+	// rename re-uploads nothing. Valid for rclone-remote destinations
+	// only.
+	LayoutContentAddressed = "content-addressed"
+)
+
+// Crypt is the optional client-side encryption overlay for a destination.
+// squirrel renders it as an rclone crypt remote stacked on the underlying
+// remote and addresses sync/restore transfers through it, so file contents
+// are encrypted before they leave the machine. Contents only:
+// filename_encryption is fixed off, keeping the destination tree layout
+// identical to an unencrypted destination.
+type Crypt struct {
+	// Password is the content-encryption password in rclone-obscured form,
+	// the same representation rclone's own crypt config stores (generate
+	// one with `rclone obscure`). Accepts a literal or { env = "VAR" }.
+	Password string
+	// Password2 is the salt, also rclone-obscured. Optional but
+	// recommended, matching rclone's crypt config.
+	Password2 string
 }
 
 // nameRE is the syntactic rule for volume and destination names. We pick a
@@ -198,11 +266,12 @@ type rawConfig struct {
 }
 
 type rawVolume struct {
-	Path       string         `toml:"path"`
-	SyncTo     []string       `toml:"sync_to"`
-	SyncEvery  string         `toml:"sync_every"`
-	IndexEvery string         `toml:"index_every"`
-	Hook       *rawVolumeHook `toml:"hook"`
+	Path            string         `toml:"path"`
+	SyncTo          []string       `toml:"sync_to"`
+	OffloadRequires []string       `toml:"offload_requires"`
+	SyncEvery       string         `toml:"sync_every"`
+	IndexEvery      string         `toml:"index_every"`
+	Hook            *rawVolumeHook `toml:"hook"`
 }
 
 type rawVolumeHook struct {
@@ -237,6 +306,9 @@ func (r *rawConfig) resolve(path string) (*Config, error) {
 			return nil, fmt.Errorf("destinations.%s: %w", name, err)
 		}
 		cfg.Destinations[name] = dest
+	}
+	if err := validateCryptRemoteNames(cfg.Destinations); err != nil {
+		return nil, err
 	}
 	for name, raw := range r.Nodes {
 		if _, clash := cfg.Destinations[name]; clash {
@@ -290,6 +362,9 @@ func resolveVolume(name string, raw rawVolume, dests map[string]*Destination, no
 		}
 		return nil, fmt.Errorf("sync_to references unknown destination or node %q", dst)
 	}
+	if err := validateOffloadRequires(raw.OffloadRequires); err != nil {
+		return nil, err
+	}
 	syncEvery, err := parseVolumeCadence("sync_every", raw.SyncEvery)
 	if err != nil {
 		return nil, err
@@ -310,13 +385,34 @@ func resolveVolume(name string, raw rawVolume, dests map[string]*Destination, no
 		return nil, err
 	}
 	return &Volume{
-		Name:       name,
-		Path:       abs,
-		SyncTo:     raw.SyncTo,
-		SyncEvery:  syncEvery,
-		IndexEvery: indexEvery,
-		Hook:       hook,
+		Name:            name,
+		Path:            abs,
+		SyncTo:          raw.SyncTo,
+		OffloadRequires: raw.OffloadRequires,
+		SyncEvery:       syncEvery,
+		IndexEvery:      indexEvery,
+		Hook:            hook,
 	}, nil
+}
+
+// validateOffloadRequires checks the offload policy entries
+// syntactically: each must be a well-formed target name and appear
+// once. Membership in this config's destinations/nodes is deliberately
+// looser than sync_to's (see Volume.OffloadRequires): a typo'd name is
+// still fail-safe because a target without recorded durability evidence
+// can never let the gate pass.
+func validateOffloadRequires(names []string) error {
+	seen := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		if !nameRE.MatchString(n) {
+			return fmt.Errorf("offload_requires entry %q is invalid (must match %s)", n, nameRE)
+		}
+		if _, dup := seen[n]; dup {
+			return fmt.Errorf("offload_requires lists %q more than once", n)
+		}
+		seen[n] = struct{}{}
+	}
+	return nil
 }
 
 // resolveVolumeHook validates an optional `[volumes.X.hook]` block. A nil

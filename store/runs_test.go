@@ -166,9 +166,11 @@ func TestRunsAuditForeignKey(t *testing.T) {
 }
 
 // TestMigrateV10ToV11CreatesRunsAudit seeds a v10-shape database by hand
-// (schema_version + volumes + runs, the FK target the migration needs),
-// opens it to trigger the v10→v11 step, and asserts the runs_audit table
-// exists, is openable, and accepts an insert against the seeded run.
+// (schema_version + volumes + runs, the FK target the migration needs,
+// plus an empty v10-shape files table so the later v14 contents split
+// has its input), opens it to trigger the v10→v11 step, and asserts the
+// runs_audit table exists, is openable, and accepts an insert against
+// the seeded run.
 func TestMigrateV10ToV11CreatesRunsAudit(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "test.db")
 	rawDB, err := sql.Open("sqlite", dsn)
@@ -191,6 +193,20 @@ func TestMigrateV10ToV11CreatesRunsAudit(t *testing.T) {
 			peer_node_id      INTEGER,
 			correlated_run_id INTEGER,
 			shallow INTEGER CHECK (shallow IS NULL OR shallow IN (0, 1))
+		)`,
+		`CREATE TABLE files (
+			folder_id         INTEGER NOT NULL,
+			name              TEXT NOT NULL,
+			blake3            BLOB NOT NULL CHECK (length(blake3) = 32),
+			size_bytes        INTEGER NOT NULL,
+			mtime_ns          INTEGER NOT NULL,
+			status            TEXT NOT NULL CHECK (status IN ('present','missing','superseded')),
+			first_seen_run_id INTEGER NOT NULL,
+			last_seen_run_id  INTEGER NOT NULL,
+			indexed_at_ns     INTEGER NOT NULL,
+			source_node_id    INTEGER,
+			source_run_id     INTEGER,
+			PRIMARY KEY (folder_id, name, blake3)
 		)`,
 		`INSERT INTO schema_version (version) VALUES (10)`,
 		`INSERT INTO volumes (id, name, path) VALUES (1, 'v', '/v')`,

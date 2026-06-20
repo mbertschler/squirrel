@@ -108,6 +108,24 @@ func TestSyncRequiresIndexedVolume(t *testing.T) {
 	}
 }
 
+// TestSyncRefusesOnVolumePathMismatch mirrors the restore and offload
+// cross-checks (#114): a DB volumes.path that no longer matches the
+// config-declared path makes the push handler refuse, so it cannot push
+// one tree while the durability advance covers another.
+func TestSyncRefusesOnVolumePathMismatch(t *testing.T) {
+	f := setupFixture(t)
+	// Seed the volume row with a path that differs from f.vol.Path so the
+	// shared requireIndexedVolume gate fails before rclone is invoked.
+	staleDir := t.TempDir()
+	if _, err := f.store.CreateVolume(context.Background(), f.vol.Name, staleDir); err != nil {
+		t.Fatalf("seed stale volume row: %v", err)
+	}
+	_, err := Sync(context.Background(), f.store, f.rcl, f.vol, f.dest, Options{})
+	if err == nil || !strings.Contains(err.Error(), "resolve the conflict") {
+		t.Fatalf("expected path-mismatch error, got %v", err)
+	}
+}
+
 func TestSyncHappyPath(t *testing.T) {
 	f := setupFixture(t)
 	if err := os.WriteFile(filepath.Join(f.vol.Path, "a.txt"), []byte("alpha"), 0o644); err != nil {
@@ -318,6 +336,39 @@ func TestSyncDryRunPath(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(f.dest.Root, f.vol.Name, "a.txt")); err == nil {
 		t.Fatalf("dry-run wrote to destination; want no-op")
 	}
+	if rep.Verification.Verified() {
+		t.Fatalf("dry-run must report an unverified result; got %+v", rep.Verification)
+	}
+}
+
+// TestSyncHappyPathStampsVerification rides on the happy-path fixture
+// to pin the typed durability report a default (BLAKE3) bucket sync
+// produces.
+func TestSyncHappyPathStampsVerification(t *testing.T) {
+	f := setupFixture(t)
+	if err := os.WriteFile(filepath.Join(f.vol.Path, "a.txt"), []byte("alpha"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.runIndex(t)
+
+	rep, err := Sync(context.Background(), f.store, f.rcl, f.vol, f.dest, Options{})
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if !rep.Verification.Verified() || rep.Verification.Method != VerifyMethodBlake3 {
+		t.Fatalf("Verification = %+v, want verified blake3", rep.Verification)
+	}
+	if rep.Verification.Files != 1 {
+		t.Fatalf("Verification.Files = %d, want 1", rep.Verification.Files)
+	}
+
+	shallowRep, err := Sync(context.Background(), f.store, f.rcl, f.vol, f.dest, Options{Shallow: true})
+	if err != nil {
+		t.Fatalf("shallow Sync: %v", err)
+	}
+	if shallowRep.Verification.Verified() || shallowRep.Verification.Method != VerifyMethodSizeMtime {
+		t.Fatalf("shallow Verification = %+v, want unverified size+mtime", shallowRep.Verification)
+	}
 }
 
 // TestSyncWarnsAboutHistoryDirInSource exercises the advisory path: a
@@ -381,7 +432,7 @@ func TestRunPairRefusesWhenAnotherIsRunning(t *testing.T) {
 
 	beforeRuns, _ := f.store.ListRuns(context.Background(), store.ListRunsOpts{})
 	p := Pair{Volume: f.vol, Destination: f.dest}
-	rep, err := RunPair(context.Background(), f.store, f.rcl, p, Options{})
+	rep, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, p, Options{})
 	if err == nil {
 		t.Fatalf("expected refusal while a run is in flight; got rep=%+v", rep)
 	}
@@ -400,7 +451,7 @@ func TestRunPairRefusesWhenAnotherIsRunning(t *testing.T) {
 	if err := f.store.FinishRun(context.Background(), stuckID, store.RunStatusFailed, "test cleanup", 0); err != nil {
 		t.Fatalf("FinishRun: %v", err)
 	}
-	if _, err := RunPair(context.Background(), f.store, f.rcl, p, Options{}); err != nil {
+	if _, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, p, Options{}); err != nil {
 		t.Fatalf("RunPair after clearing stuck row: %v", err)
 	}
 }
@@ -435,7 +486,7 @@ func TestRunPairRefusesConcurrentInvocations(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			_, err := RunPair(context.Background(), f.store, f.rcl, p, Options{})
+			_, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, p, Options{})
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
@@ -615,6 +666,156 @@ func TestBuildRcloneArgsRefusesZeroRunIDOutsideDryRun(t *testing.T) {
 	// A real runID must always succeed regardless of dry-run.
 	if _, err := buildRcloneArgs(vol, dest, 17, Options{DryRun: false}); err != nil {
 		t.Fatalf("non-zero runID outside dry-run should be allowed, got %v", err)
+	}
+}
+
+// cryptFixtureDest returns a remote destination with a crypt overlay, the
+// shape the crypt addressing/verification tests share; these tests stop
+// at argument construction.
+func cryptFixtureDest() *config.Destination {
+	return &config.Destination{
+		Name:  "offsite",
+		Type:  "sftp",
+		Root:  "/data",
+		Crypt: &config.Crypt{Password: "obscured-pw"},
+	}
+}
+
+// TestBuildRcloneArgsCryptAddressing pins the two crypt behaviours of the
+// sync args builder: transfers and the backup-dir address the overlay
+// remote (whose remote line carries the root, so paths are
+// volume-relative), and the BLAKE3 flags are dropped because crypt
+// remotes expose no content hashes.
+func TestBuildRcloneArgsCryptAddressing(t *testing.T) {
+	vol := &config.Volume{Name: "pics", Path: "/tmp/pics"}
+
+	args, err := buildRcloneArgs(vol, cryptFixtureDest(), 7, Options{})
+	if err != nil {
+		t.Fatalf("buildRcloneArgs: %v", err)
+	}
+	joined := strings.Join(args, " ")
+	if got := args[len(args)-1]; got != "offsite-crypt:pics/" {
+		t.Fatalf("dst arg = %q, want offsite-crypt:pics/", got)
+	}
+	if !strings.Contains(joined, "--backup-dir offsite-crypt:pics/"+HistoryDirName+"/run-7") {
+		t.Fatalf("backup-dir not addressed through the crypt remote: %s", joined)
+	}
+	if strings.Contains(joined, "--checksum") || strings.Contains(joined, "blake3") {
+		t.Fatalf("BLAKE3 flags passed to a crypt destination: %s", joined)
+	}
+
+	plain := cryptFixtureDest()
+	plain.Crypt = nil
+	plainArgs, err := buildRcloneArgs(vol, plain, 7, Options{})
+	if err != nil {
+		t.Fatalf("buildRcloneArgs (plain): %v", err)
+	}
+	plainJoined := strings.Join(plainArgs, " ")
+	if got := plainArgs[len(plainArgs)-1]; got != "offsite:/data/pics/" {
+		t.Fatalf("plain dst arg = %q, want offsite:/data/pics/", got)
+	}
+	if !strings.Contains(plainJoined, "--checksum --hash blake3") {
+		t.Fatalf("plain destination lost its BLAKE3 flags: %s", plainJoined)
+	}
+}
+
+// TestBuildRestoreArgsCryptAddressing mirrors the sync case for the pull
+// direction: the source is the crypt remote and the BLAKE3 flags stay off.
+func TestBuildRestoreArgsCryptAddressing(t *testing.T) {
+	vol := &config.Volume{Name: "pics", Path: "/tmp/pics"}
+	args := buildRestoreArgs(vol, cryptFixtureDest(), 3, RestoreOptions{ToPath: "/tmp/scratch"})
+	joined := strings.Join(args, " ")
+	if got := args[len(args)-2]; got != "offsite-crypt:pics/" {
+		t.Fatalf("src arg = %q, want offsite-crypt:pics/", got)
+	}
+	if strings.Contains(joined, "--checksum") || strings.Contains(joined, "blake3") {
+		t.Fatalf("BLAKE3 flags passed for a crypt source: %s", joined)
+	}
+}
+
+// TestIndexDirURICrypt: the snapshot ride-along lands inside the encrypted
+// tree, addressed through the same overlay as the data transfer.
+func TestIndexDirURICrypt(t *testing.T) {
+	if got := indexDirURI(cryptFixtureDest(), "pics"); got != "offsite-crypt:pics/"+IndexDirName {
+		t.Fatalf("indexDirURI = %q, want offsite-crypt:pics/%s", got, IndexDirName)
+	}
+}
+
+// TestEffectiveShallowCrypt pins that a crypt destination downgrades a
+// non-shallow request (and that the runs row will say so), while a plain
+// destination passes the flag through.
+func TestEffectiveShallowCrypt(t *testing.T) {
+	crypt := cryptFixtureDest()
+	plain := cryptFixtureDest()
+	plain.Crypt = nil
+	cases := []struct {
+		dest    *config.Destination
+		shallow bool
+		want    bool
+	}{
+		{crypt, false, true},
+		{crypt, true, true},
+		{plain, false, false},
+		{plain, true, true},
+	}
+	for _, c := range cases {
+		if got := EffectiveShallow(c.dest, c.shallow); got != c.want {
+			t.Errorf("EffectiveShallow(crypt=%v, shallow=%v) = %v, want %v",
+				c.dest.Crypt != nil, c.shallow, got, c.want)
+		}
+	}
+}
+
+// TestShallowForPairs pins the version-preflight scope: only an
+// invocation with at least one blake3-verified target (a plain bucket
+// or a peer node) requires the full rclone floor.
+func TestShallowForPairs(t *testing.T) {
+	crypt := cryptFixtureDest()
+	plain := cryptFixtureDest()
+	plain.Crypt = nil
+	node := Pair{Node: &config.Node{Name: "peer"}}
+	kopia := Pair{Destination: &config.Destination{Name: "mirror", Type: "kopia", Root: "/tmp/repo"}}
+	contentAddressed := Pair{Destination: &config.Destination{Name: "archive", Type: "sftp", Root: "/data", Layout: config.LayoutContentAddressed}}
+	cases := []struct {
+		name    string
+		pairs   []Pair
+		shallow bool
+		want    bool
+	}{
+		{"user shallow wins", []Pair{{Destination: plain}}, true, true},
+		{"all crypt", []Pair{{Destination: crypt}, {Destination: crypt}}, false, true},
+		{"mixed crypt and plain", []Pair{{Destination: crypt}, {Destination: plain}}, false, false},
+		{"node target verifies", []Pair{{Destination: crypt}, node}, false, false},
+		{"kopia pair puts no constraint on rclone", []Pair{kopia, {Destination: crypt}}, false, true},
+		{"kopia beside plain still verifies", []Pair{kopia, {Destination: plain}}, false, false},
+		{"content-addressed pair puts no constraint on rclone", []Pair{contentAddressed, {Destination: crypt}}, false, true},
+		{"content-addressed beside plain still verifies", []Pair{contentAddressed, {Destination: plain}}, false, false},
+		{"no pairs", nil, false, true},
+	}
+	for _, c := range cases {
+		if got := ShallowForPairs(c.pairs, c.shallow); got != c.want {
+			t.Errorf("%s: ShallowForPairs = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestCryptVerificationWarning: the advisory fires exactly when the
+// fallback is implicit — a crypt destination without --shallow. An
+// explicit --shallow run already gets the CLI's shallow warning, and a
+// plain destination has nothing to warn about.
+func TestCryptVerificationWarning(t *testing.T) {
+	crypt := cryptFixtureDest()
+	w := cryptVerificationWarning(crypt, false)
+	if !strings.Contains(w, "size+mtime") || !strings.Contains(w, crypt.Name) {
+		t.Fatalf("warning = %q, want one naming the destination and the size+mtime fallback", w)
+	}
+	if w := cryptVerificationWarning(crypt, true); w != "" {
+		t.Fatalf("warning = %q for an explicit --shallow run, want empty", w)
+	}
+	plain := cryptFixtureDest()
+	plain.Crypt = nil
+	if w := cryptVerificationWarning(plain, false); w != "" {
+		t.Fatalf("warning = %q for a plain destination, want empty", w)
 	}
 }
 

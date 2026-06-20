@@ -161,7 +161,7 @@ func (h *Runs) StartSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pair, rcl, err := h.resolveSyncTarget(r.Context(), name, dest)
+	pair, tools, err := h.resolveSyncTarget(r.Context(), name, dest)
 	if err != nil {
 		log.Printf("desktop: sync %s → %s: %v", name, dest, err)
 		http.Redirect(w, r, "/runs", http.StatusSeeOther)
@@ -178,7 +178,7 @@ func (h *Runs) StartSync(w http.ResponseWriter, r *http.Request) {
 		priorMax = h.latestSyncRunID(r.Context(), v.ID, dest)
 	}
 
-	go h.runSyncGoroutine(name, dest, pair, rcl)
+	go h.runSyncGoroutine(name, dest, pair, tools)
 
 	if volumeID == 0 {
 		// No volumes row yet means the volume has never been
@@ -225,26 +225,30 @@ func (h *Runs) runIndexGoroutine(path, name string) {
 }
 
 // resolveSyncTarget converts the validated (name, dest) into the
-// concrete sync.Pair plus a configured Rclone, isolating the
+// concrete sync.Pair plus the configured tool wrappers, isolating the
 // fail-fast surface that should redirect to /runs from the
 // validate-and-redirect-to-detail flow in StartSync.
-func (h *Runs) resolveSyncTarget(ctx context.Context, name, dest string) (syncpkg.Pair, *syncpkg.Rclone, error) {
+func (h *Runs) resolveSyncTarget(ctx context.Context, name, dest string) (syncpkg.Pair, syncpkg.Tools, error) {
 	pairs, err := syncpkg.PairsFor(h.Config, name, dest)
 	if err != nil {
-		return syncpkg.Pair{}, nil, fmt.Errorf("pairs: %w", err)
+		return syncpkg.Pair{}, syncpkg.Tools{}, fmt.Errorf("pairs: %w", err)
 	}
 	rcl, err := h.prepareRclone(ctx)
 	if err != nil {
-		return syncpkg.Pair{}, nil, fmt.Errorf("prepare rclone: %w", err)
+		return syncpkg.Pair{}, syncpkg.Tools{}, fmt.Errorf("prepare rclone: %w", err)
 	}
-	return pairs[0], rcl, nil
+	tools, err := syncpkg.ToolsFor(h.Config, pairs[:1], rcl)
+	if err != nil {
+		return syncpkg.Pair{}, syncpkg.Tools{}, err
+	}
+	return pairs[0], tools, nil
 }
 
 // runSyncGoroutine is the body of the background sync goroutine. It
 // uses a fresh context.Background() because the sync may outlive the
 // HTTP request that kicked it off, and surfaces non-success outcomes
 // via the request log — the runs table carries the durable state.
-func (h *Runs) runSyncGoroutine(name, dest string, pair syncpkg.Pair, rcl *syncpkg.Rclone) {
+func (h *Runs) runSyncGoroutine(name, dest string, pair syncpkg.Pair, tools syncpkg.Tools) {
 	ctx := context.Background()
 	var runID int64
 	opts := syncpkg.Options{
@@ -263,7 +267,7 @@ func (h *Runs) runSyncGoroutine(name, dest string, pair syncpkg.Pair, rcl *syncp
 			h.hub.Close(runID)
 		}
 	}()
-	rep, err := syncpkg.RunPair(ctx, h.Store, rcl, pair, opts)
+	rep, err := syncpkg.RunPair(ctx, h.Store, tools, pair, opts)
 	switch {
 	case err != nil:
 		log.Printf("desktop: sync %s → %s: %v", name, dest, err)
@@ -287,9 +291,14 @@ func (h *Runs) prepareRclone(ctx context.Context) (*syncpkg.Rclone, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Shallow=false matches CLI defaults — the desktop trigger runs
-	// the full integrity-checking sync, not a fast path.
-	if err := syncpkg.EnsureMinVersion(ctx, rcl, io.Discard, false); err != nil {
+	// Desktop triggers run the full integrity-checking sync (the CLI
+	// default, Shallow=false); the pairs scope the version preflight to
+	// the blake3 use the configured targets will actually invoke.
+	pairs, err := syncpkg.PairsFor(h.Config, "", "")
+	if err != nil {
+		return nil, err
+	}
+	if err := syncpkg.EnsureMinVersion(ctx, rcl, io.Discard, syncpkg.ShallowForPairs(pairs, false)); err != nil {
 		return nil, err
 	}
 	confPath := filepath.Join(filepath.Dir(h.Config.Path), "rclone.conf")

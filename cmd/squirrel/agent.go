@@ -132,12 +132,12 @@ func resolveAgentDBPath(cmd *cobra.Command, cfg *config.Config) (string, error) 
 // lookup so a host without rclone installed can still run the agent
 // for its peer-sync surface or its index cadences.
 //
-// EnsureMinVersion runs with shallow=false because scheduled syncs go
-// through sync.RunPair with the default sync.Options{} (Shallow=false)
-// — i.e. they will pass `--hash blake3`, which is only available in
-// rclone ≥ MinRcloneVersion. Failing here means the operator gets a
-// clear startup error rather than a midnight pager when the first
-// scheduled sync fires and rclone rejects the flag.
+// The version preflight mirrors what scheduled syncs will invoke: they
+// run with the default sync.Options{} (Shallow=false), so `--hash blake3`
+// requires rclone ≥ MinRcloneVersion unless every configured target is a
+// crypt destination, which forces shallow. Failing here means the
+// operator gets a clear startup error rather than a midnight pager when
+// the first scheduled sync fires and rclone rejects the flag.
 func resolveSchedulerRclone(cmd *cobra.Command, cfg *config.Config) (*sync.Rclone, error) {
 	if !anyVolumeNeedsScheduledSync(cfg) {
 		return nil, nil
@@ -146,7 +146,11 @@ func resolveSchedulerRclone(cmd *cobra.Command, cfg *config.Config) (*sync.Rclon
 	if err != nil {
 		return nil, fmt.Errorf("scheduler needs rclone for scheduled syncs: %w", err)
 	}
-	if err := sync.EnsureMinVersion(cmd.Context(), rcl, cmd.ErrOrStderr(), false); err != nil {
+	pairs, err := sync.PairsFor(cfg, "", "")
+	if err != nil {
+		return nil, fmt.Errorf("scheduler rclone preflight: %w", err)
+	}
+	if err := sync.EnsureMinVersion(cmd.Context(), rcl, cmd.ErrOrStderr(), sync.ShallowForPairs(pairs, false)); err != nil {
 		return nil, fmt.Errorf("scheduler rclone preflight: %w", err)
 	}
 	if _, err := rcl.WriteRcloneConfig(rcloneConfigPathFor(cfg), cfg.Destinations); err != nil {
@@ -180,6 +184,13 @@ func buildSchedulerSyncRunner(cfg *config.Config, s *store.Store, rcl *sync.Rclo
 		if err != nil {
 			return agent.SyncRunReport{Err: err}
 		}
+		// Per-kick because the kopia lookup belongs to the kicks that
+		// target a kopia destination: a host whose schedule never
+		// touches one runs fine without the binary installed.
+		tools, err := sync.ToolsFor(cfg, []sync.Pair{pair}, rcl)
+		if err != nil {
+			return agent.SyncRunReport{Err: err}
+		}
 		// Snapshot-on-sync fires on each node's scheduled syncs too (#75):
 		// this is the operating cadence the catalog churns on. Each kick is
 		// a single pair, so a fresh Snapshotter per kick is the right unit.
@@ -187,7 +198,7 @@ func buildSchedulerSyncRunner(cfg *config.Config, s *store.Store, rcl *sync.Rclo
 		if cfg.Backups.Enabled {
 			opts.Snapshot = sync.NewSnapshotter(s, rcl, snapshotConfig(cfg, s.Path()))
 		}
-		rep, runErr := sync.RunPair(ctx, s, rcl, pair, opts)
+		rep, runErr := sync.RunPair(ctx, s, tools, pair, opts)
 		return agent.SyncRunReport{RunID: rep.RunID, Status: rep.Status, Err: runErr}
 	}
 }

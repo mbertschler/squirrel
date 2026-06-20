@@ -12,9 +12,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zeebo/blake3"
+
 	"github.com/mbertschler/squirrel/store"
 	"github.com/mbertschler/squirrel/volmark"
 )
+
+func blake3Of(t *testing.T, content string) []byte {
+	t.Helper()
+	sum := blake3.Sum256([]byte(content))
+	return sum[:]
+}
 
 func setupStore(t *testing.T) *store.Store {
 	t.Helper()
@@ -982,5 +990,174 @@ func TestIndexRefusesMismatchedVolumeMarker(t *testing.T) {
 	var mismatch *volmark.ErrMismatch
 	if !errors.As(err, &mismatch) {
 		t.Fatalf("err type = %T (%v), want *volmark.ErrMismatch", err, err)
+	}
+}
+
+// markOffloaded flips the live row at relPath to status='offloaded'
+// via an Upsert carrying the same content — the status transition the
+// future offload command records once durability is proven.
+func markOffloaded(t *testing.T, s *store.Store, volumeID int64, relPath string) {
+	t.Helper()
+	ctx := context.Background()
+	row, err := s.GetByPath(ctx, volumeID, relPath)
+	if err != nil {
+		t.Fatalf("GetByPath %s: %v", relPath, err)
+	}
+	row.Status = store.StatusOffloaded
+	if err := s.Upsert(ctx, row, nil); err != nil {
+		t.Fatalf("Upsert offloaded %s: %v", relPath, err)
+	}
+}
+
+// TestIndexLeavesOffloadedRowsAlone: an offloaded row's on-disk absence
+// is intentional, so a re-index neither flips it to missing nor counts
+// it in the report's Missing tally.
+func TestIndexLeavesOffloadedRowsAlone(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "keep.txt"), "kept")
+	writeFile(t, filepath.Join(root, "cold.txt"), "rarely needed")
+
+	s := setupStore(t)
+	ctx := context.Background()
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("first Index: %v", err)
+	}
+	absRoot, _ := filepath.Abs(root)
+	vol := volumeFor(t, s, absRoot)
+
+	markOffloaded(t, s, vol.ID, "cold.txt")
+	if err := os.Remove(filepath.Join(root, "cold.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := Index(ctx, s, root, Options{})
+	if err != nil {
+		t.Fatalf("re-Index: %v", err)
+	}
+	if rep.Missing != 0 {
+		t.Fatalf("report.Missing = %d, want 0 (offloaded absence is expected)", rep.Missing)
+	}
+	row, err := s.GetByPath(ctx, vol.ID, "cold.txt")
+	if err != nil {
+		t.Fatalf("GetByPath cold.txt: %v", err)
+	}
+	if row.Status != store.StatusOffloaded {
+		t.Fatalf("cold.txt status = %q after re-index, want offloaded", row.Status)
+	}
+}
+
+// TestIndexFlipsOffloadedBackToPresent: when the file reappears on disk
+// with its recorded content (a restore or manual copy-back), the next
+// index run flips the row back to present, preserving first_seen.
+func TestIndexFlipsOffloadedBackToPresent(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "cold.txt"), "rarely needed")
+
+	s := setupStore(t)
+	ctx := context.Background()
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("first Index: %v", err)
+	}
+	absRoot, _ := filepath.Abs(root)
+	vol := volumeFor(t, s, absRoot)
+	before, err := s.GetByPath(ctx, vol.ID, "cold.txt")
+	if err != nil {
+		t.Fatalf("GetByPath before: %v", err)
+	}
+
+	markOffloaded(t, s, vol.ID, "cold.txt")
+	if err := os.Remove(filepath.Join(root, "cold.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("Index while offloaded: %v", err)
+	}
+
+	writeFile(t, filepath.Join(root, "cold.txt"), "rarely needed")
+	rep, err := Index(ctx, s, root, Options{})
+	if err != nil {
+		t.Fatalf("Index after reappearance: %v", err)
+	}
+	if rep.Errors != 0 {
+		t.Fatalf("report errors = %+v", rep.ErrorList)
+	}
+
+	after, err := s.GetByPath(ctx, vol.ID, "cold.txt")
+	if err != nil {
+		t.Fatalf("GetByPath after: %v", err)
+	}
+	if after.Status != store.StatusPresent {
+		t.Fatalf("cold.txt status = %q after reappearance, want present", after.Status)
+	}
+	if !bytes.Equal(after.Blake3, before.Blake3) {
+		t.Fatalf("cold.txt content changed across offload round trip")
+	}
+	if after.FirstSeenRunID != before.FirstSeenRunID {
+		t.Fatalf("first_seen_run_id = %d, want %d (reappearance must not rewrite it)",
+			after.FirstSeenRunID, before.FirstSeenRunID)
+	}
+}
+
+// TestHashStatPinnedToHashedBytes simulates a file that grows between the
+// walker's stat and the worker's hash: process must record the size read
+// from the open handle after hashing (matching the hashed content), not
+// the stale walk size. Binding the new digest to the old size would mint a
+// contents row whose size_bytes can never match the honest content again.
+func TestHashStatPinnedToHashedBytes(t *testing.T) {
+	root := t.TempDir()
+	abs := filepath.Join(root, "growing.txt")
+	content := "the full on-disk content after the append"
+	writeFile(t, abs, content)
+
+	s := setupStore(t)
+	ctx := context.Background()
+	idx, err := newIndexer(ctx, s, root, Options{Name: "vol"})
+	if err != nil {
+		t.Fatalf("newIndexer: %v", err)
+	}
+
+	stale := workItem{
+		absPath:   abs,
+		relPath:   "growing.txt",
+		sizeBytes: 3, // what the walker stat saw before the append
+		mtimeNs:   1,
+	}
+	res := idx.process(stale, make([]byte, hashReadBufferSize))
+	if res.err != nil {
+		t.Fatalf("process: %v", res.err)
+	}
+	if res.row.SizeBytes != int64(len(content)) {
+		t.Fatalf("row size = %d, want %d (the hashed bytes, not the stale walk size %d)",
+			res.row.SizeBytes, len(content), stale.sizeBytes)
+	}
+	want := blake3Of(t, content)
+	if !bytes.Equal(res.row.Blake3, want) {
+		t.Fatalf("row digest = %x, want %x", res.row.Blake3, want)
+	}
+}
+
+// TestReindexStableBytesNoSizeMismatch indexes a file, then re-indexes the
+// same untouched bytes. The contents row minted on the first pass carries
+// the size of the bytes that were hashed, so the second pass resolves the
+// same (digest, size) pair and ApplyIndexBatch does not hit the immutable
+// size cross-check that aborts the whole batch.
+func TestReindexStableBytesNoSizeMismatch(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "stable.txt"), "stable content that never changes")
+
+	s := setupStore(t)
+	ctx := context.Background()
+	if _, err := Index(ctx, s, root, Options{Name: "vol"}); err != nil {
+		t.Fatalf("first Index: %v", err)
+	}
+	rep, err := Index(ctx, s, root, Options{Name: "vol"})
+	if err != nil {
+		t.Fatalf("second Index aborted (size cross-check?): %v", err)
+	}
+	if rep.Errors != 0 {
+		t.Fatalf("re-index reported errors: %+v", rep.ErrorList)
+	}
+	if rep.Unchanged != 1 {
+		t.Fatalf("re-index unchanged = %d, want 1", rep.Unchanged)
 	}
 }
