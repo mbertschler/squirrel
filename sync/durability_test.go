@@ -138,6 +138,58 @@ func TestPullDurabilityCopiesComponents(t *testing.T) {
 	}
 }
 
+// TestPullDurabilityTagsSourcePeer: the pull tags every merged component
+// with the asserting peer's local node id (the residual of #104), so the
+// offload gate can weigh peer-asserted evidence as a distinct, revocable
+// class. Locally-verified components written here directly stay untagged.
+func TestPullDurabilityTagsSourcePeer(t *testing.T) {
+	f := setupNodeFixtureNoRclone(t)
+	ctx := context.Background()
+	f.initVol.OffloadRequires = []string{"offsite-a"}
+	f.initVol.SyncTo = nil
+	originName := seedReceiverDurability(t, f, map[string]int64{"offsite-a": 12})
+
+	v, err := f.initStore.CreateVolume(ctx, f.initVol.Name, f.initVol.Path)
+	if err != nil {
+		t.Fatalf("CreateVolume on initiator: %v", err)
+	}
+	self, err := f.initStore.GetSelfNode(ctx)
+	if err != nil {
+		t.Fatalf("GetSelfNode: %v", err)
+	}
+	if err := f.initStore.UpsertDestinationRunIDVerified(ctx, v.ID, "offsite-a", self.ID, 4, store.VerifyMethodBlake3, false); err != nil {
+		t.Fatalf("seed local verified component: %v", err)
+	}
+
+	if _, err := PullDurability(ctx, f.initStore, f.initVol, f.node, false); err != nil {
+		t.Fatalf("PullDurability: %v", err)
+	}
+
+	peer, err := f.initStore.GetNodeByName(ctx, f.node.Name)
+	if err != nil {
+		t.Fatalf("source peer %q not resolved locally: %v", f.node.Name, err)
+	}
+	origin, err := f.initStore.GetNodeByName(ctx, originName)
+	if err != nil {
+		t.Fatalf("origin node %q not created locally: %v", originName, err)
+	}
+
+	pulled, err := f.initStore.GetDestinationRunID(ctx, v.ID, "offsite-a", origin.ID)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID(pulled): %v", err)
+	}
+	if !pulled.SourceNodeID.Valid || pulled.SourceNodeID.Int64 != peer.ID {
+		t.Fatalf("pulled component source = %+v, want peer %q (id %d)", pulled.SourceNodeID, f.node.Name, peer.ID)
+	}
+	local, err := f.initStore.GetDestinationRunID(ctx, v.ID, "offsite-a", self.ID)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID(local): %v", err)
+	}
+	if local.SourceNodeID.Valid {
+		t.Fatalf("locally-verified component tagged with source %d, want NULL", local.SourceNodeID.Int64)
+	}
+}
+
 // TestPullDurabilityDropsUnconfiguredDestinations: the pull merges
 // components for destinations the volume references (one via
 // offload_requires, one via sync_to) and drops one for an unconfigured

@@ -649,3 +649,248 @@ func TestContentVerifiedMethod(t *testing.T) {
 		}
 	}
 }
+
+// TestMigrateV21ToV22AddsSourceNodeID builds a minimal v21 database with a
+// pre-existing durability component and confirms the migration adds
+// source_node_id (NULL on the carried-over row — the locally-verified
+// class) without disturbing the recorded coordinate or its method.
+func TestMigrateV21ToV22AddsSourceNodeID(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	rawDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("raw sql.Open: %v", err)
+	}
+	v21DDL := []string{
+		`CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)`,
+		`CREATE TABLE volumes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL)`,
+		`CREATE TABLE nodes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, endpoint TEXT, public_key_fingerprint TEXT)`,
+		`CREATE TABLE contents (
+			id             INTEGER PRIMARY KEY,
+			blake3         BLOB NOT NULL UNIQUE CHECK (length(blake3) = 32),
+			size_bytes     INTEGER NOT NULL,
+			origin_node_id INTEGER REFERENCES nodes(id),
+			origin_run_id  INTEGER
+		)`,
+		`CREATE TABLE destination_run_ids (
+			volume_id      INTEGER NOT NULL REFERENCES volumes(id),
+			destination    TEXT NOT NULL,
+			origin_node_id INTEGER NOT NULL REFERENCES nodes(id),
+			origin_run_id  INTEGER NOT NULL,
+			updated_at_ns  INTEGER NOT NULL,
+			verify_method  TEXT,
+			PRIMARY KEY (volume_id, destination, origin_node_id)
+		)`,
+		`CREATE TABLE destination_run_ids_history (
+			id             INTEGER PRIMARY KEY,
+			volume_id      INTEGER NOT NULL,
+			destination    TEXT NOT NULL,
+			origin_node_id INTEGER NOT NULL,
+			origin_run_id  INTEGER NOT NULL,
+			at_ns          INTEGER NOT NULL,
+			verify_method  TEXT
+		)`,
+		`INSERT INTO schema_version (version) VALUES (21)`,
+		`INSERT INTO volumes (id, name, path) VALUES (1, 'v', '/v')`,
+		`INSERT INTO nodes (id, name) VALUES (1, 'self')`,
+		`INSERT INTO destination_run_ids (volume_id, destination, origin_node_id, origin_run_id, updated_at_ns, verify_method)
+			VALUES (1, 'bucket', 1, 7, 100, 'blake3')`,
+	}
+	for _, q := range v21DDL {
+		if _, err := rawDB.Exec(q); err != nil {
+			t.Fatalf("v21 DDL %q: %v", q, err)
+		}
+	}
+	rawDB.Close()
+
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open (migrates v21→v22): %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	if v, _ := s.CurrentSchemaVersion(ctx); v != SchemaVersion {
+		t.Fatalf("schema_version = %d, want %d", v, SchemaVersion)
+	}
+	got, err := s.GetDestinationRunID(ctx, 1, "bucket", 1)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID: %v", err)
+	}
+	if got.OriginRunID != 7 || got.VerifyMethod != VerifyMethodBlake3 {
+		t.Fatalf("carried-over component = run %d method %q, want 7 / blake3", got.OriginRunID, got.VerifyMethod)
+	}
+	if got.SourceNodeID.Valid {
+		t.Fatalf("source_node_id = %d, want NULL (locally-verified backfill)", got.SourceNodeID.Int64)
+	}
+}
+
+// TestUpsertDestinationRunIDPulledTagsSource: a pulled advance records the
+// asserting peer on the live row and in history, while a locally-verified
+// advance for a different origin stays untagged (NULL). The two classes
+// are distinguishable as the residual of #104 requires.
+func TestUpsertDestinationRunIDPulledTagsSource(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+	self, err := s.GetSelfNode(ctx)
+	if err != nil {
+		t.Fatalf("GetSelfNode: %v", err)
+	}
+	peer, err := s.GetOrCreateOriginNode(ctx, "nas")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode(nas): %v", err)
+	}
+	origin, err := s.GetOrCreateOriginNode(ctx, "laptop")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode(laptop): %v", err)
+	}
+
+	if err := s.UpsertDestinationRunIDVerified(ctx, vID, "offsite", self.ID, 9, VerifyMethodBlake3, false); err != nil {
+		t.Fatalf("local verified advance: %v", err)
+	}
+	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", origin.ID, 5, VerifyMethodKopia, peer.ID, false); err != nil {
+		t.Fatalf("pulled advance: %v", err)
+	}
+
+	local, err := s.GetDestinationRunID(ctx, vID, "offsite", self.ID)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID(local): %v", err)
+	}
+	if local.SourceNodeID.Valid {
+		t.Fatalf("locally-verified component source = %d, want NULL", local.SourceNodeID.Int64)
+	}
+	pulled, err := s.GetDestinationRunID(ctx, vID, "offsite", origin.ID)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID(pulled): %v", err)
+	}
+	if !pulled.SourceNodeID.Valid || pulled.SourceNodeID.Int64 != peer.ID {
+		t.Fatalf("pulled component source = %+v, want peer %d", pulled.SourceNodeID, peer.ID)
+	}
+
+	history, err := s.ListDestinationRunIDHistory(ctx, vID, "offsite")
+	if err != nil {
+		t.Fatalf("ListDestinationRunIDHistory: %v", err)
+	}
+	bySource := map[int64]sql.NullInt64{}
+	for _, h := range history {
+		bySource[h.OriginNodeID] = h.SourceNodeID
+	}
+	if src := bySource[self.ID]; src.Valid {
+		t.Fatalf("history for local advance carries source %d, want NULL", src.Int64)
+	}
+	if src := bySource[origin.ID]; !src.Valid || src.Int64 != peer.ID {
+		t.Fatalf("history for pulled advance source = %+v, want peer %d", src, peer.ID)
+	}
+}
+
+// TestUpsertDestinationRunIDProvenanceTransitions: a peer re-confirmation
+// at the recorded run never downgrades a locally-verified (NULL)
+// component to peer-asserted, and a local re-confirmation upgrades a
+// peer-tagged component back to locally-verified — so a peer cannot
+// launder local provenance away, and a verified push reclaims a pulled
+// component.
+func TestUpsertDestinationRunIDProvenanceTransitions(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+	self, err := s.GetSelfNode(ctx)
+	if err != nil {
+		t.Fatalf("GetSelfNode: %v", err)
+	}
+	peer, err := s.GetOrCreateOriginNode(ctx, "nas")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode(nas): %v", err)
+	}
+
+	if err := s.UpsertDestinationRunIDVerified(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, false); err != nil {
+		t.Fatalf("local advance: %v", err)
+	}
+	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, peer.ID, false); err != nil {
+		t.Fatalf("peer re-confirm at recorded run: %v", err)
+	}
+	got, err := s.GetDestinationRunID(ctx, vID, "offsite", self.ID)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID: %v", err)
+	}
+	if got.SourceNodeID.Valid {
+		t.Fatalf("local component downgraded to peer %d by an equal-run re-confirm", got.SourceNodeID.Int64)
+	}
+
+	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 20, VerifyMethodKopia, peer.ID, false); err != nil {
+		t.Fatalf("peer strict advance: %v", err)
+	}
+	got, _ = s.GetDestinationRunID(ctx, vID, "offsite", self.ID)
+	if !got.SourceNodeID.Valid || got.SourceNodeID.Int64 != peer.ID {
+		t.Fatalf("after peer strict advance source = %+v, want peer %d", got.SourceNodeID, peer.ID)
+	}
+
+	if err := s.UpsertDestinationRunIDVerified(ctx, vID, "offsite", self.ID, 20, VerifyMethodBlake3, false); err != nil {
+		t.Fatalf("local re-confirm at peer run: %v", err)
+	}
+	got, _ = s.GetDestinationRunID(ctx, vID, "offsite", self.ID)
+	if got.SourceNodeID.Valid {
+		t.Fatalf("local re-confirm did not reclaim provenance, source = %d", got.SourceNodeID.Int64)
+	}
+}
+
+// TestRevokeDestinationRunIDsFromSource: revoking a peer drops the live
+// components it asserted while leaving locally-verified components and a
+// second peer's assertions in place, and the append-only history is
+// untouched — revocation is a forward act, not a rewrite of the audit
+// trail or the verified vector.
+func TestRevokeDestinationRunIDsFromSource(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+	self, err := s.GetSelfNode(ctx)
+	if err != nil {
+		t.Fatalf("GetSelfNode: %v", err)
+	}
+	badPeer, err := s.GetOrCreateOriginNode(ctx, "nas")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode(nas): %v", err)
+	}
+	goodPeer, err := s.GetOrCreateOriginNode(ctx, "mirror")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode(mirror): %v", err)
+	}
+	originA, err := s.GetOrCreateOriginNode(ctx, "laptop")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode(laptop): %v", err)
+	}
+
+	if err := s.UpsertDestinationRunIDVerified(ctx, vID, "offsite", self.ID, 9, VerifyMethodBlake3, false); err != nil {
+		t.Fatalf("local advance: %v", err)
+	}
+	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", originA.ID, 5, VerifyMethodKopia, badPeer.ID, false); err != nil {
+		t.Fatalf("bad-peer advance: %v", err)
+	}
+	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", goodPeer.ID, 3, VerifyMethodKopia, goodPeer.ID, false); err != nil {
+		t.Fatalf("good-peer advance: %v", err)
+	}
+
+	n, err := s.RevokeDestinationRunIDsFromSource(ctx, badPeer.ID)
+	if err != nil {
+		t.Fatalf("RevokeDestinationRunIDsFromSource: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("revoked %d components, want 1", n)
+	}
+
+	if _, err := s.GetDestinationRunID(ctx, vID, "offsite", originA.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("revoked component still present (err=%v)", err)
+	}
+	if local, err := s.GetDestinationRunID(ctx, vID, "offsite", self.ID); err != nil || local.SourceNodeID.Valid {
+		t.Fatalf("locally-verified component disturbed by revocation: %+v err=%v", local, err)
+	}
+	if good, err := s.GetDestinationRunID(ctx, vID, "offsite", goodPeer.ID); err != nil || good.SourceNodeID.Int64 != goodPeer.ID {
+		t.Fatalf("other peer's component disturbed by revocation: %+v err=%v", good, err)
+	}
+
+	history, err := s.ListDestinationRunIDHistory(ctx, vID, "offsite")
+	if err != nil {
+		t.Fatalf("ListDestinationRunIDHistory: %v", err)
+	}
+	if len(history) != 3 {
+		t.Fatalf("history rows = %d after revocation, want 3 (audit trail untouched)", len(history))
+	}
+}

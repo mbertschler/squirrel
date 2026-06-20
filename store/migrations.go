@@ -10,7 +10,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 21
+const SchemaVersion = 22
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -57,6 +57,7 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 19, up: migrateV18ToV19},
 		{version: 20, up: migrateV19ToV20},
 		{version: 21, up: migrateV20ToV21},
+		{version: 22, up: migrateV21ToV22},
 	}
 }
 
@@ -1868,4 +1869,45 @@ func contentsImmutableTriggers() []string {
 		     SELECT RAISE(ABORT, 'contents is append-only; a content row is never deleted');
 		 END`,
 	}
+}
+
+// --- v21 → v22 ---
+
+// migrateV21ToV22 adds source_node_id provenance to the durability vector
+// so a pulled (peer-asserted) component is distinguishable from a
+// locally-verified one. destination_run_ids.source_node_id is the peer
+// whose pull last advanced the live component; destination_run_ids_history.source_node_id
+// records the same per advance so the audit log can answer "which peer's
+// evidence gated this offload".
+//
+// Both columns are additive and nullable, FK to nodes(id). NULL is the
+// locally-verified class — the value AdvanceDestinationVectorTo writes
+// when a destination handler or peer-sync initiator confirms a transfer
+// it observed itself; a non-NULL value names the asserting peer the
+// durability pull resolved. Existing components carry over NULL, reading
+// as locally-verified, which is the safe inherited interpretation: a pull
+// re-stamps a component it asserts on the next pull, while a genuinely
+// local row stays NULL forever.
+//
+// No index: source_node_id is low-cardinality (a handful of peers), and
+// revocation scans the volume's vector by equality, which the existing
+// (volume_id, destination, origin_node_id) primary key already narrows.
+func migrateV21ToV22(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`ALTER TABLE destination_run_ids ADD COLUMN source_node_id INTEGER REFERENCES nodes(id)`,
+		`ALTER TABLE destination_run_ids_history ADD COLUMN source_node_id INTEGER REFERENCES nodes(id)`,
+		`INSERT INTO schema_version (version) VALUES (22)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("v21→v22: %w", err)
+		}
+	}
+	return tx.Commit()
 }

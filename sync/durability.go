@@ -136,6 +136,10 @@ func pullDurability(ctx context.Context, s *store.Store, client *nodeClient, vol
 	if err != nil {
 		return rep, err
 	}
+	sourceNode, err := s.GetOrCreateOriginNode(ctx, peerName)
+	if err != nil {
+		return rep, fmt.Errorf("resolve source peer %q: %w", peerName, err)
+	}
 	rep.Fetched = len(resp.Components) + len(resp.Freshness)
 	originIDs := make(map[string]int64, 4)
 	resolveOrigin := func(name string) (int64, error) {
@@ -170,7 +174,7 @@ func pullDurability(ctx context.Context, s *store.Store, client *nodeClient, vol
 		if err != nil {
 			return rep, err
 		}
-		err = s.UpsertDestinationRunIDVerified(ctx, volumeID, c.Destination, nodeID, c.OriginRun, c.VerifyMethod, allowRewind)
+		err = s.UpsertDestinationRunIDPulled(ctx, volumeID, c.Destination, nodeID, c.OriginRun, c.VerifyMethod, sourceNode.ID, allowRewind)
 		var rewind *store.DestinationRewindError
 		if errors.As(err, &rewind) {
 			rep.Rewinds = append(rep.Rewinds, DurabilityRewind{
