@@ -115,7 +115,7 @@ path    = "~/Pictures"
 sync_to = ["nas", "mirror"]
 ```
 
-Like rclone, the kopia binary is driven as an opaque child process with squirrel owning the command line: each sync connects to the repository at `root` (creating it on first use), runs `kopia snapshot create` on the volume path, then `kopia snapshot verify` on the new snapshot. The repository password is passed to kopia via its environment, never on the command line, and the per-destination kopia config file lives next to squirrel's own config — your personal kopia configuration is never touched.
+Like rclone, the kopia binary is driven as an opaque child process with squirrel owning the command line: each sync connects to the repository at `root`, runs `kopia snapshot create` on the volume path, then `kopia snapshot verify` on the new snapshot. The repository password is passed to kopia via its environment, never on the command line, and the per-destination kopia config file lives next to squirrel's own config — your personal kopia configuration is never touched. The repository is **not** created automatically: the first sync to a new kopia destination must be run interactively once with `--init` (see [First use and the `.squirrel-volume` marker](#first-use-and-the-squirrel-volume-marker)).
 
 Properties that differ from rclone destinations:
 
@@ -289,6 +289,23 @@ squirrel sync                       # every (volume, destination) pair in config
 
 Sync verifies each uploaded file's BLAKE3 against the destination (using rclone's `--checksum --hash blake3`). Mismatches abort that file before the runs row is marked success. Use `--shallow` to fall back to rclone's default size+mtime comparison if you want speed over integrity for a big initial push. Encrypted (`crypt`) destinations always use the size+mtime comparison (see [Encrypted destinations](#encrypted-destinations)).
 
+### First use and the `.squirrel-volume` marker
+
+Destinations that need first-use setup must be bootstrapped once with `--init`; without it squirrel refuses to create anything:
+
+```
+squirrel sync pictures --to mirror --init   # first time only
+squirrel sync pictures --to mirror          # every time after
+```
+
+`--init` authorises the one-time first-use setup, by destination type:
+
+- **`local`** — writes a `.squirrel-volume` marker under the destination's volume directory. Every later sync **requires** that marker and refuses if it is missing (a missing marker after the fact almost always means the root is wrong — an unmounted disk or a typo). A marker that names a *different* volume is always refused, with or without `--init`.
+- **`kopia`** — permits `kopia repository create` when connecting finds no repository.
+- **Remote rclone** (`sftp`, `s3`, `b2`, `gcs`) — do **not** yet enforce a marker, so they don't currently require `--init`; marker support for them is a tracked follow-up (#64).
+
+Why a flag rather than auto-create on first use: a missing marker (or a missing kopia repository) is ambiguous — it could mean "genuinely new" or "the destination I expect is unreachable right now." Auto-creating in the second case would mint a fresh **empty** target, record it as durable, and — once `offload` trusts that durability — let it delete the only local copy. Requiring `--init` keeps that irreversible "create a new target" step a one-time, human-driven act. In particular, **the agent/scheduler never passes `--init`**, so an unattended sync can never silently create an empty target on a transient outage.
+
 Look up a file by its BLAKE3 hex hash:
 
 ```
@@ -327,7 +344,7 @@ squirrel        # bare invocation opens the TUI when stdin/stdout are a terminal
 
 ```
 squirrel index   <volume>            [--shallow] [--dry-run] [--workers N]
-squirrel sync    [<volume>]          [--to DEST] [--shallow] [--dry-run]
+squirrel sync    [<volume>]          [--to DEST] [--shallow] [--dry-run] [--init]
 squirrel verify  [<destination>]
 squirrel offload <volume> [path...]  [--older-than DUR] [--dry-run]
 squirrel query   <hash-or-path>      [--history]
@@ -344,6 +361,7 @@ squirrel tui
 | `--db`      | from config, else default     | SQLite database path; overrides `db` in config                   |
 | `--shallow` | off                           | Skip BLAKE3 verification; use rclone's default size+mtime check  |
 | `--dry-run` | off                           | Report what would change without writing                         |
+| `--init`    | off                           | Authorise first-use destination bootstrap (sync only; see above) |
 | `--workers` | `NumCPU()`                    | Number of hashing workers (index only)                           |
 
 ## Destination layout
