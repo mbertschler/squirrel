@@ -32,6 +32,14 @@ type Agent struct {
 	// without a token is an unauthenticated open port and we refuse to
 	// start one.
 	Token string
+	// PeerTokens maps a per-peer bearer token to the node name that
+	// presents it, so the agent can recover an authenticated caller
+	// identity instead of treating every token-holder as anonymous. When
+	// non-empty the agent binds each in-flight sync session to the node
+	// whose token opened it and rejects phase calls from a different
+	// identity (#110a). Empty (the default) keeps the single shared Token
+	// as the only credential, authenticating every caller identically.
+	PeerTokens map[string]string
 	// ScanInterval is the period between drift-detection passes the
 	// agent runs over its hosted volumes (#17). Zero (the default,
 	// when the TOML key is absent) disables the scheduler — the
@@ -63,9 +71,16 @@ type rawTLS struct {
 
 // rawAuth keeps Token as `any` because the resolved value is either a
 // plain string or an inline `{ env = "VAR" }` table — same shape we use
-// for destination secrets. resolveSecret normalises both.
+// for destination secrets. resolveSecret normalises both. Peers is the
+// optional per-peer token map keyed by node name (`[agent.auth.peers.X]`),
+// each carrying its own `bearer` secret in the same shape `[nodes.X]` uses.
 type rawAuth struct {
-	Token any `toml:"token"`
+	Token any                     `toml:"token"`
+	Peers map[string]*rawPeerAuth `toml:"peers"`
+}
+
+type rawPeerAuth struct {
+	Bearer any `toml:"bearer"`
 }
 
 func resolveAgent(r *rawAgent) (*Agent, error) {
@@ -161,5 +176,42 @@ func resolveAgentAuth(r *rawAuth, a *Agent) error {
 		return errors.New("auth.token must not be empty")
 	}
 	a.Token = tok
+	return resolveAgentPeerTokens(r.Peers, a)
+}
+
+// resolveAgentPeerTokens resolves the optional `[agent.auth.peers.X]`
+// per-peer token map into Agent.PeerTokens (token → node name). A token
+// that maps to two identities can't authenticate either, so every peer
+// token must be distinct and must differ from the shared auth.token;
+// both collisions are rejected at load time rather than silently
+// shadowing one peer. Absent or empty leaves PeerTokens nil — the agent
+// then authenticates every caller with the shared token alone.
+func resolveAgentPeerTokens(peers map[string]*rawPeerAuth, a *Agent) error {
+	if len(peers) == 0 {
+		return nil
+	}
+	resolved := make(map[string]string, len(peers))
+	owners := map[string]string{a.Token: "auth.token"}
+	for name, peer := range peers {
+		if !nameRE.MatchString(name) {
+			return fmt.Errorf("auth.peers: invalid node name %q (must match %s)", name, nameRE)
+		}
+		if peer == nil || peer.Bearer == nil {
+			return fmt.Errorf("auth.peers.%s.bearer is required", name)
+		}
+		tok, err := resolveSecret(map[string]any{"bearer": peer.Bearer}, "bearer")
+		if err != nil {
+			return fmt.Errorf("auth.peers.%s.%w", name, err)
+		}
+		if tok == "" {
+			return fmt.Errorf("auth.peers.%s.bearer must not be empty", name)
+		}
+		if owner, dup := owners[tok]; dup {
+			return fmt.Errorf("auth.peers.%s.bearer reuses the token already bound to %s; each credential must map to one identity", name, owner)
+		}
+		owners[tok] = "auth.peers." + name
+		resolved[tok] = name
+	}
+	a.PeerTokens = resolved
 	return nil
 }
