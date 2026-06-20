@@ -203,12 +203,15 @@ To replay: process segments in ascending run id; each line with status `present`
 
 ```toml
 [volumes.pictures]
-path             = "~/Pictures"
-sync_to          = ["nas", "offsite"]
-offload_requires = ["nas", "offsite"]
+path                     = "~/Pictures"
+sync_to                  = ["nas", "offsite"]
+offload_requires         = ["nas", "offsite"]
+offload_max_evidence_age = "720h"   # optional; default disabled
 ```
 
 `offload_requires` is the explicit per-volume policy: every named target's recorded durability must cover a file's content before its bytes may go, and a volume without the key refuses to offload entirely. The names share the flat destination/node namespace that `sync_to` uses. They may also name targets only a *peer* pushes to: evidence about those arrives through the peer durability pull (`squirrel peer-sync pull-durability`), and a name with no recorded evidence simply keeps the gate closed.
+
+`offload_max_evidence_age` is an optional, opt-in defence-in-depth knob: when set, a target whose durability evidence was last *re-verified* longer ago than this (in wall-clock time) is treated as stale and refuses the offload, even when its version-vector coverage is sound. This stops the gate from trusting a destination that has been dead or unreachable for months on the strength of a claim never since re-confirmed. It is fail-closed — evidence with an unknown verification time (a row migrated from before the column existed, or one only ever touched without re-verification) is refused too. Re-verification (a fresh push, or a durability pull from the asserting peer) re-stamps the evidence and clears the staleness. The default is disabled (no maximum age), so existing configs are unaffected; only an equal-value re-confirmation that carries no verification never refreshes the clock, so the age tracks genuine checks rather than no-op touches.
 
 ```
 squirrel offload pictures 2019/             # a subtree

@@ -61,11 +61,12 @@ func runOffload(cmd *cobra.Command, volumeName string, paths []string, olderThan
 	defer s.Close()
 
 	rep, err := offload.Offload(cmd.Context(), s, vol.Path, offload.Options{
-		Name:      volumeName,
-		Paths:     paths,
-		OlderThan: olderThan,
-		Require:   vol.OffloadRequires,
-		DryRun:    dryRun,
+		Name:           volumeName,
+		Paths:          paths,
+		OlderThan:      olderThan,
+		Require:        vol.OffloadRequires,
+		MaxEvidenceAge: vol.OffloadMaxEvidenceAge,
+		DryRun:         dryRun,
 	})
 	printOffloadReport(cmd.OutOrStdout(), cmd.ErrOrStderr(), rep, dryRun)
 	if err != nil {

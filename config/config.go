@@ -80,6 +80,16 @@ type Volume struct {
 	// durability pull about targets only that peer reaches; a name with
 	// no recorded evidence keeps the gate closed.
 	OffloadRequires []string
+	// OffloadMaxEvidenceAge bounds how old a required target's durability
+	// evidence may be (in wall-clock time since it was last re-verified)
+	// before `squirrel offload` refuses to delete on its strength. Zero —
+	// the default — disables the time-based staleness policy, leaving the
+	// version-vector coverage gate as the sole durability check, so the
+	// knob is opt-in and existing configs are unaffected. When set,
+	// evidence whose last verification is unknown or older than this is
+	// refused (fail-closed); it pairs with periodic re-verification
+	// (`squirrel verify`, scrub) that re-stamps fresh evidence.
+	OffloadMaxEvidenceAge time.Duration
 	// SyncEvery is the agent-scheduler cadence for full syncs of this
 	// volume. Zero means "no scheduled sync" — the agent never auto-
 	// triggers a sync for this volume; manual `squirrel sync` still
@@ -266,12 +276,13 @@ type rawConfig struct {
 }
 
 type rawVolume struct {
-	Path            string         `toml:"path"`
-	SyncTo          []string       `toml:"sync_to"`
-	OffloadRequires []string       `toml:"offload_requires"`
-	SyncEvery       string         `toml:"sync_every"`
-	IndexEvery      string         `toml:"index_every"`
-	Hook            *rawVolumeHook `toml:"hook"`
+	Path                  string         `toml:"path"`
+	SyncTo                []string       `toml:"sync_to"`
+	OffloadRequires       []string       `toml:"offload_requires"`
+	OffloadMaxEvidenceAge string         `toml:"offload_max_evidence_age"`
+	SyncEvery             string         `toml:"sync_every"`
+	IndexEvery            string         `toml:"index_every"`
+	Hook                  *rawVolumeHook `toml:"hook"`
 }
 
 type rawVolumeHook struct {
@@ -365,6 +376,10 @@ func resolveVolume(name string, raw rawVolume, dests map[string]*Destination, no
 	if err := validateOffloadRequires(raw.OffloadRequires); err != nil {
 		return nil, err
 	}
+	offloadMaxEvidenceAge, err := parseOffloadMaxEvidenceAge(raw.OffloadMaxEvidenceAge)
+	if err != nil {
+		return nil, err
+	}
 	syncEvery, err := parseVolumeCadence("sync_every", raw.SyncEvery)
 	if err != nil {
 		return nil, err
@@ -385,14 +400,35 @@ func resolveVolume(name string, raw rawVolume, dests map[string]*Destination, no
 		return nil, err
 	}
 	return &Volume{
-		Name:            name,
-		Path:            abs,
-		SyncTo:          raw.SyncTo,
-		OffloadRequires: raw.OffloadRequires,
-		SyncEvery:       syncEvery,
-		IndexEvery:      indexEvery,
-		Hook:            hook,
+		Name:                  name,
+		Path:                  abs,
+		SyncTo:                raw.SyncTo,
+		OffloadRequires:       raw.OffloadRequires,
+		OffloadMaxEvidenceAge: offloadMaxEvidenceAge,
+		SyncEvery:             syncEvery,
+		IndexEvery:            indexEvery,
+		Hook:                  hook,
 	}, nil
+}
+
+// parseOffloadMaxEvidenceAge parses the optional offload_max_evidence_age
+// knob. Empty stays zero — the time-based staleness policy is disabled,
+// its opt-in default. Non-empty must parse as a strictly positive
+// time.Duration; a sub-second value is almost certainly a missing unit
+// suffix (e.g. `30` where `720h` or `30d`-style was meant) for a knob
+// whose sensible values are days to months, so it is rejected.
+func parseOffloadMaxEvidenceAge(raw string) (time.Duration, error) {
+	if raw == "" {
+		return 0, nil
+	}
+	dur, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("offload_max_evidence_age %q: %w", raw, err)
+	}
+	if dur < time.Second {
+		return 0, fmt.Errorf("offload_max_evidence_age must be at least %s, got %s", time.Second, raw)
+	}
+	return dur, nil
 }
 
 // validateOffloadRequires checks the offload policy entries

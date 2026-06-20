@@ -10,7 +10,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 22
+const SchemaVersion = 23
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -58,6 +58,7 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 20, up: migrateV19ToV20},
 		{version: 21, up: migrateV20ToV21},
 		{version: 22, up: migrateV21ToV22},
+		{version: 23, up: migrateV22ToV23},
 	}
 }
 
@@ -1912,6 +1913,45 @@ func migrateV21ToV22(ctx context.Context, db *sql.DB) error {
 	for _, q := range stmts {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("v21→v22: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// --- v22 → v23 ---
+
+// migrateV22ToV23 adds verified_at_ns to the live durability vector so the
+// offload gate can enforce a time-based staleness policy in addition to the
+// version-vector coverage it already checks (issue #131). updated_at_ns
+// keeps its prior meaning (the wall-clock of the last applied write, bumped
+// even by an equal-value re-confirmation), while verified_at_ns records only
+// the last write backed by genuine re-verification — a content-verified
+// method or a strict run advance — so a no-op touch never makes evidence
+// look freshly checked.
+//
+// The column is additive and nullable. Existing rows carry over NULL: their
+// last verification time is unknown, so the gate treats a NULL as
+// infinitely stale and refuses whenever a max-evidence-age is configured
+// (fail-closed) — a re-verification re-stamps it on the next push or pull.
+// The history table is unchanged: it already records each advance's at_ns,
+// and the gate reads only the live vector.
+//
+// No index: the gate loads the whole vector for a target and filters in Go;
+// no query selects by verified_at_ns.
+func migrateV22ToV23(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`ALTER TABLE destination_run_ids ADD COLUMN verified_at_ns INTEGER`,
+		`INSERT INTO schema_version (version) VALUES (23)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("v22→v23: %w", err)
 		}
 	}
 	return tx.Commit()

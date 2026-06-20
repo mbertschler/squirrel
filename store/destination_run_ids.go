@@ -88,6 +88,18 @@ func KnownVerifyMethod(method string) bool {
 // last relay — not the original asserter. Trust is therefore hop-by-hop:
 // each node vouches for what it relays, and revoking a peer drops
 // everything that peer asserted regardless of where it first originated.
+//
+// UpdatedAtNs is the wall-clock of the last applied write — bumped even
+// by an equal-value re-confirmation. VerifiedAtNs is the narrower
+// freshness signal the offload gate's time-based staleness policy reads:
+// it advances only on a write backed by genuine re-verification (a
+// content-verified method, or a strict run advance), so a no-op touch
+// never makes evidence look freshly checked. NULL means the verification
+// time is unknown (a pre-v23 row, or a methodless advance that never
+// carried verification) — the gate treats that as infinitely stale and
+// refuses when a max age is configured. For a peer-asserted component it
+// records when this node last pulled a fresh assertion, not the peer's
+// own verification instant.
 type DestinationRunID struct {
 	VolumeID     int64
 	Destination  string
@@ -96,6 +108,7 @@ type DestinationRunID struct {
 	UpdatedAtNs  int64
 	VerifyMethod string
 	SourceNodeID sql.NullInt64
+	VerifiedAtNs sql.NullInt64
 }
 
 // DestinationRunIDHistory is one row of the insert-only
@@ -141,7 +154,7 @@ func (e *DestinationRewindError) Unwrap() error { return ErrWatermarkRewind }
 // run id advances from it.
 func (s *Store) GetDestinationRunID(ctx context.Context, volumeID int64, destination string, originNodeID int64) (DestinationRunID, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT volume_id, destination, origin_node_id, origin_run_id, updated_at_ns, verify_method, source_node_id
+		`SELECT volume_id, destination, origin_node_id, origin_run_id, updated_at_ns, verify_method, source_node_id, verified_at_ns
 		 FROM destination_run_ids
 		 WHERE volume_id = ? AND destination = ? AND origin_node_id = ?`,
 		volumeID, destination, originNodeID)
@@ -153,7 +166,7 @@ func (s *Store) GetDestinationRunID(ctx context.Context, volumeID int64, destina
 // means the destination has no recorded durability yet.
 func (s *Store) ListDestinationRunIDs(ctx context.Context, volumeID int64, destination string) ([]DestinationRunID, error) {
 	return queryRows(ctx, s.db,
-		`SELECT volume_id, destination, origin_node_id, origin_run_id, updated_at_ns, verify_method, source_node_id
+		`SELECT volume_id, destination, origin_node_id, origin_run_id, updated_at_ns, verify_method, source_node_id, verified_at_ns
 		 FROM destination_run_ids
 		 WHERE volume_id = ? AND destination = ?
 		 ORDER BY origin_node_id`,
@@ -167,7 +180,7 @@ func (s *Store) ListDestinationRunIDs(ctx context.Context, volumeID int64, desti
 // can see.
 func (s *Store) ListVolumeDestinationRunIDs(ctx context.Context, volumeID int64) ([]DestinationRunID, error) {
 	return queryRows(ctx, s.db,
-		`SELECT volume_id, destination, origin_node_id, origin_run_id, updated_at_ns, verify_method, source_node_id
+		`SELECT volume_id, destination, origin_node_id, origin_run_id, updated_at_ns, verify_method, source_node_id, verified_at_ns
 		 FROM destination_run_ids
 		 WHERE volume_id = ?
 		 ORDER BY destination, origin_node_id`,
@@ -177,7 +190,7 @@ func (s *Store) ListVolumeDestinationRunIDs(ctx context.Context, volumeID int64)
 func scanDestinationRunID(s rowScanner) (DestinationRunID, error) {
 	var d DestinationRunID
 	var method sql.NullString
-	err := s.Scan(&d.VolumeID, &d.Destination, &d.OriginNodeID, &d.OriginRunID, &d.UpdatedAtNs, &method, &d.SourceNodeID)
+	err := s.Scan(&d.VolumeID, &d.Destination, &d.OriginNodeID, &d.OriginRunID, &d.UpdatedAtNs, &method, &d.SourceNodeID, &d.VerifiedAtNs)
 	d.VerifyMethod = method.String
 	return d, err
 }
@@ -344,6 +357,15 @@ func (s *Store) UpsertDestinationRunIDPulled(ctx context.Context, volumeID int64
 //     method this node already holds never steals ownership of
 //     locally-verified evidence (which would make it revocable), and a
 //     methodless touch changes nothing.
+//
+// updated_at_ns is set to now on every applied write. verified_at_ns —
+// the offload gate's time-based freshness signal — is set to now only
+// when the write carries genuine re-verification: a strict run advance
+// (new coverage proven) or a non-empty verify method (an advance or
+// re-confirmation that named a verification). A methodless re-confirmation
+// at the recorded run (a no-op touch, or a pull from a pre-v19 peer)
+// preserves the prior verified_at_ns, so a stale component cannot be made
+// to look freshly checked without genuine evidence.
 func (s *Store) upsertDestinationRunID(ctx context.Context, volumeID int64, destination string, originNodeID, originRunID int64, verifyMethod string, sourceNodeID sql.NullInt64, allowRewind bool) error {
 	if destination == "" {
 		return fmt.Errorf("UpsertDestinationRunID: destination must be non-empty")
@@ -357,8 +379,8 @@ func (s *Store) upsertDestinationRunID(ctx context.Context, volumeID int64, dest
 	atNs := NowNs()
 	method := nullableString(verifyMethod)
 	res, err := tx.ExecContext(ctx, `
-		INSERT INTO destination_run_ids (volume_id, destination, origin_node_id, origin_run_id, updated_at_ns, verify_method, source_node_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO destination_run_ids (volume_id, destination, origin_node_id, origin_run_id, updated_at_ns, verify_method, source_node_id, verified_at_ns)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(volume_id, destination, origin_node_id) DO UPDATE SET
 			origin_run_id = excluded.origin_run_id,
 			updated_at_ns = excluded.updated_at_ns,
@@ -373,9 +395,14 @@ func (s *Store) upsertDestinationRunID(ctx context.Context, volumeID int64, dest
 				     AND excluded.verify_method IS NOT destination_run_ids.verify_method THEN excluded.source_node_id
 				WHEN excluded.source_node_id IS NULL AND excluded.verify_method IS NOT NULL THEN NULL
 				ELSE destination_run_ids.source_node_id
+			END,
+			verified_at_ns = CASE
+				WHEN excluded.origin_run_id > destination_run_ids.origin_run_id THEN excluded.verified_at_ns
+				WHEN excluded.verify_method IS NOT NULL THEN excluded.verified_at_ns
+				ELSE destination_run_ids.verified_at_ns
 			END
 		WHERE excluded.origin_run_id >= destination_run_ids.origin_run_id OR ?
-	`, volumeID, destination, originNodeID, originRunID, atNs, method, sourceNodeID, allowRewind)
+	`, volumeID, destination, originNodeID, originRunID, atNs, method, sourceNodeID, atNs, allowRewind)
 	if err != nil {
 		return fmt.Errorf("upsert destination_run_ids: %w", err)
 	}
