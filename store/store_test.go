@@ -757,12 +757,14 @@ func TestMigrateV2ToV3(t *testing.T) {
 			t.Fatalf("v2 DDL %q: %v", q, err)
 		}
 	}
-	d := digest(0x77)
+	// Distinct content gets distinct hashes: a BLAKE3 digest is over the
+	// bytes, so two files of different size cannot share one hash (and the
+	// v13→v14 guard rejects a DB where they do).
 	if _, err := rawDB.Exec(
 		`INSERT INTO files (volume_id, path, blake3, size_bytes, mtime_ns, status, last_seen_at_ns, indexed_at_ns)
 		 VALUES (?, ?, ?, ?, ?, 'present', ?, ?), (?, ?, ?, ?, ?, 'present', ?, ?)`,
-		1, "a.txt", d, 5, 10, 100, 100,
-		2, "clip.mp4", d, 99, 20, 200, 200,
+		1, "a.txt", digest(0x77), 5, 10, 100, 100,
+		2, "clip.mp4", digest(0x88), 99, 20, 200, 200,
 	); err != nil {
 		t.Fatalf("seed files: %v", err)
 	}
@@ -3837,6 +3839,41 @@ func TestMigrateV13ContentsSplit(t *testing.T) {
 	assertSchemaGuardsAfterSplit(t, s)
 	assertRunsOffloadCheck(t, s)
 	assertDestinationStoreAfterMigration(t, s)
+	assertStatusChangedBackfill(t, s)
+}
+
+// assertStatusChangedBackfill checks the v17→v18 status_changed_run_id
+// backfill on the migrated legacy rows: a present row stamps its
+// first_seen_run_id (re-flips to present weren't recorded pre-v18), while a
+// superseded/missing row stamps its last_seen_run_id (the closest recorded
+// coordinate to its status flip). No live API exposes the column, so the
+// assertion reads it directly against the v13 fixture's known statuses.
+func assertStatusChangedBackfill(t *testing.T, s *Store) {
+	t.Helper()
+	ctx := context.Background()
+
+	cases := []struct {
+		name   string
+		status string
+		want   int64
+	}{
+		{"a.txt", "present", 1},    // first_seen=1
+		{"b.txt", "present", 3},    // first_seen=3 (folder 2 'sub')
+		{"c.txt", "present", 2},    // live c.txt: first_seen=2
+		{"c.txt", "superseded", 1}, // superseded predecessor: last_seen=1
+		{"d.txt", "missing", 3},    // missing row: last_seen=3
+	}
+	for _, c := range cases {
+		var got sql.NullInt64
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT status_changed_run_id FROM files WHERE name = ? AND status = ?`,
+			c.name, c.status).Scan(&got); err != nil {
+			t.Fatalf("status_changed_run_id for %s/%s: %v", c.name, c.status, err)
+		}
+		if !got.Valid || got.Int64 != c.want {
+			t.Fatalf("%s/%s status_changed_run_id = %+v, want %d", c.name, c.status, got, c.want)
+		}
+	}
 }
 
 // assertContentsBackfill checks the distinct-hash → contents mapping:
@@ -4213,5 +4250,313 @@ func assertContentsTriggersAbort(t *testing.T, s *Store) {
 	}
 	if count != 2 {
 		t.Fatalf("contents rows = %d after refused DELETE, want 2", count)
+	}
+}
+
+// v13CoreDDL is the v13 table set the corrupt-shape fixtures below seed
+// against. It omits the data and the uniq_files_live_per_path index so each
+// fixture can choose whether to install the index — a legacy DB missing it
+// is exactly the shape that lets a duplicate live row exist.
+func v13CoreDDL() []string {
+	return []string{
+		`CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)`,
+		`CREATE TABLE volumes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL)`,
+		`CREATE TABLE nodes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, endpoint TEXT, public_key_fingerprint TEXT)`,
+		`CREATE TABLE runs (
+			id            INTEGER PRIMARY KEY,
+			kind          TEXT NOT NULL CHECK (kind IN ('index','sync','restore','audit')),
+			volume_id     INTEGER REFERENCES volumes(id),
+			destination   TEXT,
+			started_at_ns INTEGER NOT NULL,
+			ended_at_ns   INTEGER,
+			status        TEXT NOT NULL CHECK (status IN ('running','success','failed','partial')),
+			error         TEXT,
+			file_count    INTEGER NOT NULL DEFAULT 0,
+			peer_node_id      INTEGER REFERENCES nodes(id),
+			correlated_run_id INTEGER,
+			shallow INTEGER CHECK (shallow IS NULL OR shallow IN (0, 1)),
+			CHECK (
+				(kind IN ('index','audit') AND destination IS NULL) OR
+				(kind IN ('sync','restore') AND destination IS NOT NULL AND destination != '')
+			)
+		)`,
+		`CREATE TABLE folders (
+			id                  INTEGER PRIMARY KEY,
+			volume_id           INTEGER NOT NULL REFERENCES volumes(id),
+			parent_id           INTEGER REFERENCES folders(id),
+			path                TEXT NOT NULL,
+			shallow_blake3      BLOB,
+			deep_blake3         BLOB,
+			last_changed_run_id INTEGER REFERENCES runs(id),
+			file_count      INTEGER NOT NULL DEFAULT 0,
+			cumulative_size INTEGER NOT NULL DEFAULT 0,
+			UNIQUE (volume_id, path)
+		)`,
+		`CREATE TABLE files (
+			folder_id         INTEGER NOT NULL REFERENCES folders(id),
+			name              TEXT NOT NULL,
+			blake3            BLOB NOT NULL CHECK (length(blake3) = 32),
+			size_bytes        INTEGER NOT NULL,
+			mtime_ns          INTEGER NOT NULL,
+			status            TEXT NOT NULL CHECK (status IN ('present','missing','superseded')),
+			first_seen_run_id INTEGER NOT NULL REFERENCES runs(id),
+			last_seen_run_id  INTEGER NOT NULL REFERENCES runs(id),
+			indexed_at_ns     INTEGER NOT NULL,
+			source_node_id    INTEGER REFERENCES nodes(id),
+			source_run_id     INTEGER REFERENCES runs(id),
+			PRIMARY KEY (folder_id, name, blake3)
+		)`,
+		`INSERT INTO schema_version (version) VALUES (13)`,
+		`INSERT INTO volumes (id, name, path) VALUES (1, 'photos', '/photos')`,
+		`INSERT INTO nodes (id, name) VALUES (1, 'self')`,
+		`INSERT INTO runs (id, kind, volume_id, destination, started_at_ns, status)
+		 VALUES (1, 'index', 1, NULL, 100, 'success')`,
+		`INSERT INTO folders (id, volume_id, parent_id, path) VALUES (1, 1, NULL, '')`,
+	}
+}
+
+// migrateRawFixture writes the fixture DDL to a fresh DB through a raw
+// connection (so FK enforcement stays off and pathological rows are
+// insertable), then opens it through the real migration path and returns the
+// Open error for the caller to assert on.
+func migrateRawFixture(t *testing.T, ddl []string) error {
+	t.Helper()
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	rawDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("raw sql.Open: %v", err)
+	}
+	for _, q := range ddl {
+		if _, err := rawDB.Exec(q); err != nil {
+			rawDB.Close()
+			t.Fatalf("fixture DDL %q: %v", q, err)
+		}
+	}
+	rawDB.Close()
+
+	s, err := OpenWithOptions(dsn, OpenOptions{NodeName: "self", DisablePreMigrationBackup: true})
+	if err == nil {
+		s.Close()
+	}
+	return err
+}
+
+// TestMigrateV13SameHashDifferentSizeRefused asserts the v13→v14 backfill
+// guard: two v13 files rows sharing a blake3 with differing size_bytes (only
+// reachable via prior corruption or a stat/hash TOCTOU) make the migration
+// refuse loudly instead of silently coalescing to the earliest size.
+func TestMigrateV13SameHashDifferentSizeRefused(t *testing.T) {
+	ddl := append(v13CoreDDL(),
+		`INSERT INTO files (folder_id, name, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns) VALUES
+		 (1, 'a.txt', X'`+strings.Repeat("11", 32)+`', 10, 1, 'present', 1, 1, 1),
+		 (1, 'b.txt', X'`+strings.Repeat("11", 32)+`', 20, 2, 'present', 1, 1, 2)`,
+	)
+	err := migrateRawFixture(t, ddl)
+	if err == nil {
+		t.Fatal("migration accepted same-hash-different-size files, want refusal")
+	}
+	if !strings.Contains(err.Error(), "differing size_bytes") {
+		t.Fatalf("error = %v, want same-hash-different-size refusal", err)
+	}
+}
+
+// TestMigrateV13SameHashSameSizeAccepted is the negative control for the
+// guard: the same hash at two paths with the *same* size is valid (a
+// duplicate file) and must migrate cleanly into one contents row.
+func TestMigrateV13SameHashSameSizeAccepted(t *testing.T) {
+	ddl := append(v13CoreDDL(),
+		`INSERT INTO files (folder_id, name, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns) VALUES
+		 (1, 'a.txt', X'`+strings.Repeat("11", 32)+`', 10, 1, 'present', 1, 1, 1),
+		 (1, 'b.txt', X'`+strings.Repeat("11", 32)+`', 10, 2, 'present', 1, 1, 2)`,
+	)
+	if err := migrateRawFixture(t, ddl); err != nil {
+		t.Fatalf("migration refused a valid same-hash-same-size duplicate: %v", err)
+	}
+}
+
+// TestMigrateV13OrphanedFKRolledBack asserts the v13→v14 rebuild's
+// foreign_key_check catches a files row referencing a non-existent run and
+// rolls the migration back loudly rather than landing a dangling reference.
+func TestMigrateV13OrphanedFKRolledBack(t *testing.T) {
+	ddl := append(v13CoreDDL(),
+		`INSERT INTO files (folder_id, name, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns) VALUES
+		 (1, 'a.txt', X'`+strings.Repeat("11", 32)+`', 10, 1, 'present', 1, 999, 1)`,
+	)
+	err := migrateRawFixture(t, ddl)
+	if err == nil {
+		t.Fatal("migration accepted an orphaned files→runs FK, want rollback")
+	}
+	if !strings.Contains(err.Error(), "dangling FK") {
+		t.Fatalf("error = %v, want dangling FK refusal", err)
+	}
+}
+
+// TestMigrateV13DuplicateLiveRowRolledBack asserts that a legacy DB missing
+// uniq_files_live_per_path with two live rows at one path fails loudly when
+// the v13→v14 rebuild recreates the partial unique index, rather than
+// migrating two live rows into the reshaped table.
+func TestMigrateV13DuplicateLiveRowRolledBack(t *testing.T) {
+	ddl := append(v13CoreDDL(),
+		`INSERT INTO files (folder_id, name, blake3, size_bytes, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns) VALUES
+		 (1, 'a.txt', X'`+strings.Repeat("11", 32)+`', 10, 1, 'present', 1, 1, 1),
+		 (1, 'a.txt', X'`+strings.Repeat("22", 32)+`', 20, 2, 'present', 1, 1, 2)`,
+	)
+	err := migrateRawFixture(t, ddl)
+	if err == nil {
+		t.Fatal("migration accepted two live rows at one path, want rollback")
+	}
+	if !strings.Contains(err.Error(), "UNIQUE") {
+		t.Fatalf("error = %v, want UNIQUE violation on uniq_files_live_per_path", err)
+	}
+}
+
+// v16Fixture returns a populated v16 database whose remote_objects table
+// carries the pre-v17 NOT NULL (checksum_algo, checksum) shape. It exists so
+// the v16→v17 rebuild — which actually rewrites remote_objects to relax those
+// columns to nullable — is exercised against real rows; the v18 fixture seeds
+// remote_objects but starts after that rebuild.
+func v16Fixture() []string {
+	return []string{
+		`CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)`,
+		`CREATE TABLE volumes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL)`,
+		`CREATE TABLE nodes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, endpoint TEXT, public_key_fingerprint TEXT)`,
+		`CREATE TABLE runs (
+			id            INTEGER PRIMARY KEY,
+			kind          TEXT NOT NULL CHECK (kind IN ('index','sync','restore','audit','offload')),
+			volume_id     INTEGER REFERENCES volumes(id),
+			destination   TEXT,
+			started_at_ns INTEGER NOT NULL,
+			ended_at_ns   INTEGER,
+			status        TEXT NOT NULL CHECK (status IN ('running','success','failed','partial')),
+			error         TEXT,
+			file_count    INTEGER NOT NULL DEFAULT 0,
+			peer_node_id      INTEGER REFERENCES nodes(id),
+			correlated_run_id INTEGER,
+			shallow INTEGER CHECK (shallow IS NULL OR shallow IN (0, 1)),
+			CHECK (
+				(kind IN ('index','audit','offload') AND destination IS NULL) OR
+				(kind IN ('sync','restore') AND destination IS NOT NULL AND destination != '')
+			)
+		)`,
+		`CREATE TABLE folders (
+			id                  INTEGER PRIMARY KEY,
+			volume_id           INTEGER NOT NULL REFERENCES volumes(id),
+			parent_id           INTEGER REFERENCES folders(id),
+			path                TEXT NOT NULL,
+			shallow_blake3      BLOB,
+			deep_blake3         BLOB,
+			last_changed_run_id INTEGER REFERENCES runs(id),
+			file_count      INTEGER NOT NULL DEFAULT 0,
+			cumulative_size INTEGER NOT NULL DEFAULT 0,
+			UNIQUE (volume_id, path)
+		)`,
+		`CREATE TABLE contents (
+			id             INTEGER PRIMARY KEY,
+			blake3         BLOB NOT NULL UNIQUE CHECK (length(blake3) = 32),
+			size_bytes     INTEGER NOT NULL,
+			origin_node_id INTEGER REFERENCES nodes(id),
+			origin_run_id  INTEGER
+		)`,
+		`CREATE TABLE files (
+			folder_id         INTEGER NOT NULL REFERENCES folders(id),
+			name              TEXT NOT NULL,
+			content_id        INTEGER NOT NULL REFERENCES contents(id),
+			mtime_ns          INTEGER NOT NULL,
+			status            TEXT NOT NULL CHECK (status IN ('present','missing','superseded','offloaded')),
+			first_seen_run_id INTEGER NOT NULL REFERENCES runs(id),
+			last_seen_run_id  INTEGER NOT NULL REFERENCES runs(id),
+			indexed_at_ns     INTEGER NOT NULL,
+			PRIMARY KEY (folder_id, name, content_id)
+		)`,
+		`CREATE UNIQUE INDEX uniq_files_live_per_path ON files(folder_id, name) WHERE status != 'superseded'`,
+		`CREATE TABLE destination_run_ids (
+			volume_id      INTEGER NOT NULL REFERENCES volumes(id),
+			destination    TEXT NOT NULL,
+			origin_node_id INTEGER NOT NULL REFERENCES nodes(id),
+			origin_run_id  INTEGER NOT NULL,
+			updated_at_ns  INTEGER NOT NULL,
+			PRIMARY KEY (volume_id, destination, origin_node_id)
+		)`,
+		`CREATE TABLE destination_run_ids_history (
+			id             INTEGER PRIMARY KEY,
+			volume_id      INTEGER NOT NULL,
+			destination    TEXT NOT NULL,
+			origin_node_id INTEGER NOT NULL,
+			origin_run_id  INTEGER NOT NULL,
+			at_ns          INTEGER NOT NULL
+		)`,
+		`CREATE TABLE remote_objects (
+			content_id      INTEGER NOT NULL REFERENCES contents(id),
+			destination     TEXT NOT NULL,
+			uploaded_run_id INTEGER NOT NULL REFERENCES runs(id),
+			checksum_algo   TEXT NOT NULL,
+			checksum        TEXT NOT NULL,
+			verified_at_ns  INTEGER,
+			PRIMARY KEY (content_id, destination)
+		)`,
+		`INSERT INTO schema_version (version) VALUES (16)`,
+		`INSERT INTO volumes (id, name, path) VALUES (1, 'photos', '/photos')`,
+		`INSERT INTO nodes (id, name) VALUES (1, 'self')`,
+		`INSERT INTO runs (id, kind, volume_id, destination, started_at_ns, status)
+		 VALUES (1, 'index', 1, NULL, 100, 'success'),
+		        (2, 'sync',  1, 'bucket', 200, 'success')`,
+		`INSERT INTO folders (id, volume_id, parent_id, path) VALUES (1, 1, NULL, '')`,
+		`INSERT INTO contents (id, blake3, size_bytes) VALUES
+		 (1, X'` + strings.Repeat("11", 32) + `', 10),
+		 (2, X'` + strings.Repeat("22", 32) + `', 20)`,
+		`INSERT INTO files (folder_id, name, content_id, mtime_ns, status, first_seen_run_id, last_seen_run_id, indexed_at_ns) VALUES
+		 (1, 'a.txt', 1, 1, 'present', 1, 1, 1),
+		 (1, 'b.txt', 2, 2, 'present', 1, 1, 2)`,
+		`INSERT INTO remote_objects (content_id, destination, uploaded_run_id, checksum_algo, checksum, verified_at_ns) VALUES
+		 (1, 'bucket', 2, 'blake3', 'deadbeef', 150),
+		 (2, 'bucket', 2, 'blake3', 'cafebabe', 150)`,
+	}
+}
+
+// TestMigrateV16RemoteObjectsRebuild drives a populated v16 database through
+// the v17 remote_objects rebuild and confirms the rows survive the table
+// rewrite with their fingerprints intact, and that the relaxed v17 shape now
+// accepts an upload record with a pending (NULL,NULL) fingerprint.
+func TestMigrateV16RemoteObjectsRebuild(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	rawDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("raw sql.Open: %v", err)
+	}
+	for _, q := range v16Fixture() {
+		if _, err := rawDB.Exec(q); err != nil {
+			rawDB.Close()
+			t.Fatalf("v16 DDL %q: %v", q, err)
+		}
+	}
+	rawDB.Close()
+
+	s, err := OpenWithOptions(dsn, OpenOptions{NodeName: "self"})
+	if err != nil {
+		t.Fatalf("Open (migrates v16→v%d): %v", SchemaVersion, err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	var rows int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM remote_objects`).Scan(&rows); err != nil {
+		t.Fatalf("count remote_objects: %v", err)
+	}
+	if rows != 2 {
+		t.Fatalf("remote_objects rows = %d after rebuild, want 2 (none lost)", rows)
+	}
+	var algo, checksum string
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT checksum_algo, checksum FROM remote_objects WHERE content_id = 1 AND destination = 'bucket'`).
+		Scan(&algo, &checksum); err != nil {
+		t.Fatalf("remote_objects row: %v", err)
+	}
+	if algo != "blake3" || checksum != "deadbeef" {
+		t.Fatalf("fingerprint = (%q,%q), want (blake3,deadbeef)", algo, checksum)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO remote_objects (content_id, destination, uploaded_run_id, checksum_algo, checksum)
+		 VALUES (2, 'bucket2', 2, NULL, NULL)`); err != nil {
+		t.Fatalf("v17 relaxed shape rejected a pending-fingerprint upload: %v", err)
 	}
 }

@@ -666,6 +666,78 @@ func TestReindexModifiedFilePreservesOldHash(t *testing.T) {
 	}
 }
 
+// TestHashFileSizePairsWithDigest pins the stat-after-hash contract: the
+// size hashFile returns is the count of bytes that produced the digest, read
+// from the open handle's fstat rather than a path stat that could observe a
+// different inode state. A regression to a pre-hash path stat would let the
+// digest and the size describe different bytes; here they must agree.
+func TestHashFileSizePairsWithDigest(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "doc.txt")
+	content := "the quick brown fox"
+	writeFile(t, path, content)
+
+	got, err := hashFile(path, make([]byte, hashReadBufferSize))
+	if err != nil {
+		t.Fatalf("hashFile: %v", err)
+	}
+	if got.sizeBytes != int64(len(content)) {
+		t.Fatalf("sizeBytes = %d, want %d (size of the hashed bytes)", got.sizeBytes, len(content))
+	}
+	if !bytes.Equal(got.digest, blake3Of(t, content)) {
+		t.Fatalf("digest does not match BLAKE3 of the %d hashed bytes", len(content))
+	}
+}
+
+// TestReindexAfterAppendSupersedesToConsistentRow exercises the residual the
+// stat-after-hash fix documents: a file that grows between index runs cannot
+// leave a row whose size disagrees with its hash. The grown file mints a new
+// (digest, size) pair that supersedes the prior row, and each live row's size
+// matches the content its hash covers.
+func TestReindexAfterAppendSupersedesToConsistentRow(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "doc.txt")
+	writeFile(t, path, "abc")
+
+	s := setupStore(t)
+	ctx := context.Background()
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("first Index: %v", err)
+	}
+	absRoot, _ := filepath.Abs(root)
+	vol := volumeFor(t, s, absRoot)
+	first, err := s.GetByPath(ctx, vol.ID, "doc.txt")
+	if err != nil {
+		t.Fatalf("GetByPath after first: %v", err)
+	}
+	if first.SizeBytes != 3 || !bytes.Equal(first.Blake3, blake3Of(t, "abc")) {
+		t.Fatalf("first row = (size=%d), want size=3 matching BLAKE3(abc)", first.SizeBytes)
+	}
+
+	writeFile(t, path, "abcdef")
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("second Index: %v", err)
+	}
+
+	history, err := s.ListHistoryByPath(ctx, vol.ID, "doc.txt")
+	if err != nil {
+		t.Fatalf("ListHistoryByPath: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("history = %d rows, want 2", len(history))
+	}
+	for _, row := range history {
+		want := blake3Of(t, "abc")
+		wantSize := int64(3)
+		if row.Status == store.StatusPresent {
+			want, wantSize = blake3Of(t, "abcdef"), 6
+		}
+		if row.SizeBytes != wantSize || !bytes.Equal(row.Blake3, want) {
+			t.Fatalf("row (status=%s) size=%d does not match its hash", row.Status, row.SizeBytes)
+		}
+	}
+}
+
 func TestDryRunDoesNotRecordRun(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "a.txt"), "hello")
