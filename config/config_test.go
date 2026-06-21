@@ -809,6 +809,113 @@ auth   = { token = "literal-token" }
 	}
 }
 
+func TestLoadAgentPeerTokens(t *testing.T) {
+	t.Setenv("NAS_TOKEN", "nas-secret")
+	p := writeConfig(t, `
+[agent]
+listen = "127.0.0.1:9000"
+
+[agent.auth]
+token = "shared-fallback"
+
+[agent.auth.peers.laptop]
+bearer = "laptop-secret"
+
+[agent.auth.peers.nas]
+bearer = { env = "NAS_TOKEN" }
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := map[string]string{"laptop-secret": "laptop", "nas-secret": "nas"}
+	if got := cfg.Agent.PeerTokens; len(got) != len(want) {
+		t.Fatalf("PeerTokens = %v, want %v", got, want)
+	}
+	for token, node := range want {
+		if cfg.Agent.PeerTokens[token] != node {
+			t.Fatalf("PeerTokens[%q] = %q, want %q", token, cfg.Agent.PeerTokens[token], node)
+		}
+	}
+}
+
+func TestLoadAgentPeerTokensAbsentLeavesNil(t *testing.T) {
+	p := writeConfig(t, `
+[agent]
+listen = "127.0.0.1:9000"
+auth   = { token = "only-shared" }
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Agent.PeerTokens != nil {
+		t.Fatalf("PeerTokens = %v, want nil when no peers configured", cfg.Agent.PeerTokens)
+	}
+}
+
+func TestLoadAgentPeerTokensRejectsCollisions(t *testing.T) {
+	cases := map[string]struct {
+		toml string
+		want string
+	}{
+		"duplicate across peers": {
+			toml: `
+[agent]
+listen = "127.0.0.1:9000"
+[agent.auth]
+token = "shared"
+[agent.auth.peers.a]
+bearer = "same"
+[agent.auth.peers.b]
+bearer = "same"
+`,
+			want: "reuses the token",
+		},
+		"collides with shared token": {
+			toml: `
+[agent]
+listen = "127.0.0.1:9000"
+[agent.auth]
+token = "shared"
+[agent.auth.peers.a]
+bearer = "shared"
+`,
+			want: "auth.token",
+		},
+		"empty bearer": {
+			toml: `
+[agent]
+listen = "127.0.0.1:9000"
+[agent.auth]
+token = "shared"
+[agent.auth.peers.a]
+bearer = ""
+`,
+			want: "must not be empty",
+		},
+		"invalid node name": {
+			toml: `
+[agent]
+listen = "127.0.0.1:9000"
+[agent.auth]
+token = "shared"
+[agent.auth.peers."bad/name"]
+bearer = "x"
+`,
+			want: "invalid node name",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, tc.toml))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Load err = %v, want one containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoadAgentMissingToken(t *testing.T) {
 	// auth = { } without a token must fail — an open agent port is a
 	// footgun even in lab setups, so we refuse to start one.

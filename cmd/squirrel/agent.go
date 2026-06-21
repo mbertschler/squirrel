@@ -58,6 +58,7 @@ func runAgent(cmd *cobra.Command) error {
 	srv, err := agent.New(agent.Config{
 		Listen:       cfg.Agent.Listen,
 		Token:        cfg.Agent.Token,
+		PeerTokens:   cfg.Agent.PeerTokens,
 		TLSCert:      cfg.Agent.TLSCert,
 		TLSKey:       cfg.Agent.TLSKey,
 		Version:      agentVersion,

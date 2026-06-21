@@ -612,10 +612,10 @@ func TestValidateRelPathRejectsAllReservedDirs(t *testing.T) {
 
 // TestSessionBoundToCaller (#110a): a phase call presenting a caller
 // identity that differs from the node that opened the session is refused.
-// The single shared agent token carries no per-request identity yet
-// (#110d), so the production phase handlers pass "" (no binding) — this
-// exercises the binding directly to prove the chokepoint is correct for
-// when per-peer tokens make a caller identity recoverable.
+// This exercises the lookup binding directly; the empty-caller case is
+// the shared-token path (#110d), which carries no identity and so reaches
+// the session unbound. The end-to-end binding over per-peer tokens is
+// covered by TestPeerTokenSessionBinding.
 func TestSessionBoundToCaller(t *testing.T) {
 	f := newPreStageFixture(t)
 	r := f.router
@@ -703,6 +703,78 @@ func TestPeerEndpointIgnoresWireEndpoint(t *testing.T) {
 	if got != "peer://owner" {
 		t.Fatalf("peerEndpoint = %q, want the name-derived placeholder peer://owner", got)
 	}
+}
+
+// TestPeerTokenSessionBinding (#110a + safe #110d increment): with
+// per-peer tokens configured, a session opened by one peer's token is
+// bound to that peer's identity. A phase call carrying the same
+// receiver_run_id but a different peer's token is refused with 403, so a
+// second token-holder can't hijack (or /close-abort) the session. A
+// shared-token caller still authenticates but, carrying no identity,
+// reaches the session unbound (the pre-#110d behaviour).
+func TestPeerTokenSessionBinding(t *testing.T) {
+	vol := &config.Volume{Name: "pics", Path: t.TempDir()}
+	srv := newTestServer(t, Config{
+		Token:      "shared",
+		Volumes:    map[string]*config.Volume{vol.Name: vol},
+		PeerTokens: map[string]string{"owner-token": "owner", "intruder-token": "intruder"},
+	})
+
+	var begin syncproto.BeginResponse
+	if code := postJSON(t, srv, "/v1/sync/begin", "owner-token", syncproto.BeginRequest{
+		Volume: vol.Name, InitiatorNodeName: "owner", InitiatorRunID: 1,
+	}, &begin); code != http.StatusOK {
+		t.Fatalf("begin as owner: status = %d, want 200", code)
+	}
+
+	verify := syncproto.VerifyRequest{ReceiverRunID: begin.ReceiverRunID}
+	if code := postJSON(t, srv, "/v1/sync/verify", "intruder-token", verify, nil); code != http.StatusForbidden {
+		t.Fatalf("verify as intruder: status = %d, want 403", code)
+	}
+	if code := postJSON(t, srv, "/v1/sync/verify", "owner-token", verify, nil); code != http.StatusOK {
+		t.Fatalf("verify as owner: status = %d, want 200", code)
+	}
+}
+
+// TestBeginRejectsImpersonatedNodeName (safe #110d increment): a caller
+// authenticated as one node may not open a session declaring a different
+// initiator_node_name, so the declared identity is bound to the
+// credential rather than self-asserted.
+func TestBeginRejectsImpersonatedNodeName(t *testing.T) {
+	vol := &config.Volume{Name: "pics", Path: t.TempDir()}
+	srv := newTestServer(t, Config{
+		Token:      "shared",
+		Volumes:    map[string]*config.Volume{vol.Name: vol},
+		PeerTokens: map[string]string{"owner-token": "owner"},
+	})
+	code := postJSON(t, srv, "/v1/sync/begin", "owner-token", syncproto.BeginRequest{
+		Volume: vol.Name, InitiatorNodeName: "someone-else", InitiatorRunID: 1,
+	}, nil)
+	if code != http.StatusForbidden {
+		t.Fatalf("begin impersonating someone-else: status = %d, want 403", code)
+	}
+}
+
+// postJSON marshals body, POSTs it to urlPath with the given bearer
+// token, decodes a 200 response into out (when non-nil), and returns the
+// status so a test can assert auth/binding rejections.
+func postJSON(t *testing.T, srv *Server, urlPath, token string, body, out any) int {
+	t.Helper()
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, urlPath, bytes.NewReader(encoded))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code == http.StatusOK && out != nil {
+		if err := json.Unmarshal(rec.Body.Bytes(), out); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+	}
+	return rec.Code
 }
 
 // postRaw POSTs body verbatim to urlPath with the test bearer token and
