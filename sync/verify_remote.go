@@ -399,7 +399,7 @@ func recordVerifyOutcome(ctx context.Context, s *store.Store, rep *RemoteVerifyR
 	}); err != nil {
 		return err
 	}
-	if err := s.FinishRun(ctx, rep.RunID, status, errMsg, int64(rep.Objects)); err != nil {
+	if err := s.FinishRun(ctx, rep.RunID, status, errMsg, int64(rep.Objects+rep.Packs)); err != nil {
 		return fmt.Errorf("finish verify run %d: %w", rep.RunID, err)
 	}
 	return nil
