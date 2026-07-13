@@ -92,14 +92,18 @@ func KnownVerifyMethod(method string) bool {
 // UpdatedAtNs is the wall-clock of the last applied write — bumped even
 // by an equal-value re-confirmation. VerifiedAtNs is the narrower
 // freshness signal the offload gate's time-based staleness policy reads:
-// it advances only on a write backed by genuine re-verification (a
-// content-verified method, or a strict run advance), so a no-op touch
-// never makes evidence look freshly checked. NULL means the verification
-// time is unknown (a pre-v23 row, or a methodless advance that never
-// carried verification) — the gate treats that as infinitely stale and
-// refuses when a max age is configured. For a peer-asserted component it
-// records when this node last pulled a fresh assertion, not the peer's
-// own verification instant.
+// it advances only on a write that carries a recorded verify method or
+// strictly advances the run, so a methodless no-op touch never makes
+// evidence look freshly checked. The method need not be content-verified —
+// a shallow size+mtime re-check refreshes the clock too — because the gate
+// independently requires a content-verified method before offload; the
+// freshness and the content-verification conditions are orthogonal. NULL
+// means the verification time is unknown (a pre-v23 row, or a methodless
+// advance that never carried verification) — the gate treats that as
+// infinitely stale and refuses when a max age is configured. For a
+// peer-asserted component it records the responder's own verification
+// instant, relayed on the pull and capped at now, so the puller is never
+// fresher than the evidence the peer actually holds.
 type DestinationRunID struct {
 	VolumeID     int64
 	Destination  string
@@ -372,13 +376,14 @@ func (s *Store) UpsertDestinationRunIDPulled(ctx context.Context, volumeID int64
 //     methodless touch changes nothing.
 //
 // updated_at_ns is set to now on every applied write. verified_at_ns —
-// the offload gate's time-based freshness signal — is set to now only
-// when the write carries genuine re-verification: a strict run advance
-// (new coverage proven) or a non-empty verify method (an advance or
-// re-confirmation that named a verification). A methodless re-confirmation
-// at the recorded run (a no-op touch, or a pull from a pre-v19 peer)
-// preserves the prior verified_at_ns, so a stale component cannot be made
-// to look freshly checked without genuine evidence.
+// the offload gate's time-based freshness signal — takes this write's
+// verified-at value (now for a locally-observed write; the responder's
+// relayed instant capped at now for a pull, see UpsertDestinationRunIDPulled)
+// only when the write strictly advances the run (new coverage proven) or
+// carries a non-empty verify method. A methodless re-confirmation at the
+// recorded run (a no-op touch, or a pull from a pre-v19 peer) preserves
+// the prior verified_at_ns, so a stale component cannot be made to look
+// freshly checked without a fresh write behind it.
 func (s *Store) upsertDestinationRunID(ctx context.Context, volumeID int64, destination string, originNodeID, originRunID int64, verifyMethod string, sourceNodeID sql.NullInt64, verifiedAtOverride *sql.NullInt64, allowRewind bool) error {
 	if destination == "" {
 		return fmt.Errorf("UpsertDestinationRunID: destination must be non-empty")

@@ -1925,9 +1925,8 @@ func migrateV21ToV22(ctx context.Context, db *sql.DB) error {
 // version-vector coverage it already checks (issue #131). updated_at_ns
 // keeps its prior meaning (the wall-clock of the last applied write, bumped
 // even by an equal-value re-confirmation), while verified_at_ns records only
-// the last write backed by genuine re-verification — a content-verified
-// method or a strict run advance — so a no-op touch never makes evidence
-// look freshly checked.
+// the last write that carried a verify method or strictly advanced the run —
+// so a methodless no-op touch never makes evidence look freshly checked.
 //
 // The column is additive and nullable. Existing rows carry over NULL: their
 // last verification time is unknown, so the gate treats a NULL as

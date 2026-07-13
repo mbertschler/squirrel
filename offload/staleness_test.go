@@ -72,9 +72,11 @@ func TestNullVerifiedAtRefusesUnderMaxAge(t *testing.T) {
 }
 
 // TestPeerRelayedEvidenceStaleness: a peer-asserted component's
-// verified_at_ns records when this node last pulled a fresh assertion. A
-// recent pull is trusted; a peer gone silent past the max age ages out,
-// and the refusal names the asserting peer, not the local node.
+// verified_at_ns records the responder's own verification instant (relayed
+// on the pull, capped at now). Evidence within the max age is trusted;
+// evidence older than it ages out — whether because the destination went
+// dead behind a still-answering peer or the peer itself fell silent — and
+// the refusal names the asserting peer, not the local node.
 func TestPeerRelayedEvidenceStaleness(t *testing.T) {
 	const peerID = int64(42)
 	g := staleGate(maxAge, map[int64]string{peerID: "nas"})

@@ -17,9 +17,10 @@ import (
 // behind it; source is the asserting peer's node id when the component
 // was last advanced by a durability pull, and invalid (NULL) for the
 // locally-verified class — so the gate's decision names which peer's
-// evidence backed it. verifiedAt is the wall-clock of the last write
-// backed by genuine re-verification (NULL when unknown), the basis for
-// the time-based staleness policy.
+// evidence backed it. verifiedAt is the wall-clock of the last write that
+// carried a verify method or advanced the run — for a pulled component the
+// responder's own instant, capped at now (NULL when unknown) — the basis
+// for the time-based staleness policy.
 type component struct {
 	coveredRun int64
 	method     string
@@ -172,12 +173,13 @@ func (g *gate) check(ctx context.Context, row store.FileRow) ([]string, error) {
 // show the coverage was recently re-confirmed.
 //
 // For a peer-asserted component (a durability pull tagged it) the
-// verified_at_ns this node holds is when it last pulled a fresh
-// assertion from that peer — the peer's own verification instant never
-// travels the wire — so the policy bounds how long this node trusts
-// relayed evidence without hearing from the peer again, the dead-peer
-// defence the issue calls for. A zero maxEvidenceAge disables the policy
-// entirely.
+// verified_at_ns this node holds is the responder's own verification
+// instant, relayed on the pull and capped at now — so the policy bounds
+// freshness by when the peer last genuinely re-verified, not merely when
+// this node last heard from it. A destination gone dead behind a peer
+// that keeps answering ages out here too, and a peer that falls silent
+// still ages out because no newer assertion arrives to refresh it. A zero
+// maxEvidenceAge disables the policy entirely.
 func (g *gate) staleEvidenceFailure(ctx context.Context, target string, comp component) string {
 	if g.maxEvidenceAge <= 0 {
 		return ""
