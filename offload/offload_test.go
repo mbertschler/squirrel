@@ -322,8 +322,8 @@ func TestOffloadPeerOriginContent(t *testing.T) {
 	}
 	oneResult(t, rep, "covered.txt", OutcomeOffloaded)
 	res := oneResult(t, rep, "ahead.txt", OutcomeNotDurable)
-	if !strings.Contains(res.Reasons[0], "t1: stale: have 7 need 9 (origin peer1)") {
-		t.Fatalf("reasons = %v, want stale failure naming origin peer1", res.Reasons)
+	if !strings.Contains(res.Reasons[0], "t1: stale: have 7 need 9 (origin peer1, locally verified)") {
+		t.Fatalf("reasons = %v, want stale failure naming origin peer1 and local provenance", res.Reasons)
 	}
 	mustBeGone(t, filepath.Join(root, "covered.txt"))
 	mustExist(t, filepath.Join(root, "ahead.txt"))

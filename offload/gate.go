@@ -10,12 +10,17 @@ import (
 )
 
 // component is one loaded durability-vector entry: the highest origin
-// run covered for an origin node, plus the verification method that
-// advanced it. The method lets the gate refuse a presence-only
-// component that has no content verification behind it.
+// run covered for an origin node, the verification method that advanced
+// it, and the provenance of that advance. The method lets the gate
+// refuse a presence-only component that has no content verification
+// behind it; source is the asserting peer's node id when the component
+// was last advanced by a durability pull, and invalid (NULL) for the
+// locally-verified class — so the gate's decision names which peer's
+// evidence backed it.
 type component struct {
 	coveredRun int64
 	method     string
+	source     sql.NullInt64
 }
 
 // gate is the offline durability evidence for one invocation: the self
@@ -60,7 +65,7 @@ func loadGate(ctx context.Context, s *store.Store, volumeID int64, require []str
 		}
 		vector := make(map[int64]component, len(components))
 		for _, c := range components {
-			vector[c.OriginNodeID] = component{coveredRun: c.OriginRunID, method: c.VerifyMethod}
+			vector[c.OriginNodeID] = component{coveredRun: c.OriginRunID, method: c.VerifyMethod, source: c.SourceNodeID}
 		}
 		g.vectors[target] = vector
 
@@ -115,7 +120,7 @@ func (g *gate) check(ctx context.Context, row store.FileRow) ([]string, error) {
 			continue
 		case comp.coveredRun < originRun:
 			failures = append(failures,
-				fmt.Sprintf("%s: stale: have %d need %d (origin %s)", target, comp.coveredRun, originRun, g.nodeName(ctx, originNode)))
+				fmt.Sprintf("%s: stale: have %d need %d (origin %s, %s)", target, comp.coveredRun, originRun, g.nodeName(ctx, originNode), g.provenance(ctx, comp)))
 			continue
 		}
 		if reason := g.freshnessFailure(ctx, target, row, originNode, originRun); reason != "" {
@@ -128,7 +133,7 @@ func (g *gate) check(ctx context.Context, row store.FileRow) ([]string, error) {
 		}
 		if !verified {
 			failures = append(failures,
-				fmt.Sprintf("%s: not content-verified (method %q); a verified fingerprint must back the object before offload", target, displayMethod(comp.method)))
+				fmt.Sprintf("%s: not content-verified (method %q, %s); a verified fingerprint must back the object before offload", target, displayMethod(comp.method), g.provenance(ctx, comp)))
 		}
 	}
 	return failures, nil
@@ -228,6 +233,19 @@ func (g *gate) origin(ctx context.Context, row store.FileRow) (int64, int64, err
 		return 0, 0, fmt.Errorf("introduction run for content %d: %w", row.ContentID, err)
 	}
 	return g.self.ID, intro, nil
+}
+
+// provenance renders a component's evidence class for a gate decision:
+// "locally verified" for a component this node advanced itself, or
+// "asserted by peer <name>" for one a durability pull tagged. The audit
+// trail thus names which peer's evidence gated (or failed to gate) an
+// offload, and a peer whose assertions later prove untrustworthy is
+// identifiable per decision.
+func (g *gate) provenance(ctx context.Context, comp component) string {
+	if !comp.source.Valid {
+		return "locally verified"
+	}
+	return fmt.Sprintf("asserted by peer %s", g.nodeName(ctx, comp.source.Int64))
 }
 
 // nodeName resolves an origin node id to its name for the failure

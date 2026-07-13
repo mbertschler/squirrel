@@ -347,6 +347,42 @@ func TestOffloadPresenceSizeUnverifiedFingerprintHeldOut(t *testing.T) {
 	mustExist(t, filepath.Join(root, "a.txt"))
 }
 
+// TestOffloadGateNamesPeerProvenance: a stale component a durability pull
+// asserted names the asserting peer in the gate's refusal — the audit
+// trail answers "which evidence (and from which peer) gated this offload"
+// (the residual of #104). A locally-verified component reads "locally
+// verified" instead.
+func TestOffloadGateNamesPeerProvenance(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), "alpha")
+	s := setupStore(t)
+	ctx := context.Background()
+	idx := indexVolume(t, s, root)
+	v := testVolume(t, s)
+	self := selfNode(t, s)
+
+	peer, err := s.GetOrCreateOriginNode(ctx, "nas")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode(nas): %v", err)
+	}
+	if err := s.UpsertDestinationRunIDPulled(ctx, v.ID, "t1", self.ID, idx.RunID-1, store.VerifyMethodBlake3, peer.ID, false); err != nil {
+		t.Fatalf("UpsertDestinationRunIDPulled: %v", err)
+	}
+	recordPush(t, s, v.ID, "t1")
+
+	rep, err := Offload(ctx, s, root, Options{
+		Name: volName, Paths: []string{"."}, Require: []string{"t1"},
+	})
+	if err != nil {
+		t.Fatalf("Offload: %v", err)
+	}
+	res := oneResult(t, rep, "a.txt", OutcomeNotDurable)
+	if len(res.Reasons) != 1 || !strings.Contains(res.Reasons[0], "asserted by peer nas") {
+		t.Fatalf("reasons = %v, want the stale failure naming the asserting peer nas", res.Reasons)
+	}
+	mustExist(t, filepath.Join(root, "a.txt"))
+}
+
 // TestOffloadContentVerifiedMethodsGate: blake3, peer-blake3, and
 // kopia-verify components each gate on their own (no fingerprint needed)
 // once the vector and freshness conditions hold — the stricter gate does
