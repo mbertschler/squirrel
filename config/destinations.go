@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strings"
@@ -342,6 +343,9 @@ func optionalSize(raw map[string]any, key string, def int64) (int64, error) {
 	}
 	if n == 0 {
 		return 0, fmt.Errorf("%s must be greater than zero", key)
+	}
+	if n > math.MaxInt64 {
+		return 0, fmt.Errorf("%s: size %q is too large", key, s)
 	}
 	return int64(n), nil
 }

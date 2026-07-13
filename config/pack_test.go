@@ -138,6 +138,7 @@ func TestLoadRejectsBadPackSizes(t *testing.T) {
 		{"threshold-non-string", "pack_threshold = 42"},
 		{"size-zero", `pack_size = "0B"`},
 		{"size-unparseable", `pack_size = "lots"`},
+		{"size-overflow", `pack_size = "100EiB"`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
