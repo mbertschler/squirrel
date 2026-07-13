@@ -1442,7 +1442,17 @@ func migrateV13ToV14(ctx context.Context, db *sql.DB) error {
 // row per distinct blake3 in the old files table. The seed row per hash
 // is chosen by (first_seen_run_id, rowid) ascending so the backfill is
 // deterministic when several rows share the earliest run.
+//
+// The size guard runs first: one contents row per blake3 can carry one
+// size, so two v13 rows sharing a hash with differing sizes (reachable
+// only via prior corruption or an indexer stat/hash TOCTOU) would force
+// the seed to silently keep the earliest observation's size and discard
+// the rest. Refusing turns that into a loud pre-migration failure the
+// operator can investigate against the pre-migration snapshot.
 func createAndSeedContentsV14(ctx context.Context, tx *sql.Tx) error {
+	if err := refuseSameHashDifferentSizeV14(ctx, tx); err != nil {
+		return err
+	}
 	stmts := []string{
 		// origin_run_id is in the origin node's run space (NULL together
 		// with origin_node_id means "introduced locally"), so it is
@@ -1472,6 +1482,29 @@ func createAndSeedContentsV14(ctx context.Context, tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("create contents: %w", err)
 		}
+	}
+	return nil
+}
+
+// refuseSameHashDifferentSizeV14 aborts the migration if any blake3 in the
+// old files table appears with more than one size_bytes. A BLAKE3 digest is
+// over the bytes, so differing sizes for one hash is impossible from honest
+// indexing — it signals prior corruption or a stat/hash TOCTOU. Coalescing
+// it to one size would erase the disagreement instead of surfacing it.
+func refuseSameHashDifferentSizeV14(ctx context.Context, tx *sql.Tx) error {
+	var conflicts int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM (
+			SELECT blake3 FROM files
+			GROUP BY blake3
+			HAVING COUNT(DISTINCT size_bytes) > 1
+		)`).Scan(&conflicts); err != nil {
+		return fmt.Errorf("check same-hash-different-size: %w", err)
+	}
+	if conflicts > 0 {
+		return fmt.Errorf("refusing v13→v14: %d blake3 hash(es) in files carry differing size_bytes; "+
+			"the index is corrupt and one contents row cannot represent both sizes — "+
+			"restore from the pre-migration snapshot and re-index", conflicts)
 	}
 	return nil
 }
