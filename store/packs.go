@@ -63,10 +63,13 @@ func (s *Store) InsertPacks(ctx context.Context, writes []PackWrite) error {
 		if len(w.Pack.PackKey) != 32 {
 			return fmt.Errorf("insert pack: pack_key must be 32 bytes, got %d", len(w.Pack.PackKey))
 		}
+		// Derive member_count from the members actually inserted rather than
+		// trusting the caller's field, so the stored count can never drift
+		// from the pack_members rows that reference this pack.
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO packs (pack_key, size_bytes, member_count, created_run_id)
 			VALUES (?, ?, ?, ?)
-		`, w.Pack.PackKey, w.Pack.SizeBytes, w.Pack.MemberCount, w.Pack.CreatedRunID)
+		`, w.Pack.PackKey, w.Pack.SizeBytes, int64(len(w.Members)), w.Pack.CreatedRunID)
 		if err != nil {
 			return fmt.Errorf("insert pack: %w", err)
 		}

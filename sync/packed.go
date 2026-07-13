@@ -289,6 +289,7 @@ func (h *packedHandler) buildOnePack(srcs []store.PathDelta, start int, level zs
 			srcPath:   filepath.Join(h.vol.Path, filepath.FromSlash(d.Path)),
 		}
 		if err := pw.add(src); err != nil {
+			pw.close() // release the encoder before dropping the staged pack
 			discard()
 			return assembledPack{}, 0, fmt.Errorf("pack %s: %w", d.Path, err)
 		}
@@ -566,12 +567,22 @@ func (p *packWriter) compressedSize() int64 { return p.ccount.n }
 // of the compressed bytes), the compressed size, and the members.
 func (p *packWriter) finish() ([]byte, int64, []packedMember, error) {
 	if err := p.tw.Close(); err != nil {
+		_ = p.zw.Close() // release the encoder even when the tar close fails
 		return nil, 0, nil, fmt.Errorf("close tar: %w", err)
 	}
 	if err := p.zw.Close(); err != nil {
 		return nil, 0, nil, fmt.Errorf("close zstd: %w", err)
 	}
 	return p.hasher.Sum(nil), p.ccount.n, p.members, nil
+}
+
+// close releases the tar writer and zstd encoder on the abandon path — a
+// pack dropped before finish() (e.g. an add failure). klauspost's zstd
+// encoder holds a background goroutine and buffers, so an unclosed writer
+// leaks across a long run. Best-effort; only call when finish() did not run.
+func (p *packWriter) close() {
+	_ = p.tw.Close()
+	_ = p.zw.Close()
 }
 
 // packedHandler satisfies the sealed handler interface.
