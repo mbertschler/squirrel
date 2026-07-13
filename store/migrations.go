@@ -1880,18 +1880,23 @@ func contentsImmutableTriggers() []string {
 // records the same per advance so the audit log can answer "which peer's
 // evidence gated this offload".
 //
-// Both columns are additive and nullable, FK to nodes(id). NULL is the
-// locally-verified class — the value AdvanceDestinationVectorTo writes
-// when a destination handler or peer-sync initiator confirms a transfer
-// it observed itself; a non-NULL value names the asserting peer the
-// durability pull resolved. Existing components carry over NULL, reading
-// as locally-verified, which is the safe inherited interpretation: a pull
-// re-stamps a component it asserts on the next pull, while a genuinely
-// local row stays NULL forever.
+// Both columns are additive and nullable. The live-vector column is an FK
+// to nodes(id); the history column deliberately carries no FK, matching
+// the rest of destination_run_ids_history (its origin_node_id has none
+// either) — the append-only audit log must stay writable and never be
+// coupled to the lifecycle of a row in nodes. NULL is the locally-verified
+// class — the value AdvanceDestinationVectorTo writes when a destination
+// handler or peer-sync initiator confirms a transfer it observed itself; a
+// non-NULL value names the asserting peer the durability pull resolved.
+// Existing components carry over NULL, reading as locally-verified, which
+// is the safe inherited interpretation: a pull re-stamps a component it
+// asserts on the next pull, while a genuinely local row stays NULL forever.
 //
-// No index: source_node_id is low-cardinality (a handful of peers), and
-// revocation scans the volume's vector by equality, which the existing
-// (volume_id, destination, origin_node_id) primary key already narrows.
+// No index: source_node_id is low-cardinality (a handful of peers).
+// RevokeDestinationRunIDsFromSource deletes by source_node_id alone,
+// across every volume, so it is a deliberate full-table scan of a tiny
+// table — an index on so few distinct values would not be used and would
+// violate the repo's low-cardinality-index guidance.
 func migrateV21ToV22(ctx context.Context, db *sql.DB) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1901,7 +1906,7 @@ func migrateV21ToV22(ctx context.Context, db *sql.DB) error {
 
 	stmts := []string{
 		`ALTER TABLE destination_run_ids ADD COLUMN source_node_id INTEGER REFERENCES nodes(id)`,
-		`ALTER TABLE destination_run_ids_history ADD COLUMN source_node_id INTEGER REFERENCES nodes(id)`,
+		`ALTER TABLE destination_run_ids_history ADD COLUMN source_node_id INTEGER`,
 		`INSERT INTO schema_version (version) VALUES (22)`,
 	}
 	for _, q := range stmts {

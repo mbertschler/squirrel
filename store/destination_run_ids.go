@@ -81,6 +81,13 @@ func KnownVerifyMethod(method string) bool {
 // class, via AdvanceDestinationVectorTo), and the asserting peer's node
 // id when a durability pull last advanced it. The offload gate weighs a
 // peer-asserted component as a distinct, revocable class.
+//
+// Provenance is single-hop: the durability responder serves its whole
+// vector, including components it itself pulled from a third node, so on a
+// multi-hop relay SourceNodeID names the peer this node pulled from — the
+// last relay — not the original asserter. Trust is therefore hop-by-hop:
+// each node vouches for what it relays, and revoking a peer drops
+// everything that peer asserted regardless of where it first originated.
 type DestinationRunID struct {
 	VolumeID     int64
 	Destination  string
@@ -320,12 +327,23 @@ func (s *Store) UpsertDestinationRunIDPulled(ctx context.Context, volumeID int64
 }
 
 // upsertDestinationRunID is the shared advance. sourceNodeID carries
-// provenance: an invalid (NULL) value is the locally-verified class; a
-// valid value is the asserting peer. source_node_id follows the run: a
-// strict advance adopts the incoming provenance, an incoming local (NULL)
-// re-confirmation upgrades a peer-tagged component back to local, and a
-// peer re-confirmation at the recorded run never downgrades a
-// locally-verified (NULL) component to peer-asserted.
+// provenance: an invalid (NULL) value is the locally-verified class, a
+// valid value the asserting peer. source_node_id tracks the writer of the
+// verify_method the row ends up recording, so the (method, provenance)
+// pair always describes a single write — a peer's verification can never
+// come to rest under local provenance, nor a local one under a peer:
+//
+//   - a strict run advance adopts the incoming provenance: new coverage
+//     belongs to whoever proved it;
+//   - an equal-run write that changes the recorded method adopts the
+//     incoming provenance with it, so a peer upgrading the method (e.g.
+//     presence+size → blake3) is tagged, and revocable, as that peer;
+//   - a local (NULL-source) write carrying a method reclaims the component
+//     to local, so a verified push takes back evidence a peer had asserted;
+//   - otherwise provenance is preserved: a peer merely re-confirming the
+//     method this node already holds never steals ownership of
+//     locally-verified evidence (which would make it revocable), and a
+//     methodless touch changes nothing.
 func (s *Store) upsertDestinationRunID(ctx context.Context, volumeID int64, destination string, originNodeID, originRunID int64, verifyMethod string, sourceNodeID sql.NullInt64, allowRewind bool) error {
 	if destination == "" {
 		return fmt.Errorf("UpsertDestinationRunID: destination must be non-empty")
@@ -351,7 +369,9 @@ func (s *Store) upsertDestinationRunID(ctx context.Context, volumeID int64, dest
 			END,
 			source_node_id = CASE
 				WHEN excluded.origin_run_id > destination_run_ids.origin_run_id THEN excluded.source_node_id
-				WHEN excluded.source_node_id IS NULL THEN NULL
+				WHEN excluded.verify_method IS NOT NULL
+				     AND excluded.verify_method IS NOT destination_run_ids.verify_method THEN excluded.source_node_id
+				WHEN excluded.source_node_id IS NULL AND excluded.verify_method IS NOT NULL THEN NULL
 				ELSE destination_run_ids.source_node_id
 			END
 		WHERE excluded.origin_run_id >= destination_run_ids.origin_run_id OR ?

@@ -52,7 +52,7 @@ CREATE TABLE destination_run_ids_history (
 			origin_node_id INTEGER NOT NULL,
 			origin_run_id  INTEGER NOT NULL,
 			at_ns          INTEGER NOT NULL
-		, verify_method TEXT, source_node_id INTEGER REFERENCES nodes(id));
+		, verify_method TEXT, source_node_id INTEGER);
 
 CREATE INDEX idx_destination_run_ids_history
 		 ON destination_run_ids_history(volume_id, destination);

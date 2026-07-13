@@ -832,6 +832,108 @@ func TestUpsertDestinationRunIDProvenanceTransitions(t *testing.T) {
 	}
 }
 
+// TestUpsertDestinationRunIDMethodProvenanceStayTogether pins the
+// invariant that a component's verify_method and source_node_id always
+// describe the same write, so a peer's verification claim can never be
+// recorded under local provenance (nor the reverse). The method CASE and
+// the source CASE moved in lockstep would otherwise diverge at an
+// equal-run write, laundering evidence across the trust boundary.
+func TestUpsertDestinationRunIDMethodProvenanceStayTogether(t *testing.T) {
+	ctx := context.Background()
+
+	// A peer upgrading the method at the recorded run adopts the method
+	// AND the peer tag together: the row must not read "blake3, locally
+	// verified" when only a presence+size check was ever local.
+	t.Run("peer method upgrade at equal run is tagged to the peer", func(t *testing.T) {
+		s := openTestStore(t)
+		vID := makeVolume(t, s, "/v")
+		self, err := s.GetSelfNode(ctx)
+		if err != nil {
+			t.Fatalf("GetSelfNode: %v", err)
+		}
+		peer, err := s.GetOrCreateOriginNode(ctx, "nas")
+		if err != nil {
+			t.Fatalf("GetOrCreateOriginNode: %v", err)
+		}
+		if err := s.UpsertDestinationRunIDVerified(ctx, vID, "offsite", self.ID, 10, VerifyMethodPresenceSize, false); err != nil {
+			t.Fatalf("local presence+size advance: %v", err)
+		}
+		if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, peer.ID, false); err != nil {
+			t.Fatalf("peer blake3 re-confirm at equal run: %v", err)
+		}
+		got, err := s.GetDestinationRunID(ctx, vID, "offsite", self.ID)
+		if err != nil {
+			t.Fatalf("GetDestinationRunID: %v", err)
+		}
+		if got.VerifyMethod != VerifyMethodBlake3 {
+			t.Fatalf("method = %q, want %q adopted from the peer", got.VerifyMethod, VerifyMethodBlake3)
+		}
+		if !got.SourceNodeID.Valid || got.SourceNodeID.Int64 != peer.ID {
+			t.Fatalf("source = %+v, want peer %d: the upgraded method must carry its peer provenance, not read as local", got.SourceNodeID, peer.ID)
+		}
+	})
+
+	// A methodless local touch at the recorded run must not launder a
+	// peer's recorded method into the local class: it changes nothing.
+	t.Run("methodless local touch does not reclaim a peer method", func(t *testing.T) {
+		s := openTestStore(t)
+		vID := makeVolume(t, s, "/v")
+		self, err := s.GetSelfNode(ctx)
+		if err != nil {
+			t.Fatalf("GetSelfNode: %v", err)
+		}
+		peer, err := s.GetOrCreateOriginNode(ctx, "nas")
+		if err != nil {
+			t.Fatalf("GetOrCreateOriginNode: %v", err)
+		}
+		if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, peer.ID, false); err != nil {
+			t.Fatalf("peer blake3 advance: %v", err)
+		}
+		if err := s.UpsertDestinationRunID(ctx, vID, "offsite", self.ID, 10, false); err != nil {
+			t.Fatalf("methodless local touch: %v", err)
+		}
+		got, err := s.GetDestinationRunID(ctx, vID, "offsite", self.ID)
+		if err != nil {
+			t.Fatalf("GetDestinationRunID: %v", err)
+		}
+		if got.VerifyMethod != VerifyMethodBlake3 {
+			t.Fatalf("method = %q, want %q preserved", got.VerifyMethod, VerifyMethodBlake3)
+		}
+		if !got.SourceNodeID.Valid || got.SourceNodeID.Int64 != peer.ID {
+			t.Fatalf("source = %+v, want peer %d: a methodless touch must not launder the peer method to local", got.SourceNodeID, peer.ID)
+		}
+	})
+
+	// A local verified re-confirmation of the same method a peer asserted
+	// reclaims the component to local — local evidence is dominant and
+	// never left revocable by the peer that echoed it.
+	t.Run("local re-verification of the same method reclaims", func(t *testing.T) {
+		s := openTestStore(t)
+		vID := makeVolume(t, s, "/v")
+		self, err := s.GetSelfNode(ctx)
+		if err != nil {
+			t.Fatalf("GetSelfNode: %v", err)
+		}
+		peer, err := s.GetOrCreateOriginNode(ctx, "nas")
+		if err != nil {
+			t.Fatalf("GetOrCreateOriginNode: %v", err)
+		}
+		if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, peer.ID, false); err != nil {
+			t.Fatalf("peer blake3 advance: %v", err)
+		}
+		if err := s.UpsertDestinationRunIDVerified(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, false); err != nil {
+			t.Fatalf("local blake3 re-verify at equal run: %v", err)
+		}
+		got, err := s.GetDestinationRunID(ctx, vID, "offsite", self.ID)
+		if err != nil {
+			t.Fatalf("GetDestinationRunID: %v", err)
+		}
+		if got.SourceNodeID.Valid {
+			t.Fatalf("source = %+v, want NULL: a local re-verification must reclaim ownership from the peer", got.SourceNodeID)
+		}
+	})
+}
+
 // TestRevokeDestinationRunIDsFromSource: revoking a peer drops the live
 // components it asserted while leaving locally-verified components and a
 // second peer's assertions in place, and the append-only history is
