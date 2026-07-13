@@ -167,10 +167,11 @@ CREATE TABLE remote_packs (
 			pack_id         INTEGER NOT NULL REFERENCES packs(id),
 			destination     TEXT    NOT NULL,
 			uploaded_run_id INTEGER NOT NULL REFERENCES runs(id),
-			checksum_algo   TEXT    NOT NULL,
-			checksum        TEXT    NOT NULL,
+			checksum_algo   TEXT,
+			checksum        TEXT,
 			verified_at_ns  INTEGER,
-			PRIMARY KEY (pack_id, destination)
+			PRIMARY KEY (pack_id, destination),
+			CHECK ((checksum_algo IS NULL) = (checksum IS NULL))
 		);
 
 CREATE TABLE "runs" (
