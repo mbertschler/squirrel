@@ -38,6 +38,24 @@ type RemoteVerifyReport struct {
 	// remote listing.
 	Missing    []string
 	Mismatched []RemoteObjectMismatch
+
+	// Pack counters mirror the object ones for a packed destination's
+	// per-pack sweep — one fingerprint check per pack vouches for every
+	// content it holds. Zero on a content-addressed destination.
+	Packs int
+	// PacksVerified matched their recorded fingerprint and had
+	// verified_at_ns refreshed.
+	PacksVerified int
+	// PacksPopulated had no fingerprint yet and got one recorded.
+	PacksPopulated int
+	// PacksPending still have no fingerprint: the backend exposes none.
+	PacksPending int
+	// PacksMissing lists recorded packs (hex key) absent from the remote
+	// listing.
+	PacksMissing []string
+	// PackMismatched lists packs whose provider checksum no longer matches
+	// the recorded one (Hash holds the pack key hex).
+	PackMismatched []RemoteObjectMismatch
 }
 
 // RemoteObjectMismatch is one object whose provider checksum no longer
@@ -53,10 +71,11 @@ type RemoteObjectMismatch struct {
 	Actual string
 }
 
-// Clean reports whether every recorded object was accounted for without
-// a mismatch.
+// Clean reports whether every recorded object and pack was accounted for
+// without a mismatch.
 func (r RemoteVerifyReport) Clean() bool {
-	return len(r.Missing) == 0 && len(r.Mismatched) == 0
+	return len(r.Missing) == 0 && len(r.Mismatched) == 0 &&
+		len(r.PacksMissing) == 0 && len(r.PackMismatched) == 0
 }
 
 // VerifyRemote re-reads the provider checksums of every object recorded
@@ -73,15 +92,25 @@ func (r RemoteVerifyReport) Clean() bool {
 // carries the destination name and counters.
 func VerifyRemote(ctx context.Context, s *store.Store, rcl *Rclone, dest *config.Destination) (RemoteVerifyReport, error) {
 	rep := RemoteVerifyReport{Destination: dest.Name}
-	if dest.Layout != config.LayoutContentAddressed {
-		return rep, fmt.Errorf("destination %q has layout %q — verify covers the recorded objects of content-addressed destinations", dest.Name, dest.Layout)
+	if dest.Layout != config.LayoutContentAddressed && dest.Layout != config.LayoutPacked {
+		return rep, fmt.Errorf("destination %q has layout %q — verify covers the recorded objects and packs of content-addressed and packed destinations", dest.Name, dest.Layout)
 	}
 	rows, err := s.ListRemoteObjects(ctx, dest.Name)
 	if err != nil {
 		return rep, fmt.Errorf("list recorded objects for %q: %w", dest.Name, err)
 	}
 	rep.Objects = len(rows)
-	if len(rows) == 0 {
+	// A packed destination also keeps per-pack fingerprints; a
+	// content-addressed one has none, so this stays empty there.
+	var packs []store.RemotePackRecord
+	if dest.Layout == config.LayoutPacked {
+		packs, err = s.ListRemotePacks(ctx, dest.Name)
+		if err != nil {
+			return rep, fmt.Errorf("list recorded packs for %q: %w", dest.Name, err)
+		}
+		rep.Packs = len(packs)
+	}
+	if len(rows) == 0 && len(packs) == 0 {
 		return rep, nil
 	}
 	runID, err := s.BeginRemoteVerifyRun(ctx)
@@ -90,11 +119,29 @@ func VerifyRemote(ctx context.Context, s *store.Store, rcl *Rclone, dest *config
 	}
 	rep.RunID = runID
 
-	verifyErr := verifyRecordedObjects(ctx, s, rcl, dest, rows, &rep)
+	verifyErr := verifyRecorded(ctx, s, rcl, dest, rows, packs, &rep)
 	if err := recordVerifyOutcome(ctx, s, &rep, verifyErr); err != nil {
 		return rep, err
 	}
 	return rep, verifyErr
+}
+
+// verifyRecorded sweeps a destination's recorded content objects (the
+// large-file per-object sweep, shared with content-addressed) and, for a
+// packed destination, its recorded packs — one fingerprint check per pack
+// vouching for all its members. Either sweep can be empty.
+func verifyRecorded(ctx context.Context, s *store.Store, rcl *Rclone, dest *config.Destination, rows []store.RemoteObjectRecord, packs []store.RemotePackRecord, rep *RemoteVerifyReport) error {
+	if len(rows) > 0 {
+		if err := verifyRecordedObjects(ctx, s, rcl, dest, rows, rep); err != nil {
+			return err
+		}
+	}
+	if len(packs) > 0 {
+		if err := verifyRecordedPacks(ctx, s, rcl, dest, packs, rep); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // verifyRecordedObjects compares the remote listing against the recorded
@@ -147,7 +194,7 @@ func verifyRecordedObjects(ctx context.Context, s *store.Store, rcl *Rclone, des
 // --hash` over the destination-global objects/ directory.
 func readObjectChecksums(ctx context.Context, rcl *Rclone, dest *config.Destination, rows []store.RemoteObjectRecord) (map[string]map[string]string, error) {
 	if dest.Type == "s3" {
-		reader, err := newS3ETagReader(dest)
+		reader, err := newS3ETagReader(dest, ObjectsDirName)
 		if err != nil {
 			return nil, err
 		}
@@ -161,7 +208,7 @@ func readObjectChecksums(ctx context.Context, rcl *Rclone, dest *config.Destinat
 		}
 		return byName, nil
 	}
-	entries, err := rcl.listHashes(ctx, underlyingObjectsURI(dest), verifyHashTypes(dest, rows), checkersArgs(dest)...)
+	entries, err := rcl.listHashes(ctx, underlyingDirURI(dest, ObjectsDirName), verifyObjectHashTypes(dest, rows), checkersArgs(dest)...)
 	if err != nil {
 		return nil, err
 	}
@@ -187,20 +234,135 @@ func populateFingerprint(ctx context.Context, s *store.Store, dest *config.Desti
 	return nil
 }
 
+// verifyObjectHashTypes plans the --hash-type set the object sweep
+// requests from the recorded object rows.
+func verifyObjectHashTypes(dest *config.Destination, rows []store.RemoteObjectRecord) []string {
+	var recorded []string
+	pending := false
+	for _, row := range rows {
+		if row.ChecksumAlgo.Valid {
+			recorded = append(recorded, row.ChecksumAlgo.String)
+		} else {
+			pending = true
+		}
+	}
+	return verifyHashTypes(dest, recorded, pending)
+}
+
+// verifyRecordedPacks compares the remote packs/ listing against the
+// recorded pack rows and applies the per-pack outcome. One fingerprint
+// check per pack vouches for every content it holds, so a packed
+// destination is swept per pack rather than per member.
+func verifyRecordedPacks(ctx context.Context, s *store.Store, rcl *Rclone, dest *config.Destination, packs []store.RemotePackRecord, rep *RemoteVerifyReport) error {
+	byName, err := readPackChecksums(ctx, rcl, dest, packs)
+	if err != nil {
+		return fmt.Errorf("read pack checksums from %q: %w", dest.Name, err)
+	}
+	for _, row := range packs {
+		key := hex.EncodeToString(row.PackKey)
+		hashes, ok := byName[key]
+		if !ok {
+			rep.PacksMissing = append(rep.PacksMissing, key)
+			continue
+		}
+		if !row.ChecksumAlgo.Valid {
+			if err := populatePackFingerprint(ctx, s, dest, row, hashes, rep); err != nil {
+				return err
+			}
+			continue
+		}
+		actual := hashes[algoHashType(row.ChecksumAlgo.String)]
+		if actual == row.Checksum.String {
+			if err := s.MarkRemotePackVerified(ctx, row.PackID, dest.Name, store.NowNs()); err != nil {
+				return fmt.Errorf("stamp verification of pack %s: %w", key, err)
+			}
+			rep.PacksVerified++
+			continue
+		}
+		rep.PackMismatched = append(rep.PackMismatched, RemoteObjectMismatch{
+			Hash:     key,
+			Algo:     row.ChecksumAlgo.String,
+			Recorded: row.Checksum.String,
+			Actual:   actual,
+		})
+	}
+	return nil
+}
+
+// readPackChecksums reads the provider checksums the pack sweep compares,
+// keyed by pack key hex then rclone hash name. s3 reads raw ETags from the
+// S3 API over the packs/ prefix — every pack is a multipart object, so its
+// composite ETag is only visible here, not through rclone. Every other
+// backend reads one batched `rclone lsjson --hash` over the packs/
+// directory. The listing also returns the per-run placement maps under
+// packs/; they key on their own names and never match a pack key, so they
+// are harmlessly ignored.
+func readPackChecksums(ctx context.Context, rcl *Rclone, dest *config.Destination, packs []store.RemotePackRecord) (map[string]map[string]string, error) {
+	if dest.Type == "s3" {
+		reader, err := newS3ETagReader(dest, PacksDirName)
+		if err != nil {
+			return nil, err
+		}
+		etags, err := reader.objectETags(ctx)
+		if err != nil {
+			return nil, err
+		}
+		byName := make(map[string]map[string]string, len(etags))
+		for name, etag := range etags {
+			byName[name] = map[string]string{"md5": etag}
+		}
+		return byName, nil
+	}
+	entries, err := rcl.listHashes(ctx, underlyingDirURI(dest, PacksDirName), verifyPackHashTypes(dest, packs), checkersArgs(dest)...)
+	if err != nil {
+		return nil, err
+	}
+	byName := make(map[string]map[string]string, len(entries))
+	for _, e := range entries {
+		byName[e.Name] = e.Hashes
+	}
+	return byName, nil
+}
+
+// populatePackFingerprint records the first fingerprint for a pack whose
+// pair is still pending; a backend exposing no checksum keeps it pending.
+func populatePackFingerprint(ctx context.Context, s *store.Store, dest *config.Destination, row store.RemotePackRecord, hashes map[string]string, rep *RemoteVerifyReport) error {
+	cs, ok := extractChecksum(dest, hashes)
+	if !ok {
+		rep.PacksPending++
+		return nil
+	}
+	if err := s.SetRemotePackFingerprint(ctx, row.PackID, dest.Name, cs.Algo, cs.Value, store.NowNs()); err != nil {
+		return fmt.Errorf("record fingerprint for pack %s: %w", hex.EncodeToString(row.PackKey), err)
+	}
+	rep.PacksPopulated++
+	return nil
+}
+
+// verifyPackHashTypes plans the --hash-type set the pack sweep requests
+// from the recorded pack rows.
+func verifyPackHashTypes(dest *config.Destination, packs []store.RemotePackRecord) []string {
+	var recorded []string
+	pending := false
+	for _, row := range packs {
+		if row.ChecksumAlgo.Valid {
+			recorded = append(recorded, row.ChecksumAlgo.String)
+		} else {
+			pending = true
+		}
+	}
+	return verifyHashTypes(dest, recorded, pending)
+}
+
 // verifyHashTypes plans the --hash-type set one pass requests: the hash
 // names behind every recorded algo, plus the capture set when pending
 // rows need a first fingerprint. nil requests every hash the backend
 // exposes — required when pending rows exist on a backend with no
 // configured selection.
-func verifyHashTypes(dest *config.Destination, rows []store.RemoteObjectRecord) []string {
+func verifyHashTypes(dest *config.Destination, recordedAlgos []string, pending bool) []string {
 	set := map[string]bool{}
-	pending := false
-	for _, row := range rows {
-		if row.ChecksumAlgo.Valid {
-			set[algoHashType(row.ChecksumAlgo.String)] = true
-		} else {
-			pending = true
-		}
+	for _, algo := range recordedAlgos {
+		set[algoHashType(algo)] = true
 	}
 	if pending {
 		capture := captureHashTypes(dest)
@@ -226,10 +388,12 @@ func recordVerifyOutcome(ctx context.Context, s *store.Store, rep *RemoteVerifyR
 		errMsg = verifyErr.Error()
 	case !rep.Clean():
 		status = store.RunStatusPartial
-		errMsg = fmt.Sprintf("%d object(s) failed verification on %q", len(rep.Missing)+len(rep.Mismatched), rep.Destination)
+		failed := len(rep.Missing) + len(rep.Mismatched) + len(rep.PacksMissing) + len(rep.PackMismatched)
+		errMsg = fmt.Sprintf("%d object(s)/pack(s) failed verification on %q", failed, rep.Destination)
 	}
-	note := fmt.Sprintf("destination=%s objects=%d verified=%d fingerprinted=%d pending=%d mismatched=%d missing=%d unrecorded=%d",
-		rep.Destination, rep.Objects, rep.Verified, rep.Populated, rep.Pending, len(rep.Mismatched), len(rep.Missing), rep.Unrecorded)
+	note := fmt.Sprintf("destination=%s objects=%d verified=%d fingerprinted=%d pending=%d mismatched=%d missing=%d unrecorded=%d packs=%d packs_verified=%d packs_fingerprinted=%d packs_pending=%d packs_mismatched=%d packs_missing=%d",
+		rep.Destination, rep.Objects, rep.Verified, rep.Populated, rep.Pending, len(rep.Mismatched), len(rep.Missing), rep.Unrecorded,
+		rep.Packs, rep.PacksVerified, rep.PacksPopulated, rep.PacksPending, len(rep.PackMismatched), len(rep.PacksMissing))
 	if err := s.AppendRunAudit(ctx, store.RunAuditEntry{
 		RunID: rep.RunID, Transition: store.TransitionVerifyDestination, Note: note,
 	}); err != nil {

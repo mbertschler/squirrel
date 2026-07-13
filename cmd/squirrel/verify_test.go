@@ -27,7 +27,7 @@ func TestVerifyRefusesMirrorDestination(t *testing.T) {
 func TestVerifyNoContentAddressedDestinations(t *testing.T) {
 	fx := writeSyncFixture(t)
 	_, err := runCLIExpectErr(t, "verify", "--config", fx.configPath)
-	if !strings.Contains(err.Error(), "no content-addressed destinations") {
+	if !strings.Contains(err.Error(), "no content-addressed or packed destinations") {
 		t.Fatalf("err = %v, want no-destinations refusal", err)
 	}
 }

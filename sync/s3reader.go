@@ -14,31 +14,33 @@ import (
 	"github.com/mbertschler/squirrel/config"
 )
 
-// s3ETagReader reads the raw S3 ETags of the content objects under a
-// destination's objects/ prefix, straight from the S3 API. This is the
-// only read surface that surfaces a multipart object's composite ETag
+// s3ETagReader reads the raw S3 ETags of the files under a destination's
+// objects/ or packs/ prefix, straight from the S3 API. This is the only
+// read surface that surfaces a multipart object's composite ETag
 // (<hex>-<parts>): rclone funnels every hash read through Object.Hash(MD5),
 // which returns "" for a composite ETag, so `rclone lsjson --hash` can
-// never see it. s3 fingerprint capture and verification therefore read
-// ETags here rather than through rclone.
+// never see it. Every pack exceeds the multipart threshold, so pack
+// fingerprint capture and verification always read ETags here rather than
+// through rclone; large content objects do the same.
 //
 // The value is returned verbatim: a composite <hex>-<parts> stays
 // composite. Callers compare it byte-for-byte and never recompute it, so
 // the read is correct regardless of the object's SSE mode or storage class.
 type s3ETagReader interface {
-	// objectETags lists every object under the destination's objects/
-	// prefix (a paginated ListObjectsV2, archive-tier-safe with no per-object
-	// HEAD) and returns its raw ETag keyed by the object's basename — the
-	// lowercase BLAKE3 hex, since filename encryption is off and the
-	// underlying key equals the overlay path.
+	// objectETags lists every file under the reader's configured prefix (a
+	// paginated ListObjectsV2, archive-tier-safe with no per-object HEAD)
+	// and returns its raw ETag keyed by the file's basename — the lowercase
+	// BLAKE3 hex (of the content, or of the pack's compressed bytes), since
+	// filename encryption is off and the underlying key equals the overlay
+	// path.
 	objectETags(ctx context.Context) (map[string]string, error)
 }
 
-// newS3ETagReader builds the reader for dest. It is a package var so tests
-// can substitute a fake without a live bucket; production always uses the
-// minio-go implementation.
-var newS3ETagReader = func(dest *config.Destination) (s3ETagReader, error) {
-	return newMinioETagReader(dest)
+// newS3ETagReader builds a reader over dest's dirName prefix (ObjectsDirName
+// or PacksDirName). It is a package var so tests can substitute a fake
+// without a live bucket; production always uses the minio-go implementation.
+var newS3ETagReader = func(dest *config.Destination, dirName string) (s3ETagReader, error) {
+	return newMinioETagReader(dest, dirName)
 }
 
 // minioETagReader is the production s3ETagReader, a thin wrapper over a
@@ -49,7 +51,7 @@ type minioETagReader struct {
 	prefix string
 }
 
-func newMinioETagReader(dest *config.Destination) (*minioETagReader, error) {
+func newMinioETagReader(dest *config.Destination, dirName string) (*minioETagReader, error) {
 	p := dest.Params
 	bucket := p["bucket"]
 	if bucket == "" {
@@ -78,7 +80,7 @@ func newMinioETagReader(dest *config.Destination) (*minioETagReader, error) {
 	return &minioETagReader{
 		client: client,
 		bucket: bucket,
-		prefix: path.Join(dest.Root, ObjectsDirName) + "/",
+		prefix: path.Join(dest.Root, dirName) + "/",
 	}, nil
 }
 

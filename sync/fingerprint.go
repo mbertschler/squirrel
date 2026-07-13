@@ -114,11 +114,10 @@ func checkersArgs(dest *config.Destination) []string {
 	return []string{"--checkers", strconv.Itoa(dest.Checkers)}
 }
 
-// underlyingObjectsURI addresses the destination-root objects/ directory
-// on the underlying remote, bypassing any crypt overlay: the scan-back
-// fingerprint is over the stored ciphertext, and with filename
-// encryption fixed off the underlying object key equals the overlay
-// path.
-func underlyingObjectsURI(dest *config.Destination) string {
-	return dest.Name + ":" + path.Join(dest.Root, ObjectsDirName)
+// underlyingDirURI addresses a destination-root directory (objects/ or
+// packs/) on the underlying remote, bypassing any crypt overlay: the
+// scan-back fingerprint is over the stored ciphertext, and with filename
+// encryption fixed off the underlying key equals the overlay path.
+func underlyingDirURI(dest *config.Destination, dirName string) string {
+	return dest.Name + ":" + path.Join(dest.Root, dirName)
 }

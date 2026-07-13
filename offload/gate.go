@@ -245,11 +245,12 @@ func (g *gate) freshnessFailure(ctx context.Context, target string, row store.Fi
 // methodVerified reports whether the target's component for this row
 // rests on genuine content verification. A blake3 / peer-blake3 /
 // kopia-verify component passes directly. A presence+size component (a
-// content-addressed offsite, where crypt hides the content hash) passes
-// only once a verified scan-back fingerprint backs the gated object:
-// remote_objects must carry a checksum and a verified_at_ns for this
-// (content, destination). Any other method (including a size+mtime push
-// or an unknown/pre-v19 component) does not gate.
+// content-addressed or packed offsite, where crypt hides the content hash)
+// passes only once a verified scan-back fingerprint backs the gated content
+// — via either layout: a remote_objects row (per-hash object) or a
+// remote_packs row for the content's pack, each carrying a checksum and a
+// verified_at_ns for this destination. Any other method (including a
+// size+mtime push or an unknown/pre-v19 component) does not gate.
 func (g *gate) methodVerified(ctx context.Context, target string, comp component, row store.FileRow) (bool, error) {
 	if store.ContentVerifiedMethod(comp.method) {
 		return true, nil
@@ -257,14 +258,11 @@ func (g *gate) methodVerified(ctx context.Context, target string, comp component
 	if comp.method != store.VerifyMethodPresenceSize {
 		return false, nil
 	}
-	obj, err := g.store.GetRemoteObject(ctx, row.ContentID, target)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
+	verified, err := g.store.ContentFingerprintVerified(ctx, row.ContentID, target)
 	if err != nil {
 		return false, fmt.Errorf("load fingerprint for content %d on %q: %w", row.ContentID, target, err)
 	}
-	return obj.Checksum.Valid && obj.Checksum.String != "" && obj.VerifiedAtNs.Valid, nil
+	return verified, nil
 }
 
 // displayMethod renders a possibly-empty method for a failure message.

@@ -200,6 +200,58 @@ Each `<volume>/index/run-<id>` segment is JSONL — one JSON object per line, li
 
 To replay: process segments in ascending run id; each line with status `present`, `missing`, or `offloaded` sets that path's current `(content, status)` — last write wins per path. `superseded` lines are history only (the outgoing content of a path that changed) and update no mapping. A full recovery script is: replay every segment, then for each `present`/`offloaded` path download `objects/<blake3>` (decrypting with the `crypt` password if one was set). `missing` paths are known-but-lost at the origin — the object may still exist from an earlier upload.
 
+### Packed destinations
+
+A content-addressed destination stores one object per file. That is ideal until a volume holds a great many *small* files: one remote object apiece is slow to write, slow to list, and on some providers billed per object. The **packed** layout is the content-addressed layout with a size split — large files stay one-object-per-hash, small files are bundled into a few big immutable archives:
+
+```toml
+[destinations.archive]
+type   = "sftp"
+host   = "archive.example"
+user   = "u"
+root   = "/data"
+layout = "packed"
+pack_threshold = "1MiB"   # files smaller than this are packed; at/above land as objects
+pack_size      = "512MiB" # target size of one pack before it is closed
+zstd_level     = 3        # 1 fastest … 4 best
+```
+
+Routing is by **size**: content at or above `pack_threshold` lands as `objects/<hash>` exactly as in the content-addressed layout (same per-object `remote_objects` record and scan-back fingerprint); content below it is bundled. The destination root therefore holds three streams:
+
+- **`objects/<hash>`** — large files, exactly as content-addressed (shared across volumes, uploaded once per hash).
+- **`packs/<pack-key>`** — one immutable **tar.zst pack** per bundle: small files, hash-sorted into a normalized PAX tar and solid-compressed with zstd (encrypted client-side when the destination has a `crypt` block). The file name is the BLAKE3 of the compressed bytes, so an identical bundle names the same file. A pack is written once and never rewritten or deleted; content already packed is never re-packed.
+- **`packs/map-<run>`** — one **placement map** per sync run: JSONL locating each newly packed content inside its pack (see the format below), alongside the same `<volume>/index/run-<id>` manifest segment the content-addressed layout writes.
+
+Durability is **transactional per run and three-artifact**: a run advances the destination's durability evidence only once *all three* of its artifacts — every pack, the run's `packs/map-<run>`, and its `index/run-<run>` segment — are confirmed on the remote **and** every pack has a verified scan-back fingerprint. A pack's fingerprint is read straight back from the provider after upload (one check per ~512 MB pack vouches for every file it holds — the packed analogue of the per-object scan-back); if that read is unavailable the pack is left **pending** with a warning and the vector is *not* advanced, so unverified packed content is never counted durable. [`squirrel verify`](#offsite-verification-squirrel-verify) fills any pending pack fingerprint and re-confirms the rest, per pack.
+
+Properties match the content-addressed layout: verification is presence+size (recorded shallow), the layout is chosen at first use and refuses to run against a differently-shaped history, `--dry-run` is not supported yet, and **`squirrel restore` refuses the layout** — recovery tooling ships separately, and the format is simple enough to recover without squirrel (below).
+
+#### Placement map format
+
+Each `packs/map-<run>` is JSONL — one JSON object per newly packed content, in the pack's member order:
+
+```json
+{"blake3":"26e7…e5ad","pack":"9f3a…1c02","offset":512,"length":123}
+```
+
+- `blake3` — 64-char lowercase hex BLAKE3-256 of the file content
+- `pack` — the pack key; the bytes live at `packs/<pack>`
+- `offset`, `length` — the content's byte span inside the pack's *uncompressed* tar
+
+#### Disaster recovery without squirrel
+
+The path→hash mapping comes from the manifest segments exactly as in the content-addressed layout; the packs add hash→bytes. To recover one packed file end-to-end:
+
+1. Replay the volume's `index/run-*` segments to resolve a path to its `blake3` (as above).
+2. Find that hash in any `packs/map-*` to get its `pack`, `offset`, and `length` (a hash at or above the threshold has no map entry — its bytes are at `objects/<blake3>` instead).
+3. Stream the pack through stock zstd and tar — the member is named by its hash, or equivalently is the `offset..offset+length` slice of the decompressed tar:
+
+   ```
+   rclone cat archive:packs/<pack> | zstd -d | tar -xO <blake3>
+   ```
+
+   (decrypt with the `crypt` password first if the destination has one). The recovered bytes hash back to `<blake3>`, so recovery is self-checking.
+
 ### Offloading
 
 `squirrel offload` deletes the **local** copy of files whose content is provably stored on every target the volume's offload policy requires — never a blind delete. It is the only squirrel command that deletes user data.
@@ -389,7 +441,7 @@ Each mirrored destination (`layout = "mirror"`, the default) is a tree shaped li
 
 `.squirrel-index/` holds the index snapshots ridden along after each successful sync (see [Index snapshots](#index-snapshots)). Like `.squirrel-history`, it is filtered out of all sync and restore transfers and from peer-sync, so a snapshot is never mistaken for user content.
 
-A [content-addressed destination](#content-addressed-destinations) holds a shared `objects/` directory at its root and `index/` under each per-volume directory instead of a mirrored tree (plus the same `.squirrel-index/` ride-along).
+A [content-addressed destination](#content-addressed-destinations) holds a shared `objects/` directory at its root and `index/` under each per-volume directory instead of a mirrored tree (plus the same `.squirrel-index/` ride-along). A [packed destination](#packed-destinations) adds a shared `packs/` directory (tar.zst bundles of small files plus one placement map per run) alongside the same `objects/` and `index/`.
 
 ## Notes
 
