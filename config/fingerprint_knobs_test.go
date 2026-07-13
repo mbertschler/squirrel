@@ -147,6 +147,75 @@ root = "/data"
 	}
 }
 
+func TestLoadForcePathStyle(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+[destinations.bucket]
+type             = "s3"
+provider         = "Minio"
+bucket           = "b"
+root             = "p"
+endpoint         = "https://minio.local:9000"
+layout           = "content-addressed"
+force_path_style = true
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	d := cfg.Destinations["bucket"]
+	if !d.PathStyle {
+		t.Fatalf("PathStyle = %v, want true", d.PathStyle)
+	}
+	// The knob governs squirrel's own S3 client, not the rclone transport,
+	// so it must not leak into rclone.conf.
+	if strings.Contains(d.RcloneSection(), "force_path_style") {
+		t.Fatalf("force_path_style leaked into rclone.conf:\n%s", d.RcloneSection())
+	}
+}
+
+func TestLoadForcePathStyleDefaultsOff(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+[destinations.bucket]
+type     = "s3"
+provider = "AWS"
+bucket   = "b"
+root     = "p"
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Destinations["bucket"].PathStyle {
+		t.Fatalf("PathStyle defaulted on")
+	}
+}
+
+func TestLoadRejectsForcePathStyleOnNonS3(t *testing.T) {
+	_, err := Load(writeConfig(t, `
+[destinations.archive]
+type             = "sftp"
+host             = "host.example"
+user             = "u"
+root             = "/data"
+force_path_style = true
+`))
+	if err == nil || !strings.Contains(err.Error(), "force_path_style") {
+		t.Fatalf("err = %v, want force_path_style rejection on sftp", err)
+	}
+}
+
+func TestLoadRejectsNonBoolForcePathStyle(t *testing.T) {
+	_, err := Load(writeConfig(t, `
+[destinations.bucket]
+type             = "s3"
+provider         = "AWS"
+bucket           = "b"
+root             = "p"
+force_path_style = "yes"
+`))
+	if err == nil || !strings.Contains(err.Error(), "force_path_style") {
+		t.Fatalf("err = %v, want boolean rejection", err)
+	}
+}
+
 func TestLoadRejectsCheckersOnKopia(t *testing.T) {
 	_, err := Load(writeConfig(t, `
 [destinations.repo]

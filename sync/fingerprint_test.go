@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -138,17 +139,26 @@ func TestCaptureReadsUnderlyingRemote(t *testing.T) {
 	}
 }
 
-// TestCaptureRecordsEtagFlavorForS3: on an s3 destination the recorded
-// fingerprint is the ETag rclone surfaces as the md5 hash, labeled with
-// its etag flavor, and the listing requests only the md5 hash type.
-func TestCaptureRecordsEtagFlavorForS3(t *testing.T) {
-	f := setupCAFixture(t, `[destinations.offsite]
+// s3DestBlock declares a plain (no-crypt) content-addressed s3
+// destination named offsite for the capture/verify tests, whose ETag
+// reads are mocked via installS3Reader.
+const s3DestBlock = `[destinations.offsite]
 type     = "s3"
 provider = "Other"
 bucket   = "b"
 root     = "data"
 layout   = "content-addressed"
-`, "")
+`
+
+// TestCaptureRecordsEtagFlavorForS3: on an s3 destination the recorded
+// fingerprint is the object ETag read via the S3 API, labeled etag-md5 for
+// a plain whole-object value — and no rclone hash listing runs, since the
+// ETag never comes through rclone.
+func TestCaptureRecordsEtagFlavorForS3(t *testing.T) {
+	f := setupCAFixture(t, s3DestBlock, "")
+	installS3Reader(t, fakeS3Reader{etags: map[string]string{
+		blake3Hex("alpha"): "9e107d9d372bb6826bd81d3542a419d6",
+	}})
 	f.write(t, "a.txt", "alpha")
 	f.index(t)
 	if _, err := f.sync(t); err != nil {
@@ -156,27 +166,22 @@ layout   = "content-addressed"
 	}
 
 	obj := f.remoteObject(t, "a.txt")
-	if obj.ChecksumAlgo.String != AlgoEtagMD5 || !obj.Checksum.Valid {
-		t.Fatalf("remote object = %+v, want an etag-md5 fingerprint", obj)
+	if obj.ChecksumAlgo.String != AlgoEtagMD5 || obj.Checksum.String != "9e107d9d372bb6826bd81d3542a419d6" {
+		t.Fatalf("remote object = %+v, want an etag-md5 fingerprint read via the S3 API", obj)
 	}
-	lines := f.captureLines(t)
-	if len(lines) != 1 || !strings.Contains(lines[0], "--hash-type md5") {
-		t.Fatalf("capture argv should request md5 only:\n%s", strings.Join(lines, "\n"))
+	if lines := f.captureLines(t); len(lines) != 0 {
+		t.Fatalf("s3 capture must not run an rclone hash listing:\n%s", strings.Join(lines, "\n"))
 	}
 }
 
 // TestCaptureCompositeEtagRecordedOpaquely: a multipart-style composite
-// ETag is recorded as-is under its own flavor and verifies by verbatim
-// comparison — no recomputation anywhere.
+// ETag read via the S3 API is recorded as-is under its own flavor and
+// verifies by verbatim comparison — no recomputation anywhere.
 func TestCaptureCompositeEtagRecordedOpaquely(t *testing.T) {
-	f := setupCAFixture(t, `[destinations.offsite]
-type     = "s3"
-provider = "Other"
-bucket   = "b"
-root     = "data"
-layout   = "content-addressed"
-`, "")
-	t.Setenv("RCLONE_FAKE_HASH_VALUE", "9e107d9d372bb6826bd81d3542a419d6-12")
+	f := setupCAFixture(t, s3DestBlock, "")
+	installS3Reader(t, fakeS3Reader{etags: map[string]string{
+		blake3Hex("alpha"): "9e107d9d372bb6826bd81d3542a419d6-12",
+	}})
 	f.write(t, "a.txt", "alpha")
 	f.index(t)
 	if _, err := f.sync(t); err != nil {
@@ -195,6 +200,64 @@ layout   = "content-addressed"
 	if rep.Verified != 1 || !rep.Clean() {
 		t.Fatalf("rep = %+v, want the composite etag verified by verbatim compare", rep)
 	}
+}
+
+// TestCaptureS3ReadErrorStaysPending: a transient S3 read failure leaves
+// every fingerprint pending with a warning and never fabricates one — the
+// push still succeeds, since capture is off the durability critical path.
+func TestCaptureS3ReadErrorStaysPending(t *testing.T) {
+	f := setupCAFixture(t, s3DestBlock, "")
+	installS3Reader(t, fakeS3Reader{err: errors.New("connection reset")})
+	f.write(t, "a.txt", "alpha")
+	f.index(t)
+
+	rep, err := f.sync(t)
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if rep.Status != store.RunStatusSuccess || rep.Fingerprints != 0 {
+		t.Fatalf("rep = status=%q fingerprints=%d, want success with none recorded", rep.Status, rep.Fingerprints)
+	}
+	if !warnsContains(rep.Warnings, "checksums stay pending") {
+		t.Fatalf("Warnings = %v, want a capture-failed advisory", rep.Warnings)
+	}
+	if obj := f.remoteObject(t, "a.txt"); obj.ChecksumAlgo.Valid || obj.Checksum.Valid {
+		t.Fatalf("remote object = %+v, want a pending pair", obj)
+	}
+}
+
+// TestCaptureS3AbsentObjectStaysPending: an object the S3 listing does not
+// return yet stays pending with the distinct "not yet returned" advisory,
+// separate from a hard read failure — the push still succeeds.
+func TestCaptureS3AbsentObjectStaysPending(t *testing.T) {
+	f := setupCAFixture(t, s3DestBlock, "")
+	installS3Reader(t, fakeS3Reader{etags: map[string]string{}})
+	f.write(t, "a.txt", "alpha")
+	f.index(t)
+
+	rep, err := f.sync(t)
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if rep.Status != store.RunStatusSuccess || rep.Fingerprints != 0 {
+		t.Fatalf("rep = status=%q fingerprints=%d, want success with none recorded", rep.Status, rep.Fingerprints)
+	}
+	if !warnsContains(rep.Warnings, "not yet returned by the remote listing") {
+		t.Fatalf("Warnings = %v, want a not-yet-listed advisory", rep.Warnings)
+	}
+	if obj := f.remoteObject(t, "a.txt"); obj.ChecksumAlgo.Valid || obj.Checksum.Valid {
+		t.Fatalf("remote object = %+v, want a pending pair", obj)
+	}
+}
+
+// warnsContains reports whether any warning contains sub.
+func warnsContains(warns []string, sub string) bool {
+	for _, w := range warns {
+		if strings.Contains(w, sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // TestCaptureNoChecksumWarns: a backend exposing no checksum leaves the
