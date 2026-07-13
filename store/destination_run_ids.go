@@ -208,7 +208,7 @@ func scanDestinationRunID(s rowScanner) (DestinationRunID, error) {
 // use rather than writing components directly.
 func (s *Store) AdvanceDestinationVectorTo(ctx context.Context, volumeID int64, destination, verifyMethod string, components []OriginComponent) error {
 	for _, c := range components {
-		err := s.upsertDestinationRunID(ctx, volumeID, destination, c.OriginNodeID, c.OriginRunID, verifyMethod, sql.NullInt64{}, false)
+		err := s.upsertDestinationRunID(ctx, volumeID, destination, c.OriginNodeID, c.OriginRunID, verifyMethod, sql.NullInt64{}, nil, false)
 		if errors.Is(err, ErrWatermarkRewind) {
 			continue
 		}
@@ -316,7 +316,7 @@ func scanOriginComponent(s rowScanner) (OriginComponent, error) {
 // is unchanged, so a methodless re-confirmation (e.g. a pull from a
 // pre-v19 peer) never degrades a content-verified component to unknown.
 func (s *Store) UpsertDestinationRunID(ctx context.Context, volumeID int64, destination string, originNodeID, originRunID int64, allowRewind bool) error {
-	return s.upsertDestinationRunID(ctx, volumeID, destination, originNodeID, originRunID, "", sql.NullInt64{}, allowRewind)
+	return s.upsertDestinationRunID(ctx, volumeID, destination, originNodeID, originRunID, "", sql.NullInt64{}, nil, allowRewind)
 }
 
 // UpsertDestinationRunIDVerified advances a component this node verified
@@ -325,7 +325,7 @@ func (s *Store) UpsertDestinationRunID(ctx context.Context, volumeID int64, dest
 // it — peer-asserted advances go through UpsertDestinationRunIDPulled so
 // the two classes stay distinguishable and a peer's assertions revocable.
 func (s *Store) UpsertDestinationRunIDVerified(ctx context.Context, volumeID int64, destination string, originNodeID, originRunID int64, verifyMethod string, allowRewind bool) error {
-	return s.upsertDestinationRunID(ctx, volumeID, destination, originNodeID, originRunID, verifyMethod, sql.NullInt64{}, allowRewind)
+	return s.upsertDestinationRunID(ctx, volumeID, destination, originNodeID, originRunID, verifyMethod, sql.NullInt64{}, nil, allowRewind)
 }
 
 // UpsertDestinationRunIDPulled records a peer-pulled advance: it carries
@@ -335,8 +335,21 @@ func (s *Store) UpsertDestinationRunIDVerified(ctx context.Context, volumeID int
 // entry point that stamps non-local provenance; every locally-verified
 // path leaves source_node_id NULL, so revocation can drop a peer's
 // assertions without touching evidence this node observed itself.
-func (s *Store) UpsertDestinationRunIDPulled(ctx context.Context, volumeID int64, destination string, originNodeID, originRunID int64, verifyMethod string, sourceNodeID int64, allowRewind bool) error {
-	return s.upsertDestinationRunID(ctx, volumeID, destination, originNodeID, originRunID, verifyMethod, sql.NullInt64{Int64: sourceNodeID, Valid: true}, allowRewind)
+//
+// relayedVerifiedAtNs is the responder's own verified_at_ns for the
+// component (zero when unknown). The pulled component's recorded
+// verified_at_ns is bounded by it — capped at now for clock skew — so the
+// puller's freshness is never greater than the evidence the responder
+// actually holds: a destination gone dead behind a still-answering peer
+// ages out on the puller under the time-based staleness policy, not only
+// when the peer itself falls silent. A zero relay records NULL, which the
+// gate reads as never-verified (fail-closed).
+func (s *Store) UpsertDestinationRunIDPulled(ctx context.Context, volumeID int64, destination string, originNodeID, originRunID int64, verifyMethod string, sourceNodeID int64, relayedVerifiedAtNs int64, allowRewind bool) error {
+	verifiedAt := sql.NullInt64{} // NULL: responder's verification time unknown
+	if relayedVerifiedAtNs > 0 {
+		verifiedAt = sql.NullInt64{Int64: min(NowNs(), relayedVerifiedAtNs), Valid: true}
+	}
+	return s.upsertDestinationRunID(ctx, volumeID, destination, originNodeID, originRunID, verifyMethod, sql.NullInt64{Int64: sourceNodeID, Valid: true}, &verifiedAt, allowRewind)
 }
 
 // upsertDestinationRunID is the shared advance. sourceNodeID carries
@@ -366,7 +379,7 @@ func (s *Store) UpsertDestinationRunIDPulled(ctx context.Context, volumeID int64
 // at the recorded run (a no-op touch, or a pull from a pre-v19 peer)
 // preserves the prior verified_at_ns, so a stale component cannot be made
 // to look freshly checked without genuine evidence.
-func (s *Store) upsertDestinationRunID(ctx context.Context, volumeID int64, destination string, originNodeID, originRunID int64, verifyMethod string, sourceNodeID sql.NullInt64, allowRewind bool) error {
+func (s *Store) upsertDestinationRunID(ctx context.Context, volumeID int64, destination string, originNodeID, originRunID int64, verifyMethod string, sourceNodeID sql.NullInt64, verifiedAtOverride *sql.NullInt64, allowRewind bool) error {
 	if destination == "" {
 		return fmt.Errorf("UpsertDestinationRunID: destination must be non-empty")
 	}
@@ -378,6 +391,15 @@ func (s *Store) upsertDestinationRunID(ctx context.Context, volumeID int64, dest
 
 	atNs := NowNs()
 	method := nullableString(verifyMethod)
+	// verified_at_ns offered to the CASE below is this write's own instant
+	// for a locally-observed advance (verifiedAtOverride nil). A durability
+	// pull passes an override: the responder's relayed verification instant
+	// capped at now, or NULL when the responder's own time is unknown, so a
+	// pulled component is never fresher than the evidence behind it.
+	verifiedAt := sql.NullInt64{Int64: atNs, Valid: true}
+	if verifiedAtOverride != nil {
+		verifiedAt = *verifiedAtOverride
+	}
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO destination_run_ids (volume_id, destination, origin_node_id, origin_run_id, updated_at_ns, verify_method, source_node_id, verified_at_ns)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -402,7 +424,7 @@ func (s *Store) upsertDestinationRunID(ctx context.Context, volumeID int64, dest
 				ELSE destination_run_ids.verified_at_ns
 			END
 		WHERE excluded.origin_run_id >= destination_run_ids.origin_run_id OR ?
-	`, volumeID, destination, originNodeID, originRunID, atNs, method, sourceNodeID, atNs, allowRewind)
+	`, volumeID, destination, originNodeID, originRunID, atNs, method, sourceNodeID, verifiedAt, allowRewind)
 	if err != nil {
 		return fmt.Errorf("upsert destination_run_ids: %w", err)
 	}

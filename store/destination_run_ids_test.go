@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // TestMigrateV18ToV19AddsVerifyMethod builds a minimal v18 database with
@@ -904,7 +905,7 @@ func TestUpsertDestinationRunIDPulledTagsSource(t *testing.T) {
 	if err := s.UpsertDestinationRunIDVerified(ctx, vID, "offsite", self.ID, 9, VerifyMethodBlake3, false); err != nil {
 		t.Fatalf("local verified advance: %v", err)
 	}
-	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", origin.ID, 5, VerifyMethodKopia, peer.ID, false); err != nil {
+	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", origin.ID, 5, VerifyMethodKopia, peer.ID, NowNs(), false); err != nil {
 		t.Fatalf("pulled advance: %v", err)
 	}
 
@@ -961,7 +962,7 @@ func TestUpsertDestinationRunIDProvenanceTransitions(t *testing.T) {
 	if err := s.UpsertDestinationRunIDVerified(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, false); err != nil {
 		t.Fatalf("local advance: %v", err)
 	}
-	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, peer.ID, false); err != nil {
+	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, peer.ID, NowNs(), false); err != nil {
 		t.Fatalf("peer re-confirm at recorded run: %v", err)
 	}
 	got, err := s.GetDestinationRunID(ctx, vID, "offsite", self.ID)
@@ -972,7 +973,7 @@ func TestUpsertDestinationRunIDProvenanceTransitions(t *testing.T) {
 		t.Fatalf("local component downgraded to peer %d by an equal-run re-confirm", got.SourceNodeID.Int64)
 	}
 
-	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 20, VerifyMethodKopia, peer.ID, false); err != nil {
+	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 20, VerifyMethodKopia, peer.ID, NowNs(), false); err != nil {
 		t.Fatalf("peer strict advance: %v", err)
 	}
 	got, _ = s.GetDestinationRunID(ctx, vID, "offsite", self.ID)
@@ -1015,7 +1016,7 @@ func TestUpsertDestinationRunIDMethodProvenanceStayTogether(t *testing.T) {
 		if err := s.UpsertDestinationRunIDVerified(ctx, vID, "offsite", self.ID, 10, VerifyMethodPresenceSize, false); err != nil {
 			t.Fatalf("local presence+size advance: %v", err)
 		}
-		if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, peer.ID, false); err != nil {
+		if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, peer.ID, NowNs(), false); err != nil {
 			t.Fatalf("peer blake3 re-confirm at equal run: %v", err)
 		}
 		got, err := s.GetDestinationRunID(ctx, vID, "offsite", self.ID)
@@ -1043,7 +1044,7 @@ func TestUpsertDestinationRunIDMethodProvenanceStayTogether(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetOrCreateOriginNode: %v", err)
 		}
-		if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, peer.ID, false); err != nil {
+		if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, peer.ID, NowNs(), false); err != nil {
 			t.Fatalf("peer blake3 advance: %v", err)
 		}
 		if err := s.UpsertDestinationRunID(ctx, vID, "offsite", self.ID, 10, false); err != nil {
@@ -1075,7 +1076,7 @@ func TestUpsertDestinationRunIDMethodProvenanceStayTogether(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetOrCreateOriginNode: %v", err)
 		}
-		if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, peer.ID, false); err != nil {
+		if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, peer.ID, NowNs(), false); err != nil {
 			t.Fatalf("peer blake3 advance: %v", err)
 		}
 		if err := s.UpsertDestinationRunIDVerified(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, false); err != nil {
@@ -1089,6 +1090,62 @@ func TestUpsertDestinationRunIDMethodProvenanceStayTogether(t *testing.T) {
 			t.Fatalf("source = %+v, want NULL: a local re-verification must reclaim ownership from the peer", got.SourceNodeID)
 		}
 	})
+}
+
+// TestUpsertDestinationRunIDPulledBoundsFreshnessByRelay pins issue #131
+// finding 2: a pull records verified_at_ns bounded by the responder's own
+// verification instant, not the moment of the pull. So a destination gone
+// dead behind a still-answering peer ages out on the puller under the
+// time-based staleness policy — freshness does not reset just because the
+// peer keeps replying. An unknown (zero) relay records NULL (fail-closed).
+func TestUpsertDestinationRunIDPulledBoundsFreshnessByRelay(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+	self, err := s.GetSelfNode(ctx)
+	if err != nil {
+		t.Fatalf("GetSelfNode: %v", err)
+	}
+	peer, err := s.GetOrCreateOriginNode(ctx, "nas")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode(nas): %v", err)
+	}
+	origin, err := s.GetOrCreateOriginNode(ctx, "laptop")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode(laptop): %v", err)
+	}
+
+	// The peer relays a verification instant well in the past (its own
+	// evidence has not been re-verified in months, though it still answers).
+	staleRelay := NowNs() - int64(90*24*time.Hour)
+	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, peer.ID, staleRelay, false); err != nil {
+		t.Fatalf("pulled advance with stale relay: %v", err)
+	}
+	got, err := s.GetDestinationRunID(ctx, vID, "offsite", self.ID)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID: %v", err)
+	}
+	if !got.VerifiedAtNs.Valid || got.VerifiedAtNs.Int64 != staleRelay {
+		t.Fatalf("verified_at_ns = %v, want the relayed stale instant %d: freshness must be bounded by the responder, not reset to the pull time", got.VerifiedAtNs, staleRelay)
+	}
+	// updated_at_ns still tracks the pull itself, so the two signals stay
+	// distinct: the component was touched now, but verified long ago.
+	if got.UpdatedAtNs <= staleRelay {
+		t.Fatalf("updated_at_ns = %d, want ~now (the pull touched the row), well above the stale relay %d", got.UpdatedAtNs, staleRelay)
+	}
+
+	// An unknown (zero) relay — a pre-v23 responder, or evidence never
+	// re-verified — records NULL, which the gate reads as never-verified.
+	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", origin.ID, 4, VerifyMethodBlake3, peer.ID, 0, false); err != nil {
+		t.Fatalf("pulled advance with unknown relay: %v", err)
+	}
+	got, err = s.GetDestinationRunID(ctx, vID, "offsite", origin.ID)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID: %v", err)
+	}
+	if got.VerifiedAtNs.Valid {
+		t.Fatalf("verified_at_ns = %v, want NULL for an unknown relay (fail-closed)", got.VerifiedAtNs)
+	}
 }
 
 // TestRevokeDestinationRunIDsFromSource: revoking a peer drops the live
@@ -1120,10 +1177,10 @@ func TestRevokeDestinationRunIDsFromSource(t *testing.T) {
 	if err := s.UpsertDestinationRunIDVerified(ctx, vID, "offsite", self.ID, 9, VerifyMethodBlake3, false); err != nil {
 		t.Fatalf("local advance: %v", err)
 	}
-	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", originA.ID, 5, VerifyMethodKopia, badPeer.ID, false); err != nil {
+	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", originA.ID, 5, VerifyMethodKopia, badPeer.ID, NowNs(), false); err != nil {
 		t.Fatalf("bad-peer advance: %v", err)
 	}
-	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", goodPeer.ID, 3, VerifyMethodKopia, goodPeer.ID, false); err != nil {
+	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", goodPeer.ID, 3, VerifyMethodKopia, goodPeer.ID, NowNs(), false); err != nil {
 		t.Fatalf("good-peer advance: %v", err)
 	}
 

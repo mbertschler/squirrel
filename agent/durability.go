@@ -84,6 +84,7 @@ func (r *peerSyncRouter) durabilityResponse(ctx context.Context, volumeName stri
 			OriginRun:    row.OriginRunID,
 			UpdatedAtNs:  row.UpdatedAtNs,
 			VerifyMethod: row.VerifyMethod,
+			VerifiedAtNs: row.VerifiedAtNs.Int64, // zero when NULL (unknown)
 		})
 	}
 	for _, row := range fresh {

@@ -190,6 +190,59 @@ func TestPullDurabilityTagsSourcePeer(t *testing.T) {
 	}
 }
 
+// TestPullDurabilityRelaysVerifiedAt: the pull records verified_at_ns
+// bounded by the responder's own verification instant (relayed over the
+// wire), not reset to the moment of the pull (issue #131 finding 2). The
+// initiator's pulled component must carry exactly the receiver's recorded
+// verified_at — the old "stamp now on every pull" behavior would record a
+// strictly later instant and so keep a dead-destination-behind-a-live-peer
+// looking perpetually fresh.
+func TestPullDurabilityRelaysVerifiedAt(t *testing.T) {
+	f := setupNodeFixtureNoRclone(t)
+	ctx := context.Background()
+	f.initVol.OffloadRequires = []string{"offsite-a"}
+	f.initVol.SyncTo = nil
+	originName := seedReceiverDurability(t, f, map[string]int64{"offsite-a": 12})
+
+	// The receiver's own recorded verification instant for the component,
+	// stamped when the seed wrote it — earlier than the pull below.
+	recvVol, err := f.recvStore.GetVolumeByName(ctx, f.recvVol.Name)
+	if err != nil {
+		t.Fatalf("receiver GetVolumeByName: %v", err)
+	}
+	recvSelf, err := f.recvStore.GetSelfNode(ctx)
+	if err != nil {
+		t.Fatalf("receiver GetSelfNode: %v", err)
+	}
+	recvComp, err := f.recvStore.GetDestinationRunID(ctx, recvVol.ID, "offsite-a", recvSelf.ID)
+	if err != nil {
+		t.Fatalf("receiver GetDestinationRunID: %v", err)
+	}
+	if !recvComp.VerifiedAtNs.Valid {
+		t.Fatalf("receiver component has no verified_at to relay")
+	}
+
+	v, err := f.initStore.CreateVolume(ctx, f.initVol.Name, f.initVol.Path)
+	if err != nil {
+		t.Fatalf("CreateVolume on initiator: %v", err)
+	}
+	if _, err := PullDurability(ctx, f.initStore, f.initVol, f.node, false); err != nil {
+		t.Fatalf("PullDurability: %v", err)
+	}
+
+	origin, err := f.initStore.GetNodeByName(ctx, originName)
+	if err != nil {
+		t.Fatalf("origin node %q not created locally: %v", originName, err)
+	}
+	pulled, err := f.initStore.GetDestinationRunID(ctx, v.ID, "offsite-a", origin.ID)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID(pulled): %v", err)
+	}
+	if !pulled.VerifiedAtNs.Valid || pulled.VerifiedAtNs.Int64 != recvComp.VerifiedAtNs.Int64 {
+		t.Fatalf("pulled verified_at = %v, want the receiver's relayed instant %d: freshness must be bounded by the responder, not reset to the pull time", pulled.VerifiedAtNs, recvComp.VerifiedAtNs.Int64)
+	}
+}
+
 // TestPullDurabilityDropsUnconfiguredDestinations: the pull merges
 // components for destinations the volume references (one via
 // offload_requires, one via sync_to) and drops one for an unconfigured

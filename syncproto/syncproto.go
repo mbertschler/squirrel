@@ -387,12 +387,22 @@ type DurabilityResponse struct {
 // advanced it on the responding node, carried verbatim so the puller's
 // offload gate weighs a pulled component exactly as the responder did
 // (empty for a pre-v19 responder, which the gate reads as unverified).
+//
+// VerifiedAtNs is when the responding node last backed this component
+// with genuine re-verification (its own verified_at_ns), relayed so the
+// puller can bound its freshness by the responder's — a destination gone
+// dead behind a still-answering peer ages out on the puller too, not just
+// when the peer itself falls silent. Zero means the responder's
+// verification time is unknown (a pre-v23 responder, or evidence never
+// re-verified); the puller treats that as fail-closed. The responder's
+// own verification instant, never fresher than this hop's pull.
 type DurabilityComponent struct {
 	Destination  string `json:"destination"`
 	OriginNode   string `json:"origin_node"`
 	OriginRun    int64  `json:"origin_run"`
 	UpdatedAtNs  int64  `json:"updated_at_ns"`
 	VerifyMethod string `json:"verify_method,omitempty"`
+	VerifiedAtNs int64  `json:"verified_at_ns,omitempty"`
 }
 
 // DurabilityFreshness is one origin-space freshness coordinate: the
