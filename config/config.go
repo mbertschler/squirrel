@@ -185,6 +185,21 @@ type Destination struct {
 	// whose endpoint the client's auto-detection addresses wrongly (an IP,
 	// a minio host). Off — the default — lets the client pick per endpoint.
 	PathStyle bool
+	// PackThreshold is the content-size ceiling (bytes) under which a file
+	// is bundled into a tar.zst pack instead of uploaded as its own
+	// object. Meaningful only for LayoutPacked destinations, where it
+	// defaults to 32 MiB; zero on every other layout.
+	PackThreshold int64
+	// PackSize is the target uploaded (compressed) size (bytes) of one
+	// pack; the writer seals a pack once it reaches this size. Meaningful
+	// only for LayoutPacked destinations, where it defaults to 512 MiB;
+	// zero on every other layout.
+	PackSize int64
+	// ZstdLevel is the klauspost/compress zstd compression level applied
+	// when writing packs (1=fastest .. 4=best). Meaningful only for
+	// LayoutPacked destinations, where it defaults to 3; zero on every
+	// other layout.
+	ZstdLevel int
 }
 
 // Destination layout values. The layout shapes what sync writes under
@@ -201,6 +216,12 @@ const (
 	// rename re-uploads nothing. Valid for rclone-remote destinations
 	// only.
 	LayoutContentAddressed = "content-addressed"
+	// LayoutPacked bundles small files into immutable tar.zst packs
+	// (plus per-object storage for large files), an append-only archive
+	// layout tuned for cold destinations that penalise many small
+	// objects. Valid for rclone-remote destinations only. Tuned by the
+	// pack_threshold, pack_size, and zstd_level knobs.
+	LayoutPacked = "packed"
 )
 
 // Crypt is the optional client-side encryption overlay for a destination.

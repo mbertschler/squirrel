@@ -6,6 +6,8 @@ import (
 	"os"
 	"sort"
 	"strings"
+
+	"github.com/dustin/go-humanize"
 )
 
 // destSchema declares the parameter schema for one destination type. The
@@ -141,6 +143,10 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 	if err != nil {
 		return nil, err
 	}
+	pack, err := resolvePackKnobs(raw, layout)
+	if err != nil {
+		return nil, err
+	}
 	params, err := validateAndResolveParams(schema, raw)
 	if err != nil {
 		return nil, err
@@ -148,6 +154,7 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 	return &Destination{
 		Name: name, Type: typ, Root: root, Layout: layout, Params: params,
 		Crypt: crypt, HashAlgo: hashAlgo, Checkers: checkers, PathStyle: pathStyle,
+		PackThreshold: pack.threshold, PackSize: pack.size, ZstdLevel: pack.zstdLevel,
 	}, nil
 }
 
@@ -231,10 +238,10 @@ func sortedKeys(m map[string]bool) []string {
 }
 
 // resolveLayout validates the optional `layout` key of a destination. An
-// absent key resolves to LayoutMirror. LayoutContentAddressed drives
-// per-object rclone transfers, so it requires an rclone-remote type:
-// type "local" is addressed by filesystem path, and "kopia" repositories
-// already use kopia's own content-addressed format.
+// absent key resolves to LayoutMirror. LayoutContentAddressed and
+// LayoutPacked drive squirrel's own rclone transfers, so both require an
+// rclone-remote type: type "local" is addressed by filesystem path, and
+// "kopia" repositories already use kopia's own content-addressed format.
 func resolveLayout(raw map[string]any, typ string) (string, error) {
 	v, err := optionalString(raw, "layout")
 	if err != nil {
@@ -243,17 +250,117 @@ func resolveLayout(raw map[string]any, typ string) (string, error) {
 	switch v {
 	case "", LayoutMirror:
 		return LayoutMirror, nil
-	case LayoutContentAddressed:
-		switch typ {
-		case "local":
-			return "", fmt.Errorf(`layout %q requires an rclone-remote destination; type "local" is addressed by filesystem path`, LayoutContentAddressed)
-		case "kopia":
-			return "", fmt.Errorf(`layout %q requires an rclone-remote destination; type "kopia" repositories are content-addressed by kopia itself`, LayoutContentAddressed)
+	case LayoutContentAddressed, LayoutPacked:
+		if err := requireRcloneRemote(v, typ); err != nil {
+			return "", err
 		}
-		return LayoutContentAddressed, nil
+		return v, nil
 	default:
-		return "", fmt.Errorf("unknown layout %q (supported: %q, %q)", v, LayoutMirror, LayoutContentAddressed)
+		return "", fmt.Errorf("unknown layout %q (supported: %q, %q, %q)", v, LayoutMirror, LayoutContentAddressed, LayoutPacked)
 	}
+}
+
+// requireRcloneRemote rejects the two rclone-remote-only layouts on the
+// destination types that can't drive per-object squirrel transfers: type
+// "local" is a filesystem path, and "kopia" runs its own content-addressed
+// binary. Shared by the LayoutContentAddressed and LayoutPacked branches so
+// both give the same guardrail message.
+func requireRcloneRemote(layout, typ string) error {
+	switch typ {
+	case "local":
+		return fmt.Errorf(`layout %q requires an rclone-remote destination; type "local" is addressed by filesystem path`, layout)
+	case "kopia":
+		return fmt.Errorf(`layout %q requires an rclone-remote destination; type "kopia" repositories are content-addressed by kopia itself`, layout)
+	}
+	return nil
+}
+
+// Pack-layout knob defaults, applied when a LayoutPacked destination omits
+// the corresponding key. Sizes are in bytes.
+const (
+	defaultPackThreshold = 32 << 20  // 32 MiB
+	defaultPackSize      = 512 << 20 // 512 MiB
+	defaultZstdLevel     = 3
+	// minZstdLevel/maxZstdLevel bound zstd_level to the range
+	// klauspost/compress exposes: 1 (fastest) .. 4 (best).
+	minZstdLevel = 1
+	maxZstdLevel = 4
+)
+
+// packKnobs carries the resolved pack-layout tuning for one destination.
+type packKnobs struct {
+	threshold int64
+	size      int64
+	zstdLevel int
+}
+
+// resolvePackKnobs validates the optional pack_threshold, pack_size, and
+// zstd_level keys. They tune only the packed layout, so on any other layout
+// a present key is an error (matching how hash_algo/checkers are confined to
+// their types); LayoutPacked destinations get the defaults when a key is
+// absent. Sizes are human strings like "32MiB"; zstd_level is an integer in
+// [minZstdLevel, maxZstdLevel].
+func resolvePackKnobs(raw map[string]any, layout string) (packKnobs, error) {
+	if layout != LayoutPacked {
+		for _, k := range []string{"pack_threshold", "pack_size", "zstd_level"} {
+			if _, ok := raw[k]; ok {
+				return packKnobs{}, fmt.Errorf("%s requires the %q layout", k, LayoutPacked)
+			}
+		}
+		return packKnobs{}, nil
+	}
+	threshold, err := optionalSize(raw, "pack_threshold", defaultPackThreshold)
+	if err != nil {
+		return packKnobs{}, err
+	}
+	size, err := optionalSize(raw, "pack_size", defaultPackSize)
+	if err != nil {
+		return packKnobs{}, err
+	}
+	level, err := optionalZstdLevel(raw, "zstd_level", defaultZstdLevel)
+	if err != nil {
+		return packKnobs{}, err
+	}
+	return packKnobs{threshold: threshold, size: size, zstdLevel: level}, nil
+}
+
+// optionalSize parses a human size string (e.g. "32MiB") at key, returning
+// def when the key is absent. The parsed value must be positive; zero or a
+// negative/unparseable size is an error.
+func optionalSize(raw map[string]any, key string, def int64) (int64, error) {
+	v, ok := raw[key]
+	if !ok {
+		return def, nil
+	}
+	s, ok := v.(string)
+	if !ok || s == "" {
+		return 0, fmt.Errorf(`%s must be a size string like "32MiB"`, key)
+	}
+	n, err := humanize.ParseBytes(s)
+	if err != nil {
+		return 0, fmt.Errorf("%s: invalid size %q: %w", key, s, err)
+	}
+	if n == 0 {
+		return 0, fmt.Errorf("%s must be greater than zero", key)
+	}
+	return int64(n), nil
+}
+
+// optionalZstdLevel parses the integer zstd_level at key, returning def when
+// the key is absent. The value must fall within [minZstdLevel, maxZstdLevel].
+func optionalZstdLevel(raw map[string]any, key string, def int) (int, error) {
+	v, ok := raw[key]
+	if !ok {
+		return def, nil
+	}
+	n, ok := v.(int64)
+	if !ok {
+		return 0, fmt.Errorf("%s must be an integer", key)
+	}
+	if n < minZstdLevel || n > maxZstdLevel {
+		return 0, fmt.Errorf("%s must be between %d and %d (klauspost zstd fastest..best), got %d", key, minZstdLevel, maxZstdLevel, n)
+	}
+	return int(n), nil
 }
 
 // resolveCrypt validates the optional `crypt` sub-table of a destination.
@@ -326,6 +433,7 @@ func validateAndResolveParams(schema destSchema, raw map[string]any) (map[string
 	seen := map[string]bool{
 		"type": true, "root": true, "crypt": true, "layout": true,
 		"hash_algo": true, "checkers": true, "force_path_style": true,
+		"pack_threshold": true, "pack_size": true, "zstd_level": true,
 	}
 	for _, key := range schema.requiredString {
 		v, err := requireString(raw, key)
