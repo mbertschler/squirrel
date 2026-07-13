@@ -100,13 +100,9 @@ func VerifyRemote(ctx context.Context, s *store.Store, rcl *Rclone, dest *config
 // verifyRecordedObjects compares the remote listing against the recorded
 // rows and applies the per-object outcome to the store and the report.
 func verifyRecordedObjects(ctx context.Context, s *store.Store, rcl *Rclone, dest *config.Destination, rows []store.RemoteObjectRecord, rep *RemoteVerifyReport) error {
-	entries, err := rcl.listHashes(ctx, underlyingObjectsURI(dest), verifyHashTypes(dest, rows), checkersArgs(dest)...)
+	byName, err := readObjectChecksums(ctx, rcl, dest, rows)
 	if err != nil {
 		return fmt.Errorf("read object checksums from %q: %w", dest.Name, err)
-	}
-	byName := make(map[string]map[string]string, len(entries))
-	for _, e := range entries {
-		byName[e.Name] = e.Hashes
 	}
 	matched := 0
 	for _, row := range rows {
@@ -138,8 +134,42 @@ func verifyRecordedObjects(ctx context.Context, s *store.Store, rcl *Rclone, des
 			Actual:   actual,
 		})
 	}
-	rep.Unrecorded = len(entries) - matched
+	rep.Unrecorded = len(byName) - matched
 	return nil
+}
+
+// readObjectChecksums reads the provider checksums verification compares,
+// keyed by object basename (blake3 hex) then rclone hash name. s3 reads raw
+// ETags straight from the S3 API — the only surface exposing a multipart
+// composite ETag — and presents each under the "md5" slot so the shared
+// comparison path (extractChecksum, algoHashType) treats it like any other
+// backend hash. Every other backend reads one batched `rclone lsjson
+// --hash` over the destination-global objects/ directory.
+func readObjectChecksums(ctx context.Context, rcl *Rclone, dest *config.Destination, rows []store.RemoteObjectRecord) (map[string]map[string]string, error) {
+	if dest.Type == "s3" {
+		reader, err := newS3ETagReader(dest)
+		if err != nil {
+			return nil, err
+		}
+		etags, err := reader.objectETags(ctx)
+		if err != nil {
+			return nil, err
+		}
+		byName := make(map[string]map[string]string, len(etags))
+		for name, etag := range etags {
+			byName[name] = map[string]string{"md5": etag}
+		}
+		return byName, nil
+	}
+	entries, err := rcl.listHashes(ctx, underlyingObjectsURI(dest), verifyHashTypes(dest, rows), checkersArgs(dest)...)
+	if err != nil {
+		return nil, err
+	}
+	byName := make(map[string]map[string]string, len(entries))
+	for _, e := range entries {
+		byName[e.Name] = e.Hashes
+	}
+	return byName, nil
 }
 
 // populateFingerprint records the first fingerprint for a row whose pair

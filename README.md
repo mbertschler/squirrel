@@ -152,11 +152,11 @@ Properties that differ from mirrored destinations:
 
 #### Offsite verification (`squirrel verify`)
 
-Cold archive storage is exactly the copy you can't cheaply re-download and re-hash. Content-addressed destinations therefore get a metadata-only integrity check, the **scan-back fingerprint**: after each object upload is confirmed, squirrel reads the *provider's own checksum* of the stored bytes (the ciphertext, for `crypt` destinations) back from the remote via `rclone lsjson --hash` and records it in the index next to the upload. Verification then re-fetches the same metadata later and compares **provider value then vs provider value now** — squirrel never recomputes a provider checksum, so provider-specific composite forms are handled as opaque strings, and no object body is ever transferred.
+Cold archive storage is exactly the copy you can't cheaply re-download and re-hash. Content-addressed destinations therefore get a metadata-only integrity check, the **scan-back fingerprint**: after each object upload is confirmed, squirrel reads the *provider's own checksum* of the stored bytes (the ciphertext, for `crypt` destinations) back from the remote — via a direct S3 `ListObjectsV2` for `s3`, or `rclone lsjson --hash` for every other backend — and records it in the index next to the upload. Verification then re-fetches the same metadata later and compares **provider value then vs provider value now** — squirrel never recomputes a provider checksum, so provider-specific composite forms are handled as opaque strings, and no object body is ever transferred.
 
 What gets recorded depends on the backend type:
 
-- **`s3`** — the object **ETag**, recorded as `etag-md5` (or `etag-md5-composite` for multipart-style values). Reading it is a listing/metadata operation, so it works on archive-tier objects without a restore.
+- **`s3`** — the object **ETag**, recorded as `etag-md5` for a single-part upload's whole-object MD5, or `etag-md5-composite` for a multipart object's `<hex>-<parts>` value, stored verbatim either way. The ETag is read straight from the S3 API with a paginated `ListObjectsV2` over the `objects/` prefix, *not* through rclone: rclone funnels every hash read through `Object.Hash(MD5)`, which returns an empty string for a composite ETag, so a multipart (or client-encrypted, always-streamed) object would otherwise never expose a fingerprint at all. Listing is archive-tier-safe (no per-object `HEAD`, no restore), and the composite ETag is fixed at upload time and unaffected by later storage-class transitions or server-side encryption, so the recorded value stays stable for the life of the object. This read is the counterpart to the (deferred) write-side use of S3 additional checksums; capturing the ETag needs no upload-side change. For S3-compatible providers whose endpoint the client addresses wrongly, set `force_path_style = true` (see below).
 - **`sftp`** — the checksum computed server-side by the remote's hash command. Content-addressed sftp destinations default to **SHA-256** (`hash_algo = "sha256"`, rendered as rclone's sftp `hashes` option so the selection is explicit rather than rclone's md5/sha1 preference); set `hash_algo` if your server only offers another type.
 - **other backends** — whatever hash `rclone lsjson --hash` exposes, recorded under its rclone hash name (e.g. `sha1` on b2). A backend exposing no checksum leaves the fingerprint pending, with a warning in the sync output.
 
@@ -171,16 +171,19 @@ The pass lists the destination's `objects/` directory once (batched, metadata-on
 
 Because crypt encrypts with a random per-file nonce, the fingerprint is a property of the *uploaded ciphertext*, not of the content — which is exactly right here: the layout is append-only and each object is uploaded once, so the fingerprint is stable for the life of the object.
 
-Two related destination knobs (both optional):
+Related destination knobs (all optional):
 
 ```toml
 [destinations.archive]
 # ...
-hash_algo = "sha256"  # sftp only: which server-side hash the fingerprint uses
-checkers  = 4         # cap rclone's concurrent checkers (providers that limit connections)
+hash_algo        = "sha256"  # sftp only: which server-side hash the fingerprint uses
+checkers         = 4         # cap rclone's concurrent checkers (providers that limit connections)
+force_path_style = true      # s3 only: path-style bucket addressing for the ETag reader
 ```
 
 `checkers` flows into `--checkers` on the rclone invocations squirrel runs against that destination — useful when a provider caps simultaneous connections (server-side hashing typically uses one connection per concurrent check).
+
+`force_path_style` governs only squirrel's own S3 client (the one that reads scan-back ETags), not the rclone transport. Leave it off for AWS and most providers — the client picks virtual-host or path-style addressing per endpoint on its own — and set it `true` only for an S3-compatible provider (a minio host, an IP endpoint) whose addressing the auto-detection gets wrong.
 
 #### Manifest segment format
 

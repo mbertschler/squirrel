@@ -11,17 +11,15 @@ import (
 )
 
 // Checksum algo labels recorded in remote_objects.checksum_algo for the
-// s3 backend, whose provider checksum is the object ETag. rclone surfaces
-// the ETag in the md5 hash slot only for objects it can treat as an MD5 —
-// single-part uploads, or multipart objects that carry an MD5 in their
-// metadata. A multipart object without that metadata exposes no md5 hash
-// through lsjson, so its fingerprint stays pending (see the capture path).
-// Recorded values are compared verbatim on verification — squirrel never
-// recomputes a provider checksum. Every other backend records the plain
-// rclone hash name (sha256, sha1, …).
-//
-// The exact reach of ETag capture against a live multipart-splitting
-// backend still needs confirmation — see the follow-up issue.
+// s3 backend, whose provider checksum is the object ETag. The ETag is read
+// straight from the S3 API (a ListObjectsV2 over the objects/ prefix, see
+// s3reader.go), not through rclone — rclone funnels every hash read through
+// Object.Hash(MD5), which returns "" for a multipart object's composite
+// ETag. A single-part upload's whole-object MD5 is recorded as etag-md5; a
+// multipart <hex>-<parts> value as etag-md5-composite. Both are recorded
+// and compared verbatim — squirrel never recomputes a provider checksum, so
+// the read is correct regardless of the object's SSE mode. Every other
+// backend records the plain rclone hash name (sha256, sha1, …).
 const (
 	AlgoEtagMD5          = "etag-md5"
 	AlgoEtagMD5Composite = "etag-md5-composite"
@@ -88,12 +86,10 @@ func etagFlavor(v string) string {
 // requests from dest's underlying remote; nil means "whatever the
 // backend exposes". Narrowing matters on backends that compute hashes
 // per request (sftp runs one server-side sum command per file per hash
-// type).
+// type). s3 never reaches here — its ETag is read straight from the S3
+// API, not through an rclone hash request.
 func captureHashTypes(dest *config.Destination) []string {
-	switch {
-	case dest.Type == "s3":
-		return []string{"md5"}
-	case dest.HashAlgo != "":
+	if dest.HashAlgo != "" {
 		return []string{dest.HashAlgo}
 	}
 	return nil

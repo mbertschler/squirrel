@@ -179,6 +179,12 @@ type Destination struct {
 	// invocations against this destination, for providers that cap
 	// simultaneous connections. Zero leaves rclone's default in force.
 	Checkers int
+	// PathStyle forces path-style bucket addressing (bucket in the URL
+	// path, not the host) for the direct S3 client that reads scan-back
+	// ETags. Settable on s3 destinations only, for S3-compatible providers
+	// whose endpoint the client's auto-detection addresses wrongly (an IP,
+	// a minio host). Off — the default — lets the client pick per endpoint.
+	PathStyle bool
 }
 
 // Destination layout values. The layout shapes what sync writes under

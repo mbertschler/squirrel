@@ -266,13 +266,30 @@ func (h *contentAddressedHandler) uploadObjects(ctx context.Context, rep *Report
 const fingerprintBatchSize = 200
 
 // captureFingerprints fills the pending checksum pair of every object
-// confirmed during this run with the provider checksum read back from
-// the underlying remote — batched into one `lsjson --hash` per chunk,
-// scoped by --include filters so the backend hashes only this run's
-// uploads. Capture problems are warnings, not failures: the upload is
-// already confirmed and recorded, and `squirrel verify` fills any
-// fingerprint left pending.
+// confirmed during this run with the provider checksum read back from the
+// underlying remote. s3 destinations read the object ETag straight from the
+// S3 API (the one surface exposing a multipart composite ETag); every other
+// backend reads `rclone lsjson --hash`. Capture problems are warnings, not
+// failures: the upload is already confirmed and recorded, and `squirrel
+// verify` fills any fingerprint left pending.
 func (h *contentAddressedHandler) captureFingerprints(ctx context.Context, rep *Report, confirmed []store.PathDelta) {
+	// A run that uploaded nothing new has nothing to fingerprint; return
+	// before the s3 path would otherwise list the whole objects/ prefix (and
+	// possibly warn on a transient failure) for an empty batch.
+	if len(confirmed) == 0 {
+		return
+	}
+	if h.dest.Type == "s3" {
+		h.captureFingerprintsS3(ctx, rep, confirmed)
+		return
+	}
+	h.captureFingerprintsRclone(ctx, rep, confirmed)
+}
+
+// captureFingerprintsRclone reads provider checksums via `rclone lsjson
+// --hash`, batched into one invocation per chunk and scoped by --include
+// filters so the backend hashes only this run's uploads.
+func (h *contentAddressedHandler) captureFingerprintsRclone(ctx context.Context, rep *Report, confirmed []store.PathDelta) {
 	dirURI := underlyingObjectsURI(h.dest)
 	types := captureHashTypes(h.dest)
 	for batch := range slices.Chunk(confirmed, fingerprintBatchSize) {
@@ -291,23 +308,56 @@ func (h *contentAddressedHandler) captureFingerprints(ctx context.Context, rep *
 			byName[e.Name] = e.Hashes
 			present[e.Name] = true
 		}
-		for _, d := range batch {
-			hash := hex.EncodeToString(d.Blake3)
-			if !present[hash] {
-				rep.Warnings = append(rep.Warnings, fmt.Sprintf("object %s on %q: not yet returned by the remote listing; fingerprint stays pending", hash, h.dest.Name))
-				continue
+		h.recordCapturedFingerprints(ctx, rep, batch, byName, present)
+	}
+}
+
+// captureFingerprintsS3 reads every object ETag under the destination's
+// objects/ prefix in one ListObjectsV2, presenting each ETag under the
+// "md5" slot so the shared recording path classifies it via etagFlavor.
+// A read failure leaves every fingerprint pending with a warning — capture
+// is not on the durability critical path (the bytes are already confirmed),
+// so `squirrel verify` is the backstop.
+func (h *contentAddressedHandler) captureFingerprintsS3(ctx context.Context, rep *Report, confirmed []store.PathDelta) {
+	reader, err := newS3ETagReader(h.dest)
+	if err == nil {
+		var etags map[string]string
+		etags, err = reader.objectETags(ctx)
+		if err == nil {
+			byName := make(map[string]map[string]string, len(etags))
+			present := make(map[string]bool, len(etags))
+			for name, etag := range etags {
+				byName[name] = map[string]string{"md5": etag}
+				present[name] = true
 			}
-			cs, ok := extractChecksum(h.dest, byName[hash])
-			if !ok {
-				rep.Warnings = append(rep.Warnings, fmt.Sprintf("object %s on %q: remote exposes no usable checksum (e.g. a multipart object whose ETag rclone does not surface as a hash); fingerprint stays pending", hash, h.dest.Name))
-				continue
-			}
-			if err := h.store.SetRemoteObjectChecksum(ctx, d.ContentID, h.dest.Name, cs.Algo, cs.Value); err != nil {
-				rep.Warnings = append(rep.Warnings, fmt.Sprintf("record fingerprint for %s: %v", hash, err))
-				continue
-			}
-			rep.Fingerprints++
+			h.recordCapturedFingerprints(ctx, rep, confirmed, byName, present)
+			return
 		}
+	}
+	rep.Warnings = append(rep.Warnings, fmt.Sprintf("fingerprint capture on %q failed: %v — checksums stay pending until `squirrel verify`", h.dest.Name, err))
+}
+
+// recordCapturedFingerprints records the provider checksum for each object
+// in batch from the listing (byName, present). An object absent from the
+// listing or exposing no usable checksum stays pending with a warning; the
+// fingerprint is never fabricated.
+func (h *contentAddressedHandler) recordCapturedFingerprints(ctx context.Context, rep *Report, batch []store.PathDelta, byName map[string]map[string]string, present map[string]bool) {
+	for _, d := range batch {
+		hash := hex.EncodeToString(d.Blake3)
+		if !present[hash] {
+			rep.Warnings = append(rep.Warnings, fmt.Sprintf("object %s on %q: not yet returned by the remote listing; fingerprint stays pending", hash, h.dest.Name))
+			continue
+		}
+		cs, ok := extractChecksum(h.dest, byName[hash])
+		if !ok {
+			rep.Warnings = append(rep.Warnings, fmt.Sprintf("object %s on %q: remote exposes no usable checksum for this object; fingerprint stays pending", hash, h.dest.Name))
+			continue
+		}
+		if err := h.store.SetRemoteObjectChecksum(ctx, d.ContentID, h.dest.Name, cs.Algo, cs.Value); err != nil {
+			rep.Warnings = append(rep.Warnings, fmt.Sprintf("record fingerprint for %s: %v", hash, err))
+			continue
+		}
+		rep.Fingerprints++
 	}
 }
 

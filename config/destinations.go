@@ -137,13 +137,17 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 	if err != nil {
 		return nil, err
 	}
+	pathStyle, err := resolvePathStyle(raw, typ)
+	if err != nil {
+		return nil, err
+	}
 	params, err := validateAndResolveParams(schema, raw)
 	if err != nil {
 		return nil, err
 	}
 	return &Destination{
 		Name: name, Type: typ, Root: root, Layout: layout, Params: params,
-		Crypt: crypt, HashAlgo: hashAlgo, Checkers: checkers,
+		Crypt: crypt, HashAlgo: hashAlgo, Checkers: checkers, PathStyle: pathStyle,
 	}, nil
 }
 
@@ -196,6 +200,25 @@ func resolveCheckers(raw map[string]any, typ string) (int, error) {
 		return 0, errors.New("checkers must be a positive integer")
 	}
 	return int(n), nil
+}
+
+// resolvePathStyle validates the optional `force_path_style` key: a
+// boolean confined to s3 destinations, consumed by the direct S3 ETag
+// client (not rendered into rclone.conf — it governs only squirrel's own
+// listing). An absent key is false.
+func resolvePathStyle(raw map[string]any, typ string) (bool, error) {
+	v, ok := raw["force_path_style"]
+	if !ok {
+		return false, nil
+	}
+	if typ != "s3" {
+		return false, fmt.Errorf(`force_path_style is only supported on type "s3" destinations, not %q`, typ)
+	}
+	b, ok := v.(bool)
+	if !ok {
+		return false, errors.New("force_path_style must be a boolean")
+	}
+	return b, nil
 }
 
 func sortedKeys(m map[string]bool) []string {
@@ -302,7 +325,7 @@ func validateAndResolveParams(schema destSchema, raw map[string]any) (map[string
 	out := make(map[string]string)
 	seen := map[string]bool{
 		"type": true, "root": true, "crypt": true, "layout": true,
-		"hash_algo": true, "checkers": true,
+		"hash_algo": true, "checkers": true, "force_path_style": true,
 	}
 	for _, key := range schema.requiredString {
 		v, err := requireString(raw, key)
