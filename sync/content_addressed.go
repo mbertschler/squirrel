@@ -89,6 +89,20 @@ func encodeManifestSegment(delta []store.PathDelta) ([]byte, error) {
 	return out, nil
 }
 
+// contentPusher drives the object and manifest-segment transfers that
+// the content-addressed and packed layouts share. Both address content
+// objects at objects/<hash> on the destination-global root, write one
+// per-run manifest segment under <volume>/index/run-<id>, and fingerprint
+// freshly landed objects the same way. The content-addressed layout uses
+// this base directly; the packed layout embeds it and adds pack assembly
+// for content below its threshold.
+type contentPusher struct {
+	store *store.Store
+	rcl   *Rclone
+	vol   *config.Volume
+	dest  *config.Destination
+}
+
 // contentAddressedHandler pushes a volume to a content-addressed rclone
 // destination: per-hash `rclone copyto` for each content object the
 // destination lacks, then the run's manifest segment. The landing is
@@ -99,10 +113,7 @@ func encodeManifestSegment(delta []store.PathDelta) ([]byte, error) {
 // (or re-uploaded idempotently) and harmless without a segment mapping
 // them.
 type contentAddressedHandler struct {
-	store *store.Store
-	rcl   *Rclone
-	vol   *config.Volume
-	dest  *config.Destination
+	contentPusher
 }
 
 func (h *contentAddressedHandler) TargetName() string { return h.dest.Name }
@@ -166,7 +177,7 @@ func (h *contentAddressedHandler) push(ctx context.Context, rep *Report, volID, 
 		return fmt.Errorf("compute path delta since run %d: %w", watermark, err)
 	}
 	rep.Verification.Files = int64(len(delta))
-	if err := h.uploadObjects(ctx, rep, runID, delta); err != nil {
+	if err := h.uploadObjects(ctx, rep, runID, plannedUploads(delta)); err != nil {
 		return err
 	}
 	if err := h.uploadSegment(ctx, delta, runID); err != nil {
@@ -206,8 +217,11 @@ func (h *contentAddressedHandler) watermark(ctx context.Context, volID int64) (i
 	return last.ID, nil
 }
 
-// uploadObjects lands every content object the delta needs that the
-// destination has no upload record for. Counters land on
+// uploadObjects lands every planned content object that the destination
+// has no upload record for. planned is the deduplicated, present-only
+// upload set (plannedUploads) — the content-addressed layout passes its
+// whole delta's uploads, the packed layout passes only the files at or
+// above its pack threshold. Counters land on
 // rep.RcloneResult so the run report reads like the other rclone
 // flows: Transferred = objects uploaded, Checked = objects skipped as
 // already recorded, Errors/FailedFiles = per-object failures. Per-object
@@ -221,10 +235,10 @@ func (h *contentAddressedHandler) watermark(ctx context.Context, volID int64) (i
 // advance. The next run recomputes the same delta and re-offers the
 // object, letting the honest bytes land once they are restored — without
 // the drifted bytes ever being recorded under the hash.
-func (h *contentAddressedHandler) uploadObjects(ctx context.Context, rep *Report, runID int64, delta []store.PathDelta) error {
+func (h *contentPusher) uploadObjects(ctx context.Context, rep *Report, runID int64, planned []store.PathDelta) error {
 	var confirmed []store.PathDelta
 	var drifted int
-	for _, d := range plannedUploads(delta) {
+	for _, d := range planned {
 		recorded, err := h.store.HasRemoteObject(ctx, d.ContentID, h.dest.Name)
 		if err != nil {
 			return fmt.Errorf("lookup upload record for %s: %w", d.Path, err)
@@ -272,7 +286,7 @@ const fingerprintBatchSize = 200
 // backend reads `rclone lsjson --hash`. Capture problems are warnings, not
 // failures: the upload is already confirmed and recorded, and `squirrel
 // verify` fills any fingerprint left pending.
-func (h *contentAddressedHandler) captureFingerprints(ctx context.Context, rep *Report, confirmed []store.PathDelta) {
+func (h *contentPusher) captureFingerprints(ctx context.Context, rep *Report, confirmed []store.PathDelta) {
 	// A run that uploaded nothing new has nothing to fingerprint; return
 	// before the s3 path would otherwise list the whole objects/ prefix (and
 	// possibly warn on a transient failure) for an empty batch.
@@ -289,7 +303,7 @@ func (h *contentAddressedHandler) captureFingerprints(ctx context.Context, rep *
 // captureFingerprintsRclone reads provider checksums via `rclone lsjson
 // --hash`, batched into one invocation per chunk and scoped by --include
 // filters so the backend hashes only this run's uploads.
-func (h *contentAddressedHandler) captureFingerprintsRclone(ctx context.Context, rep *Report, confirmed []store.PathDelta) {
+func (h *contentPusher) captureFingerprintsRclone(ctx context.Context, rep *Report, confirmed []store.PathDelta) {
 	dirURI := underlyingObjectsURI(h.dest)
 	types := captureHashTypes(h.dest)
 	for batch := range slices.Chunk(confirmed, fingerprintBatchSize) {
@@ -318,7 +332,7 @@ func (h *contentAddressedHandler) captureFingerprintsRclone(ctx context.Context,
 // A read failure leaves every fingerprint pending with a warning — capture
 // is not on the durability critical path (the bytes are already confirmed),
 // so `squirrel verify` is the backstop.
-func (h *contentAddressedHandler) captureFingerprintsS3(ctx context.Context, rep *Report, confirmed []store.PathDelta) {
+func (h *contentPusher) captureFingerprintsS3(ctx context.Context, rep *Report, confirmed []store.PathDelta) {
 	reader, err := newS3ETagReader(h.dest)
 	if err == nil {
 		var etags map[string]string
@@ -341,7 +355,7 @@ func (h *contentAddressedHandler) captureFingerprintsS3(ctx context.Context, rep
 // in batch from the listing (byName, present). An object absent from the
 // listing or exposing no usable checksum stays pending with a warning; the
 // fingerprint is never fabricated.
-func (h *contentAddressedHandler) recordCapturedFingerprints(ctx context.Context, rep *Report, batch []store.PathDelta, byName map[string]map[string]string, present map[string]bool) {
+func (h *contentPusher) recordCapturedFingerprints(ctx context.Context, rep *Report, batch []store.PathDelta, byName map[string]map[string]string, present map[string]bool) {
 	for _, d := range batch {
 		hash := hex.EncodeToString(d.Blake3)
 		if !present[hash] {
@@ -402,7 +416,7 @@ var errContentDrift = errors.New("source content drifted from its indexed hash")
 // span, and the scan-back fingerprint pass (#109) re-reads the landed
 // object to upgrade the durability vector, catching any byte that slipped
 // through before the object is treated as content-verified.
-func (h *contentAddressedHandler) uploadOneObject(ctx context.Context, runID int64, d store.PathDelta) error {
+func (h *contentPusher) uploadOneObject(ctx context.Context, runID int64, d store.PathDelta) error {
 	src := filepath.Join(h.vol.Path, filepath.FromSlash(d.Path))
 	digest, err := hashLocalFile(src)
 	if err != nil {
@@ -453,7 +467,7 @@ func hashLocalFile(path string) ([]byte, error) {
 // landed at the expected size. Every run uploads one — an unchanged
 // volume yields an empty segment — so each successful run leaves the
 // landing evidence the next watermark check looks for.
-func (h *contentAddressedHandler) uploadSegment(ctx context.Context, delta []store.PathDelta, runID int64) error {
+func (h *contentPusher) uploadSegment(ctx context.Context, delta []store.PathDelta, runID int64) error {
 	body, err := encodeManifestSegment(delta)
 	if err != nil {
 		return err
@@ -488,12 +502,12 @@ func (h *contentAddressedHandler) uploadSegment(ctx context.Context, delta []sto
 // objectURI addresses one content object under the destination-root
 // objects/ directory, through the crypt overlay when the destination
 // has one.
-func (h *contentAddressedHandler) objectURI(hash string) string {
+func (h *contentPusher) objectURI(hash string) string {
 	return remoteSubpathURI(h.dest, path.Join(ObjectsDirName, hash))
 }
 
 // segmentURI addresses one run's manifest segment under the
 // destination's per-volume index/ directory.
-func (h *contentAddressedHandler) segmentURI(runID int64) string {
+func (h *contentPusher) segmentURI(runID int64) string {
 	return remoteSubpathURI(h.dest, path.Join(h.vol.Name, ManifestDirName, "run-"+strconv.FormatInt(runID, 10)))
 }
