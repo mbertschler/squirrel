@@ -273,6 +273,12 @@ const fingerprintBatchSize = 200
 // failures: the upload is already confirmed and recorded, and `squirrel
 // verify` fills any fingerprint left pending.
 func (h *contentAddressedHandler) captureFingerprints(ctx context.Context, rep *Report, confirmed []store.PathDelta) {
+	// A run that uploaded nothing new has nothing to fingerprint; return
+	// before the s3 path would otherwise list the whole objects/ prefix (and
+	// possibly warn on a transient failure) for an empty batch.
+	if len(confirmed) == 0 {
+		return
+	}
 	if h.dest.Type == "s3" {
 		h.captureFingerprintsS3(ctx, rep, confirmed)
 		return
@@ -344,7 +350,7 @@ func (h *contentAddressedHandler) recordCapturedFingerprints(ctx context.Context
 		}
 		cs, ok := extractChecksum(h.dest, byName[hash])
 		if !ok {
-			rep.Warnings = append(rep.Warnings, fmt.Sprintf("object %s on %q: remote exposes no usable checksum (e.g. a multipart object whose ETag rclone does not surface as a hash); fingerprint stays pending", hash, h.dest.Name))
+			rep.Warnings = append(rep.Warnings, fmt.Sprintf("object %s on %q: remote exposes no usable checksum for this object; fingerprint stays pending", hash, h.dest.Name))
 			continue
 		}
 		if err := h.store.SetRemoteObjectChecksum(ctx, d.ContentID, h.dest.Name, cs.Algo, cs.Value); err != nil {

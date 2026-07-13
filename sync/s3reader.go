@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"net/url"
 	"path"
 	"strings"
@@ -66,7 +67,7 @@ func newMinioETagReader(dest *config.Destination) (*minioETagReader, error) {
 		lookup = minio.BucketLookupPath
 	}
 	client, err := minio.New(endpoint, &minio.Options{
-		Creds:        credentials.NewStaticV4(p["access_key_id"], p["secret_access_key"], ""),
+		Creds:        s3Credentials(p["access_key_id"], p["secret_access_key"]),
 		Secure:       secure,
 		Region:       p["region"],
 		BucketLookup: lookup,
@@ -83,18 +84,39 @@ func newMinioETagReader(dest *config.Destination) (*minioETagReader, error) {
 
 func (r *minioETagReader) objectETags(ctx context.Context) (map[string]string, error) {
 	out := map[string]string{}
+	// minio-go's ListObjects issues ListObjectsV2 requests by default and
+	// paginates internally, so this ranges over every object under the
+	// prefix without a manual continuation-token loop.
 	for obj := range r.client.ListObjects(ctx, r.bucket, minio.ListObjectsOptions{Prefix: r.prefix, Recursive: true}) {
 		if obj.Err != nil {
 			return nil, fmt.Errorf("list s3://%s/%s: %w", r.bucket, r.prefix, obj.Err)
 		}
-		// minio-go strips the surrounding quotes from the raw ETag; a plain
-		// 32-hex value is a whole-object MD5, a <hex>-<parts> value the
-		// multipart composite form — both recorded verbatim by the caller.
-		if obj.ETag != "" {
-			out[path.Base(obj.Key)] = obj.ETag
-		}
+		// Record every listed key, even the (in practice never seen) empty
+		// ETag: the object *is* present, so the caller must classify it as
+		// "present, no usable checksum" rather than "not listed" — dropping
+		// it here would misreport a live object as missing. minio-go strips
+		// the surrounding quotes from the raw ETag; a plain 32-hex value is a
+		// whole-object MD5, a <hex>-<parts> value the multipart composite
+		// form — both recorded verbatim by the caller.
+		out[path.Base(obj.Key)] = obj.ETag
 	}
 	return out, nil
+}
+
+// s3Credentials picks the credential source for the ETag reader: explicit
+// static keys when both are configured, otherwise minio-go's chain (AWS
+// env vars, shared credentials file, then IAM role) — the same ambient
+// sources rclone falls back to when a destination sets no keys, so
+// scan-back fingerprinting works on every S3 destination rclone can reach.
+func s3Credentials(accessKeyID, secretAccessKey string) *credentials.Credentials {
+	if accessKeyID != "" && secretAccessKey != "" {
+		return credentials.NewStaticV4(accessKeyID, secretAccessKey, "")
+	}
+	return credentials.NewChainCredentials([]credentials.Provider{
+		&credentials.EnvAWS{},
+		&credentials.FileAWSCredentials{},
+		&credentials.IAM{Client: &http.Client{Transport: http.DefaultTransport}},
+	})
 }
 
 // s3Endpoint resolves the minio host[:port] and TLS flag from the
