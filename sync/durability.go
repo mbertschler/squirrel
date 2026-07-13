@@ -174,7 +174,7 @@ func pullDurability(ctx context.Context, s *store.Store, client *nodeClient, vol
 		if err != nil {
 			return rep, err
 		}
-		err = s.UpsertDestinationRunIDPulled(ctx, volumeID, c.Destination, nodeID, c.OriginRun, c.VerifyMethod, sourceNode.ID, allowRewind)
+		err = s.UpsertDestinationRunIDPulled(ctx, volumeID, c.Destination, nodeID, c.OriginRun, c.VerifyMethod, sourceNode.ID, c.VerifiedAtNs, allowRewind)
 		var rewind *store.DestinationRewindError
 		if errors.As(err, &rewind) {
 			rep.Rewinds = append(rep.Rewinds, DurabilityRewind{

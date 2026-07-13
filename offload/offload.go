@@ -41,6 +41,12 @@ type Options struct {
 	// policy is an explicit precondition, there is no default target
 	// set.
 	Require []string
+	// MaxEvidenceAge, when positive, refuses any required target whose
+	// durability evidence was last re-verified longer ago than this in
+	// wall-clock time (issue #131). Zero disables the time-based
+	// staleness policy — the opt-in default, so the version-vector gate
+	// behaves exactly as before.
+	MaxEvidenceAge time.Duration
 	// DryRun evaluates and reports the per-file gate decisions from the
 	// index alone: no runs row, no file reads, no deletions, no status
 	// flips. Disk-drift checks only happen on a real run, immediately
@@ -129,7 +135,8 @@ func Offload(ctx context.Context, s *store.Store, root string, opts Options) (re
 	if err != nil {
 		return Report{}, err
 	}
-	g, err := loadGate(ctx, s, vol.ID, opts.Require)
+	now := time.Now()
+	g, err := loadGate(ctx, s, vol.ID, opts.Require, now.UnixNano(), opts.MaxEvidenceAge)
 	if err != nil {
 		return Report{}, err
 	}
@@ -137,7 +144,7 @@ func Offload(ctx context.Context, s *store.Store, root string, opts Options) (re
 	if err != nil {
 		return Report{}, err
 	}
-	candidates, misses := selectCandidates(rows, selectors, opts.OlderThan)
+	candidates, misses := selectCandidates(rows, selectors, opts.OlderThan, now)
 	report.SelectorMisses = misses
 
 	if opts.DryRun {
@@ -248,11 +255,11 @@ func underReservedSubtree(p string) bool {
 // is applied after selector-hit tracking so a selector that only
 // matched younger files still counts as matched. Candidates come back
 // in path order for deterministic reports.
-func selectCandidates(rows map[string]store.FileRow, selectors []string, olderThan time.Duration) ([]store.FileRow, []string) {
+func selectCandidates(rows map[string]store.FileRow, selectors []string, olderThan time.Duration, now time.Time) ([]store.FileRow, []string) {
 	ageFiltered := olderThan > 0
 	var cutoffNs int64
 	if ageFiltered {
-		cutoffNs = time.Now().Add(-olderThan).UnixNano()
+		cutoffNs = now.Add(-olderThan).UnixNano()
 	}
 	hit := make(map[string]bool, len(selectors))
 	var out []store.FileRow

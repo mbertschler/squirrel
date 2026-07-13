@@ -286,6 +286,52 @@ offload_requires = ["nas", "nas"]
 	}
 }
 
+// TestLoadOffloadMaxEvidenceAge: the optional staleness knob parses as a
+// duration; absent it defaults to zero (the time-based policy disabled).
+func TestLoadOffloadMaxEvidenceAge(t *testing.T) {
+	p := writeConfig(t, `
+[volumes.pictures]
+path = "/tmp/pictures"
+offload_requires = ["nas"]
+offload_max_evidence_age = "720h"
+
+[volumes.docs]
+path = "/tmp/docs"
+offload_requires = ["nas"]
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Volumes["pictures"].OffloadMaxEvidenceAge; got != 720*time.Hour {
+		t.Fatalf("OffloadMaxEvidenceAge = %s, want 720h", got)
+	}
+	if got := cfg.Volumes["docs"].OffloadMaxEvidenceAge; got != 0 {
+		t.Fatalf("OffloadMaxEvidenceAge = %s, want 0 (disabled by default)", got)
+	}
+}
+
+func TestLoadRejectsBadOffloadMaxEvidenceAge(t *testing.T) {
+	cases := []struct{ name, value string }{
+		{"garbage", "soon"},
+		{"sub_second", "500ms"},
+		{"unitless", "30"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := writeConfig(t, `
+[volumes.pictures]
+path = "/tmp/pictures"
+offload_requires = ["nas"]
+offload_max_evidence_age = "`+c.value+`"
+`)
+			if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "offload_max_evidence_age") {
+				t.Fatalf("expected offload_max_evidence_age error, got %v", err)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsInvalidName(t *testing.T) {
 	// Names that wouldn't survive being a filesystem subfolder or an
 	// rclone.conf section are rejected at load time.

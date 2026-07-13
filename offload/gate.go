@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/mbertschler/squirrel/store"
 )
@@ -16,11 +17,15 @@ import (
 // behind it; source is the asserting peer's node id when the component
 // was last advanced by a durability pull, and invalid (NULL) for the
 // locally-verified class — so the gate's decision names which peer's
-// evidence backed it.
+// evidence backed it. verifiedAt is the wall-clock of the last write that
+// carried a verify method or advanced the run — for a pulled component the
+// responder's own instant, capped at now (NULL when unknown) — the basis
+// for the time-based staleness policy.
 type component struct {
 	coveredRun int64
 	method     string
 	source     sql.NullInt64
+	verifiedAt sql.NullInt64
 }
 
 // gate is the offline durability evidence for one invocation: the self
@@ -41,22 +46,33 @@ type gate struct {
 	lastPush  map[string]int64               // target → last whole-volume push run (local space)
 	freshness map[string]map[int64]int64     // target → origin node id → pulled push-freshness origin run
 	nodeNames map[int64]string
+	// nowNs is the invocation's wall-clock, captured once so every
+	// candidate's staleness is judged against one instant and tests can
+	// inject a fixed time.
+	nowNs int64
+	// maxEvidenceAge, when positive, refuses a component whose
+	// verified_at_ns is older than nowNs − maxEvidenceAge (or unknown).
+	// Zero disables the time-based policy — the opt-in default, so the
+	// version-vector gate behaves exactly as before.
+	maxEvidenceAge time.Duration
 }
 
-func loadGate(ctx context.Context, s *store.Store, volumeID int64, require []string) (*gate, error) {
+func loadGate(ctx context.Context, s *store.Store, volumeID int64, require []string, nowNs int64, maxEvidenceAge time.Duration) (*gate, error) {
 	self, err := s.GetSelfNode(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("lookup self node: %w", err)
 	}
 	g := &gate{
-		store:     s,
-		volumeID:  volumeID,
-		self:      self,
-		require:   require,
-		vectors:   make(map[string]map[int64]component, len(require)),
-		lastPush:  make(map[string]int64, len(require)),
-		freshness: make(map[string]map[int64]int64, len(require)),
-		nodeNames: map[int64]string{self.ID: self.Name},
+		store:          s,
+		volumeID:       volumeID,
+		self:           self,
+		require:        require,
+		vectors:        make(map[string]map[int64]component, len(require)),
+		lastPush:       make(map[string]int64, len(require)),
+		freshness:      make(map[string]map[int64]int64, len(require)),
+		nodeNames:      map[int64]string{self.ID: self.Name},
+		nowNs:          nowNs,
+		maxEvidenceAge: maxEvidenceAge,
 	}
 	for _, target := range require {
 		components, err := s.ListDestinationRunIDs(ctx, volumeID, target)
@@ -65,7 +81,7 @@ func loadGate(ctx context.Context, s *store.Store, volumeID int64, require []str
 		}
 		vector := make(map[int64]component, len(components))
 		for _, c := range components {
-			vector[c.OriginNodeID] = component{coveredRun: c.OriginRunID, method: c.VerifyMethod, source: c.SourceNodeID}
+			vector[c.OriginNodeID] = component{coveredRun: c.OriginRunID, method: c.VerifyMethod, source: c.SourceNodeID, verifiedAt: c.VerifiedAtNs}
 		}
 		g.vectors[target] = vector
 
@@ -89,9 +105,13 @@ func loadGate(ctx context.Context, s *store.Store, volumeID int64, require []str
 }
 
 // check evaluates the gate for one present row. Content with origin
-// (N, r) is durable on a target only when all three conditions hold:
+// (N, r) is durable on a target only when all four conditions hold:
 //
 //   - origin vector: the target's component for N covers r;
+//   - evidence age: when a max evidence age is configured, the
+//     component's verified_at_ns is within it — defence-in-depth against
+//     a destination that was once durable but has not had its coverage
+//     re-confirmed in wall-clock time;
 //   - freshness: a successful whole-volume push covers the run in which
 //     the path last became present, so a path re-acquired after the last
 //     push is held until a fresh push covers it. For a target this node
@@ -102,7 +122,7 @@ func loadGate(ctx context.Context, s *store.Store, volumeID int64, require []str
 //     only content-addressed component — a verified scan-back
 //     fingerprint backs the gated object.
 //
-// The file passes only when every required target satisfies all three.
+// The file passes only when every required target satisfies all four.
 // The returned failures name each failing target and reason; an empty
 // slice means the gate passed.
 func (g *gate) check(ctx context.Context, row store.FileRow) ([]string, error) {
@@ -123,6 +143,10 @@ func (g *gate) check(ctx context.Context, row store.FileRow) ([]string, error) {
 				fmt.Sprintf("%s: stale: have %d need %d (origin %s, %s)", target, comp.coveredRun, originRun, g.nodeName(ctx, originNode), g.provenance(ctx, comp)))
 			continue
 		}
+		if reason := g.staleEvidenceFailure(ctx, target, comp); reason != "" {
+			failures = append(failures, reason)
+			continue
+		}
 		if reason := g.freshnessFailure(ctx, target, row, originNode, originRun); reason != "" {
 			failures = append(failures, reason)
 			continue
@@ -137,6 +161,40 @@ func (g *gate) check(ctx context.Context, row store.FileRow) ([]string, error) {
 		}
 	}
 	return failures, nil
+}
+
+// staleEvidenceFailure refuses the target when a max evidence age is
+// configured and the component's verification is older than that age in
+// wall-clock time — the time-based staleness policy (issue #131), a
+// complement to the version-vector coverage check above. It is
+// fail-closed: a component whose verified_at_ns is unknown (NULL — a
+// pre-v23 row, or one only ever advanced methodlessly at its recorded
+// run) is treated as infinitely stale and refused, since the gate cannot
+// show the coverage was recently re-confirmed.
+//
+// For a peer-asserted component (a durability pull tagged it) the
+// verified_at_ns this node holds is the responder's own verification
+// instant, relayed on the pull and capped at now — so the policy bounds
+// freshness by when the peer last genuinely re-verified, not merely when
+// this node last heard from it. A destination gone dead behind a peer
+// that keeps answering ages out here too, and a peer that falls silent
+// still ages out because no newer assertion arrives to refresh it. A zero
+// maxEvidenceAge disables the policy entirely.
+func (g *gate) staleEvidenceFailure(ctx context.Context, target string, comp component) string {
+	if g.maxEvidenceAge <= 0 {
+		return ""
+	}
+	cutoff := g.nowNs - int64(g.maxEvidenceAge)
+	if !comp.verifiedAt.Valid {
+		return fmt.Sprintf("%s: stale evidence: never re-verified (max age %s, %s)",
+			target, g.maxEvidenceAge, g.provenance(ctx, comp))
+	}
+	if comp.verifiedAt.Int64 < cutoff {
+		age := time.Duration(g.nowNs - comp.verifiedAt.Int64)
+		return fmt.Sprintf("%s: stale evidence: last verified %s ago > max age %s (%s)",
+			target, age.Round(time.Second), g.maxEvidenceAge, g.provenance(ctx, comp))
+	}
+	return ""
 }
 
 // freshnessFailure refuses the target when no successful whole-volume

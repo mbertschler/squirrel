@@ -365,7 +365,7 @@ func TestOffloadGateNamesPeerProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetOrCreateOriginNode(nas): %v", err)
 	}
-	if err := s.UpsertDestinationRunIDPulled(ctx, v.ID, "t1", self.ID, idx.RunID-1, store.VerifyMethodBlake3, peer.ID, false); err != nil {
+	if err := s.UpsertDestinationRunIDPulled(ctx, v.ID, "t1", self.ID, idx.RunID-1, store.VerifyMethodBlake3, peer.ID, store.NowNs(), false); err != nil {
 		t.Fatalf("UpsertDestinationRunIDPulled: %v", err)
 	}
 	recordPush(t, s, v.ID, "t1")

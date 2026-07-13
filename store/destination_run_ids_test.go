@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // TestMigrateV18ToV19AddsVerifyMethod builds a minimal v18 database with
@@ -78,6 +79,82 @@ func TestMigrateV18ToV19AddsVerifyMethod(t *testing.T) {
 	}
 	if got.VerifyMethod != "" {
 		t.Fatalf("verify method = %q, want empty (NULL backfill)", got.VerifyMethod)
+	}
+}
+
+// TestMigrateV22ToV23AddsVerifiedAt builds a minimal v22 database with a
+// pre-existing durability component and confirms the migration adds
+// verified_at_ns (NULL on the carried-over row) without disturbing the
+// recorded coordinate. A NULL verified_at_ns is the fail-closed signal:
+// the gate reads it as "never re-verified" when a max age is configured.
+func TestMigrateV22ToV23AddsVerifiedAt(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "test.db")
+	rawDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("raw sql.Open: %v", err)
+	}
+	v22DDL := []string{
+		`CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)`,
+		`CREATE TABLE volumes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL)`,
+		`CREATE TABLE nodes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, endpoint TEXT, public_key_fingerprint TEXT)`,
+		`CREATE TABLE contents (
+			id             INTEGER PRIMARY KEY,
+			blake3         BLOB NOT NULL UNIQUE CHECK (length(blake3) = 32),
+			size_bytes     INTEGER NOT NULL,
+			origin_node_id INTEGER REFERENCES nodes(id),
+			origin_run_id  INTEGER
+		)`,
+		`CREATE TABLE destination_run_ids (
+			volume_id      INTEGER NOT NULL REFERENCES volumes(id),
+			destination    TEXT NOT NULL,
+			origin_node_id INTEGER NOT NULL REFERENCES nodes(id),
+			origin_run_id  INTEGER NOT NULL,
+			updated_at_ns  INTEGER NOT NULL,
+			verify_method  TEXT,
+			source_node_id INTEGER REFERENCES nodes(id),
+			PRIMARY KEY (volume_id, destination, origin_node_id)
+		)`,
+		`CREATE TABLE destination_run_ids_history (
+			id             INTEGER PRIMARY KEY,
+			volume_id      INTEGER NOT NULL,
+			destination    TEXT NOT NULL,
+			origin_node_id INTEGER NOT NULL,
+			origin_run_id  INTEGER NOT NULL,
+			at_ns          INTEGER NOT NULL,
+			verify_method  TEXT,
+			source_node_id INTEGER REFERENCES nodes(id)
+		)`,
+		`INSERT INTO schema_version (version) VALUES (22)`,
+		`INSERT INTO volumes (id, name, path) VALUES (1, 'v', '/v')`,
+		`INSERT INTO nodes (id, name) VALUES (1, 'self')`,
+		`INSERT INTO destination_run_ids (volume_id, destination, origin_node_id, origin_run_id, updated_at_ns, verify_method)
+			VALUES (1, 'bucket', 1, 7, 100, 'blake3')`,
+	}
+	for _, q := range v22DDL {
+		if _, err := rawDB.Exec(q); err != nil {
+			t.Fatalf("v22 DDL %q: %v", q, err)
+		}
+	}
+	rawDB.Close()
+
+	s, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("Open (migrates v22→v23): %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	if v, _ := s.CurrentSchemaVersion(ctx); v != SchemaVersion {
+		t.Fatalf("schema_version = %d, want %d", v, SchemaVersion)
+	}
+	got, err := s.GetDestinationRunID(ctx, 1, "bucket", 1)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID: %v", err)
+	}
+	if got.OriginRunID != 7 || got.VerifyMethod != VerifyMethodBlake3 {
+		t.Fatalf("got run=%d method=%q, want 7 and %q (carried over)", got.OriginRunID, got.VerifyMethod, VerifyMethodBlake3)
+	}
+	if got.VerifiedAtNs.Valid {
+		t.Fatalf("verified_at_ns = %v, want NULL on the carried-over row", got.VerifiedAtNs)
 	}
 }
 
@@ -601,6 +678,87 @@ func TestUpsertDestinationRunIDPreservesMethodOnMethodlessReconfirm(t *testing.T
 	}
 }
 
+// TestUpsertDestinationRunIDVerifiedStampsVerifiedAt: a content-verified
+// advance records verified_at_ns alongside updated_at_ns, the freshness
+// signal the offload gate's time-based staleness policy reads.
+func TestUpsertDestinationRunIDVerifiedStampsVerifiedAt(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+	node, err := s.GetSelfNode(ctx)
+	if err != nil {
+		t.Fatalf("GetSelfNode: %v", err)
+	}
+
+	before := NowNs()
+	if err := s.UpsertDestinationRunIDVerified(ctx, vID, "bucket", node.ID, 5, VerifyMethodBlake3, false); err != nil {
+		t.Fatalf("UpsertDestinationRunIDVerified: %v", err)
+	}
+	after := NowNs()
+	got, err := s.GetDestinationRunID(ctx, vID, "bucket", node.ID)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID: %v", err)
+	}
+	if !got.VerifiedAtNs.Valid {
+		t.Fatalf("verified_at_ns is NULL, want a stamp from the verified advance")
+	}
+	if got.VerifiedAtNs.Int64 < before || got.VerifiedAtNs.Int64 > after {
+		t.Fatalf("verified_at_ns = %d, want within [%d, %d]", got.VerifiedAtNs.Int64, before, after)
+	}
+}
+
+// TestUpsertDestinationRunIDVerifiedAtNotBumpedByMethodlessReconfirm: an
+// equal-value methodless re-confirmation (a no-op touch, or a pull from a
+// pre-v19 peer) refreshes updated_at_ns but must NOT advance
+// verified_at_ns — the timestamp the gate trusts tracks genuine
+// re-verification, not no-op touches (issue #131).
+func TestUpsertDestinationRunIDVerifiedAtNotBumpedByMethodlessReconfirm(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+	node, err := s.GetSelfNode(ctx)
+	if err != nil {
+		t.Fatalf("GetSelfNode: %v", err)
+	}
+
+	// Seed a component whose verified_at_ns is deliberately far in the
+	// past, so a re-confirm that wrongly bumped it would be obvious.
+	const seededVerifiedAt = int64(1000)
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO destination_run_ids (volume_id, destination, origin_node_id, origin_run_id, updated_at_ns, verify_method, verified_at_ns)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, vID, "bucket", node.ID, 5, seededVerifiedAt, VerifyMethodBlake3, seededVerifiedAt); err != nil {
+		t.Fatalf("seed component: %v", err)
+	}
+
+	if err := s.UpsertDestinationRunID(ctx, vID, "bucket", node.ID, 5, false); err != nil {
+		t.Fatalf("methodless reconfirm: %v", err)
+	}
+	got, err := s.GetDestinationRunID(ctx, vID, "bucket", node.ID)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID: %v", err)
+	}
+	if !got.VerifiedAtNs.Valid || got.VerifiedAtNs.Int64 != seededVerifiedAt {
+		t.Fatalf("verified_at_ns = %v, want preserved at %d", got.VerifiedAtNs, seededVerifiedAt)
+	}
+	if got.UpdatedAtNs <= seededVerifiedAt {
+		t.Fatalf("updated_at_ns = %d, want bumped above the seed %d", got.UpdatedAtNs, seededVerifiedAt)
+	}
+
+	// A strict advance, even methodless, is new coverage proven, so it
+	// re-stamps verified_at_ns.
+	if err := s.UpsertDestinationRunID(ctx, vID, "bucket", node.ID, 9, false); err != nil {
+		t.Fatalf("methodless advance: %v", err)
+	}
+	got, err = s.GetDestinationRunID(ctx, vID, "bucket", node.ID)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID: %v", err)
+	}
+	if !got.VerifiedAtNs.Valid || got.VerifiedAtNs.Int64 <= seededVerifiedAt {
+		t.Fatalf("verified_at_ns = %v, want re-stamped on the strict advance", got.VerifiedAtNs)
+	}
+}
+
 // TestDestinationRunIDNullVerifyMethodReadsUnverified pins the v19
 // backfill contract: a component with a NULL verify_method (a pre-v19
 // row, or a legacy upsert) scans back as an empty method, which
@@ -747,7 +905,7 @@ func TestUpsertDestinationRunIDPulledTagsSource(t *testing.T) {
 	if err := s.UpsertDestinationRunIDVerified(ctx, vID, "offsite", self.ID, 9, VerifyMethodBlake3, false); err != nil {
 		t.Fatalf("local verified advance: %v", err)
 	}
-	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", origin.ID, 5, VerifyMethodKopia, peer.ID, false); err != nil {
+	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", origin.ID, 5, VerifyMethodKopia, peer.ID, NowNs(), false); err != nil {
 		t.Fatalf("pulled advance: %v", err)
 	}
 
@@ -804,7 +962,7 @@ func TestUpsertDestinationRunIDProvenanceTransitions(t *testing.T) {
 	if err := s.UpsertDestinationRunIDVerified(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, false); err != nil {
 		t.Fatalf("local advance: %v", err)
 	}
-	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, peer.ID, false); err != nil {
+	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, peer.ID, NowNs(), false); err != nil {
 		t.Fatalf("peer re-confirm at recorded run: %v", err)
 	}
 	got, err := s.GetDestinationRunID(ctx, vID, "offsite", self.ID)
@@ -815,7 +973,7 @@ func TestUpsertDestinationRunIDProvenanceTransitions(t *testing.T) {
 		t.Fatalf("local component downgraded to peer %d by an equal-run re-confirm", got.SourceNodeID.Int64)
 	}
 
-	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 20, VerifyMethodKopia, peer.ID, false); err != nil {
+	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 20, VerifyMethodKopia, peer.ID, NowNs(), false); err != nil {
 		t.Fatalf("peer strict advance: %v", err)
 	}
 	got, _ = s.GetDestinationRunID(ctx, vID, "offsite", self.ID)
@@ -858,7 +1016,7 @@ func TestUpsertDestinationRunIDMethodProvenanceStayTogether(t *testing.T) {
 		if err := s.UpsertDestinationRunIDVerified(ctx, vID, "offsite", self.ID, 10, VerifyMethodPresenceSize, false); err != nil {
 			t.Fatalf("local presence+size advance: %v", err)
 		}
-		if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, peer.ID, false); err != nil {
+		if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, peer.ID, NowNs(), false); err != nil {
 			t.Fatalf("peer blake3 re-confirm at equal run: %v", err)
 		}
 		got, err := s.GetDestinationRunID(ctx, vID, "offsite", self.ID)
@@ -886,7 +1044,7 @@ func TestUpsertDestinationRunIDMethodProvenanceStayTogether(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetOrCreateOriginNode: %v", err)
 		}
-		if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, peer.ID, false); err != nil {
+		if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, peer.ID, NowNs(), false); err != nil {
 			t.Fatalf("peer blake3 advance: %v", err)
 		}
 		if err := s.UpsertDestinationRunID(ctx, vID, "offsite", self.ID, 10, false); err != nil {
@@ -918,7 +1076,7 @@ func TestUpsertDestinationRunIDMethodProvenanceStayTogether(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetOrCreateOriginNode: %v", err)
 		}
-		if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, peer.ID, false); err != nil {
+		if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, peer.ID, NowNs(), false); err != nil {
 			t.Fatalf("peer blake3 advance: %v", err)
 		}
 		if err := s.UpsertDestinationRunIDVerified(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, false); err != nil {
@@ -932,6 +1090,62 @@ func TestUpsertDestinationRunIDMethodProvenanceStayTogether(t *testing.T) {
 			t.Fatalf("source = %+v, want NULL: a local re-verification must reclaim ownership from the peer", got.SourceNodeID)
 		}
 	})
+}
+
+// TestUpsertDestinationRunIDPulledBoundsFreshnessByRelay pins issue #131
+// finding 2: a pull records verified_at_ns bounded by the responder's own
+// verification instant, not the moment of the pull. So a destination gone
+// dead behind a still-answering peer ages out on the puller under the
+// time-based staleness policy — freshness does not reset just because the
+// peer keeps replying. An unknown (zero) relay records NULL (fail-closed).
+func TestUpsertDestinationRunIDPulledBoundsFreshnessByRelay(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+	self, err := s.GetSelfNode(ctx)
+	if err != nil {
+		t.Fatalf("GetSelfNode: %v", err)
+	}
+	peer, err := s.GetOrCreateOriginNode(ctx, "nas")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode(nas): %v", err)
+	}
+	origin, err := s.GetOrCreateOriginNode(ctx, "laptop")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode(laptop): %v", err)
+	}
+
+	// The peer relays a verification instant well in the past (its own
+	// evidence has not been re-verified in months, though it still answers).
+	staleRelay := NowNs() - int64(90*24*time.Hour)
+	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", self.ID, 10, VerifyMethodBlake3, peer.ID, staleRelay, false); err != nil {
+		t.Fatalf("pulled advance with stale relay: %v", err)
+	}
+	got, err := s.GetDestinationRunID(ctx, vID, "offsite", self.ID)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID: %v", err)
+	}
+	if !got.VerifiedAtNs.Valid || got.VerifiedAtNs.Int64 != staleRelay {
+		t.Fatalf("verified_at_ns = %v, want the relayed stale instant %d: freshness must be bounded by the responder, not reset to the pull time", got.VerifiedAtNs, staleRelay)
+	}
+	// updated_at_ns still tracks the pull itself, so the two signals stay
+	// distinct: the component was touched now, but verified long ago.
+	if got.UpdatedAtNs <= staleRelay {
+		t.Fatalf("updated_at_ns = %d, want ~now (the pull touched the row), well above the stale relay %d", got.UpdatedAtNs, staleRelay)
+	}
+
+	// An unknown (zero) relay — a pre-v23 responder, or evidence never
+	// re-verified — records NULL, which the gate reads as never-verified.
+	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", origin.ID, 4, VerifyMethodBlake3, peer.ID, 0, false); err != nil {
+		t.Fatalf("pulled advance with unknown relay: %v", err)
+	}
+	got, err = s.GetDestinationRunID(ctx, vID, "offsite", origin.ID)
+	if err != nil {
+		t.Fatalf("GetDestinationRunID: %v", err)
+	}
+	if got.VerifiedAtNs.Valid {
+		t.Fatalf("verified_at_ns = %v, want NULL for an unknown relay (fail-closed)", got.VerifiedAtNs)
+	}
 }
 
 // TestRevokeDestinationRunIDsFromSource: revoking a peer drops the live
@@ -963,10 +1177,10 @@ func TestRevokeDestinationRunIDsFromSource(t *testing.T) {
 	if err := s.UpsertDestinationRunIDVerified(ctx, vID, "offsite", self.ID, 9, VerifyMethodBlake3, false); err != nil {
 		t.Fatalf("local advance: %v", err)
 	}
-	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", originA.ID, 5, VerifyMethodKopia, badPeer.ID, false); err != nil {
+	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", originA.ID, 5, VerifyMethodKopia, badPeer.ID, NowNs(), false); err != nil {
 		t.Fatalf("bad-peer advance: %v", err)
 	}
-	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", goodPeer.ID, 3, VerifyMethodKopia, goodPeer.ID, false); err != nil {
+	if err := s.UpsertDestinationRunIDPulled(ctx, vID, "offsite", goodPeer.ID, 3, VerifyMethodKopia, goodPeer.ID, NowNs(), false); err != nil {
 		t.Fatalf("good-peer advance: %v", err)
 	}
 
