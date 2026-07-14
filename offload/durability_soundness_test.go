@@ -2,6 +2,7 @@ package offload
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -360,13 +361,10 @@ func TestOffloadPresenceSizeHeldOutUntilFingerprint(t *testing.T) {
 	}
 	mustExist(t, filepath.Join(root, "a.txt"))
 
-	// The scan-back pass records a fingerprint and confirms it: now the
-	// presence+size component gates.
-	if err := s.SetRemoteObjectChecksum(ctx, row.ContentID, "offsite", "sftp-sha256", "deadbeef"); err != nil {
-		t.Fatalf("SetRemoteObjectChecksum: %v", err)
-	}
-	if err := s.MarkRemoteObjectVerified(ctx, row.ContentID, "offsite", store.NowNs()); err != nil {
-		t.Fatalf("MarkRemoteObjectVerified: %v", err)
+	// The scan-back pass records a fingerprint and confirms it in one write:
+	// now the presence+size component gates.
+	if err := s.SetRemoteObjectFingerprint(ctx, row.ContentID, "offsite", "sftp-sha256", "deadbeef", store.NowNs()); err != nil {
+		t.Fatalf("SetRemoteObjectFingerprint: %v", err)
 	}
 
 	rep, err = Offload(ctx, s, root, Options{
@@ -379,10 +377,12 @@ func TestOffloadPresenceSizeHeldOutUntilFingerprint(t *testing.T) {
 	mustBeGone(t, filepath.Join(root, "a.txt"))
 }
 
-// TestOffloadPresenceSizeUnverifiedFingerprintHeldOut: a recorded but
-// not-yet-verified fingerprint (checksum present, verified_at_ns NULL)
-// is not enough — the gate requires the re-read confirmation, not just
-// the upload-time record.
+// TestOffloadPresenceSizeUnverifiedFingerprintHeldOut: a row with a
+// checksum but a NULL verified_at_ns (constructed directly here — the
+// scan-back capture now stamps verification in the same write, so this
+// state only arises from a legacy/pre-verify-at-capture row or a partial
+// write) is not enough. The gate fails closed on a missing verification
+// stamp regardless of how the row got there.
 func TestOffloadPresenceSizeUnverifiedFingerprintHeldOut(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "a.txt"), "alpha")
@@ -397,15 +397,15 @@ func TestOffloadPresenceSizeUnverifiedFingerprintHeldOut(t *testing.T) {
 	}
 	recordPush(t, s, v.ID, "offsite")
 	row := rowAt(t, s, v.ID, "a.txt")
+	// Recorded checksum but verified_at_ns left NULL.
 	if err := s.InsertRemoteObject(ctx, store.RemoteObject{
 		ContentID:     row.ContentID,
 		Destination:   "offsite",
 		UploadedRunID: idx.RunID,
+		ChecksumAlgo:  sql.NullString{String: "sftp-sha256", Valid: true},
+		Checksum:      sql.NullString{String: "deadbeef", Valid: true},
 	}); err != nil {
 		t.Fatalf("InsertRemoteObject: %v", err)
-	}
-	if err := s.SetRemoteObjectChecksum(ctx, row.ContentID, "offsite", "sftp-sha256", "deadbeef"); err != nil {
-		t.Fatalf("SetRemoteObjectChecksum: %v", err)
 	}
 
 	rep, err := Offload(ctx, s, root, Options{

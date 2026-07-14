@@ -74,10 +74,11 @@ func TestRemoteObjectRoundTrip(t *testing.T) {
 	}
 }
 
-// TestSetRemoteObjectChecksumFillsPendingPair: the scan-back pass fills
-// the NULL pair left by a fingerprint-pending upload, leaving the rest
-// of the row untouched.
-func TestSetRemoteObjectChecksumFillsPendingPair(t *testing.T) {
+// TestSetRemoteObjectFingerprintFillsPendingPair: the scan-back pass fills
+// the NULL pair left by a fingerprint-pending upload and stamps the
+// verification instant in the same write (the read-back is the first
+// verification), leaving the rest of the row untouched.
+func TestSetRemoteObjectFingerprintFillsPendingPair(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 	contentID, runID := remoteObjectFixture(t, s)
@@ -87,8 +88,8 @@ func TestSetRemoteObjectChecksumFillsPendingPair(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("InsertRemoteObject: %v", err)
 	}
-	if err := s.SetRemoteObjectChecksum(ctx, contentID, "bucket-a", "sha256", "deadbeef"); err != nil {
-		t.Fatalf("SetRemoteObjectChecksum: %v", err)
+	if err := s.SetRemoteObjectFingerprint(ctx, contentID, "bucket-a", "sha256", "deadbeef", 12345); err != nil {
+		t.Fatalf("SetRemoteObjectFingerprint: %v", err)
 	}
 	got, err := s.GetRemoteObject(ctx, contentID, "bucket-a")
 	if err != nil {
@@ -97,15 +98,15 @@ func TestSetRemoteObjectChecksumFillsPendingPair(t *testing.T) {
 	if got.ChecksumAlgo != nullStr("sha256") || got.Checksum != nullStr("deadbeef") {
 		t.Fatalf("pair = (%+v, %+v), want (sha256, deadbeef)", got.ChecksumAlgo, got.Checksum)
 	}
-	if got.UploadedRunID != runID || got.VerifiedAtNs.Valid {
-		t.Fatalf("row = %+v, want run %d and no verification stamp", got, runID)
+	if got.UploadedRunID != runID || !got.VerifiedAtNs.Valid || got.VerifiedAtNs.Int64 != 12345 {
+		t.Fatalf("row = %+v, want run %d and verification stamp 12345", got, runID)
 	}
 }
 
-// TestSetRemoteObjectChecksumRefusesOverwrite: a recorded fingerprint is
+// TestSetRemoteObjectFingerprintRefusesOverwrite: a recorded fingerprint is
 // the comparison baseline for every later verification and must never be
 // silently replaced.
-func TestSetRemoteObjectChecksumRefusesOverwrite(t *testing.T) {
+func TestSetRemoteObjectFingerprintRefusesOverwrite(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 	contentID, runID := remoteObjectFixture(t, s)
@@ -116,7 +117,7 @@ func TestSetRemoteObjectChecksumRefusesOverwrite(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("InsertRemoteObject: %v", err)
 	}
-	err := s.SetRemoteObjectChecksum(ctx, contentID, "bucket-a", "sha256", "tampered")
+	err := s.SetRemoteObjectFingerprint(ctx, contentID, "bucket-a", "sha256", "tampered", 12345)
 	if err == nil {
 		t.Fatalf("overwrite of a recorded fingerprint succeeded")
 	}
@@ -129,10 +130,10 @@ func TestSetRemoteObjectChecksumRefusesOverwrite(t *testing.T) {
 	}
 }
 
-func TestSetRemoteObjectChecksumUnknownPair(t *testing.T) {
+func TestSetRemoteObjectFingerprintUnknownPair(t *testing.T) {
 	s := openTestStore(t)
-	if err := s.SetRemoteObjectChecksum(context.Background(), 1, "bucket-a", "sha256", "x"); err == nil {
-		t.Fatalf("checksum for unrecorded upload succeeded, want error")
+	if err := s.SetRemoteObjectFingerprint(context.Background(), 1, "bucket-a", "sha256", "x", 12345); err == nil {
+		t.Fatalf("fingerprint for unrecorded upload succeeded, want error")
 	}
 }
 

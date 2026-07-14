@@ -87,8 +87,8 @@ func TestVerifyRemoteMismatchIsLoudAndPreservesEvidence(t *testing.T) {
 	}
 
 	after := f.remoteObject(t, "a.txt")
-	if after.Checksum != recorded.Checksum || after.VerifiedAtNs.Valid {
-		t.Fatalf("object = %+v after mismatch, want the recorded fingerprint preserved and no stamp", after)
+	if after.Checksum != recorded.Checksum || after.VerifiedAtNs != recorded.VerifiedAtNs {
+		t.Fatalf("object = %+v after mismatch, want the recorded fingerprint and capture-time stamp preserved unchanged", after)
 	}
 	run, err := f.store.GetRun(ctx, rep.RunID)
 	if err != nil {
@@ -100,8 +100,9 @@ func TestVerifyRemoteMismatchIsLoudAndPreservesEvidence(t *testing.T) {
 }
 
 // TestVerifyRemotePopulatesPendingPair: objects uploaded without a
-// fingerprint get one recorded on the first pass — counted separately,
-// not stamped verified — and verify as matches on the next.
+// fingerprint get one recorded and stamped verified on the first pass
+// (counted as populated, since it is the first record), and re-confirm as
+// matches on the next.
 func TestVerifyRemotePopulatesPendingPair(t *testing.T) {
 	f := setupContentAddressedFixture(t)
 	t.Setenv("RCLONE_FAKE_NO_HASHES", "1")
@@ -121,8 +122,8 @@ func TestVerifyRemotePopulatesPendingPair(t *testing.T) {
 		t.Fatalf("rep = %+v, want one populated fingerprint and none verified", rep)
 	}
 	obj := f.remoteObject(t, "a.txt")
-	if obj.ChecksumAlgo.String != "sha256" || obj.VerifiedAtNs.Valid {
-		t.Fatalf("object = %+v, want a fresh sha256 fingerprint without a stamp", obj)
+	if obj.ChecksumAlgo.String != "sha256" || !obj.VerifiedAtNs.Valid {
+		t.Fatalf("object = %+v, want a fresh sha256 fingerprint stamped verified", obj)
 	}
 
 	rep, err = VerifyRemote(ctx, f.store, f.rcl, f.pair.Destination)

@@ -233,17 +233,14 @@ func TestTwoSourcePresence(t *testing.T) {
 	}
 	assertPresence(t, s, packed, "bucket-a", true, true)
 
-	// The object source: pending, then verified.
+	// The object source: pending (present, unverified), then the scan-back
+	// fingerprint records and verifies it in one write.
 	if err := s.InsertRemoteObject(ctx, RemoteObject{ContentID: obj, Destination: "bucket-a", UploadedRunID: runID}); err != nil {
 		t.Fatalf("InsertRemoteObject: %v", err)
 	}
 	assertPresence(t, s, obj, "bucket-a", true, false)
-	if err := s.SetRemoteObjectChecksum(ctx, obj, "bucket-a", "sha256", "deadbeef"); err != nil {
-		t.Fatalf("SetRemoteObjectChecksum: %v", err)
-	}
-	assertPresence(t, s, obj, "bucket-a", true, false) // checksum but not yet verified
-	if err := s.MarkRemoteObjectVerified(ctx, obj, "bucket-a", NowNs()); err != nil {
-		t.Fatalf("MarkRemoteObjectVerified: %v", err)
+	if err := s.SetRemoteObjectFingerprint(ctx, obj, "bucket-a", "sha256", "deadbeef", NowNs()); err != nil {
+		t.Fatalf("SetRemoteObjectFingerprint: %v", err)
 	}
 	assertPresence(t, s, obj, "bucket-a", true, true)
 }
