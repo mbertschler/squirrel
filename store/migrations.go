@@ -10,7 +10,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 23
+const SchemaVersion = 24
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -59,6 +59,7 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 21, up: migrateV20ToV21},
 		{version: 22, up: migrateV21ToV22},
 		{version: 23, up: migrateV22ToV23},
+		{version: 24, up: migrateV23ToV24},
 	}
 }
 
@@ -1984,6 +1985,76 @@ func migrateV22ToV23(ctx context.Context, db *sql.DB) error {
 	for _, q := range stmts {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("v22→v23: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// --- v23 → v24 ---
+
+// migrateV23ToV24 lays the packed-layout substrate (issue #136), all
+// additive:
+//
+//   - packs: the immutable pack entity. One row per assembled tar.zst
+//     pack, keyed by a 32-byte pack_key, carrying its uploaded
+//     (compressed) size, member count, and the run that created it.
+//   - pack_members: content → its byte slice of a pack's uncompressed
+//     tar. The PRIMARY KEY on content_id alone enforces that a given
+//     content is packed exactly once, so a member's offset/length never
+//     become ambiguous.
+//   - remote_packs: the per-pack upload fingerprint — the pack-level
+//     analog of remote_objects. One row per (pack, destination) carrying
+//     the provider checksum recorded at upload and the last verification
+//     time.
+//
+// These tables only hold rows once the pack writer (a later change) runs;
+// after this migration they are empty. No existing row is rewritten, so
+// the content-immutability invariant on `files`/`contents` is untouched.
+//
+// The one index is idx_pack_members_pack, backing the pack→members
+// enumeration the writer and any reader need; pack_id is high-cardinality
+// (one distinct value per pack) so a plain index is appropriate rather
+// than a partial one. No index on remote_packs.destination or
+// packs.created_run_id: both are low-cardinality and no query selects by
+// them alone.
+func migrateV23ToV24(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`CREATE TABLE packs (
+			id             INTEGER PRIMARY KEY,
+			pack_key       BLOB NOT NULL UNIQUE CHECK (length(pack_key) = 32),
+			size_bytes     INTEGER NOT NULL,
+			member_count   INTEGER NOT NULL,
+			created_run_id INTEGER NOT NULL REFERENCES runs(id)
+		)`,
+		`CREATE TABLE pack_members (
+			content_id  INTEGER NOT NULL REFERENCES contents(id),
+			pack_id     INTEGER NOT NULL REFERENCES packs(id),
+			byte_offset INTEGER NOT NULL,
+			byte_length INTEGER NOT NULL,
+			PRIMARY KEY (content_id)
+		)`,
+		`CREATE INDEX idx_pack_members_pack ON pack_members(pack_id)`,
+		`CREATE TABLE remote_packs (
+			pack_id         INTEGER NOT NULL REFERENCES packs(id),
+			destination     TEXT    NOT NULL,
+			uploaded_run_id INTEGER NOT NULL REFERENCES runs(id),
+			checksum_algo   TEXT,
+			checksum        TEXT,
+			verified_at_ns  INTEGER,
+			PRIMARY KEY (pack_id, destination),
+			CHECK ((checksum_algo IS NULL) = (checksum IS NULL))
+		)`,
+		`INSERT INTO schema_version (version) VALUES (24)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("v23→v24: %w", err)
 		}
 	}
 	return tx.Commit()
