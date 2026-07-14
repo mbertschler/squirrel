@@ -466,6 +466,7 @@ type rcloneEvent struct {
 // of a copy run. Field names follow rclone's casing exactly.
 type rcloneStats struct {
 	Bytes          int64 `json:"bytes"`
+	TotalBytes     int64 `json:"totalBytes"`
 	TotalTransfers int64 `json:"totalTransfers"`
 	TotalChecks    int64 `json:"totalChecks"`
 	Errors         int64 `json:"errors"`
@@ -532,7 +533,7 @@ func parseJSONLog(r io.Reader, result *RunResult, onProgress func(runevents.Prog
 					Done:       result.Transferred,
 					Total:      ev.Stats.TotalTransfers + ev.Stats.TotalChecks,
 					BytesDone:  result.Bytes,
-					BytesTotal: 0,
+					BytesTotal: ev.Stats.TotalBytes,
 				})
 			}
 			continue

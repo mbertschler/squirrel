@@ -401,8 +401,8 @@ squirrel        # bare invocation opens the TUI when stdin/stdout are a terminal
 ## CLI reference
 
 ```
-squirrel index   <volume>            [--shallow] [--dry-run] [--workers N]
-squirrel sync    [<volume>]          [--to DEST] [--shallow] [--dry-run] [--init]
+squirrel index   <volume>            [--shallow] [--dry-run] [--workers N] [--progress]
+squirrel sync    [<volume>]          [--to DEST] [--shallow] [--dry-run] [--init] [--progress]
 squirrel verify  [<destination>]
 squirrel offload <volume> [path...]  [--older-than DUR] [--dry-run]
 squirrel query   <hash-or-path>      [--history]
@@ -421,6 +421,7 @@ squirrel tui
 | `--dry-run` | off                           | Report what would change without writing                         |
 | `--init`    | off                           | Authorise first-use destination bootstrap (sync only; see above) |
 | `--workers` | `NumCPU()`                    | Number of hashing workers (index only)                           |
+| `--progress`, `-P` | auto on a terminal     | Show a live, throttled progress line on stderr while `index`/`sync` run (files, bytes, rate, and — for sync — ETA); auto-enabled when stdout is a TTY, off for pipes/cron/the agent. `--progress=false` forces it off. The final summary line is unchanged. |
 
 ## Destination layout
 
