@@ -122,15 +122,15 @@ func HandlerFor(s *store.Store, tools Tools, p Pair) (Handler, error) {
 		}
 		return &kopiaHandler{store: s, kopia: tools.Kopia, vol: p.Volume, dest: p.Destination}, nil
 	case p.Destination.Layout == config.LayoutPacked:
-		// PR 2 replaces this guard with the real packed-layout handler.
-		// Until then, a packed destination must fail loudly rather than
-		// silently fall through to the default mirror handler below.
-		return nil, fmt.Errorf("destination %q: the packed layout is not yet available in this build", p.Destination.Name)
+		if tools.Rclone == nil {
+			return nil, fmt.Errorf("destination %q: rclone wrapper is required", p.Destination.Name)
+		}
+		return &packedHandler{contentPusher{store: s, rcl: tools.Rclone, vol: p.Volume, dest: p.Destination}}, nil
 	case p.Destination.Layout == config.LayoutContentAddressed:
 		if tools.Rclone == nil {
 			return nil, fmt.Errorf("destination %q: rclone wrapper is required", p.Destination.Name)
 		}
-		return &contentAddressedHandler{store: s, rcl: tools.Rclone, vol: p.Volume, dest: p.Destination}, nil
+		return &contentAddressedHandler{contentPusher{store: s, rcl: tools.Rclone, vol: p.Volume, dest: p.Destination}}, nil
 	default:
 		if tools.Rclone == nil {
 			return nil, fmt.Errorf("destination %q: rclone wrapper is required", p.Destination.Name)
