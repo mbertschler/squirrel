@@ -345,8 +345,8 @@ func TestContentAddressedPushHappyPath(t *testing.T) {
 	if obj.UploadedRunID != rep.RunID || obj.ChecksumAlgo.String != "sha256" || !obj.Checksum.Valid {
 		t.Fatalf("remote object = %+v, want a sha256-fingerprinted record for run %d", obj, rep.RunID)
 	}
-	if obj.VerifiedAtNs.Valid {
-		t.Fatalf("fresh upload already verified: %+v", obj)
+	if !obj.VerifiedAtNs.Valid {
+		t.Fatalf("scan-back capture did not stamp verification: %+v", obj)
 	}
 	if rep.Fingerprints != 2 {
 		t.Fatalf("Fingerprints = %d, want 2", rep.Fingerprints)

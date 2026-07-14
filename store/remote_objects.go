@@ -15,9 +15,12 @@ import (
 // is NULL together while the fingerprint is still pending — the upload
 // happened, the scan-back pass hasn't filled the provider checksum in
 // yet (a CHECK in the schema keeps the two columns paired).
-// UploadedRunID references the local run that performed the upload;
-// VerifiedAtNs is NULL until the first re-verification confirms the
-// object unchanged.
+// UploadedRunID references the local run that performed the upload.
+// VerifiedAtNs is stamped when the scan-back read fills the fingerprint —
+// that read is itself the object's first verification (there is no
+// independent local value to compare against, so the recorded checksum is
+// the provider's own) — and is re-stamped by each later verify pass. It is
+// NULL only while the fingerprint pair is still pending.
 type RemoteObject struct {
 	ContentID     int64
 	Destination   string
@@ -54,35 +57,40 @@ func (s *Store) InsertRemoteObject(ctx context.Context, o RemoteObject) error {
 	return nil
 }
 
-// SetRemoteObjectChecksum fills the pending checksum pair on an upload
-// record: the scan-back fingerprint read from the provider after the
-// upload was confirmed. Only a NULL pair is filled — the recorded
-// fingerprint is what every later verification compares against, so a
-// second write for the same (content, destination) fails instead of
-// replacing it, and a missing record errors as a caller bug.
-func (s *Store) SetRemoteObjectChecksum(ctx context.Context, contentID int64, destination, algo, checksum string) error {
+// SetRemoteObjectFingerprint fills the pending checksum pair on an upload
+// record and stamps verified_at_ns in the same write: the scan-back
+// fingerprint read from the provider after the upload was confirmed. That
+// read is itself the first verification — for the ciphertext-ETag model
+// there is no independent local value to compare against, so the recorded
+// value is the provider's own, and reading it establishes the baseline
+// every later verification re-confirms against. Only a NULL pair is filled,
+// so a second write for the same (content, destination) fails instead of
+// replacing it, and a missing record errors as a caller bug. Mirrors
+// SetRemotePackFingerprint; the periodic verify (MarkRemoteObjectVerified)
+// re-stamps verified_at_ns on each re-confirmation.
+func (s *Store) SetRemoteObjectFingerprint(ctx context.Context, contentID int64, destination, algo, checksum string, atNs int64) error {
 	if algo == "" || checksum == "" {
-		return fmt.Errorf("SetRemoteObjectChecksum: algo and checksum must be non-empty")
+		return fmt.Errorf("SetRemoteObjectFingerprint: algo and checksum must be non-empty")
 	}
 	res, err := s.db.ExecContext(ctx, `
-		UPDATE remote_objects SET checksum_algo = ?, checksum = ?
+		UPDATE remote_objects SET checksum_algo = ?, checksum = ?, verified_at_ns = ?
 		WHERE content_id = ? AND destination = ?
 		  AND checksum_algo IS NULL AND checksum IS NULL
-	`, algo, checksum, contentID, destination)
+	`, algo, checksum, atNs, contentID, destination)
 	if err != nil {
-		return fmt.Errorf("set remote object checksum: %w", err)
+		return fmt.Errorf("set remote object fingerprint: %w", err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("set remote object checksum rows: %w", err)
+		return fmt.Errorf("set remote object fingerprint rows: %w", err)
 	}
 	if n == 0 {
 		if _, getErr := s.GetRemoteObject(ctx, contentID, destination); errors.Is(getErr, sql.ErrNoRows) {
-			return fmt.Errorf("set remote object checksum: no remote object for content %d on %q", contentID, destination)
+			return fmt.Errorf("set remote object fingerprint: no remote object for content %d on %q", contentID, destination)
 		} else if getErr != nil {
-			return fmt.Errorf("set remote object checksum: %w", getErr)
+			return fmt.Errorf("set remote object fingerprint: %w", getErr)
 		}
-		return fmt.Errorf("set remote object checksum: content %d on %q already has a recorded fingerprint", contentID, destination)
+		return fmt.Errorf("set remote object fingerprint: content %d on %q already has a recorded fingerprint", contentID, destination)
 	}
 	return nil
 }

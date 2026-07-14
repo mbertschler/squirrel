@@ -220,14 +220,16 @@ func readObjectChecksums(ctx context.Context, rcl *Rclone, dest *config.Destinat
 }
 
 // populateFingerprint records the first fingerprint for a row whose pair
-// is still pending; a backend exposing no checksum keeps it pending.
+// is still pending, stamping verified_at_ns since this verify read is that
+// object's first confirmation (mirrors populatePackFingerprint); a backend
+// exposing no checksum keeps it pending.
 func populateFingerprint(ctx context.Context, s *store.Store, dest *config.Destination, row store.RemoteObjectRecord, hashes map[string]string, rep *RemoteVerifyReport) error {
 	cs, ok := extractChecksum(dest, hashes)
 	if !ok {
 		rep.Pending++
 		return nil
 	}
-	if err := s.SetRemoteObjectChecksum(ctx, row.ContentID, dest.Name, cs.Algo, cs.Value); err != nil {
+	if err := s.SetRemoteObjectFingerprint(ctx, row.ContentID, dest.Name, cs.Algo, cs.Value, store.NowNs()); err != nil {
 		return fmt.Errorf("record fingerprint for %s: %w", hex.EncodeToString(row.Blake3), err)
 	}
 	rep.Populated++

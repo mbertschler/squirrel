@@ -280,8 +280,10 @@ func (h *contentPusher) uploadObjects(ctx context.Context, rep *Report, runID in
 // captureFingerprints fills the pending checksum pair of every object
 // confirmed during this run with the provider checksum read back from the
 // underlying remote's objects/ directory, over the shared scan-back capture
-// surface. Each object records via SetRemoteObjectChecksum, leaving
-// verified_at_ns for the later `squirrel verify` re-read to stamp.
+// surface. That read-back is the first verification, so each object records
+// and stamps verified_at_ns in one write (SetRemoteObjectFingerprint) —
+// matching the packed layout; the later `squirrel verify` re-read re-stamps
+// it on each re-confirmation.
 func (h *contentPusher) captureFingerprints(ctx context.Context, rep *Report, confirmed []store.PathDelta) {
 	targets := make([]captureTarget, 0, len(confirmed))
 	for _, d := range confirmed {
@@ -290,7 +292,7 @@ func (h *contentPusher) captureFingerprints(ctx context.Context, rep *Report, co
 			name:  hex.EncodeToString(d.Blake3),
 			label: "object",
 			record: func(ctx context.Context, algo, value string) error {
-				return h.store.SetRemoteObjectChecksum(ctx, d.ContentID, h.dest.Name, algo, value)
+				return h.store.SetRemoteObjectFingerprint(ctx, d.ContentID, h.dest.Name, algo, value, store.NowNs())
 			},
 		})
 	}
