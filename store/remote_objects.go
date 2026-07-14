@@ -15,9 +15,12 @@ import (
 // is NULL together while the fingerprint is still pending — the upload
 // happened, the scan-back pass hasn't filled the provider checksum in
 // yet (a CHECK in the schema keeps the two columns paired).
-// UploadedRunID references the local run that performed the upload;
-// VerifiedAtNs is NULL until the first re-verification confirms the
-// object unchanged.
+// UploadedRunID references the local run that performed the upload.
+// VerifiedAtNs is stamped when the scan-back read fills the fingerprint —
+// that read is itself the object's first verification (there is no
+// independent local value to compare against, so the recorded checksum is
+// the provider's own) — and is re-stamped by each later verify pass. It is
+// NULL only while the fingerprint pair is still pending.
 type RemoteObject struct {
 	ContentID     int64
 	Destination   string
