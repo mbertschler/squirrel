@@ -838,6 +838,9 @@ func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volum
 	if dest.Layout == config.LayoutContentAddressed {
 		return rep, fmt.Errorf("destination %q uses the content-addressed layout — its restore tooling ships separately; the data is recoverable by replaying the manifest segments under %s/%s/ against the destination-root %s/ (see the README's manifest format)", dest.Name, vol.Name, ManifestDirName, ObjectsDirName)
 	}
+	if dest.Layout == config.LayoutPacked {
+		return rep, fmt.Errorf("destination %q uses the packed layout — its restore tooling ships separately; the data is recoverable by replaying the manifest segments under %s/%s/ together with the placement maps under %s/ against the packs and objects at the destination root (see the README's packed layout section)", dest.Name, vol.Name, ManifestDirName, PacksDirName)
+	}
 	if w := cryptVerificationWarning(dest, opts.Shallow); w != "" {
 		rep.Warnings = append(rep.Warnings, w)
 	}

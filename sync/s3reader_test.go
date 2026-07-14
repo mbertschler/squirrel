@@ -25,7 +25,7 @@ func (f fakeS3Reader) objectETags(context.Context) (map[string]string, error) {
 func installS3Reader(t *testing.T, r s3ETagReader) {
 	t.Helper()
 	prev := newS3ETagReader
-	newS3ETagReader = func(*config.Destination) (s3ETagReader, error) { return r, nil }
+	newS3ETagReader = func(*config.Destination, string) (s3ETagReader, error) { return r, nil }
 	t.Cleanup(func() { newS3ETagReader = prev })
 }
 

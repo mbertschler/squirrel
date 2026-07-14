@@ -144,27 +144,90 @@ func mustPackKeyOf(t *testing.T, f *caFixture) []byte {
 	return nil
 }
 
-// TestPackedDurabilityNotCertified: a successful packed push leaves the
-// destination durability vector empty — packed content is not certified
-// durable until PR 3 fingerprints packs. This pins the PR-2/PR-3 seam.
+// remotePackOf returns the remote_packs upload record for the single pack
+// the fixture produced on the offsite destination.
+func (f *caFixture) remotePackOf(t *testing.T) store.RemotePack {
+	t.Helper()
+	pack, err := f.store.GetPackByKey(context.Background(), mustPackKeyOf(t, f))
+	if err != nil {
+		t.Fatalf("GetPackByKey: %v", err)
+	}
+	rp, err := f.store.GetRemotePack(context.Background(), pack.ID, "offsite")
+	if err != nil {
+		t.Fatalf("GetRemotePack: %v", err)
+	}
+	return rp
+}
+
+// TestPackedDurabilityNotCertified pins both sides of the three-artifact
+// gate seam: with a pack fingerprint captured the run certifies durability
+// (a presence+size vector component plus a verified remote_packs row); with
+// the fingerprint left pending (the backend exposes no checksum) the run
+// still succeeds but the vector is NOT advanced — unverified packed content
+// is never counted durable.
 func TestPackedDurabilityNotCertified(t *testing.T) {
-	f := setupPackedFixture(t, "1MiB")
-	f.write(t, "small.txt", "tiny")
-	f.index(t)
-	rep, err := f.sync(t)
-	if err != nil {
-		t.Fatalf("sync: %v", err)
-	}
-	if rep.Verification.Verified() {
-		t.Fatalf("packed push reported verified; must stay uncertified")
-	}
-	vector, err := f.store.ListDestinationRunIDs(context.Background(), f.volumeID(t), "offsite")
-	if err != nil {
-		t.Fatalf("ListDestinationRunIDs: %v", err)
-	}
-	if len(vector) != 0 {
-		t.Fatalf("durability vector = %+v, want empty (no auto-certify for packed)", vector)
-	}
+	t.Run("certified after fingerprint", func(t *testing.T) {
+		f := setupPackedFixture(t, "1MiB")
+		f.write(t, "small.txt", "tiny")
+		f.index(t)
+		rep, err := f.sync(t)
+		if err != nil {
+			t.Fatalf("sync: %v", err)
+		}
+		if rep.Status != store.RunStatusSuccess {
+			t.Fatalf("Status = %q, want success", rep.Status)
+		}
+		// presence+size is not itself a content-verified method; the gate
+		// upgrades it through the pack's verified fingerprint.
+		if rep.Verification.Verified() {
+			t.Fatalf("packed push reported verified; presence+size is not content-verified")
+		}
+		if rep.Fingerprints != 1 {
+			t.Fatalf("Fingerprints = %d, want 1 (the pack scan-back)", rep.Fingerprints)
+		}
+		rp := f.remotePackOf(t)
+		if !rp.Checksum.Valid || !rp.VerifiedAtNs.Valid {
+			t.Fatalf("remote pack = %+v, want a verified fingerprint after capture", rp)
+		}
+		vector, err := f.store.ListDestinationRunIDs(context.Background(), f.volumeID(t), "offsite")
+		if err != nil {
+			t.Fatalf("ListDestinationRunIDs: %v", err)
+		}
+		if len(vector) != 1 || vector[0].VerifyMethod != store.VerifyMethodPresenceSize {
+			t.Fatalf("vector = %+v, want one presence+size component (certified after fingerprint)", vector)
+		}
+	})
+
+	t.Run("not certified while pending", func(t *testing.T) {
+		f := setupPackedFixture(t, "1MiB")
+		t.Setenv("RCLONE_FAKE_NO_HASHES", "1") // backend exposes no checksum
+		f.write(t, "small.txt", "tiny")
+		f.index(t)
+		rep, err := f.sync(t)
+		if err != nil {
+			t.Fatalf("sync: %v", err)
+		}
+		if rep.Status != store.RunStatusSuccess {
+			t.Fatalf("Status = %q, want success (capture is off the critical path)", rep.Status)
+		}
+		if rep.Fingerprints != 0 {
+			t.Fatalf("Fingerprints = %d, want 0 while pending", rep.Fingerprints)
+		}
+		rp := f.remotePackOf(t)
+		if rp.Checksum.Valid || rp.VerifiedAtNs.Valid {
+			t.Fatalf("remote pack = %+v, want a pending pair (no fabricated fingerprint)", rp)
+		}
+		if !warnsContains(rep.Warnings, "not yet fingerprint-verified") {
+			t.Fatalf("Warnings = %v, want a not-advanced advisory", rep.Warnings)
+		}
+		vector, err := f.store.ListDestinationRunIDs(context.Background(), f.volumeID(t), "offsite")
+		if err != nil {
+			t.Fatalf("ListDestinationRunIDs: %v", err)
+		}
+		if len(vector) != 0 {
+			t.Fatalf("vector = %+v, want empty (pending fingerprint must not certify)", vector)
+		}
+	})
 }
 
 // TestPackedAssemblyDeterministic: the same input set produces byte-for-byte
@@ -418,6 +481,145 @@ func TestPackedRefusesReservedVolumeName(t *testing.T) {
 			t.Fatalf("volume %q: expected collision refusal, got %v", name, err)
 		}
 	}
+}
+
+// dirS3Reader is a test s3ETagReader that scans the fixture's fake packs
+// directory and returns a stable composite ETag (<32 hex>-2) per pack file,
+// so pack fingerprint capture and verification exercise the S3 multipart
+// path with a value only the S3 API surface would expose. Placement maps
+// (map-<run>) are skipped, mirroring the production reader's per-file keys.
+type dirS3Reader struct{ dir string }
+
+func (r dirS3Reader) objectETags(context.Context) (map[string]string, error) {
+	entries, err := os.ReadDir(r.dir)
+	if err != nil {
+		return map[string]string{}, nil // dir not created yet: nothing listed
+	}
+	out := map[string]string{}
+	for _, e := range entries {
+		if e.IsDir() || strings.HasPrefix(e.Name(), "map-") {
+			continue
+		}
+		out[e.Name()] = e.Name()[:32] + "-2"
+	}
+	return out, nil
+}
+
+// s3PackedBlock declares a plain (no-crypt) s3 destination with the packed
+// layout; its pack ETag reads are mocked via installS3Reader.
+const s3PackedBlock = `[destinations.offsite]
+type     = "s3"
+provider = "Other"
+bucket   = "b"
+root     = "data"
+layout   = "packed"
+pack_threshold = "1MiB"
+pack_size      = "512MiB"
+zstd_level     = 3
+`
+
+// TestPackedFingerprintCaptureS3: on an s3 packed destination the pack
+// scan-back fingerprint is the composite ETag read via the S3 API (never
+// rclone's md5 slot, blank for a multipart object), recorded verified, and
+// the durability vector advances. No rclone hash listing runs.
+func TestPackedFingerprintCaptureS3(t *testing.T) {
+	f := setupCAFixture(t, s3PackedBlock, "data")
+	installS3Reader(t, dirS3Reader{dir: f.remotePath(PacksDirName)})
+	f.write(t, "small.txt", "tiny")
+	f.index(t)
+	rep, err := f.sync(t)
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if rep.Status != store.RunStatusSuccess || rep.Fingerprints != 1 {
+		t.Fatalf("rep = status=%q fingerprints=%d, want success with one pack fingerprint", rep.Status, rep.Fingerprints)
+	}
+	rp := f.remotePackOf(t)
+	if rp.ChecksumAlgo.String != AlgoEtagMD5Composite || !strings.HasSuffix(rp.Checksum.String, "-2") || !rp.VerifiedAtNs.Valid {
+		t.Fatalf("remote pack = %+v, want a verified composite-etag fingerprint read via the S3 API", rp)
+	}
+	if lines := f.captureLines(t); len(lines) != 0 {
+		t.Fatalf("s3 pack capture must not run an rclone hash listing:\n%s", strings.Join(lines, "\n"))
+	}
+	vector, err := f.store.ListDestinationRunIDs(context.Background(), f.volumeID(t), "offsite")
+	if err != nil || len(vector) != 1 {
+		t.Fatalf("vector = %+v (err=%v), want one component", vector, err)
+	}
+}
+
+// TestPackedVerifyRefreshesPackFingerprint: `squirrel verify` populates a
+// pending pack fingerprint, then on a later pass re-confirms it (verbatim
+// compare) and refreshes verified_at_ns — the per-pack sweep, one check per
+// pack. It also handles a mixed destination carrying both a large object
+// and a pack.
+func TestPackedVerifyRefreshesPackFingerprint(t *testing.T) {
+	f := setupCAFixture(t, s3PackedBlock, "data")
+	// Capture fails at push (empty listing), leaving the pack pending.
+	installS3Reader(t, fakeS3Reader{etags: map[string]string{}})
+	f.write(t, "small.txt", "tiny")                         // -> pack
+	f.write(t, "big.bin", strings.Repeat("B", 2*1024*1024)) // >= 1MiB -> object
+	f.index(t)
+	if _, err := f.sync(t); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if rp := f.remotePackOf(t); rp.Checksum.Valid {
+		t.Fatalf("pack fingerprint recorded despite empty listing: %+v", rp)
+	}
+
+	// A verify pass with readers that now surface the composite ETags
+	// populates the pending pack and the large object fingerprint. The pack
+	// sweep reads packs/, the object sweep objects/ — route each by dirName.
+	installCombinedS3Reader(t, combinedS3Reader{
+		packs:   dirS3Reader{dir: f.remotePath(PacksDirName)},
+		objects: dirS3Reader{dir: f.remotePath(ObjectsDirName)},
+	})
+	rep, err := VerifyRemote(context.Background(), f.store, f.rcl, f.pair.Destination)
+	if err != nil {
+		t.Fatalf("VerifyRemote populate: %v", err)
+	}
+	if rep.PacksPopulated != 1 || rep.Packs != 1 {
+		t.Fatalf("verify rep = %+v, want one pack populated", rep)
+	}
+	rp := f.remotePackOf(t)
+	if !rp.Checksum.Valid || !rp.VerifiedAtNs.Valid {
+		t.Fatalf("pack after populate = %+v, want a verified fingerprint", rp)
+	}
+	firstVerify := rp.VerifiedAtNs.Int64
+
+	// A second pass re-confirms and refreshes verified_at_ns.
+	rep, err = VerifyRemote(context.Background(), f.store, f.rcl, f.pair.Destination)
+	if err != nil {
+		t.Fatalf("VerifyRemote refresh: %v", err)
+	}
+	if rep.PacksVerified != 1 {
+		t.Fatalf("verify rep = %+v, want one pack re-verified", rep)
+	}
+	if rp = f.remotePackOf(t); rp.VerifiedAtNs.Int64 < firstVerify {
+		t.Fatalf("verified_at_ns not refreshed: %d < %d", rp.VerifiedAtNs.Int64, firstVerify)
+	}
+	if !rep.Clean() {
+		t.Fatalf("verify rep not clean on a mixed object+pack destination: %+v", rep)
+	}
+}
+
+// combinedS3Reader routes object and pack ETag reads to separate directory
+// scanners so a mixed-destination verify pass finds both.
+type combinedS3Reader struct {
+	packs, objects dirS3Reader
+}
+
+// installCombinedS3Reader points newS3ETagReader at the right scanner by the
+// dirName it is constructed with.
+func installCombinedS3Reader(t *testing.T, c combinedS3Reader) {
+	t.Helper()
+	prev := newS3ETagReader
+	newS3ETagReader = func(_ *config.Destination, dirName string) (s3ETagReader, error) {
+		if dirName == PacksDirName {
+			return c.packs, nil
+		}
+		return c.objects, nil
+	}
+	t.Cleanup(func() { newS3ETagReader = prev })
 }
 
 // --- pack-assembly unit helpers ---

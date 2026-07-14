@@ -12,19 +12,19 @@ import (
 )
 
 // newVerifyCmd returns the `squirrel verify [<destination>]` cobra
-// command: re-read the provider checksums of every object recorded on a
-// content-addressed destination and compare them against the
-// fingerprints captured at upload time. Matches stamp the object
-// verified; objects uploaded before fingerprint capture (or whose
-// capture failed) get their fingerprint recorded on the first pass. A
-// mismatch or a missing object is potential offsite corruption or
-// tampering: it is reported per object and fails the command, with the
-// destination and the recorded fingerprint left exactly as found so the
-// operator inspects the evidence.
+// command: re-read the provider checksums of every object and pack recorded
+// on a content-addressed or packed destination and compare them against the
+// fingerprints captured at upload time. Matches stamp the object/pack
+// verified; artifacts uploaded before fingerprint capture (or whose capture
+// failed) get their fingerprint recorded on the first pass. A mismatch or a
+// missing object/pack is potential offsite corruption or tampering: it is
+// reported per artifact and fails the command, with the destination and the
+// recorded fingerprint left exactly as found so the operator inspects the
+// evidence.
 func newVerifyCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "verify [<destination>]",
-		Short: "Re-check recorded offsite objects against their upload fingerprints",
+		Short: "Re-check recorded offsite objects and packs against their upload fingerprints",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			destName := ""
@@ -76,55 +76,71 @@ func runVerify(cmd *cobra.Command, destName string) error {
 
 // verifyTargetNames resolves the verification subjects in deterministic
 // order: an explicit destination (validated to exist and be
-// content-addressed), or every content-addressed destination in config.
+// content-addressed or packed), or every such destination in config.
 func verifyTargetNames(cfg *config.Config, destName string) ([]string, error) {
 	if destName != "" {
 		d, ok := cfg.Destinations[destName]
 		if !ok {
 			return nil, fmt.Errorf("unknown destination %q (declare it in %s)", destName, cfg.Path)
 		}
-		if d.Layout != config.LayoutContentAddressed {
-			return nil, fmt.Errorf("destination %q has layout %q — verify covers the recorded objects of content-addressed destinations", destName, d.Layout)
+		if !verifiableLayout(d.Layout) {
+			return nil, fmt.Errorf("destination %q has layout %q — verify covers the recorded objects and packs of content-addressed and packed destinations", destName, d.Layout)
 		}
 		return []string{destName}, nil
 	}
 	var names []string
 	for name, d := range cfg.Destinations {
-		if d.Layout == config.LayoutContentAddressed {
+		if verifiableLayout(d.Layout) {
 			names = append(names, name)
 		}
 	}
 	if len(names) == 0 {
-		return nil, fmt.Errorf("no content-addressed destinations declared in %s", cfg.Path)
+		return nil, fmt.Errorf("no content-addressed or packed destinations declared in %s", cfg.Path)
 	}
 	sort.Strings(names)
 	return names, nil
 }
 
+// verifiableLayout reports whether a destination's layout keeps per-object
+// or per-pack fingerprints that `squirrel verify` re-checks.
+func verifiableLayout(layout string) bool {
+	return layout == config.LayoutContentAddressed || layout == config.LayoutPacked
+}
+
 // printVerifyReport renders one destination's pass: a loud stderr line
-// per missing or mismatched object, then the summary counters.
+// per missing or mismatched object or pack, then the summary counters.
 func printVerifyReport(out, errOut io.Writer, rep sync.RemoteVerifyReport, runErr error) {
-	for _, hash := range rep.Missing {
-		fmt.Fprintf(errOut, "error: object %s on %q: recorded as uploaded but absent from the remote\n", hash, rep.Destination)
-	}
-	for _, m := range rep.Mismatched {
-		if m.Actual == "" {
-			fmt.Fprintf(errOut, "error: object %s on %q: recorded %s %s, but the remote no longer exposes a %s checksum\n",
-				m.Hash, rep.Destination, m.Algo, m.Recorded, m.Algo)
-			continue
-		}
-		fmt.Fprintf(errOut, "error: object %s on %q: recorded %s %s, remote now reports %s — possible corruption or tampering\n",
-			m.Hash, rep.Destination, m.Algo, m.Recorded, m.Actual)
-	}
+	printVerifyFailures(errOut, "object", rep.Destination, rep.Missing, rep.Mismatched)
+	printVerifyFailures(errOut, "pack", rep.Destination, rep.PacksMissing, rep.PackMismatched)
 	if runErr != nil {
 		fmt.Fprintf(errOut, "verify %s: %v\n", rep.Destination, runErr)
 		return
 	}
-	if rep.Objects == 0 {
-		fmt.Fprintf(out, "verify %s: no recorded objects\n", rep.Destination)
+	if rep.Objects == 0 && rep.Packs == 0 {
+		fmt.Fprintf(out, "verify %s: no recorded objects or packs\n", rep.Destination)
 		return
 	}
-	fmt.Fprintf(out, "verify %s: run=%d objects=%d verified=%d fingerprinted=%d pending=%d mismatched=%d missing=%d unrecorded=%d\n",
+	fmt.Fprintf(out, "verify %s: run=%d objects=%d verified=%d fingerprinted=%d pending=%d mismatched=%d missing=%d unrecorded=%d packs=%d packs_verified=%d packs_fingerprinted=%d packs_pending=%d packs_mismatched=%d packs_missing=%d\n",
 		rep.Destination, rep.RunID, rep.Objects, rep.Verified, rep.Populated, rep.Pending,
-		len(rep.Mismatched), len(rep.Missing), rep.Unrecorded)
+		len(rep.Mismatched), len(rep.Missing), rep.Unrecorded,
+		rep.Packs, rep.PacksVerified, rep.PacksPopulated, rep.PacksPending,
+		len(rep.PackMismatched), len(rep.PacksMissing))
+}
+
+// printVerifyFailures writes one stderr line per missing or mismatched
+// artifact (an object or a pack), naming the kind so a mixed destination's
+// failures stay distinguishable.
+func printVerifyFailures(errOut io.Writer, kind, dest string, missing []string, mismatched []sync.RemoteObjectMismatch) {
+	for _, hash := range missing {
+		fmt.Fprintf(errOut, "error: %s %s on %q: recorded as uploaded but absent from the remote\n", kind, hash, dest)
+	}
+	for _, m := range mismatched {
+		if m.Actual == "" {
+			fmt.Fprintf(errOut, "error: %s %s on %q: recorded %s %s, but the remote no longer exposes a %s checksum\n",
+				kind, m.Hash, dest, m.Algo, m.Recorded, m.Algo)
+			continue
+		}
+		fmt.Fprintf(errOut, "error: %s %s on %q: recorded %s %s, remote now reports %s — possible corruption or tampering\n",
+			kind, m.Hash, dest, m.Algo, m.Recorded, m.Actual)
+	}
 }

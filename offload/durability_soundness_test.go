@@ -10,6 +10,77 @@ import (
 	"github.com/mbertschler/squirrel/store"
 )
 
+// packOneContent records a single-member pack for the content plus a
+// fingerprint-pending remote_packs row on the destination (the pack landed
+// but was not yet fingerprint-verified), and returns the pack id.
+func packOneContent(t *testing.T, s *store.Store, contentID, runID int64, dest string) int64 {
+	t.Helper()
+	ctx := context.Background()
+	key := make([]byte, 32)
+	key[0] = byte(contentID)
+	key[1] = 0x5a
+	if err := s.InsertPacks(ctx, []store.PackWrite{{
+		Pack:    store.Pack{PackKey: key, SizeBytes: 1, MemberCount: 1, CreatedRunID: runID},
+		Members: []store.PackMember{{ContentID: contentID, ByteOffset: 512, ByteLength: 1}},
+	}}); err != nil {
+		t.Fatalf("InsertPacks: %v", err)
+	}
+	pack, err := s.GetPackByKey(ctx, key)
+	if err != nil {
+		t.Fatalf("GetPackByKey: %v", err)
+	}
+	if err := s.InsertRemotePack(ctx, store.RemotePack{PackID: pack.ID, Destination: dest, UploadedRunID: runID}); err != nil {
+		t.Fatalf("InsertRemotePack: %v", err)
+	}
+	return pack.ID
+}
+
+// TestOffloadPackedMemberGatesViaPack is the packed analogue of
+// TestOffloadPresenceSizeHeldOutUntilFingerprint: a small file has no
+// remote_objects row, only a pack membership. With the pack's fingerprint
+// pending the presence+size component does not gate; once the pack's
+// scan-back fingerprint is verified, the member gates through it (two-source
+// presence).
+func TestOffloadPackedMemberGatesViaPack(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), "tiny")
+	s := setupStore(t)
+	ctx := context.Background()
+	idx := indexVolume(t, s, root)
+	v := testVolume(t, s)
+	self := selfNode(t, s)
+
+	// Presence+size vector + freshness satisfied, like the packed push
+	// leaves them, but the pack fingerprint is pending.
+	if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, "offsite", self.ID, idx.RunID, store.VerifyMethodPresenceSize, false); err != nil {
+		t.Fatalf("UpsertDestinationRunIDVerified: %v", err)
+	}
+	recordPush(t, s, v.ID, "offsite")
+	row := rowAt(t, s, v.ID, "a.txt")
+	packID := packOneContent(t, s, row.ContentID, idx.RunID, "offsite")
+
+	rep, err := Offload(ctx, s, root, Options{Name: volName, Paths: []string{"."}, Require: []string{"offsite"}})
+	if err != nil {
+		t.Fatalf("Offload (pending pack): %v", err)
+	}
+	res := oneResult(t, rep, "a.txt", OutcomeNotDurable)
+	if len(res.Reasons) != 1 || !strings.Contains(res.Reasons[0], "not content-verified") {
+		t.Fatalf("reasons = %v, want a not-content-verified failure", res.Reasons)
+	}
+	mustExist(t, filepath.Join(root, "a.txt"))
+
+	// Fingerprint the pack: the member now gates via its verified pack.
+	if err := s.SetRemotePackFingerprint(ctx, packID, "offsite", "etag-md5", "abc-2", store.NowNs()); err != nil {
+		t.Fatalf("SetRemotePackFingerprint: %v", err)
+	}
+	rep, err = Offload(ctx, s, root, Options{Name: volName, Paths: []string{"."}, Require: []string{"offsite"}})
+	if err != nil {
+		t.Fatalf("Offload (verified pack): %v", err)
+	}
+	oneResult(t, rep, "a.txt", OutcomeOffloaded)
+	mustBeGone(t, filepath.Join(root, "a.txt"))
+}
+
 // seedVerifiedComponent records only the vector component (content-
 // verified, blake3) for a target, without the freshness push run —
 // isolating the freshness condition.

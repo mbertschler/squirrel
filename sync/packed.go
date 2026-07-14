@@ -81,12 +81,15 @@ func encodePlacementMap(placements []PlacementEntry) ([]byte, error) {
 // same per-volume manifest segment the content-addressed layout writes, so
 // the two together recover path → hash → bytes with no SQLite.
 //
-// Durability boundary: this handler uploads packs and records them in the
-// local packs/pack_members tables, but it does NOT fingerprint packs or
-// advance the destination durability vector — packed content is not
-// certified durable until the per-pack fingerprint and gate land (see the
-// seam in push). Large files reuse the content-addressed object path and
-// keep its per-object remote_objects record and fingerprint capture.
+// Durability: this handler uploads packs, records them in the local
+// packs/pack_members tables, reads each pack's scan-back fingerprint into
+// remote_packs, and advances the destination durability vector at
+// presence+size only once every pack this run assembled is
+// fingerprint-verified alongside the placement map and manifest segment
+// (see certifyPacked). The offload gate then certifies a packed content
+// through its pack's verified remote_packs row. Large files reuse the
+// content-addressed object path and keep its per-object remote_objects
+// record and fingerprint capture.
 type packedHandler struct {
 	contentPusher
 }
@@ -133,12 +136,20 @@ func (h *packedHandler) Push(ctx context.Context, opts Options) (Report, error) 
 }
 
 // push runs the transactional landing: delta → objects (large) + packs
-// (small) → placement map → manifest segment → local pack rows. rep.Status
-// starts failed and is promoted only after every piece is confirmed
-// present, so a partial landing never presents as success.
+// (small) → placement map → manifest segment → local pack rows → per-pack
+// fingerprints → vector advance. rep.Status starts failed and is promoted
+// only after every piece is confirmed present, so a partial landing never
+// presents as success.
 func (h *packedHandler) push(ctx context.Context, rep *Report, volID, runID int64) error {
 	rep.Status = store.RunStatusFailed
 	watermark, err := h.watermark(ctx, volID)
+	if err != nil {
+		return err
+	}
+	// Snapshot the advance before any transfer so a row committed mid-push
+	// is never folded into it — the same discipline the content-addressed
+	// handler uses.
+	advance, err := captureDurabilityAdvance(ctx, h.store, volID)
 	if err != nil {
 		return err
 	}
@@ -172,16 +183,65 @@ func (h *packedHandler) push(ctx context.Context, rep *Report, volID, runID int6
 	}
 	rep.Status = store.RunStatusSuccess
 	rep.Verification.Bytes = rep.RcloneResult.Bytes
-	// Durability seam for PR 3: unlike the content-addressed handler, the
-	// packed push does NOT advance the destination durability vector here.
-	// Packed (small-file) content carries no per-pack fingerprint yet, so
-	// advancing the vector — even at presence+size — would let the offload
-	// gate count it as landed with nothing to verify against. rep stays
-	// unverified and rep.durabilityAdvance nil, so RunPair does not advance
-	// the vector either; packed content is simply not certified durable
-	// until PR 3 captures remote_packs fingerprints and teaches the gate to
-	// require them. PR 3 hooks the advance in at this point.
+	return h.certifyPacked(ctx, rep, volID, runID, writes, advance)
+}
+
+// certifyPacked closes the durability seam: it records a remote_packs row
+// per landed pack, reads each pack's scan-back fingerprint, and advances
+// the destination vector only once every pack this run assembled is
+// fingerprint-verified — the third leg of the three-artifact gate (packs +
+// placement map + manifest segment all landed and confirmed). A pending
+// capture holds the vector so the offload gate never counts unverified
+// packed content as durable; `squirrel verify` fills the fingerprint later
+// and a subsequent sync advances the vector. rep.Verification stays
+// unverified (presence+size is not a content-verified method), so RunPair
+// does not advance the vector a second time.
+func (h *packedHandler) certifyPacked(ctx context.Context, rep *Report, volID, runID int64, writes []store.PackWrite, advance []store.OriginComponent) error {
+	verified := h.capturePackFingerprints(ctx, rep, runID, writes)
+	if verified < len(writes) {
+		rep.Warnings = append(rep.Warnings, fmt.Sprintf("destination %q: %d of %d pack(s) this run are not yet fingerprint-verified; the durability vector was not advanced — run `squirrel verify` to certify them", h.dest.Name, len(writes)-verified, len(writes)))
+		return nil
+	}
+	if err := h.store.AdvanceDestinationVectorTo(ctx, volID, h.dest.Name, store.VerifyMethodPresenceSize, advance); err != nil {
+		return fmt.Errorf("advance destination vector for %s: %w", h.dest.Name, err)
+	}
 	return nil
+}
+
+// capturePackFingerprints records a per-destination upload row for each
+// landed pack and fills its scan-back fingerprint, reusing the shared
+// capture surface over the packs/ directory. Every pack exceeds the
+// multipart threshold, so on s3 the composite ETag is read from the S3 API
+// (never rclone's md5 slot, which is blank for a multipart object); other
+// backends read `rclone lsjson --hash`. A pack whose fingerprint could not
+// be read stays pending (checksum NULL) with a warning — never a fabricated
+// value. It returns how many packs were fingerprint-verified this run.
+func (h *packedHandler) capturePackFingerprints(ctx context.Context, rep *Report, runID int64, writes []store.PackWrite) int {
+	before := rep.Fingerprints
+	targets := make([]captureTarget, 0, len(writes))
+	for _, w := range writes {
+		pack, err := h.store.GetPackByKey(ctx, w.Pack.PackKey)
+		if err != nil {
+			rep.Warnings = append(rep.Warnings, fmt.Sprintf("look up recorded pack %s: %v", hex.EncodeToString(w.Pack.PackKey), err))
+			continue
+		}
+		if err := h.store.InsertRemotePack(ctx, store.RemotePack{
+			PackID: pack.ID, Destination: h.dest.Name, UploadedRunID: runID,
+		}); err != nil {
+			rep.Warnings = append(rep.Warnings, fmt.Sprintf("record pack upload %s: %v", hex.EncodeToString(w.Pack.PackKey), err))
+			continue
+		}
+		packID := pack.ID
+		targets = append(targets, captureTarget{
+			name:  hex.EncodeToString(w.Pack.PackKey),
+			label: "pack",
+			record: func(ctx context.Context, algo, value string) error {
+				return h.store.SetRemotePackFingerprint(ctx, packID, h.dest.Name, algo, value, store.NowNs())
+			},
+		})
+	}
+	h.captureScanBackFingerprints(ctx, rep, PacksDirName, targets)
+	return int(rep.Fingerprints - before)
 }
 
 // watermark resolves the run id the delta starts after: the last
