@@ -1,0 +1,14 @@
+{
+  "identities": [
+    {
+      "name": "squirrel-integration",
+      "credentials": [
+        {
+          "accessKey": "squirreltest",
+          "secretKey": "squirreltestsecret"
+        }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}
