@@ -28,7 +28,9 @@ func checkTargetsCanGate(require []string, dests map[string]*config.Destination)
 	var refusals []string
 	for _, name := range require {
 		d, ok := dests[name]
-		if !ok {
+		if !ok || d == nil {
+			// Absent — or present but nil in a partially-constructed map —
+			// is left to the per-file gate, never a preflight crash.
 			continue
 		}
 		if capable, reason := d.CanEverGateOffload(); !capable {

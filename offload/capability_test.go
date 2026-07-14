@@ -47,6 +47,16 @@ func TestOffloadIncapableTargetAbortsUpFront(t *testing.T) {
 	mustExist(t, filepath.Join(root, "a.txt"))
 }
 
+// TestCheckTargetsCanGateSkipsNilAndAbsent: a nil value in the dests map
+// (a partially-constructed map) is treated like an absent key — skipped,
+// left to the per-file gate — never a preflight nil-dereference crash.
+func TestCheckTargetsCanGateSkipsNilAndAbsent(t *testing.T) {
+	dests := map[string]*config.Destination{"backup": nil}
+	if err := checkTargetsCanGate([]string{"backup", "missing"}, dests); err != nil {
+		t.Fatalf("checkTargetsCanGate with nil/absent entries = %v, want nil (skipped)", err)
+	}
+}
+
 // TestOffloadCapableTargetPendingStillWalks: a required target that is
 // structurally capable (a plain mirror destination) but whose durability
 // evidence is not yet recorded must NOT fail fast — supplying its config to
