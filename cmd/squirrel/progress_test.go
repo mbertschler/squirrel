@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 
@@ -23,10 +24,11 @@ func TestProgressEnabledGating(t *testing.T) {
 		return c
 	}
 
-	// Flag untouched: auto path -> quiet in a non-TTY test environment.
+	// Flag untouched: auto path follows stdoutIsTTY() (deterministic
+	// regardless of whether the test runs under a real terminal).
 	c := newCmd()
-	if progressEnabled(c, false) {
-		t.Error("flag untouched under non-TTY stdout should be quiet")
+	if got := progressEnabled(c, false); got != stdoutIsTTY() {
+		t.Errorf("flag untouched should follow stdoutIsTTY() = %v, got %v", stdoutIsTTY(), got)
 	}
 
 	// Explicit --progress forces on even without a TTY.
@@ -87,6 +89,20 @@ func TestTruncatePath(t *testing.T) {
 	}
 	if !strings.HasSuffix(got, "file.txt") {
 		t.Errorf("truncation dropped the tail: %q", got)
+	}
+
+	// Multibyte path: truncation must count runes and never split a
+	// UTF-8 sequence.
+	multi := strings.Repeat("ф", 100) + "/файл.txt"
+	gotM := truncatePath(multi, 20)
+	if len([]rune(gotM)) != 20 {
+		t.Errorf("multibyte truncated rune-len = %d, want 20 (%q)", len([]rune(gotM)), gotM)
+	}
+	if !utf8.ValidString(gotM) {
+		t.Errorf("truncation split a UTF-8 sequence: %q", gotM)
+	}
+	if !strings.HasSuffix(gotM, "файл.txt") {
+		t.Errorf("multibyte truncation dropped the tail: %q", gotM)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
@@ -61,12 +62,13 @@ func (p *progressPrinter) update(ev runevents.Progress) {
 	line := p.format(ev)
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	width := utf8.RuneCountInString(line)
 	pad := ""
-	if d := p.lastLen - len(line); d > 0 {
+	if d := p.lastLen - width; d > 0 {
 		pad = strings.Repeat(" ", d)
 	}
 	fmt.Fprintf(p.w, "\r%s%s", line, pad)
-	p.lastLen = len(line)
+	p.lastLen = width
 	p.active = true
 }
 
@@ -178,11 +180,12 @@ func humanDuration(d time.Duration) string {
 // truncatePath shortens a path to at most max runes, keeping the tail (the
 // filename end is the useful part) behind a leading ellipsis.
 func truncatePath(s string, max int) string {
-	if len(s) <= max {
+	r := []rune(s)
+	if len(r) <= max {
 		return s
 	}
 	if max <= 1 {
-		return s[len(s)-max:]
+		return string(r[len(r)-max:])
 	}
-	return "…" + s[len(s)-(max-1):]
+	return "…" + string(r[len(r)-(max-1):])
 }
