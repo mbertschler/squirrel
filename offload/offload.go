@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/store"
 	"github.com/mbertschler/squirrel/volmark"
 )
@@ -41,6 +42,15 @@ type Options struct {
 	// policy is an explicit precondition, there is no default target
 	// set.
 	Require []string
+	// RequireDests carries the resolved destination config for each
+	// required target that is configured locally, keyed by target name.
+	// Offload consults it once up front to fail fast when a required
+	// target is structurally incapable of ever satisfying the durability
+	// gate (see checkTargetsCanGate). A required target absent from the
+	// map — a peer-relayed target this node has no local destination for —
+	// is left to the per-file gate; a nil map skips the pre-check
+	// entirely. It never changes a per-file gate decision.
+	RequireDests map[string]*config.Destination
 	// MaxEvidenceAge, when positive, refuses any required target whose
 	// durability evidence was last re-verified longer ago than this in
 	// wall-clock time (issue #131). Zero disables the time-based
@@ -129,6 +139,9 @@ func (r *Report) record(res FileResult) {
 func Offload(ctx context.Context, s *store.Store, root string, opts Options) (report Report, err error) {
 	selectors, err := validateOptions(opts)
 	if err != nil {
+		return Report{}, err
+	}
+	if err := checkTargetsCanGate(opts.Require, opts.RequireDests); err != nil {
 		return Report{}, err
 	}
 	vol, err := resolveVolume(ctx, s, opts.Name, root)

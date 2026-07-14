@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/offload"
 )
 
@@ -65,6 +66,7 @@ func runOffload(cmd *cobra.Command, volumeName string, paths []string, olderThan
 		Paths:          paths,
 		OlderThan:      olderThan,
 		Require:        vol.OffloadRequires,
+		RequireDests:   requiredDestinations(cfg, vol.OffloadRequires),
 		MaxEvidenceAge: vol.OffloadMaxEvidenceAge,
 		DryRun:         dryRun,
 	})
@@ -76,6 +78,20 @@ func runOffload(cmd *cobra.Command, volumeName string, paths []string, olderThan
 		return fmt.Errorf("%d file(s) failed during offload", rep.Errors)
 	}
 	return nil
+}
+
+// requiredDestinations resolves the volume's offload_requires target names
+// to their local destination configs, for the offload capability
+// pre-check. Names with no local destination — peer-relayed targets this
+// node cannot see — are omitted; the per-file gate handles those.
+func requiredDestinations(cfg *config.Config, require []string) map[string]*config.Destination {
+	out := make(map[string]*config.Destination, len(require))
+	for _, name := range require {
+		if d, ok := cfg.Destinations[name]; ok {
+			out[name] = d
+		}
+	}
+	return out
 }
 
 // olderThanDaysRE accepts the whole-day shorthand (e.g. "90d") that
