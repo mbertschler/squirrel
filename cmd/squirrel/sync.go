@@ -17,10 +17,11 @@ import (
 // --to it narrows to a single pair.
 func newSyncCmd() *cobra.Command {
 	var (
-		to      string
-		shallow bool
-		dryRun  bool
-		initDst bool
+		to       string
+		shallow  bool
+		dryRun   bool
+		initDst  bool
+		progress bool
 	)
 	cmd := &cobra.Command{
 		Use:   "sync [<volume>]",
@@ -31,7 +32,7 @@ func newSyncCmd() *cobra.Command {
 			if len(args) == 1 {
 				volumeName = args[0]
 			}
-			return runSync(cmd, volumeName, to, sync.Options{
+			return runSync(cmd, volumeName, to, progress, sync.Options{
 				Shallow: shallow,
 				DryRun:  dryRun,
 				Init:    initDst,
@@ -42,10 +43,11 @@ func newSyncCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&shallow, "shallow", false, "skip BLAKE3 verification; trust rclone's default size+mtime comparison")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview rclone actions without transferring; no runs row is written")
 	cmd.Flags().BoolVar(&initDst, "init", false, "authorise first-use destination bootstrap: write a .squirrel-volume marker, or create a kopia repository when connect finds none (refused without --init so a typo or outage can't mint a fresh empty target)")
+	cmd.Flags().BoolVarP(&progress, "progress", "P", false, "show live transfer progress (auto-enabled on a terminal; use --progress=false to force off)")
 	return cmd
 }
 
-func runSync(cmd *cobra.Command, volumeName, destinationName string, opts sync.Options) error {
+func runSync(cmd *cobra.Command, volumeName, destinationName string, progress bool, opts sync.Options) error {
 	cfg, err := requireConfig(cmd)
 	if err != nil {
 		return err
@@ -86,9 +88,22 @@ func runSync(cmd *cobra.Command, volumeName, destinationName string, opts sync.O
 		opts.Snapshot = sync.NewSnapshotter(s, rcl, snapshotConfig(cfg, s.Path()))
 	}
 
+	// Progress renders to stderr (leaving stdout for the summary lines). A
+	// fresh printer per pair so the rate/ETA reflect that one transfer; it
+	// is cleared before its pair's report is printed on a clean line.
+	showProgress := progressEnabled(cmd, progress)
+
 	var anyFailed bool
 	for _, p := range pairs {
+		var pp *progressPrinter
+		if showProgress {
+			pp = newProgressPrinter(cmd.ErrOrStderr())
+			opts.Progress = pp.update
+		}
 		rep, err := sync.RunPair(cmd.Context(), s, tools, p, opts)
+		if pp != nil {
+			pp.clear()
+		}
 		printSyncReport(out, rep, err)
 		if err != nil || rep.Status != "success" {
 			anyFailed = true

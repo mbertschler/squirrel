@@ -14,16 +14,17 @@ import (
 // the volume in config first.
 func newIndexCmd() *cobra.Command {
 	var (
-		shallow bool
-		dryRun  bool
-		workers int
+		shallow  bool
+		dryRun   bool
+		workers  int
+		progress bool
 	)
 	cmd := &cobra.Command{
 		Use:   "index <volume>",
 		Short: "Walk a config-declared volume, hash regular files, and update the index",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runIndex(cmd, args[0], index.Options{
+			return runIndex(cmd, args[0], progress, index.Options{
 				Shallow: shallow,
 				DryRun:  dryRun,
 				Workers: workers,
@@ -33,10 +34,11 @@ func newIndexCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&shallow, "shallow", false, "skip rehash when (size, mtime) match the stored row")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "report what would change without writing to the database")
 	cmd.Flags().IntVar(&workers, "workers", 0, "number of hashing workers (0 = runtime.NumCPU())")
+	cmd.Flags().BoolVarP(&progress, "progress", "P", false, "show live progress (auto-enabled on a terminal; use --progress=false to force off)")
 	return cmd
 }
 
-func runIndex(cmd *cobra.Command, volumeName string, opts index.Options) error {
+func runIndex(cmd *cobra.Command, volumeName string, progress bool, opts index.Options) error {
 	cfg, err := requireConfig(cmd)
 	if err != nil {
 		return err
@@ -53,7 +55,19 @@ func runIndex(cmd *cobra.Command, volumeName string, opts index.Options) error {
 	}
 	defer s.Close()
 
+	// Progress renders to stderr so a redirected stdout still captures only
+	// the final summary line. The line is erased right after Index returns
+	// (both paths) so any error list and the summary print on a clean line.
+	var pp *progressPrinter
+	if progressEnabled(cmd, progress) {
+		pp = newProgressPrinter(cmd.ErrOrStderr())
+		opts.Progress = pp.update
+	}
+
 	rep, err := index.Index(cmd.Context(), s, vol.Path, opts)
+	if pp != nil {
+		pp.clear()
+	}
 	if err != nil {
 		return err
 	}

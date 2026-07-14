@@ -14,6 +14,7 @@ import (
 
 	"github.com/zeebo/blake3"
 
+	"github.com/mbertschler/squirrel/runevents"
 	"github.com/mbertschler/squirrel/store"
 	"github.com/mbertschler/squirrel/volmark"
 )
@@ -136,6 +137,70 @@ func TestReindexNoOpUnchanged(t *testing.T) {
 	}
 	if rep.Unchanged != 2 || rep.Added != 0 || rep.Modified != 0 {
 		t.Fatalf("expected no-op (shallow), got %+v", rep)
+	}
+}
+
+// TestProgressCallbackCarriesBytesAndPath verifies the index collector emits
+// in-flight progress events that carry the running file count, a non-zero
+// byte total, and the current path — the signal the CLI renders live. The
+// callback is invoked from the collector goroutine, so guard the slice.
+func TestProgressCallbackCarriesBytesAndPath(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), "hello")
+	writeFile(t, filepath.Join(root, "sub", "b.txt"), "world!!")
+
+	s := setupStore(t)
+	ctx := context.Background()
+
+	var mu sync.Mutex
+	var events []runevents.Progress
+	rep, err := Index(ctx, s, root, Options{
+		Progress: func(p runevents.Progress) {
+			mu.Lock()
+			events = append(events, p)
+			mu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	if rep.Added != 2 {
+		t.Fatalf("expected 2 added, got %+v", rep)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) == 0 {
+		t.Fatal("no progress events emitted")
+	}
+	last := events[len(events)-1]
+	if last.Stage != runevents.StageHashing {
+		t.Errorf("stage = %q, want %q", last.Stage, runevents.StageHashing)
+	}
+	if last.Done != 2 {
+		t.Errorf("final Done = %d, want 2", last.Done)
+	}
+	if last.BytesDone != int64(len("hello")+len("world!!")) {
+		t.Errorf("final BytesDone = %d, want %d", last.BytesDone, len("hello")+len("world!!"))
+	}
+	if last.Message == "" {
+		t.Error("progress event carried no current path")
+	}
+}
+
+// TestNoProgressCallbackIsQuiet confirms a nil Progress option (the agent and
+// scripted path) neither errors nor changes the outcome — the throttle no-ops.
+func TestNoProgressCallbackIsQuiet(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), "hello")
+
+	s := setupStore(t)
+	rep, err := Index(context.Background(), s, root, Options{})
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	if rep.Added != 1 {
+		t.Fatalf("expected 1 added, got %+v", rep)
 	}
 }
 

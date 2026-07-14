@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/mbertschler/squirrel/config"
+	"github.com/mbertschler/squirrel/runevents"
 )
 
 // requireRclone skips the test if rclone is not on PATH. The wrapper tests
@@ -100,6 +101,35 @@ func TestParseJSONLogNoFalseHashFallback(t *testing.T) {
 	parseJSONLog(strings.NewReader(stream), &r, nil)
 	if r.HashFallback {
 		t.Fatalf("HashFallback = true on a clean run, want false")
+	}
+}
+
+// TestParseJSONLogEmitsProgressWithByteTotal verifies that per-second stats
+// lines drive the onProgress callback and that the announced byte total is
+// surfaced (it backs the CLI's ETA). A nil callback path is exercised
+// elsewhere; here we assert the event shape.
+func TestParseJSONLogEmitsProgressWithByteTotal(t *testing.T) {
+	stream := strings.Join([]string{
+		`{"stats":{"errors":0,"fatalError":false,"totalTransfers":10,"totalChecks":0,"bytes":512,"totalBytes":2048}}`,
+		`{"stats":{"errors":0,"fatalError":false,"totalTransfers":10,"totalChecks":0,"bytes":2048,"totalBytes":2048}}`,
+	}, "\n")
+	var r RunResult
+	var events []runevents.Progress
+	parseJSONLog(strings.NewReader(stream), &r, func(p runevents.Progress) {
+		events = append(events, p)
+	})
+	if len(events) != 2 {
+		t.Fatalf("progress events = %d, want 2", len(events))
+	}
+	first := events[0]
+	if first.Stage != runevents.StageUploading {
+		t.Errorf("stage = %q, want %q", first.Stage, runevents.StageUploading)
+	}
+	if first.BytesDone != 512 || first.BytesTotal != 2048 {
+		t.Errorf("first event bytes = %d/%d, want 512/2048", first.BytesDone, first.BytesTotal)
+	}
+	if first.Total != 10 {
+		t.Errorf("first event Total (transfers+checks) = %d, want 10", first.Total)
 	}
 }
 

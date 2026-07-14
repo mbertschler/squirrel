@@ -437,7 +437,7 @@ func (i *indexer) collect() (Report, error) {
 	}
 	progress := runevents.NewThrottle(i.opts.Progress, 500*time.Millisecond, 100)
 	defer progress.Flush()
-	var done int64
+	var done, bytesDone int64
 	for r := range i.results {
 		if r.err != nil {
 			report.Errors++
@@ -446,7 +446,19 @@ func (i *indexer) collect() (Report, error) {
 		}
 		tally(&report, r.kind)
 		done++
-		progress.Emit(runevents.Progress{Stage: runevents.StageHashing, Done: done})
+		// Message carries the just-processed relative path so an
+		// interactive consumer can show what's in flight; BytesDone is
+		// the running sum of processed file sizes (a rate/throughput
+		// signal — for shallow-skipped files it counts the stored size,
+		// not bytes re-read). Total stays zero: the indexer never stats
+		// the whole tree up front, so no file/byte total is known here.
+		bytesDone += r.row.SizeBytes
+		progress.Emit(runevents.Progress{
+			Stage:     runevents.StageHashing,
+			Done:      done,
+			BytesDone: bytesDone,
+			Message:   r.row.Path,
+		})
 		if i.opts.DryRun {
 			i.seen[r.row.Path] = struct{}{}
 			continue
