@@ -1,9 +1,9 @@
 ---
 title: Squirrel
-description: Content-addressed backup tool for your own NAS plus cloud offsite storage. Every upload is BLAKE3-verified end-to-end; destinations are append-only.
+description: Content-addressed backup tool for your own NAS plus cloud offsite storage. Every upload is verified; destinations are append-only.
 template: splash
 hero:
-  tagline: Backup tool for your own NAS + cloud offsite storage. Indexes by BLAKE3 content hash, verifies every upload end-to-end, and never deletes history.
+  tagline: Backup tool for your own NAS + cloud offsite storage. Indexes by BLAKE3 content hash, verifies every upload, and never deletes history.
   actions:
     - text: Get started
       link: /squirrel/start/install/
@@ -19,7 +19,9 @@ import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
 Squirrel indexes a local file tree by BLAKE3 content hash and syncs it to one or
 more remote destinations (NAS, S3, B2, GCS, SFTP, …) via
-[rclone](https://rclone.org). Every upload is BLAKE3-verified end-to-end.
+[rclone](https://rclone.org). Every upload is verified — BLAKE3 end-to-end for
+standard destinations, and a size+mtime or provider-checksum check for encrypted
+and cold-archive layouts (see [verification](/squirrel/guides/verification/)).
 Destinations are append-only: an overwrite at the destination moves the prior
 bytes into `.squirrel-history/run-<id>/`, never deletes them.
 
@@ -31,10 +33,10 @@ bytes into `.squirrel-history/run-<id>/`, never deletes them.
     observations of content, not the other way around — `squirrel query <hash>`
     still finds a hash whose path now holds different content.
   </Card>
-  <Card title="Verified end-to-end" icon="seti:lock">
-    Sync verifies each uploaded file's BLAKE3 against the destination. Cold
-    archive tiers get a metadata-only scan-back fingerprint check that never
-    re-downloads a byte.
+  <Card title="Verified uploads" icon="seti:lock">
+    Sync verifies each uploaded file's BLAKE3 against the destination. Encrypted
+    remotes fall back to size+mtime, and cold-archive tiers get a metadata-only
+    scan-back fingerprint check that never re-downloads a byte.
   </Card>
   <Card title="Append-only by design" icon="document">
     Overwrites are preserved under `.squirrel-history/`, and sync never deletes

@@ -1,6 +1,6 @@
 ---
 title: Restoring
-description: Pull a volume back from one of its rclone destinations, with BLAKE3 verification on the way down.
+description: Pull a volume back from one of its rclone destinations, with content verification on the way down (BLAKE3 where the destination exposes hashes).
 ---
 
 `squirrel restore` pulls a volume back from one of its rclone destinations.
@@ -27,6 +27,13 @@ It takes exactly one positional argument — the **volume name**.
 By default, restore verifies each file's BLAKE3 as it arrives, the same
 end-to-end check [`sync`](/squirrel/guides/syncing/) uses on the way up. Pass
 `--shallow` to skip it.
+
+:::note[Encrypted destinations are always size+mtime]
+[Encrypted (`crypt`)](/squirrel/layouts/encrypted/) destinations cannot expose
+content hashes through rclone, so restore from one falls back to a size+mtime
+comparison — recorded as shallow — **even without** `--shallow`, exactly as sync
+does. Passing `--shallow` changes nothing for these destinations.
+:::
 
 ## Restoring in place
 

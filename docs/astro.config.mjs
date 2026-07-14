@@ -12,7 +12,7 @@ export default defineConfig({
     starlight({
       title: "Squirrel",
       description:
-        "Content-addressed backup tool for your own NAS plus cloud offsite storage. Every upload is BLAKE3-verified; destinations are append-only.",
+        "Content-addressed backup tool for your own NAS plus cloud offsite storage. Every upload is verified; destinations are append-only.",
       social: [
         {
           icon: "github",

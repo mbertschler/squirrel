@@ -223,6 +223,10 @@ Exactly one positional — the volume name. See [Restoring](/squirrel/guides/res
 | `--dry-run` | `false` | Preview rclone actions without transferring. |
 | `--in-place` | `false` | Permit restore against a non-empty live path; overwritten files move to `.squirrel-restore-history/run-<id>/`. |
 
+Restore from an [encrypted (`crypt`)](/squirrel/layouts/encrypted/) destination
+is always a size+mtime comparison (recorded shallow) even without `--shallow`,
+because rclone crypt remotes don't expose content hashes.
+
 ---
 
 ## squirrel audit
