@@ -1,0 +1,58 @@
+---
+title: Squirrel
+description: Content-addressed backup tool for your own NAS plus cloud offsite storage. Every upload is BLAKE3-verified end-to-end; destinations are append-only.
+template: splash
+hero:
+  tagline: Backup tool for your own NAS + cloud offsite storage. Indexes by BLAKE3 content hash, verifies every upload end-to-end, and never deletes history.
+  actions:
+    - text: Get started
+      link: /squirrel/start/install/
+      icon: right-arrow
+      variant: primary
+    - text: View on GitHub
+      link: https://github.com/mbertschler/squirrel
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+Squirrel indexes a local file tree by BLAKE3 content hash and syncs it to one or
+more remote destinations (NAS, S3, B2, GCS, SFTP, …) via
+[rclone](https://rclone.org). Every upload is BLAKE3-verified end-to-end.
+Destinations are append-only: an overwrite at the destination moves the prior
+bytes into `.squirrel-history/run-<id>/`, never deletes them.
+
+## Why squirrel
+
+<CardGrid stagger>
+  <Card title="Content, not paths" icon="approve-check">
+    A BLAKE3 hash that has ever been observed stays retrievable. Paths are
+    observations of content, not the other way around — `squirrel query <hash>`
+    still finds a hash whose path now holds different content.
+  </Card>
+  <Card title="Verified end-to-end" icon="seti:lock">
+    Sync verifies each uploaded file's BLAKE3 against the destination. Cold
+    archive tiers get a metadata-only scan-back fingerprint check that never
+    re-downloads a byte.
+  </Card>
+  <Card title="Append-only by design" icon="document">
+    Overwrites are preserved under `.squirrel-history/`, and sync never deletes
+    at the destination even when the local copy is gone. History is an audit
+    trail, never auto-pruned.
+  </Card>
+  <Card title="Many backends, one config" icon="setting">
+    Mirror, encrypted, kopia, content-addressed, and packed layouts across
+    local, sftp, s3, b2, and gcs — all declared in one TOML file. Squirrel owns
+    the rclone command line so you never run `rclone config`.
+  </Card>
+</CardGrid>
+
+## Where to next
+
+<CardGrid>
+  <LinkCard title="Installation" href="/squirrel/start/install/" description="Install squirrel and rclone." />
+  <LinkCard title="Quickstart" href="/squirrel/start/quickstart/" description="Index a volume and sync it in a few commands." />
+  <LinkCard title="The core principle" href="/squirrel/start/principle/" description="Why squirrel indexes content, not paths." />
+  <LinkCard title="CLI reference" href="/squirrel/reference/cli/" description="Every command, flag, and argument." />
+</CardGrid>
