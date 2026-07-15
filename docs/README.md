@@ -7,17 +7,19 @@ navigable presentation of the same material.
 
 ## Local development
 
+This site uses [Bun](https://bun.sh) (matching the `squirrel-desktop` frontend).
+
 ```sh
 cd docs
-npm install
-npm run dev      # serve at http://localhost:4321/squirrel
+bun install
+bun run dev      # serve at http://localhost:4321/squirrel
 ```
 
 ## Build
 
 ```sh
-npm run build    # output to docs/dist
-npm run preview  # preview the production build locally
+bun run build    # output to docs/dist
+bun run preview  # preview the production build locally
 ```
 
 ## Structure
