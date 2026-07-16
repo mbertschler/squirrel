@@ -19,15 +19,8 @@ services:
       - "8333:8333" # S3 API
     volumes:
       - ./s3config.json:/etc/seaweedfs/s3config.json:ro
-    healthcheck:
-      # curl ships in the seaweedfs image. A bare GET to the S3 port returns
-      # 403 (AccessDenied) the moment the gateway is serving, which is all we
-      # need to know it is up — and curl without -f exits 0 on any HTTP
-      # response, non-zero only when the port is not yet listening. This
-      # avoids depending on the /status health route, which older image tags
-      # (e.g. 3.80) do not expose on the S3 API.
-      test: ["CMD", "curl", "-s", "-o", "/dev/null", "http://localhost:8333"]
-      interval: 3s
-      timeout: 3s
-      retries: 20
-      start_period: 30s
+    # No container healthcheck: the 3.80 image ships neither curl nor a
+    # /status route on the S3 API, so an in-container probe is unreliable
+    # across versions. Readiness is instead polled from the host against the
+    # published port (see README.md / the CI job) — the same reachability the
+    # test itself needs.

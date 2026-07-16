@@ -66,9 +66,25 @@ jobs:
 
       # Bring up the SeaweedFS S3 gateway from the same fixture developers
       # run locally (test/integration/), so CI exercises the documented path.
-      # --wait blocks until the container's healthcheck reports healthy.
       - name: Start SeaweedFS
-        run: docker compose -f test/integration/docker-compose.yml up -d --wait
+        run: docker compose -f test/integration/docker-compose.yml up -d
+
+      # Poll the published S3 port from the host (curl is on the runner). A
+      # bare GET returns 403 once the gateway is serving; curl without -f
+      # exits 0 on any HTTP response and non-zero only while the port is not
+      # yet listening. This is the same reachability the test needs.
+      - name: Wait for S3 endpoint
+        run: |
+          for i in $(seq 1 60); do
+            if curl -s -o /dev/null http://127.0.0.1:8333; then
+              echo "S3 endpoint ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "S3 endpoint did not become ready within 60s" >&2
+          docker compose -f test/integration/docker-compose.yml logs
+          exit 1
 
       - name: go test (integration tag)
         env:

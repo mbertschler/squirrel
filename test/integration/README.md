@@ -16,7 +16,10 @@ The tests are gated behind the `integration` build tag **and** skip unless
 `SQUIRREL_TEST_S3_ENDPOINT` is set, so `go test ./...` stays hermetic.
 
 ```sh
-docker compose -f test/integration/docker-compose.yml up -d --wait
+docker compose -f test/integration/docker-compose.yml up -d
+
+# Wait for the S3 gateway to start serving (a bare GET returns 403 once up).
+until curl -s -o /dev/null http://127.0.0.1:8333; do sleep 1; done
 
 export SQUIRREL_TEST_S3_ENDPOINT=http://127.0.0.1:8333
 export SQUIRREL_TEST_S3_ACCESS_KEY=squirreltest
@@ -26,6 +29,10 @@ go test -tags integration ./sync/ -run TestS3 -v
 
 docker compose -f test/integration/docker-compose.yml down -v
 ```
+
+> The fixture has no container healthcheck (the 3.80 image ships neither
+> `curl` nor a `/status` route on the S3 API), so readiness is polled from
+> the host against the published port instead of via `--wait`.
 
 ## Environment variables
 
