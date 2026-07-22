@@ -1,0 +1,26 @@
+# SeaweedFS S3 gateway for squirrel's S3 integration tests.
+#
+#   docker compose -f test/integration/docker-compose.yml up -d
+#   export SQUIRREL_TEST_S3_ENDPOINT=http://127.0.0.1:8333
+#   export SQUIRREL_TEST_S3_ACCESS_KEY=squirreltest
+#   export SQUIRREL_TEST_S3_SECRET_KEY=squirreltestsecret
+#   go test -tags integration ./sync/ -run TestS3 -v
+#   docker compose -f test/integration/docker-compose.yml down -v
+#
+# See README.md in this directory for details.
+services:
+  seaweedfs:
+    image: chrislusf/seaweedfs:3.80
+    command: >
+      server -s3 -dir=/data
+      -s3.config=/etc/seaweedfs/s3config.json
+      -master.volumeSizeLimitMB=64
+    ports:
+      - "8333:8333" # S3 API
+    volumes:
+      - ./s3config.json:/etc/seaweedfs/s3config.json:ro
+    # No container healthcheck: the 3.80 image ships neither curl nor a
+    # /status route on the S3 API, so an in-container probe is unreliable
+    # across versions. Readiness is instead polled from the host against the
+    # published port (see README.md / the CI job) — the same reachability the
+    # test itself needs.
