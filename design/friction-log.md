@@ -136,16 +136,30 @@ slash-trimmed; pinned by tests. *Process lesson for the log: every
 "success" the scheduler reported for s3archive during this era was a
 write to the wrong bucket.*
 
-**F13 · S1 — packed durability advanced with a pending pack
-fingerprint (suspected real bug #3, unfixed).** After the bug-era
-docs→s3archive push, `remote_packs` correctly held the pack as
-*pending* (no checksum, never verified) — but `destination_run_ids`
-still gained `(docs, s3archive, verify_method=presence+size)` and
-`destination_push_freshness` advanced. The packed design doc is
-explicit that the vector must not advance until "every pack has a
-verified scan-back fingerprint". Evidence preserved in the walk notes;
-needs a dedicated reproduction + fix PR. Until then the offload gate
-can be fed evidence the fingerprint layer never vouched for.
+**F13 · S1 — packed durability advances past a pending pack
+fingerprint (real bug #3, confirmed, unfixed).** Mechanism, from the
+DB evidence plus `packedHandler.certifyPacked`: the "no advance while
+packs are unverified" gate only counts packs written *by this run*
+(`verified < len(writes)`). Run A writes a pack, fingerprint capture
+fails → correctly warns and holds the vector. Run B, the next cadence
+tick, packs nothing (`writes` empty), the guard is vacuously satisfied,
+and `AdvanceDestinationVectorTo` advances over the whole volume state —
+including content reachable only through run A's still-pending pack.
+Observed live: docs pack pending from run 10; a later 0-file docs sync
+advanced `(docs, s3archive, presence+size)` anyway. The flaw is
+two-sided, same root: (a) a run that packs nothing skips certify
+entirely, yet when a *later content-writing* run certifies, its
+advance covers the whole volume including content only reachable
+through still-pending earlier packs; and (b) once `squirrel verify`
+fills the pending fingerprints, nothing re-advances the vector until
+the next content-writing sync happens to run — observed live as
+verify reporting 21/21 objects + 2/2 packs clean while the volume's
+vector stayed empty for many cadence ticks. Verify says "perfect",
+the offload gate says "no evidence", and both are telling the truth.
+The fix is to gate the advance on *no pending artifacts for the
+(volume, destination) pair* — and to advance (or re-attempt the
+advance) when verify newly certifies the outstanding set. Needs its
+own PR + regression tests for both sides.
 
 **F14 · S2 — a killed agent leaves phantom "running" runs forever.**
 Run #17 (interrupted when the agent process was killed mid-sync) still
@@ -190,6 +204,66 @@ hundreds of no-ops. Filters (`runs --failed`, `runs --changes`) and
 TUI-side folding of consecutive no-ops would restore the audit trail's
 readability. (The `runs` help text also still says "List index runs";
 it lists every kind.)
+
+**F20 · S2 — recovering a wrecked destination has no supported path.**
+After the F12 bug era the packed-layout guard refused every further
+s3archive sync ("its history is not packed … point the layout at a
+fresh destination or root"). But the guard keys on the pair's *run
+history by destination name*, so following its own advice — a fresh
+`root` — still refuses (the recorded success at run 208 has no
+placement map at *any* root). The only escape is a new destination
+*name*, which is a cross-machine config migration by hand: nas
+`sync_to` lists, the laptop's `offload_requires`, and the loss of all
+recorded evidence continuity. Two directions, both needed: the guard
+should recognise "configured root is empty ⇒ fresh start", and an
+explicit operator verb for "forget/reset this destination's recorded
+state" (audit-preserving) should exist rather than leaving sqlite
+surgery or renames as the only outs.
+
+**F21 · S1 — mirror destinations produce no durability evidence, so
+`offload_requires` naming one can never be satisfied.** The mirror
+sync path contains no vector-advance call at all (only the
+content-addressed/packed and node paths do). The reference setup as
+originally designed — laptop requiring `cloudbox` (crypt mirror) —
+would wait forever: not refused, not warned, just a gate that can
+never open, discovered only when an offload is finally attempted.
+Config validation should reject (or loudly warn on) an
+`offload_requires` entry whose destination layout structurally never
+yields evidence; longer-term, verified plain-mirror runs
+(`rclone-blake3`) arguably deserve vector advances. The walk switched
+the laptop's policy to `s3archive2`; `reference-setup.md` needs the
+same amendment with the reasoning.
+
+## Checkpoints 4–5 — trip return + offload day
+
+**F22 · S2 — gate refusals are per-file walls of jargon that can't
+distinguish "not yet" from "never".** `offload --dry-run` on 26 files
+prints the identical two-line reason 26 times
+(`cloudbox: missing component for origin laptop (need 1)`), with no
+aggregation ("26 files, all blocked by the same 2 targets"), no
+mention of which requirements already *passed* (nas had, silently),
+and — the trust-critical gap — no distinction between s3archive2
+("evidence exists on the hub, arrives with the next durability pull")
+and cloudbox ("a mirror destination, structurally never produces
+evidence" — F21). The user cannot tell waiting from wedged, and the
+vocabulary (component/origin/need N) is the internal vector model
+verbatim.
+
+**F23 · S2 — the edge machine is blind to its own safety.** The
+laptop's TUI shows index/sync freshness only. For the machine whose
+seat is "roaming, small disk, wants to offload", none of its real
+questions are answerable: has my content reached the offsites (via
+the hub)? how fresh is my relayed evidence? what could I offload
+today? The durability answer exists in its own DB (pulled vectors) —
+nothing renders it. Same F17 gap, but sharpest at the edge seat.
+
+**F24 · S3 — trip-return catch-up worked perfectly but invisibly.**
+404 new photos: indexed and pushed to the hub in a single 30 s
+cadence tick (run #124, 1.1 s transfer) — genuinely impressive.
+The only trace is one runs row among dozens of no-ops; nothing
+summarises "you were away, 404 files are now safe on nas, offsite
+copies followed at HH:MM". The moment squirrel earns the most trust
+is rendered indistinguishable from routine noise.
 
 **Positive observations worth keeping:** the scheduler's
 kicked/finished/error log discipline is excellent; runs correlate
