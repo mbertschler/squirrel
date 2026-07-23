@@ -19,7 +19,9 @@ months without running a single squirrel command — and lose nothing.
 
 The corollary: **any routine action that must be typed by hand is a
 design bug.** Known gaps against this principle (a living list — remove
-entries as they close, add new ones as they're found):
+entries as they close, add new ones as they're found; the full,
+evidence-backed catalogue from walking the reference setup lives in
+[`friction-log.md`](friction-log.md)):
 
 - `squirrel verify` (offsite fingerprint re-check) has no agent cadence;
   it only runs when typed. Bitrot checking that depends on someone
