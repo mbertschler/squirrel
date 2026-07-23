@@ -52,9 +52,19 @@ so nothing ever tries.
 
 | Volume | Lives on | Flow | Offload |
 |---|---|---|---|
-| **photos** | laptop, homepc, htpc, nas (master) | laptop/homepc → nas → cloudbox + s3archive + kopia-mirror; nas → htpc for TV slideshows | laptop offloads old years once nas + both offsites hold them |
+| **photos** | laptop, homepc, htpc, nas (master) | laptop/homepc → nas → cloudbox + s3archive + kopia-mirror; nas → htpc for TV slideshows | laptop offloads old years once nas + s3archive hold them |
 | **docs** | laptop, homepc, nas (master) | laptop/homepc → nas → cloudbox + s3archive + kopia-mirror; homepc also → usb | never — small enough to keep everywhere |
-| **media** | nas (master), htpc | nas → htpc; nas → cloudbox | htpc offloads watched items once nas + cloudbox hold them |
+| **media** | nas (master), htpc | nas → htpc; nas → cloudbox + s3archive | htpc offloads watched items once s3archive holds them |
+
+Offload gates deliberately name only targets that *produce durability
+evidence* — content-addressed/packed destinations and peer nodes the
+offloading machine itself pushes to. A crypt mirror (cloudbox) never
+yields evidence today (friction log F21), so naming it in
+`offload_requires` waits forever; and a receive-only node (htpc)
+cannot credit its *upstream* peer, so its gate rests on the offsites
+the hub pushes to, reached via the durability pull. Media therefore
+also rides to s3archive: an offloadable volume must live on at least
+one evidence-producing target.
 
 The offload story is the crown jewel and the reason this topology is
 worth its complexity: the laptop never talks to cloudbox or s3archive,
@@ -126,7 +136,7 @@ sync_every = "6h"
 
 [volumes.media]
 path       = "/volume1/media"
-sync_to    = ["cloudbox", "htpc"]
+sync_to    = ["cloudbox", "s3archive", "htpc"]
 sync_every = "24h"
 
 [destinations.cloudbox]
@@ -185,7 +195,7 @@ token = { env = "SQUIRREL_AGENT_TOKEN" }
 path                     = "~/Pictures"
 sync_to                  = ["nas"]
 sync_every               = "1h"
-offload_requires         = ["nas", "cloudbox", "s3archive"]
+offload_requires         = ["nas", "s3archive"]
 offload_max_evidence_age = "720h"
 
 [volumes.docs]
@@ -235,7 +245,7 @@ bearer = { env = "SQUIRREL_PEER_NAS" }
 
 [volumes.media]
 path                     = "/data/media"
-offload_requires         = ["nas", "cloudbox"]
+offload_requires         = ["s3archive"]
 offload_max_evidence_age = "720h"
 
 [volumes.photos]
