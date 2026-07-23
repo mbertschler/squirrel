@@ -27,7 +27,7 @@ import (
 // playback is layout-agnostic, so the caFixture helpers work unchanged.
 func setupPackedFixture(t *testing.T, threshold string) *caFixture {
 	t.Helper()
-	return setupCAFixture(t, fmt.Sprintf(`[destinations.offsite]
+	f := setupCAFixture(t, fmt.Sprintf(`[destinations.offsite]
 type   = "sftp"
 host   = "remote.invalid"
 user   = "u"
@@ -40,11 +40,13 @@ zstd_level     = 3
 [destinations.offsite.crypt]
 password = "obscured-pw"
 `, threshold), "/data")
+	t.Setenv("RCLONE_FAKE_CRYPT_SUFFIX", cryptDataSuffix)
+	return f
 }
 
 func (f *caFixture) readPlacementMap(t *testing.T, runID int64) []PlacementEntry {
 	t.Helper()
-	data, err := os.ReadFile(f.remotePath(PacksDirName, fmt.Sprintf("map-%d", runID)))
+	data, err := os.ReadFile(f.remoteBlob(PacksDirName, fmt.Sprintf("map-%d", runID)))
 	if err != nil {
 		t.Fatalf("read placement map: %v", err)
 	}
@@ -79,10 +81,10 @@ func TestPackedSizeRouting(t *testing.T) {
 		t.Fatalf("Status = %q, want success", rep.Status)
 	}
 	// The large file is a plain object; the small file is not.
-	if _, err := os.Stat(f.remotePath(ObjectsDirName, blake3Hex(strings.Repeat("B", 64)))); err != nil {
+	if _, err := os.Stat(f.remoteBlob(ObjectsDirName, blake3Hex(strings.Repeat("B", 64)))); err != nil {
 		t.Fatalf("large file did not land as an object: %v", err)
 	}
-	if _, err := os.Stat(f.remotePath(ObjectsDirName, blake3Hex("tiny"))); err == nil {
+	if _, err := os.Stat(f.remoteBlob(ObjectsDirName, blake3Hex("tiny"))); err == nil {
 		t.Fatalf("small file wrongly landed as an object")
 	}
 
@@ -134,9 +136,10 @@ func mustPackKeyOf(t *testing.T, f *caFixture) []byte {
 		if strings.HasPrefix(e.Name(), "map-") {
 			continue
 		}
-		key, err := hex.DecodeString(e.Name())
+		name := strings.TrimSuffix(e.Name(), os.Getenv("RCLONE_FAKE_CRYPT_SUFFIX"))
+		key, err := hex.DecodeString(name)
 		if err != nil {
-			t.Fatalf("pack name %q not hex: %v", e.Name(), err)
+			t.Fatalf("pack name %q not hex: %v", name, err)
 		}
 		return key
 	}
@@ -342,7 +345,7 @@ func TestPackedDRReplay(t *testing.T) {
 			t.Fatalf("no placement for %s (%s)", name, hash)
 		}
 		// Fetch and decompress the pack, then slice by offset/length.
-		packBytes, err := os.ReadFile(f.remotePath(PacksDirName, place.Pack))
+		packBytes, err := os.ReadFile(f.remoteBlob(PacksDirName, place.Pack))
 		if err != nil {
 			t.Fatalf("read pack %s: %v", place.Pack, err)
 		}
@@ -415,7 +418,7 @@ func TestPackedWatermarkGuardRefusesContentAddressed(t *testing.T) {
 	if err := f.store.FinishRun(ctx, caRun, store.RunStatusSuccess, "", 1); err != nil {
 		t.Fatalf("finish ca-era run: %v", err)
 	}
-	segPath := f.remotePath("pics", ManifestDirName, fmt.Sprintf("run-%d", caRun))
+	segPath := f.remoteBlob("pics", ManifestDirName, fmt.Sprintf("run-%d", caRun))
 	if err := os.MkdirAll(filepath.Dir(segPath), 0o755); err != nil {
 		t.Fatal(err)
 	}

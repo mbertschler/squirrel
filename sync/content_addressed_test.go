@@ -44,11 +44,16 @@ cmd=$1; shift
 resolve() {
   case "$1" in
   *:*)
+    r="${1%%:*}"
     p="${1#*:}"
     case "$p" in
     "${RCLONE_FAKE_STRIP:-//none//}"/*) p="${p#"${RCLONE_FAKE_STRIP}"/}" ;;
     esac
-    printf '%s/%s' "$RCLONE_FAKE_ROOT" "$p" ;;
+    sfx=""
+    case "$r" in
+    *-crypt) sfx="$RCLONE_FAKE_CRYPT_SUFFIX" ;;
+    esac
+    printf '%s/%s%s' "$RCLONE_FAKE_ROOT" "$p" "$sfx" ;;
   *) printf '%s' "$1" ;;
   esac
 }
@@ -133,7 +138,7 @@ type caFixture struct {
 
 func setupContentAddressedFixture(t *testing.T) *caFixture {
 	t.Helper()
-	return setupCAFixture(t, `[destinations.offsite]
+	f := setupCAFixture(t, `[destinations.offsite]
 type   = "sftp"
 host   = "remote.invalid"
 user   = "u"
@@ -143,6 +148,12 @@ layout = "content-addressed"
 [destinations.offsite.crypt]
 password = "obscured-pw"
 `, "/data")
+	// Crypt reality: files written through the overlay carry rclone
+	// crypt's data suffix on the underlying remote, which is where
+	// scan-back and verify list from. The shim appends the suffix on
+	// overlay writes so those listings see what real rclone would.
+	t.Setenv("RCLONE_FAKE_CRYPT_SUFFIX", cryptDataSuffix)
+	return f
 }
 
 // setupCAFixture is the destination-configurable body of
@@ -169,6 +180,7 @@ func setupCAFixture(t *testing.T, destBlock, strip string) *caFixture {
 	t.Setenv("RCLONE_FAKE_NO_HASHES", "")
 	t.Setenv("RCLONE_FAKE_HASH_VALUE", "")
 	t.Setenv("RCLONE_FAKE_HASH_PREFIX", "")
+	t.Setenv("RCLONE_FAKE_CRYPT_SUFFIX", "")
 
 	root := t.TempDir()
 	volPath := filepath.Join(root, "src")
@@ -259,9 +271,16 @@ func (f *caFixture) remotePath(parts ...string) string {
 	return filepath.Join(append([]string{f.fakeRoot}, parts...)...)
 }
 
+// remoteBlob is remotePath for file artifacts written through the crypt
+// overlay: when the fixture simulates crypt's data suffix, on-disk file
+// names carry it. Directory paths keep using remotePath.
+func (f *caFixture) remoteBlob(parts ...string) string {
+	return f.remotePath(parts...) + os.Getenv("RCLONE_FAKE_CRYPT_SUFFIX")
+}
+
 func (f *caFixture) readSegment(t *testing.T, runID int64) []ManifestEntry {
 	t.Helper()
-	data, err := os.ReadFile(f.remotePath("pics", ManifestDirName, fmt.Sprintf("run-%d", runID)))
+	data, err := os.ReadFile(f.remoteBlob("pics", ManifestDirName, fmt.Sprintf("run-%d", runID)))
 	if err != nil {
 		t.Fatalf("read manifest segment: %v", err)
 	}
@@ -308,7 +327,7 @@ func TestContentAddressedPushHappyPath(t *testing.T) {
 	}
 
 	for name, content := range map[string]string{"a.txt": "alpha", "b.txt": "beta"} {
-		obj := f.remotePath(ObjectsDirName, blake3Hex(content))
+		obj := f.remoteBlob(ObjectsDirName, blake3Hex(content))
 		got, err := os.ReadFile(obj)
 		if err != nil {
 			t.Fatalf("object for %s missing at %s: %v", name, obj, err)
@@ -447,7 +466,7 @@ func TestContentAddressedManifestSegmentGolden(t *testing.T) {
 		line("d.txt", "dd", store.StatusPresent, f.mtimeNs(t, "d.txt")),
 	}, "\n") + "\n"
 
-	got, err := os.ReadFile(f.remotePath("pics", ManifestDirName, fmt.Sprintf("run-%d", rep.RunID)))
+	got, err := os.ReadFile(f.remoteBlob("pics", ManifestDirName, fmt.Sprintf("run-%d", rep.RunID)))
 	if err != nil {
 		t.Fatalf("read segment: %v", err)
 	}
@@ -472,7 +491,7 @@ func TestContentAddressedObjectFailureIsTransactional(t *testing.T) {
 	if rep.Status != store.RunStatusFailed {
 		t.Fatalf("Status = %q, want failed", rep.Status)
 	}
-	if _, statErr := os.Stat(f.remotePath("pics", ManifestDirName, fmt.Sprintf("run-%d", rep.RunID))); statErr == nil {
+	if _, statErr := os.Stat(f.remoteBlob("pics", ManifestDirName, fmt.Sprintf("run-%d", rep.RunID))); statErr == nil {
 		t.Fatalf("manifest segment written despite object failure")
 	}
 	run, err := f.store.GetRun(context.Background(), rep.RunID)
@@ -512,7 +531,7 @@ func TestContentAddressedSegmentFailureThenRecovery(t *testing.T) {
 	if rep.Status != store.RunStatusFailed {
 		t.Fatalf("Status = %q, want failed", rep.Status)
 	}
-	if _, err := os.Stat(f.remotePath(ObjectsDirName, blake3Hex("alpha"))); err != nil {
+	if _, err := os.Stat(f.remoteBlob(ObjectsDirName, blake3Hex("alpha"))); err != nil {
 		t.Fatalf("object should have landed before the segment failed: %v", err)
 	}
 	vector, err := f.store.ListDestinationRunIDs(context.Background(), f.volumeID(t), "offsite")
@@ -556,7 +575,7 @@ func TestContentAddressedEmptyDeltaStillLandsSegment(t *testing.T) {
 	if rep.Status != store.RunStatusSuccess || rep.Verification.Files != 0 {
 		t.Fatalf("rep = status=%q files=%d, want success with an empty delta", rep.Status, rep.Verification.Files)
 	}
-	data, err := os.ReadFile(f.remotePath("pics", ManifestDirName, fmt.Sprintf("run-%d", rep.RunID)))
+	data, err := os.ReadFile(f.remoteBlob("pics", ManifestDirName, fmt.Sprintf("run-%d", rep.RunID)))
 	if err != nil {
 		t.Fatalf("empty segment missing: %v", err)
 	}
@@ -582,7 +601,7 @@ func TestContentAddressedReservedDirsStayHome(t *testing.T) {
 	if len(entries) != 1 || entries[0].Path != "a.txt" {
 		t.Fatalf("segment = %+v, want only a.txt", entries)
 	}
-	if _, err := os.Stat(f.remotePath(ObjectsDirName, blake3Hex("do-not-upload"))); err == nil {
+	if _, err := os.Stat(f.remoteBlob(ObjectsDirName, blake3Hex("do-not-upload"))); err == nil {
 		t.Fatalf("reserved-subtree content was uploaded as an object")
 	}
 }
@@ -668,14 +687,14 @@ func TestContentAddressedCrossVolumeDedup(t *testing.T) {
 	if rep.RcloneResult.Transferred != 0 || rep.RcloneResult.Checked != 1 {
 		t.Fatalf("docs transferred=%d checked=%d, want 0/1 (object shared across volumes)", rep.RcloneResult.Transferred, rep.RcloneResult.Checked)
 	}
-	data, err := os.ReadFile(f.remotePath("docs", ManifestDirName, fmt.Sprintf("run-%d", rep.RunID)))
+	data, err := os.ReadFile(f.remoteBlob("docs", ManifestDirName, fmt.Sprintf("run-%d", rep.RunID)))
 	if err != nil {
 		t.Fatalf("docs segment missing: %v", err)
 	}
 	if !strings.Contains(string(data), blake3Hex("shared-bytes")) || !strings.Contains(string(data), "report.txt") {
 		t.Fatalf("docs segment = %q, want report.txt mapped onto the shared object", data)
 	}
-	if _, err := os.Stat(f.remotePath(ObjectsDirName, blake3Hex("shared-bytes"))); err != nil {
+	if _, err := os.Stat(f.remoteBlob(ObjectsDirName, blake3Hex("shared-bytes"))); err != nil {
 		t.Fatalf("shared object missing at the destination root: %v", err)
 	}
 }
@@ -715,7 +734,7 @@ func TestContentAddressedDriftRefusesObject(t *testing.T) {
 	if len(rep.Warnings) == 0 || !strings.Contains(strings.Join(rep.Warnings, "\n"), "drifted") {
 		t.Fatalf("Warnings = %+v, want a drift advisory", rep.Warnings)
 	}
-	if _, statErr := os.Stat(f.remotePath(ObjectsDirName, blake3Hex("alpha"))); statErr == nil {
+	if _, statErr := os.Stat(f.remoteBlob(ObjectsDirName, blake3Hex("alpha"))); statErr == nil {
 		t.Fatalf("drifted source uploaded an object under the indexed hash")
 	}
 
@@ -726,7 +745,7 @@ func TestContentAddressedDriftRefusesObject(t *testing.T) {
 	if has, _ := f.store.HasRemoteObject(context.Background(), row.ContentID, "offsite"); has {
 		t.Fatalf("drifted object was recorded in remote_objects")
 	}
-	if _, statErr := os.Stat(f.remotePath("pics", ManifestDirName, fmt.Sprintf("run-%d", rep.RunID))); statErr == nil {
+	if _, statErr := os.Stat(f.remoteBlob("pics", ManifestDirName, fmt.Sprintf("run-%d", rep.RunID))); statErr == nil {
 		t.Fatalf("manifest segment written despite a refused object")
 	}
 	if vector, err := f.store.ListDestinationRunIDs(context.Background(), f.volumeID(t), "offsite"); err != nil || len(vector) != 0 {
@@ -749,7 +768,7 @@ func TestContentAddressedDriftRefusesObject(t *testing.T) {
 	if has, _ := f.store.HasRemoteObject(context.Background(), row.ContentID, "offsite"); !has {
 		t.Fatalf("honest re-upload was not recorded")
 	}
-	got, err := os.ReadFile(f.remotePath(ObjectsDirName, blake3Hex("alpha")))
+	got, err := os.ReadFile(f.remoteBlob(ObjectsDirName, blake3Hex("alpha")))
 	if err != nil {
 		t.Fatalf("object missing after honest re-upload: %v", err)
 	}

@@ -164,7 +164,7 @@ func TestVerifyRemoteMissingObject(t *testing.T) {
 	if _, err := f.sync(t); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
-	if err := os.Remove(f.remotePath(ObjectsDirName, blake3Hex("alpha"))); err != nil {
+	if err := os.Remove(f.remoteBlob(ObjectsDirName, blake3Hex("alpha"))); err != nil {
 		t.Fatalf("remove remote object: %v", err)
 	}
 
@@ -195,7 +195,7 @@ func TestVerifyRemoteCountsUnrecordedObjects(t *testing.T) {
 	if _, err := f.sync(t); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
-	orphan := f.remotePath(ObjectsDirName, strings.Repeat("ab", 32))
+	orphan := f.remoteBlob(ObjectsDirName, strings.Repeat("ab", 32))
 	if err := os.WriteFile(orphan, []byte("orphan"), 0o644); err != nil {
 		t.Fatalf("write orphan: %v", err)
 	}
