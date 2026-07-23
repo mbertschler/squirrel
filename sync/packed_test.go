@@ -523,7 +523,7 @@ zstd_level     = 3
 // rclone's md5 slot, blank for a multipart object), recorded verified, and
 // the durability vector advances. No rclone hash listing runs.
 func TestPackedFingerprintCaptureS3(t *testing.T) {
-	f := setupCAFixture(t, s3PackedBlock, "data")
+	f := setupCAFixture(t, s3PackedBlock, "b/data")
 	installS3Reader(t, dirS3Reader{dir: f.remotePath(PacksDirName)})
 	f.write(t, "small.txt", "tiny")
 	f.index(t)
@@ -553,7 +553,7 @@ func TestPackedFingerprintCaptureS3(t *testing.T) {
 // pack. It also handles a mixed destination carrying both a large object
 // and a pack.
 func TestPackedVerifyRefreshesPackFingerprint(t *testing.T) {
-	f := setupCAFixture(t, s3PackedBlock, "data")
+	f := setupCAFixture(t, s3PackedBlock, "b/data")
 	// Capture fails at push (empty listing), leaving the pack pending.
 	installS3Reader(t, fakeS3Reader{etags: map[string]string{}})
 	f.write(t, "small.txt", "tiny")                         // -> pack

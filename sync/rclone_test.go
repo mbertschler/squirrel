@@ -547,3 +547,33 @@ func TestRunBackupDirMoves(t *testing.T) {
 		t.Fatalf("backup-dir a.txt = %q, want v1", old)
 	}
 }
+
+// TestRemoteSubpathURIBucketBackend pins that plain (non-crypt) remote
+// URIs include the bucket for bucket-addressed backends. rclone treats
+// the first path segment as the bucket, so omitting it sends transfers
+// to a bucket named after root's first segment or the volume itself.
+func TestRemoteSubpathURIBucketBackend(t *testing.T) {
+	t.Setenv("K", "k")
+	cfg := writeFakeConfig(t, `
+[destinations.arch]
+type              = "s3"
+provider          = "Other"
+bucket            = "bkt"
+root              = "/"
+access_key_id     = { env = "K" }
+secret_access_key = { env = "K" }
+
+[destinations.box]
+type     = "sftp"
+host     = "h"
+user     = "u"
+root     = "/abs"
+password = { env = "K" }
+`)
+	if got, want := remoteSubpathURI(cfg.Destinations["arch"], "docs"), "arch:bkt/docs"; got != want {
+		t.Errorf("s3 URI = %q, want %q", got, want)
+	}
+	if got, want := remoteSubpathURI(cfg.Destinations["box"], "docs"), "box:/abs/docs"; got != want {
+		t.Errorf("sftp URI = %q, want %q", got, want)
+	}
+}

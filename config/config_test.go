@@ -1469,3 +1469,78 @@ func TestMissingErrorWrappingChain(t *testing.T) {
 		t.Fatalf("errors.As should populate Path")
 	}
 }
+
+// TestRemoteRoot pins the bucket-aware remote path root: rclone
+// addresses bucket backends by leading path segment, so RemoteRoot must
+// compose bucket+root for s3/b2/gcs and leave every other type's root
+// untouched (an sftp root is legitimately absolute).
+func TestRemoteRoot(t *testing.T) {
+	t.Setenv("K", "k")
+	body := `
+[destinations.arch]
+type              = "s3"
+provider          = "Other"
+bucket            = "bkt"
+root              = "/"
+access_key_id     = { env = "K" }
+secret_access_key = { env = "K" }
+
+[destinations.sub]
+type              = "s3"
+provider          = "Other"
+bucket            = "bkt"
+root              = "/deep/er"
+access_key_id     = { env = "K" }
+secret_access_key = { env = "K" }
+
+[destinations.box]
+type     = "sftp"
+host     = "h"
+user     = "u"
+root     = "/abs/path"
+password = { env = "K" }
+`
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	cases := map[string]string{
+		"arch": "bkt",
+		"sub":  "bkt/deep/er",
+		"box":  "/abs/path",
+	}
+	for name, want := range cases {
+		if got := cfg.Destinations[name].RemoteRoot(); got != want {
+			t.Errorf("RemoteRoot(%s) = %q, want %q", name, got, want)
+		}
+	}
+}
+
+// TestRcloneSectionCryptBucketBackend pins that a crypt overlay on a
+// bucket backend bakes the bucket into its remote line. Without it the
+// overlay's transfers land in a bucket named after root's first
+// segment (or the volume), invisible to the direct S3 reader that
+// honours the configured bucket.
+func TestRcloneSectionCryptBucketBackend(t *testing.T) {
+	t.Setenv("K", "k")
+	body := `
+[destinations.arch]
+type              = "s3"
+provider          = "Other"
+bucket            = "bkt"
+root              = "/"
+access_key_id     = { env = "K" }
+secret_access_key = { env = "K" }
+
+[destinations.arch.crypt]
+password = "obscured"
+`
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	section := cfg.Destinations["arch"].RcloneSection()
+	if !strings.Contains(section, "remote = arch:bkt\n") {
+		t.Fatalf("crypt remote must include the bucket, got:\n%s", section)
+	}
+}

@@ -116,3 +116,84 @@ credentials could work at all. The friction is concentrated in (a)
 credential/trust material setup being fully DIY (F1-F3), (b) silence
 where affirmative feedback belongs (F4, F7, F8), and (c) failure-path
 opacity (F5, F6, F10).
+
+## Checkpoints 2–3 — first push + steady state under agents
+
+**F12 · S1 — s3/b2/gcs rclone transfers ignore the configured bucket
+(real bug #2, fixed in this branch).** `remoteSubpathURI` composed
+`name:root/subpath` with no bucket; rclone's bucket backends treat the
+first path segment as the bucket, so the reference config
+(`bucket = "household-archive"`, `root = "/"`) silently wrote into
+auto-created buckets named `docs`, `objects`, and `packs` — while
+`verify`'s direct S3 reader (and the crypt overlay's fingerprint path)
+addressed the configured bucket, which never existed. The two S3
+surfaces were each self-consistent and never cross-checked (CI's
+integration test exercises the reader alone). The reader also built
+key prefixes with a leading slash for `root = "/"`, matching nothing.
+Fixed: `Destination.RemoteRoot()` composes bucket+root for bucket
+backends everywhere rclone paths are built; reader prefix
+slash-trimmed; pinned by tests. *Process lesson for the log: every
+"success" the scheduler reported for s3archive during this era was a
+write to the wrong bucket.*
+
+**F13 · S1 — packed durability advanced with a pending pack
+fingerprint (suspected real bug #3, unfixed).** After the bug-era
+docs→s3archive push, `remote_packs` correctly held the pack as
+*pending* (no checksum, never verified) — but `destination_run_ids`
+still gained `(docs, s3archive, verify_method=presence+size)` and
+`destination_push_freshness` advanced. The packed design doc is
+explicit that the vector must not advance until "every pack has a
+verified scan-back fingerprint". Evidence preserved in the walk notes;
+needs a dedicated reproduction + fix PR. Until then the offload gate
+can be fed evidence the fingerprint layer never vouched for.
+
+**F14 · S2 — a killed agent leaves phantom "running" runs forever.**
+Run #17 (interrupted when the agent process was killed mid-sync) still
+shows `status=running` in `squirrel runs` and renders as a live,
+elapsed-ticking banner at the top of the TUI dashboard — hours later.
+Agent startup should reap its own orphaned runs (`status=aborted`),
+else the trust surface displays activity that is not happening.
+
+**F15 · S1 — failed rclone runs record an empty error in the audit
+trail.** `runs` shows bug-era cloudbox failures as `failed` with a
+blank ERROR column, while kopia failures carry their full message. The
+run row is the permanent record; for rclone it preserves no evidence
+at all (compounding F6, which is about the live surfaces).
+
+**F16 · S2 — per-destination sync coverage is invisible at a glance.**
+The TUI dashboard and volumes tab show a single "LAST SYNC" cell per
+volume, but photos syncs to four targets. A destination can fail for a
+week behind a fresh ✓ earned by any other target. The one question the
+dashboard must answer — "is every configured target caught up?" —
+needs a per-(volume × destination) grid with per-cell staleness.
+
+**F17 · S2 — durability has no question command.** Nothing answers
+"what is durable where": the vectors, freshness, verify methods, and
+evidence ages live only in the DB, surfaced indirectly through offload
+refusals (`squirrel offload --dry-run` side effects). For the safety
+model squirrel is built on, this is the flagship missing
+introspection — a `squirrel status`/TUI durability panel showing, per
+volume × target: vector coverage, verify method, evidence age.
+
+**F18 · S3 — inbound and outbound peer runs are indistinguishable.**
+On the nas, `sync photos laptop` (received from laptop) and
+`sync photos htpc` (pushed to htpc) render identically in `runs` and
+the TUI — the destination column holds a peer name in both directions.
+The audit trail answers "what happened" but not "who initiated".
+
+**F19 · S3 — steady-state run noise buries signal.** With compressed
+cadences the runs list is dominated by 0-file no-op rows (one per
+volume × destination per tick). Nothing distinguishes "checked,
+nothing to do" from "transferred nothing unexpectedly"; a day of real
+household cadences would interleave the interesting rows with
+hundreds of no-ops. Filters (`runs --failed`, `runs --changes`) and
+TUI-side folding of consecutive no-ops would restore the audit trail's
+readability. (The `runs` help text also still says "List index runs";
+it lists every kind.)
+
+**Positive observations worth keeping:** the scheduler's
+kicked/finished/error log discipline is excellent; runs correlate
+across peers (`receiver_run=`); the marker and kopia-init refusals are
+model failure messages; the hooks tab's empty state explains exactly
+how to get content into it; kopia destinations report
+`verified=true` inline in the sync summary.

@@ -119,5 +119,5 @@ func checkersArgs(dest *config.Destination) []string {
 // scan-back fingerprint is over the stored ciphertext, and with filename
 // encryption fixed off the underlying key equals the overlay path.
 func underlyingDirURI(dest *config.Destination, dirName string) string {
-	return dest.Name + ":" + path.Join(dest.Root, dirName)
+	return dest.Name + ":" + path.Join(dest.RemoteRoot(), dirName)
 }
