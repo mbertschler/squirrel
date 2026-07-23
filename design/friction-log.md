@@ -313,9 +313,110 @@ re-supersede a path whose live row lost a conflict since your last
 delivery without operator action), and a `squirrel conflicts`
 question-command to list unresolved ones.
 
+**F29 · S1 — relayed offload against a cold archive is structurally
+unreachable, so no machine in the reference household can offload
+anything.** The endgame of the whole design — htpc/laptop dropping
+local bytes because the hub proved them durable offsite — dead-ends
+at the last gate: packed/CA components are written (and relayed) as
+`verify_method=presence+size` and are *never upgraded* when
+`squirrel verify` (or verify-at-capture) certifies every underlying
+fingerprint, and the offload gate — correctly fail-closed — refuses
+non-content-verified methods:
+`s3archive2: not content-verified (method "presence+size", asserted
+by peer nas); a verified fingerprint must back the object before
+offload` (that refusal message, by the way, is the best diagnostic
+squirrel printed all night). Combined with F21 (mirrors: no evidence)
+and the receive-only gap (a downstream node can't credit its upstream
+peer), every gate path is closed: only kopia (`kopia-verify`) and
+direct peer pushes (`peer-blake3`) yield acceptable methods, and
+neither is an offsite the edges gate on. Fix direction: when a
+verify pass (or capture) leaves a (volume, destination) with all
+objects+packs fingerprint-verified, upgrade the vector component to a
+content-verified method and relay that — the schema already carries
+`verify_method` end-to-end.
+
+## Checkpoint 8 — restore day
+
+**F28 · S2 — a dead edge machine has no supported restore path.** The
+laptop syncs only to the nas (a node), and `restore` refuses nodes
+outright ("restore from node destinations is not supported" — clear,
+at least). The machinery for the recovery *exists* — a reverse peer
+push, exactly what nas→htpc does daily — but there is no verb, no
+documented runbook, and re-pairing a replacement machine (config,
+tokens, cert pins, node entries on both sides) is the full bootstrap
+gauntlet again. "Laptop died" is the single most likely disaster in
+the household; today its answer is "copy files back by hand".
+
+**F30 · S2 — tamper detection rings once, then everything carries
+on.** The corruption drill was caught perfectly (loud per-object line,
+recorded-vs-current fingerprint, non-zero exit, audit run recorded as
+`partial` with the error — even visible in the recovered catalog).
+But nothing changes state: the next scheduled sync pushes to the
+flagged destination as if nothing happened, and no surface carries a
+standing "destination in alarm since HH:MM" indicator. An alarm that
+lives only in a scrolled-away runs row is not an alarm (principle 4);
+a mismatch should latch a visible per-destination state until an
+operator clears it.
+
+**F31 · S3 — disaster recovery works but only as archaeology.** Every
+piece proved out: mirror restore was byte-identical (crypt decrypt
+included), packed/kopia refusals point at their exact recovery
+procedure, ride-along index snapshots rotate on the offsite and the
+fetched catalog answers `runs`/`query` immediately. What's missing is
+the connective tissue: a "your NAS died" runbook (or `squirrel
+recover` guided flow) that sequences fetch-snapshot → restore volumes
+→ re-pair peers. Tonight that sequence took tool-author knowledge to
+assemble.
+
+**Not walked:** `offload_max_evidence_age` staleness refusals (the
+gate currently refuses CA evidence earlier, on verify-method — F29 —
+so the staleness path can't be reached end-to-end; it is
+unit-covered), b2/gcs (no endpoints), hooks (none configured in the
+walk), the desktop app (explicitly out of scope).
+
 **Positive observations worth keeping:** the scheduler's
 kicked/finished/error log discipline is excellent; runs correlate
 across peers (`receiver_run=`); the marker and kopia-init refusals are
 model failure messages; the hooks tab's empty state explains exactly
 how to get content into it; kopia destinations report
-`verified=true` inline in the sync summary.
+`verified=true` inline in the sync summary; the offload gate's
+verify-method refusal names the method, the asserting peer, and the
+missing prerequisite; tamper detection prints exactly the right line;
+`pull-durability` reports fetched/applied/dropped per component;
+post-offload steady state is flawless (offloaded ≠ missing, no
+deletion propagation, no re-transfer); the trip-return catch-up moved
+404 files in one cadence tick; and the no-loss principle held through
+every failure injected tonight — nothing was ever lost, including
+both sides of every conflict round.
+
+## Summary and priority
+
+The engine is trustworthy; the *seams* between its subsystems and the
+human are where trust leaks. Tonight's walk found four real product
+bugs (F5 sftp `pass`, F12 bucket addressing — fixed on this branch;
+F13 packed-vector gate, F29 method never upgraded — open) and the
+pattern behind most S1/S2 findings is consistent: **squirrel does the
+right thing and doesn't tell anyone, or refuses the wrong thing and
+can't be asked why.**
+
+Suggested attack order:
+
+1. **Make offload reachable** (F29 + F13 + F21): upgrade vector
+   methods on full fingerprint verification, fix the pending-pack
+   gate, decide mirror evidence policy, and validate
+   `offload_requires` against target capabilities at config load.
+   Until then the flagship feature doesn't exist for users.
+2. **Make failure visible** (F6/F15, F26, F14, F30, F10): rclone
+   stderr into run rows and scheduler errors; refusals mint run rows;
+   reap orphaned runs; latch verify alarms; back off un-bootstrapped
+   destinations. One theme: every failure becomes a run row and every
+   abnormal state a standing surface.
+3. **Make the conflict loop converge and notify** (F27).
+4. **Answer the two standing questions** (F16, F17, F23): per-
+   (volume × destination) coverage grid and a durability/offloadable
+   panel — CLI (`squirrel status`) and TUI dashboard both.
+5. **De-friction bootstrap** (F1-F4, F20, F28): cert/token/pairing
+   helpers, config check, destination reset, machine-replacement
+   runbook.
+6. **Unstall the scheduler** (F25): per-destination isolation +
+   transfer timeouts.
