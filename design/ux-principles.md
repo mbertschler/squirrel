@@ -31,6 +31,12 @@ entries as they close, add new ones as they're found):
   command that deletes user data — but the *decision support* should be
   automatic: the operator should see "N GB offloadable now" without
   computing it themselves.
+- A mirrored + crypt destination is the least-verified copy in the
+  reference setup: crypt remotes expose no hashes, so transfers compare
+  size+mtime forever, and `squirrel verify` covers only
+  content-addressed layouts — the cloudbox copy is never content-checked
+  after upload. The best-trusted offsite (browsable plain files) is
+  paradoxically the least-audited one.
 
 ## 2. The CLI is for change and for questions — never for operations
 

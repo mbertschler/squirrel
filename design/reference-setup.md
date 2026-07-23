@@ -53,7 +53,7 @@ so nothing ever tries.
 | Volume | Lives on | Flow | Offload |
 |---|---|---|---|
 | **photos** | laptop, homepc, htpc, nas (master) | laptop/homepc → nas → cloudbox + s3archive + kopia-mirror; nas → htpc for TV slideshows | laptop offloads old years once nas + both offsites hold them |
-| **docs** | laptop, homepc, nas (master) | laptop/homepc → nas → cloudbox + s3archive; homepc also → usb | never — small enough to keep everywhere |
+| **docs** | laptop, homepc, nas (master) | laptop/homepc → nas → cloudbox + s3archive + kopia-mirror; homepc also → usb | never — small enough to keep everywhere |
 | **media** | nas (master), htpc | nas → htpc; nas → cloudbox | htpc offloads watched items once nas + cloudbox hold them |
 
 The offload story is the crown jewel and the reason this topology is
@@ -63,6 +63,31 @@ nas pushes, records durability vectors, and the laptop pulls them over
 the peer API. Content origin coordinates survive the hop (the laptop's
 photos stay attributed to `(laptop, run)` even when nas forwards them),
 which is exactly what the version-vector gate needs.
+
+## The kopia leg: implementation independence
+
+Every squirrel copy in the household — nas, htpc, cloudbox, s3archive,
+usb — is produced by the same walker, hasher, indexer, and upload
+pipeline. A systematic squirrel bug (a walker silently skipping a
+directory class, an indexer recording the wrong state) replicates
+faithfully to all of them, and squirrel verifying itself cannot see it:
+verification checks reality against squirrel's own beliefs. The
+`kopia-mirror` destination is the one copy whose correctness does not
+depend on squirrel being correct — a disjoint implementation walking
+the same disk, with its own end-to-end verification (`snapshot
+verify`) on every sync, recorded in squirrel's runs table like any
+other destination.
+
+Because its purpose is *implementation* redundancy, not geo redundancy
+(cloudbox and s3archive cover that twice), living on the nas's second
+disk group is fine: independent, cheap, fast to restore from. It is
+scoped to the irreplaceable volumes — photos and docs — and not to
+media, which is large and replaceable.
+
+The kopia leg is **first-class until squirrel is out of beta**, which
+may take years. Dropping it is a deliberate amendment to this document
+and requires, at minimum: point-in-time restore shipped, verification
+running on an agent cadence, and years of proven operation.
 
 ## Per-machine configuration
 
@@ -96,7 +121,7 @@ sync_every = "6h"
 
 [volumes.docs]
 path       = "/volume1/docs"
-sync_to    = ["cloudbox", "s3archive"]
+sync_to    = ["cloudbox", "s3archive", "kopia-mirror"]
 sync_every = "6h"
 
 [volumes.media]
