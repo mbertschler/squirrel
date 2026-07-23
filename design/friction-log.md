@@ -257,6 +257,18 @@ the hub)? how fresh is my relayed evidence? what could I offload
 today? The durability answer exists in its own DB (pulled vectors) —
 nothing renders it. Same F17 gap, but sharpest at the edge seat.
 
+**F25 · S1 — one hung transfer starves the whole household schedule.**
+When the S3 endpoint stopped accepting writes (storage full), the
+in-flight `rclone copyto` hung and the nas scheduler — a single
+serial worker — kicked nothing else for minutes: no cloudbox pushes,
+no htpc peer-syncs, no kopia snapshots, across all volumes. There is
+no per-run wall-clock bound, no per-destination isolation, and no
+in-flight surface (the only trace is a `kicked` line with no
+`finished`). In the reference household this means a dark cloud
+destination silently stops *local* NAS→HTPC replication too. Needs:
+per-destination workers (or at least a stall timeout + skip), and the
+TUI showing "in flight since HH:MM" per pair.
+
 **F24 · S3 — trip-return catch-up worked perfectly but invisibly.**
 404 new photos: indexed and pushed to the hub in a single 30 s
 cadence tick (run #124, 1.1 s transfer) — genuinely impressive.
@@ -264,6 +276,37 @@ The only trace is one runs row among dozens of no-ops; nothing
 summarises "you were away, 404 files are now safe on nas, offsite
 copies followed at HH:MM". The moment squirrel earns the most trust
 is rendered indistinguishable from routine noise.
+
+## Checkpoints 6–7 — conflict + scary moments
+
+**F26 · S1 — refused syncs leave no run row, so the audit trail (and
+TUI) never show them.** With the USB disk "unplugged", the scheduled
+docs→usb sync is refused (marker missing) with a perfect *message* —
+but `run_id=0`: the refusal happens before a runs row exists, so the
+permanent record and every squirrel surface show only that the last
+usb success is quietly aging. A month-dead backup disk produces zero
+red anywhere except agent stderr. Same for the CLI (`status= … run=0`
+noted in F11). Preflight refusals must still mint a failed/refused
+run row — the audit trail is the trust contract (principle 5).
+
+**F27 · S1 — divergent edits ping-pong forever, silently.** The same
+doc edited on laptop and homepc between cadences: each side's
+scheduled push re-asserts its version in turn; every 30 s tick mints
+another `.squirrel-conflicts/run-N/` copy on the nas (run-393, 396,
+398, … observed growing), the live file flip-flops between versions,
+and *no human is ever told* — the edge agents' logs carry no conflict
+signal at all (SyncRunReport has no conflict field), the receiver's
+CONFLICTS column is visible only to someone reading the hub's runs
+table, and the losing machine's own TUI shows all-green 0-file
+syncs while its local file silently differs from the household
+master. Nothing is lost (every round preserves both versions — the
+no-loss principle held), but convergence never happens and the
+conflict store grows unboundedly. Needs: conflict propagation back to
+both initiators (runs rows + TUI badge on *their* machines), a "this
+path is contested" state that stops the ping-pong (e.g. don't
+re-supersede a path whose live row lost a conflict since your last
+delivery without operator action), and a `squirrel conflicts`
+question-command to list unresolved ones.
 
 **Positive observations worth keeping:** the scheduler's
 kicked/finished/error log discipline is excellent; runs correlate
