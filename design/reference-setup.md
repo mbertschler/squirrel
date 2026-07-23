@@ -1,0 +1,292 @@
+# The reference setup
+
+The canonical household all UX work is anchored on. It is deliberately
+expansive: five machines, three volumes, and every supported target
+type in play — four peer nodes, `local`, `sftp`, `s3`, and `kopia`
+destinations, mirrored and packed layouts, crypt, offload with relayed
+evidence. If the UX works here, the two-machine starter setup falls out
+for free.
+
+## Machines
+
+| Machine | Role | Storage | Squirrel role |
+|---|---|---|---|
+| **nas** | Synology/QNAP, always on, runs squirrel in a container | 8 TB | **Hub node.** Master copy of everything; receives peer-syncs; the only machine that talks to the offsites; runs the drift scans |
+| **laptop** | Daily driver, roaming, often asleep or away | 512 GB | Edge node. Originates photos and docs; pushes to nas; offloads old photo years to reclaim space |
+| **homepc** | Desktop at home, GUI, regularly on | 2 TB | Edge node. Originates photos and docs; pushes to nas; also mirrors to a USB disk (`local` destination) |
+| **htpc** | Home theater PC on the TV, no GUI, always at home | 1 TB | Edge node, receive-only. Holds the media + photos it plays back; nas pushes to it; offloads what it no longer needs locally |
+| **cloudbox** | Rented storage box: **pure SFTP access, cannot run programs** (Hetzner-Storage-Box-like) | 5 TB | `sftp` **destination** only — no agent, no index. Encrypted, browsable mirror |
+| *(bucket)* **s3archive** | S3 bucket on an archive-ish tier | ∞ | `s3` **destination**, packed + crypt: the cold, cheap, append-only copy |
+
+The Synology-vs-QNAP question dissolves at this level: both run the
+agent as a container with the volumes bind-mounted; every difference
+(package manager, mount paths, port exposure) sits below squirrel.
+What *does* matter is the fork the table encodes: the cloudbox cannot
+run programs, so it is a dumb **destination**; the NAS can, so it is a
+**node** — and since most bytes live there, it is the hub.
+
+## Topology
+
+```
+ laptop ──peer-sync──▶ ┌─────┐ ──rclone──▶ cloudbox  (sftp, crypt, mirror)
+ homepc ──peer-sync──▶ │ nas │ ──rclone──▶ s3archive (s3, crypt, packed)
+                       │     │ ──kopia───▶ kopia-mirror (2nd NAS volume)
+ htpc  ◀──peer-sync──  └─────┘
+   ▲                      │
+   └──── durability evidence flows back out to the edges ────┘
+
+ homepc ──rclone──▶ usb (local destination, .squirrel-volume marker)
+```
+
+Initiation direction follows availability: the intermittently-awake
+machines (laptop, homepc) initiate toward the always-on nas; the nas
+initiates toward the always-on htpc. A sleeping laptop can't be dialed,
+so nothing ever tries.
+
+## Volumes and flows
+
+| Volume | Lives on | Flow | Offload |
+|---|---|---|---|
+| **photos** | laptop, homepc, htpc, nas (master) | laptop/homepc → nas → cloudbox + s3archive + kopia-mirror; nas → htpc for TV slideshows | laptop offloads old years once nas + both offsites hold them |
+| **docs** | laptop, homepc, nas (master) | laptop/homepc → nas → cloudbox + s3archive; homepc also → usb | never — small enough to keep everywhere |
+| **media** | nas (master), htpc | nas → htpc; nas → cloudbox | htpc offloads watched items once nas + cloudbox hold them |
+
+The offload story is the crown jewel and the reason this topology is
+worth its complexity: the laptop never talks to cloudbox or s3archive,
+yet its offload gate requires them. The evidence arrives relayed —
+nas pushes, records durability vectors, and the laptop pulls them over
+the peer API. Content origin coordinates survive the hop (the laptop's
+photos stay attributed to `(laptop, run)` even when nas forwards them),
+which is exactly what the version-vector gate needs.
+
+## Per-machine configuration
+
+Realistic sketches with real keys — these seed the testbed configs.
+Secrets are `{ env = "…" }` throughout.
+
+### nas — the hub
+
+```toml
+db        = "/volume1/squirrel/index.db"
+node_name = "nas"
+
+[agent]
+listen        = "0.0.0.0:8443"
+scan_interval = "168h"        # weekly drift scan over all volumes
+scan_strategy = "shallow"
+[agent.tls]
+cert = "/volume1/squirrel/agent.crt"   # self-signed; peers pin the fingerprint
+key  = "/volume1/squirrel/agent.key"
+[agent.auth]
+token = { env = "SQUIRREL_AGENT_TOKEN" }
+[agent.auth.peers.laptop]
+bearer = { env = "SQUIRREL_PEER_LAPTOP" }
+[agent.auth.peers.homepc]
+bearer = { env = "SQUIRREL_PEER_HOMEPC" }
+
+[volumes.photos]
+path       = "/volume1/photos"
+sync_to    = ["cloudbox", "s3archive", "kopia-mirror", "htpc"]
+sync_every = "6h"
+
+[volumes.docs]
+path       = "/volume1/docs"
+sync_to    = ["cloudbox", "s3archive"]
+sync_every = "6h"
+
+[volumes.media]
+path       = "/volume1/media"
+sync_to    = ["cloudbox", "htpc"]
+sync_every = "24h"
+
+[destinations.cloudbox]
+type             = "sftp"
+host             = "u123456.your-storagebox.example"
+user             = "u123456"
+password         = { env = "CLOUDBOX_PASSWORD" }
+root             = "/squirrel"
+known_hosts_file = "/volume1/squirrel/known_hosts"
+[destinations.cloudbox.crypt]
+password  = { env = "CLOUDBOX_CRYPT_PASSWORD" }
+password2 = { env = "CLOUDBOX_CRYPT_SALT" }
+
+[destinations.s3archive]
+type              = "s3"
+provider          = "AWS"
+region            = "eu-central-1"
+access_key_id     = { env = "AWS_ACCESS_KEY_ID" }
+secret_access_key = { env = "AWS_SECRET_ACCESS_KEY" }
+bucket            = "household-squirrel-archive"
+root              = "/"
+layout            = "packed"          # exercises objects/ + packs/ + maps
+pack_threshold    = "1MiB"
+pack_size         = "512MiB"
+storage_class     = "GLACIER_IR"
+[destinations.s3archive.crypt]
+password  = { env = "S3_CRYPT_PASSWORD" }
+password2 = { env = "S3_CRYPT_SALT" }
+
+[destinations.kopia-mirror]
+type     = "kopia"
+root     = "/volume2/kopia-repo"      # second disk group: independent format
+password = { env = "KOPIA_REPO_PASSWORD" }
+
+[nodes.htpc]
+endpoint = "https://htpc.home:8443"
+path     = "/mnt/htpc-export"         # htpc's data dir, NFS-mounted on the nas
+[nodes.htpc.auth]
+bearer = { env = "SQUIRREL_PEER_HTPC" }
+[nodes.htpc.tls]
+cert_fingerprint = "sha256:…"
+```
+
+### laptop — roaming edge
+
+```toml
+db        = "~/.squirrel/index.db"
+node_name = "laptop"
+
+[agent]
+listen = "127.0.0.1:8443"   # never receives; agent runs only for the cadences
+[agent.auth]
+token = { env = "SQUIRREL_AGENT_TOKEN" }
+
+[volumes.photos]
+path                     = "~/Pictures"
+sync_to                  = ["nas"]
+sync_every               = "1h"
+offload_requires         = ["nas", "cloudbox", "s3archive"]
+offload_max_evidence_age = "720h"
+
+[volumes.docs]
+path       = "~/Documents"
+sync_to    = ["nas"]
+sync_every = "1h"
+
+[nodes.nas]
+endpoint = "https://nas.home:8443"
+path     = "/Volumes/squirrel"        # the nas volume share, SMB-mounted
+[nodes.nas.auth]
+bearer = { env = "SQUIRREL_PEER_LAPTOP" }
+[nodes.nas.tls]
+cert_fingerprint = "sha256:…"
+```
+
+### homepc — edge with a USB mirror
+
+As laptop (`node_name = "homepc"`, same two volumes → nas, hourly),
+plus:
+
+```toml
+[volumes.docs]
+path    = "~/Documents"
+sync_to = ["nas", "usb"]
+
+[destinations.usb]
+type = "local"
+root = "/media/usb-backup"            # .squirrel-volume marker guards this
+```
+
+### htpc — receive-only edge
+
+```toml
+db        = "/var/lib/squirrel/index.db"
+node_name = "htpc"
+
+[agent]
+listen = "0.0.0.0:8443"               # receives nas's pushes
+[agent.tls]
+cert = "/var/lib/squirrel/agent.crt"
+key  = "/var/lib/squirrel/agent.key"
+[agent.auth]
+token = { env = "SQUIRREL_AGENT_TOKEN" }
+[agent.auth.peers.nas]
+bearer = { env = "SQUIRREL_PEER_NAS" }
+
+[volumes.media]
+path                     = "/data/media"
+offload_requires         = ["nas", "cloudbox"]
+offload_max_evidence_age = "720h"
+
+[volumes.photos]
+path = "/data/photos"
+
+[nodes.nas]                            # not in any sync_to: exists so the
+endpoint = "https://nas.home:8443"     # htpc can *pull durability* from nas
+path     = "/mnt/nas-export"
+[nodes.nas.auth]
+bearer = { env = "SQUIRREL_PEER_HTPC" }
+[nodes.nas.tls]
+cert_fingerprint = "sha256:…"
+```
+
+## Steady state: what runs untyped
+
+Per [ux-principles](ux-principles.md#1-set-up-once-then-trust), after
+bootstrap the household should run itself. Today's coverage:
+
+| Loop | Automated today? |
+|---|---|
+| Index + sync on cadence (`sync_every`/`index_every`) | ✅ agent scheduler |
+| Drift detection (`scan_interval`) | ✅ agent, hub |
+| Index snapshots local + ride-along | ✅ on every successful sync |
+| Durability pull after node sync | ✅ initiator side only |
+| Offsite fingerprint re-check (`squirrel verify`) | ❌ manual only |
+| Durability refresh on a *receive-only* node (htpc) | ❌ never fires — htpc initiates no syncs, so its gate evidence only moves when someone types `peer-sync pull-durability` |
+| Offload | ❌ manual by design; the *readiness signal* should still be automatic |
+
+The two ❌-gaps that break the trust principle (verify cadence,
+receiver-side evidence refresh) are prime candidates from the first
+friction pass; the offload row needs a design decision, not just code.
+
+## Lifecycle checkpoints
+
+The moments the testbed walk has to cover, in rough story order:
+
+1. **Bootstrap day** — five configs written by hand; tokens generated
+   and distributed; TLS certs created and fingerprints pinned; SMB/NFS
+   byte-paths mounted; `sync --init` per fresh destination. How many
+   steps, how many chances to get one silently wrong?
+2. **First full push** — terabytes to two offsites over home upload
+   bandwidth: interruptions, resume, progress visibility over days.
+3. **Steady state** — a week of untyped operation; does the TUI answer
+   "am I safe?" on each machine ([principle 3](ux-principles.md#3-the-tui-must-answer-am-i-safe-in-one-glance))?
+4. **Return from a trip** — laptop reappears after three weeks with
+   2 000 new photos; catch-up sync, evidence staleness
+   (`offload_max_evidence_age`) recovery.
+5. **Offload day** — laptop is full; old photo years go. Gate refusals
+   must be legible; the relayed-evidence path must be visible, not
+   mystical.
+6. **Conflict** — the same document edited on laptop and homepc between
+   syncs; `.squirrel-conflicts/` must be discoverable and resolvable.
+7. **Scary moments** — a verify mismatch on s3archive; cloudbox dark
+   for a month (evidence ages out, offloads freeze — correctly, but
+   how does the operator find out *why*?); the USB disk left unplugged
+   (marker refusal).
+8. **Restore day** — the laptop dies; new laptop, restore docs + photos
+   from nas. Separately: the nas dies; restore a volume *and its
+   index* from cloudbox using the ride-along snapshot.
+
+## Deliberate scope cuts
+
+- **b2 / gcs** — same rclone-bucket interaction shape as s3; nothing
+  new for the UX seat.
+- **NAS vendor packaging** — container setup is below squirrel; we
+  assume "can run a Docker container".
+- **Desktop app** — explicitly later; nothing here may depend on it.
+
+## Open questions surfaced while writing this
+
+- A cadence-only machine (laptop) must run the full agent HTTP server
+  just to get its scheduler, and `[agent] listen` is required. A
+  listener that exists only to be unused is config noise at best.
+- The node byte-path (`[nodes.X] path`) quietly assumes an out-of-band
+  transport (SMB/NFS mount, or an rclone `remote:` prefix) that
+  squirrel neither validates at load time nor helps set up — likely
+  the roughest edge of bootstrap day.
+- `[nodes.nas]` on the htpc exists purely for durability pulls — a
+  node entry with a mandatory `path` that no bytes ever traverse.
+- Token topology (one shared agent token vs `auth.peers.*`), cert
+  generation, and fingerprint pinning are all manual today; bootstrap
+  friction will tell us how much of this wants tooling
+  (`squirrel node add`?).
