@@ -20,6 +20,24 @@ and operator-driven.
 Any new feature (sync, prune, dedup, GC) must preserve both: no deleting or
 overwriting history without an explicit, opt-in retention policy.
 
+# Product vision & design direction
+
+The durable product vision lives in `design/` — read it before
+designing any feature or changing user-facing behaviour:
+
+- `design/ux-principles.md` — "set up once, then trust": the agent owns
+  routine operation; every CLI command is either a *change* or a
+  *question*, never a routine chore; the TUI answers "am I safe?" in
+  one glance; failure paths are first-class UX; automation never skips
+  the audit trail.
+- `design/reference-setup.md` — the canonical five-machine household
+  every feature must make sense in. Sanity-check new behaviour against
+  it: which machine's seat does it improve, and what does it look like
+  from the others (the hub NAS, a roaming laptop, a receive-only HTPC)?
+
+A change that conflicts with these documents must amend the document in
+the same PR, deliberately — never silently diverge from it.
+
 # Schema & migrations
 
 Real databases migrate through the forward-only Go registry in

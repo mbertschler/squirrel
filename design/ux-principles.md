@@ -18,7 +18,8 @@ typing anything. A correctly configured household should be able to go
 months without running a single squirrel command — and lose nothing.
 
 The corollary: **any routine action that must be typed by hand is a
-design bug.** Today's known gaps against this principle:
+design bug.** Known gaps against this principle (a living list — remove
+entries as they close, add new ones as they're found):
 
 - `squirrel verify` (offsite fingerprint re-check) has no agent cadence;
   it only runs when typed. Bitrot checking that depends on someone

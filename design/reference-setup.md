@@ -1,11 +1,16 @@
 # The reference setup
 
-The canonical household all UX work is anchored on. It is deliberately
+The canonical household squirrel is designed for. It is deliberately
 expansive: five machines, three volumes, and every supported target
 type in play — four peer nodes, `local`, `sftp`, `s3`, and `kopia`
 destinations, mirrored and packed layouts, crypt, offload with relayed
 evidence. If the UX works here, the two-machine starter setup falls out
 for free.
+
+This is the yardstick for feature design, not just for the current UX
+push: when proposing any change, place it in this household first —
+which machine runs it, what it looks like from the other seats, and
+what happens to it at each lifecycle checkpoint below.
 
 ## Machines
 
