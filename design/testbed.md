@@ -25,15 +25,17 @@ what the failure looks like to the surviving side.
 ## Binaries via mise
 
 The repo already pins rclone through `mise.toml`. The other two
-testbed binaries install the same way — mise's `ubi` backend pulls
-static binaries straight from GitHub releases, no plugins:
+testbed binaries install the same way, straight from GitHub releases,
+no plugins. Prefer a registry shorthand where one exists (kopia is in
+the mise registry); otherwise use the built-in `github` backend — its
+predecessor `ubi` is deprecated and rejected for new registry entries:
 
 ```toml
 [tools]
 rclone        = "1.74.1"
 golangci-lint = "2.12.2"
-"ubi:seaweedfs/seaweedfs" = { version = "3.80", exe = "weed" }
-"ubi:kopia/kopia"         = "0.21.1"
+"github:seaweedfs/seaweedfs" = { version = "3.80", exe = "weed" }
+kopia                        = "latest"   # registry shorthand
 ```
 
 (Exact pins to be finalized when the testbed lands; CI keeps using the
