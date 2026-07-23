@@ -30,3 +30,6 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Local testbed runtime (design/testbed.md) — configs, dbs, generated data
+.testbed/
