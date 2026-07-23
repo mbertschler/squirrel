@@ -265,8 +265,13 @@ no htpc peer-syncs, no kopia snapshots, across all volumes. There is
 no per-run wall-clock bound, no per-destination isolation, and no
 in-flight surface (the only trace is a `kicked` line with no
 `finished`). In the reference household this means a dark cloud
-destination silently stops *local* NAS→HTPC replication too. Needs:
-per-destination workers (or at least a stall timeout + skip), and the
+destination silently stops *local* NAS→HTPC replication too. Later
+the same night the S3 endpoint died completely for ~9 minutes
+(testbed accident, kept as data): transfers hung indefinitely — no
+rclone timeout fired, no run failed, no surface showed anything wrong
+— and unfreezing required an operator killing the rclone process by
+hand. Needs: per-destination workers (or at least a stall timeout +
+skip), rclone invocations bounded by --contimeout/--timeout, and the
 TUI showing "in flight since HH:MM" per pair.
 
 **F24 · S3 — trip-return catch-up worked perfectly but invisibly.**
