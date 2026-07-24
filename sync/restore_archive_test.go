@@ -168,6 +168,90 @@ func TestArchiveRestoreVerifyOnExtract(t *testing.T) {
 	}
 }
 
+// TestPackedRestoreVerifyOnExtractMember corrupts a single member's bytes
+// inside a pack — leaving the tar framing and every other member intact — and
+// confirms the pack-extraction hash check refuses only that content: its
+// target file is never written, while the pack's other members still restore
+// correctly. This is the pack-side counterpart of
+// TestArchiveRestoreVerifyOnExtract (which covers the standalone-object path),
+// exercising the readMember/extractMembers verify-before-write branch and the
+// mid-stream continue that lets later members survive a failed one.
+func TestPackedRestoreVerifyOnExtractMember(t *testing.T) {
+	f := setupPackedFixture(t, "16B")
+	files := map[string]string{
+		"s1.txt": "one",   // < threshold -> pack
+		"s2.txt": "two",   // < threshold -> pack (the member we corrupt)
+		"s3.txt": "three", // < threshold -> pack
+	}
+	for name, content := range files {
+		f.write(t, name, content)
+	}
+	f.index(t)
+	rep, err := f.sync(t)
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	// All three tiny files must share one pack, so this genuinely tests
+	// "other members in the same pack still restore" rather than trivially
+	// separate packs.
+	place := map[string]PlacementEntry{}
+	for _, p := range f.readPlacementMap(t, rep.RunID) {
+		place[p.Blake3] = p
+	}
+	corrupt := place[blake3Hex("two")]
+	if corrupt.Pack == "" {
+		t.Fatalf("no placement entry for the corrupted content")
+	}
+	for _, c := range []string{"one", "three"} {
+		if place[blake3Hex(c)].Pack != corrupt.Pack {
+			t.Fatalf("expected %q to share the corrupted pack %s; got %+v", c, corrupt.Pack, place[blake3Hex(c)])
+		}
+	}
+
+	// Flip the "two" member's bytes in the uncompressed tar (same length, so
+	// every other member's offset is unchanged), then recompress and write the
+	// pack back. The pack key no longer matches the tampered bytes, but restore
+	// verifies per member, not per pack — so only s2.txt's re-hash must fail.
+	packPath := f.remoteBlob(PacksDirName, corrupt.Pack)
+	packBytes, err := os.ReadFile(packPath)
+	if err != nil {
+		t.Fatalf("read pack: %v", err)
+	}
+	tarBytes := decompress(t, packBytes)
+	if corrupt.Offset+corrupt.Length > int64(len(tarBytes)) {
+		t.Fatalf("placement offset/length exceed the decompressed tar")
+	}
+	for i := corrupt.Offset; i < corrupt.Offset+corrupt.Length; i++ {
+		tarBytes[i] ^= 0xff
+	}
+	if err := os.WriteFile(packPath, compress(t, tarBytes), 0o644); err != nil {
+		t.Fatalf("rewrite tampered pack: %v", err)
+	}
+
+	target := t.TempDir()
+	rrep, rerr := f.restore(t, RestoreOptions{ToPath: target})
+	if rerr == nil {
+		t.Fatalf("expected a pack-member verification failure, got nil (rep=%+v)", rrep)
+	}
+	if rrep.Status != store.RunStatusPartial || rrep.RcloneResult.Errors != 1 {
+		t.Fatalf("rep = status=%q errors=%d, want partial/1", rrep.Status, rrep.RcloneResult.Errors)
+	}
+	// The corrupt member's bytes never reach the target...
+	if _, statErr := os.Stat(filepath.Join(target, "s2.txt")); statErr == nil {
+		t.Fatalf("corrupt pack member was written to the target despite the hash mismatch")
+	}
+	// ...while the pack's other members restore correctly.
+	if rrep.RcloneResult.Transferred != 2 {
+		t.Fatalf("transferred = %d, want 2 (the uncorrupted members)", rrep.RcloneResult.Transferred)
+	}
+	for _, name := range []string{"s1.txt", "s3.txt"} {
+		if got := mustReadRestored(t, target, name); got != files[name] {
+			t.Fatalf("restored %s = %q, want %q", name, got, files[name])
+		}
+	}
+}
+
 // TestArchiveRestoreDedup confirms one fetch serves every path that
 // references the same content, and all of them are written.
 func TestArchiveRestoreDedup(t *testing.T) {
