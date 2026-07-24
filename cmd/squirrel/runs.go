@@ -95,11 +95,18 @@ func printActiveAlarms(w io.Writer, alarms []store.DestinationAlarm) {
 	}
 }
 
-// gatherRuns resolves the optional volume filter, fetches runs, derives
-// conflict counts, and applies the --failed/--changes predicates. When a
-// predicate is active the fetch is unbounded (opts.Limit=0) so the SQL
-// LIMIT can't cap before the predicate runs and silently drop matches; the
-// result is truncated to limit after filtering instead.
+// gatherRuns resolves the optional volume filter, fetches runs, applies the
+// --failed/--changes predicates, and returns the rows to display plus the
+// conflict counts for their CONFLICTS column. When a predicate is active the
+// fetch is unbounded (opts.Limit=0) so the SQL LIMIT can't cap before the
+// predicate runs and silently drop matches; the result is truncated to limit
+// after filtering instead.
+//
+// Conflict counts are loaded only where they are actually needed, never
+// across the whole unbounded fetch: --failed needs none for filtering, and
+// the CONFLICTS column only covers the displayed rows. This keeps the id set
+// handed to the count query small (and the query itself batches ids), so a
+// large peer-sync history can't overflow SQLite's bound-parameter cap.
 func gatherRuns(cmd *cobra.Command, s *store.Store, volumeName string, limit int, onlyFailed, onlyChanges bool) ([]store.Run, map[int64]int, error) {
 	filtering := onlyFailed || onlyChanges
 	opts := store.ListRunsOpts{Limit: limit, Descending: true}
@@ -120,17 +127,40 @@ func gatherRuns(cmd *cobra.Command, s *store.Store, volumeName string, limit int
 	if err != nil {
 		return nil, nil, err
 	}
-	conflicts, err := loadConflictCounts(cmd, s, runs)
-	if err != nil {
-		return nil, nil, err
-	}
 	if filtering {
-		runs = filterRuns(runs, conflicts, onlyFailed, onlyChanges)
+		filterConflicts, err := conflictCountsForFilter(cmd, s, runs, onlyFailed)
+		if err != nil {
+			return nil, nil, err
+		}
+		runs = filterRuns(runs, filterConflicts, onlyFailed, onlyChanges)
 		if limit > 0 && len(runs) > limit {
 			runs = runs[:limit]
 		}
 	}
+	// Load the CONFLICTS-column counts for exactly the displayed rows.
+	conflicts, err := loadConflictCounts(cmd, s, runs)
+	if err != nil {
+		return nil, nil, err
+	}
 	return runs, conflicts, nil
+}
+
+// conflictCountsForFilter loads only the conflict counts the active filter
+// needs. --failed consults none — an attention-worthy run is unconditionally
+// kept — so it returns an empty map. --changes needs them only for the
+// ambiguous rows (a clean success that touched no files), so it counts just
+// those rather than the whole unbounded fetch.
+func conflictCountsForFilter(cmd *cobra.Command, s *store.Store, runs []store.Run, onlyFailed bool) (map[int64]int, error) {
+	if onlyFailed {
+		return map[int64]int{}, nil
+	}
+	var candidates []store.Run
+	for _, r := range runs {
+		if r.Status == store.RunStatusSuccess && r.FileCount == 0 {
+			candidates = append(candidates, r)
+		}
+	}
+	return loadConflictCounts(cmd, s, candidates)
 }
 
 // filterRuns applies the --failed / --changes predicates in one pass,
