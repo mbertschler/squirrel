@@ -286,6 +286,54 @@ offload_requires = ["nas", "nas"]
 	}
 }
 
+// TestLoadRejectsCryptMirrorOffloadRequires: naming a locally-configured
+// crypt mirror in offload_requires is unsatisfiable by construction (the
+// crypt overlay hides the content hash, so the push is never content-verified
+// and the mirror layout keeps no fingerprint to upgrade). Config load rejects
+// it fail-early rather than leaving a gate that waits forever (F21), and the
+// message points at the layouts that do produce evidence.
+func TestLoadRejectsCryptMirrorOffloadRequires(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.cloudbox]
+type = "sftp"
+host = "host.example"
+user = "u"
+root = "/data"
+password = "transport-pw"
+
+[destinations.cloudbox.crypt]
+password = "obscured-pw"
+
+[volumes.pictures]
+path = "/tmp/pictures"
+sync_to = ["cloudbox"]
+offload_requires = ["cloudbox"]
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "can never satisfy the durability gate") {
+		t.Fatalf("expected crypt-mirror offload_requires rejection, got %v", err)
+	}
+}
+
+// TestLoadAcceptsPlainMirrorOffloadRequires: a plain (non-crypt) mirror is
+// now an evidence-producing target — a BLAKE3-verified sync advances its
+// durability vector — so naming one in offload_requires must load cleanly.
+func TestLoadAcceptsPlainMirrorOffloadRequires(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.usb]
+type = "local"
+root = "/media/usb"
+
+[volumes.docs]
+path = "/tmp/docs"
+sync_to = ["usb"]
+offload_requires = ["usb"]
+`)
+	if _, err := Load(p); err != nil {
+		t.Fatalf("Load with plain-mirror offload_requires: %v", err)
+	}
+}
+
 // TestLoadOffloadMaxEvidenceAge: the optional staleness knob parses as a
 // duration; absent it defaults to zero (the time-based policy disabled).
 func TestLoadOffloadMaxEvidenceAge(t *testing.T) {
