@@ -12,9 +12,26 @@ The same principle extends to sync: overwrites at the destination are preserved 
 
 ## Install
 
+### Prebuilt binary (no Go toolchain)
+
+Each `vX.Y.Z` tag publishes cross-platform binaries on the [releases page](https://github.com/mbertschler/squirrel/releases). Download the archive for your OS/arch, verify it against `checksums.txt`, extract, and put `squirrel` on your `PATH`:
+
+```
+# Linux/macOS — adjust VERSION/OS/ARCH to the asset you downloaded:
+tar -xzf squirrel_<VERSION>_<OS>_<ARCH>.tar.gz
+sudo mv squirrel /usr/local/bin/
+squirrel version
+```
+
+`squirrel version` (and the agent's `GET /v1/health`) reports the exact release you installed, so you can pin or roll back to a known build.
+
+### From source (Go toolchain)
+
 ```
 go install github.com/mbertschler/squirrel/cmd/squirrel@latest
 ```
+
+A source build reports its version as `0.0.0-dev` — the version is only stamped into the released binaries at build time.
 
 You will also need [rclone](https://rclone.org) ≥ 1.66 on `PATH` for `sync` and `restore` to work (BLAKE3 hash support landed in rclone 1.66):
 

@@ -1,0 +1,67 @@
+# GoReleaser config for squirrel. A pushed `vX.Y.Z` tag drives
+# .github/workflows/release.yml, which runs `goreleaser release` to build
+# the CLI for the common platforms and publish the binaries (plus
+# checksums) as GitHub Release assets.
+#
+# Only ./cmd/squirrel is released here. cmd/squirrel-desktop is a Wails
+# app that needs CGO and native WebKitGTK, so it is deliberately out of
+# scope for the cross-platform binary release.
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: squirrel
+    main: ./cmd/squirrel
+    binary: squirrel
+    # modernc.org/sqlite is pure Go, so the CLI cross-compiles without a
+    # C toolchain. Keeping CGO off is what lets one runner emit every
+    # target below.
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    # Inject build metadata into package main (see cmd/squirrel/version.go).
+    # -s -w strips the symbol table / DWARF to keep the binaries small.
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .Commit }}
+      - -X main.date={{ .Date }}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: squirrel
+    formats: [tar.gz]
+    # Windows users expect a zip.
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+
+release:
+  draft: false
+  # A tag like v1.2.3-rc.1 publishes as a GitHub pre-release automatically.
+  prerelease: auto
