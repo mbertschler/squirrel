@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
@@ -85,13 +86,19 @@ func TestGatherRelayedCapabilitiesFiltersToTargets(t *testing.T) {
 
 // TestGatherRelayedCapabilitiesUnreachablePeerIsSoft: an unreachable peer
 // yields a soft advisory and no capability, never a hard error — the caller
-// falls back to the per-file gate.
+// falls back to the per-file gate. The unreachable endpoint is a freshly
+// started httptest server closed immediately: its address is guaranteed to
+// be non-serving and OS-assigned, which is portable (unlike hardcoding a
+// port that could happen to be in use).
 func TestGatherRelayedCapabilitiesUnreachablePeerIsSoft(t *testing.T) {
-	dead := &config.Node{
-		Name:     "nas",
-		Endpoint: mustURL(t, "http://127.0.0.1:1"), // nothing listening
-		Token:    "test-token",
+	ts := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	endpoint, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatalf("parse test URL: %v", err)
 	}
+	ts.Close() // nothing listens on endpoint now
+
+	dead := &config.Node{Name: "nas", Endpoint: endpoint, Token: "test-token"}
 	caps, softErrs := GatherRelayedCapabilities(context.Background(), "pics",
 		[]*config.Node{dead}, map[string]struct{}{"cloudbox": {}})
 	if len(caps) != 0 {
@@ -100,13 +107,4 @@ func TestGatherRelayedCapabilitiesUnreachablePeerIsSoft(t *testing.T) {
 	if len(softErrs) != 1 {
 		t.Fatalf("softErrs = %v, want exactly one advisory", softErrs)
 	}
-}
-
-func mustURL(t *testing.T, raw string) *url.URL {
-	t.Helper()
-	u, err := url.Parse(raw)
-	if err != nil {
-		t.Fatalf("parse %q: %v", raw, err)
-	}
-	return u
 }
