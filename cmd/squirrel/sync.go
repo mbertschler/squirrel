@@ -193,7 +193,7 @@ func printSyncReport(w io.Writer, rep sync.Report, runErr error) {
 		// object side rode the objects=/bytes= counters above. Only a
 		// packed dry-run sets SizeBand, so this line is preview-only.
 		if p := rep.PackPreview; p.SizeBand > 0 {
-			fmt.Fprintf(w, "  would pack %d content(s), %d uncompressed byte(s), into ~%d pack(s) of up to %d byte(s)\n",
+			fmt.Fprintf(w, "  would pack %d content(s) (%d uncompressed byte(s)) into ~%d pack(s), each targeting %d compressed byte(s)\n",
 				p.Contents, p.Bytes, p.Packs, p.SizeBand)
 		}
 	default:

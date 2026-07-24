@@ -81,14 +81,17 @@ func encodePlacementMap(placements []PlacementEntry) ([]byte, error) {
 //
 // Bytes is the uncompressed member total — the compressed pack size is
 // unknown until a pack is assembled, which a dry-run must not do — and
-// Packs is the resulting upper-bound pack count: the same size-band walk
-// buildOnePack uses, run over uncompressed sizes. Compression only shrinks
-// the output, so a real run never produces more packs than this. SizeBand
+// Packs is an estimate of the resulting pack count from the same size-band
+// walk buildOnePack uses, run over uncompressed sizes. It is an estimate,
+// not a bound, and can be wrong in either direction: compression shrinks
+// the packed output (fewer packs), while the PAX tar headers, block
+// padding, and zstd framing a pack adds over many small members can push
+// the real output past the uncompressed total (more packs). SizeBand
 // echoes the destination's pack_size, the target compressed pack size.
 type PackPreview struct {
 	Contents int64 // members that would be newly packed
 	Bytes    int64 // their total uncompressed bytes
-	Packs    int64 // upper-bound pack count over the uncompressed total
+	Packs    int64 // estimated pack count from the uncompressed size-band walk
 	SizeBand int64 // destination pack_size (target compressed pack size)
 }
 
@@ -189,7 +192,7 @@ func (h *packedHandler) previewDryRun(ctx context.Context, rep *Report, volID in
 // selected, without assembling a pack. small is already hash-sorted, so
 // the size-band walk mirrors buildOnePack's — accumulate members until the
 // running total reaches PackSize, then close a pack — but over uncompressed
-// sizes, yielding an upper-bound pack count (see PackPreview).
+// sizes, yielding an estimated (not bounded) pack count (see PackPreview).
 func (h *packedHandler) previewPacks(small []store.PathDelta) PackPreview {
 	p := PackPreview{SizeBand: h.dest.PackSize}
 	for i := 0; i < len(small); {

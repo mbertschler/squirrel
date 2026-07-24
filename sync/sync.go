@@ -121,7 +121,7 @@ type Report struct {
 	Fingerprints int64
 	// PackPreview is populated only by a packed --dry-run push: the
 	// pack-side routing of the preview (content that would be bundled into
-	// packs, the upper-bound pack count, and the pack-size band). The
+	// packs, an estimated pack count, and the pack-size band). The
 	// object side of the preview rides on RcloneResult, as it does for the
 	// content-addressed dry-run. Zero-valued for every other push.
 	PackPreview PackPreview
