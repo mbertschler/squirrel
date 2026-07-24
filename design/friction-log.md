@@ -205,7 +205,7 @@ TUI-side folding of consecutive no-ops would restore the audit trail's
 readability. (The `runs` help text also still says "List index runs";
 it lists every kind.)
 
-**F20 · S2 — recovering a wrecked destination has no supported path.**
+**F20 · S2 — ~~recovering a wrecked destination has no supported path.~~ (`squirrel destination reset` + empty-root guard, #176)**
 After the F12 bug era the packed-layout guard refused every further
 s3archive sync ("its history is not packed … point the layout at a
 fresh destination or root"). But the guard keys on the pair's *run
@@ -337,7 +337,7 @@ content-verified method and relay that — the schema already carries
 
 ## Checkpoint 8 — restore day
 
-**F28 · S2 — a dead edge machine has no supported restore path.** The
+**F28 · S2 — ~~a dead edge machine has no supported restore path.~~ (reverse-peer-push runbook + restore signpost, #176)** The
 laptop syncs only to the nas (a node), and `restore` refuses nodes
 outright ("restore from node destinations is not supported" — clear,
 at least). The machinery for the recovery *exists* — a reverse peer
