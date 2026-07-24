@@ -403,6 +403,9 @@ func resolveVolume(name string, raw rawVolume, dests map[string]*Destination, no
 	if err := validateOffloadRequires(raw.OffloadRequires); err != nil {
 		return nil, err
 	}
+	if err := rejectUnsatisfiableOffloadRequires(raw.OffloadRequires, dests); err != nil {
+		return nil, err
+	}
 	offloadMaxEvidenceAge, err := parseOffloadMaxEvidenceAge(raw.OffloadMaxEvidenceAge)
 	if err != nil {
 		return nil, err
@@ -474,6 +477,34 @@ func validateOffloadRequires(names []string) error {
 			return fmt.Errorf("offload_requires lists %q more than once", n)
 		}
 		seen[n] = struct{}{}
+	}
+	return nil
+}
+
+// rejectUnsatisfiableOffloadRequires fails config load when offload_requires
+// names a locally-configured destination that can never contribute a
+// durability component the offload gate accepts — the one structural case
+// being a crypt mirror, whose size+mtime comparison is never content-verified
+// and whose layout records no scan-back fingerprint to upgrade
+// (Destination.CanEverGateOffload). offload_requires is a conjunction, so a
+// single such target makes every file undeletable forever: a policy error,
+// not a pending state. Catching it here is fail-early — before, it was found
+// only at the first offload (#121's pre-check) or, for the reference laptop
+// gating on the crypt-mirror cloudbox, never (friction log F21).
+//
+// Only names with a resolved local destination are judged. A name absent from
+// dests is a peer-relayed target this node cannot see as a destination; its
+// evidence can arrive via a durability pull (see Volume.OffloadRequires), so
+// it stays permitted and remains the per-file gate's concern (#145).
+func rejectUnsatisfiableOffloadRequires(names []string, dests map[string]*Destination) error {
+	for _, n := range names {
+		d, ok := dests[n]
+		if !ok {
+			continue
+		}
+		if capable, reason := d.CanEverGateOffload(); !capable {
+			return fmt.Errorf("offload_requires names %q, which can never satisfy the durability gate (%s); require a content-addressed or packed destination, a kopia repository, a plain (non-crypt) mirror synced with BLAKE3 verification, or a peer node instead", n, reason)
+		}
 	}
 	return nil
 }
