@@ -121,9 +121,13 @@ lsjson)
   fi
   ;;
 lsf)
-  # Directory listing for the layout guard's emptiness probe. Resolve the
-  # base directory ignoring any crypt filename suffix — we only need to
-  # know whether any file exists beneath the root — then list recursively.
+  # Directory listing for the layout guard's emptiness probe. An injected
+  # error simulates a not-found (fresh root) or a real failure (auth etc.)
+  # so the guard's fail-closed classification can be tested.
+  if [ -n "$RCLONE_FAKE_LSF_ERROR" ]; then echo "$RCLONE_FAKE_LSF_ERROR" >&2; exit 1; fi
+  # Resolve the base directory ignoring any crypt filename suffix — we only
+  # need to know whether any file exists beneath the root — then list
+  # recursively.
   case "$a1" in
   *:*)
     p="${a1#*:}"
@@ -198,6 +202,7 @@ func setupCAFixture(t *testing.T, destBlock, strip string) *caFixture {
 	t.Setenv("RCLONE_FAKE_HASH_VALUE", "")
 	t.Setenv("RCLONE_FAKE_HASH_PREFIX", "")
 	t.Setenv("RCLONE_FAKE_CRYPT_SUFFIX", "")
+	t.Setenv("RCLONE_FAKE_LSF_ERROR", "")
 
 	root := t.TempDir()
 	volPath := filepath.Join(root, "src")
@@ -650,6 +655,33 @@ func TestContentAddressedWatermarkGuard(t *testing.T) {
 	}
 	if rep.Status != store.RunStatusFailed {
 		t.Fatalf("Status = %q, want failed", rep.Status)
+	}
+}
+
+// TestRemoteRootEmptyClassifiesErrors guards the layout guard's fail-closed
+// contract: only rclone's canonical not-found reads as an empty (fresh)
+// root; any other lsf error must surface so the guard refuses rather than
+// mistaking a broken probe (auth, network) for a wiped destination.
+func TestRemoteRootEmptyClassifiesErrors(t *testing.T) {
+	f := setupContentAddressedFixture(t)
+	ctx := context.Background()
+
+	// A canonical directory-not-found is a fresh root.
+	t.Setenv("RCLONE_FAKE_LSF_ERROR", "2020/01/01 ERROR : directory not found")
+	empty, err := f.rcl.remoteRootEmpty(ctx, "offsite:/data")
+	if err != nil || !empty {
+		t.Fatalf("not-found lsf = (%t, %v), want (true, nil)", empty, err)
+	}
+
+	// An auth/network error must surface so the guard fails closed — never
+	// reported as an empty root just because stdout was empty.
+	t.Setenv("RCLONE_FAKE_LSF_ERROR", "Failed to create file system: 401 Unauthorized")
+	empty, err = f.rcl.remoteRootEmpty(ctx, "offsite:/data")
+	if err == nil {
+		t.Fatalf("auth lsf error swallowed (empty=%t); guard would proceed instead of refusing", empty)
+	}
+	if empty {
+		t.Fatalf("auth lsf error reported empty root; must be false")
 	}
 }
 

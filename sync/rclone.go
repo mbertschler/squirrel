@@ -389,24 +389,41 @@ func (r *Rclone) deleteFile(ctx context.Context, fileURI string) error {
 }
 
 // remoteRootEmpty reports whether rootURI holds no files, listing it
-// recursively via `rclone lsf -R --files-only`. A missing root (rclone
-// exits non-zero with empty output, as when the directory was never
-// created) counts as empty, mirroring listSnapshots' treatment of an
-// absent snapshot directory. The layout guards use it to recognise a
-// wiped or repointed destination — including one whose recorded state was
-// cleared by `squirrel destination reset` — as a fresh start rather than
-// a layout conflict. A genuine listing error (non-empty stderr, empty
-// stdout) surfaces so the caller can stay fail-closed and refuse.
+// recursively via `rclone lsf -R --files-only`. Only rclone's canonical
+// "directory not found" (a root that was never created) — accepting the
+// "object not found" phrasing too — counts as an empty/fresh root. Every
+// other error (auth, network, permission) surfaces so the layout guards
+// stay fail-closed and refuse rather than mistaking a broken probe for a
+// wiped destination: runPlain carries stderr only in the returned error,
+// not in stdout, so an empty stdout alone must never be read as "empty".
+// The guards use the empty result to recognise a wiped or repointed
+// destination — including one whose recorded state was cleared by
+// `squirrel destination reset` — as a fresh start rather than a layout
+// conflict.
 func (r *Rclone) remoteRootEmpty(ctx context.Context, rootURI string, extraArgs ...string) (bool, error) {
 	args := append([]string{"lsf", "-R", "--files-only"}, extraArgs...)
 	out, err := r.runPlain(ctx, append(args, rootURI)...)
 	if err != nil {
-		if len(bytes.TrimSpace(out)) == 0 {
+		if isRemoteNotFound(err) {
 			return true, nil
 		}
 		return false, err
 	}
 	return len(bytes.TrimSpace(out)) == 0, nil
+}
+
+// isRemoteNotFound reports whether err is rclone's canonical
+// "directory not found" (or "object not found") — the only listing failure
+// the layout guard reads as an empty, fresh root. Any other error must
+// surface so the guard fails closed. #150's isNotFoundErr is not on this
+// branch, so the canonical-phrase check lives here; runPlain formats
+// rclone's stderr into the error string, so matching err.Error() catches it.
+func isRemoteNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "directory not found") || strings.Contains(msg, "object not found")
 }
 
 // statRemote returns the size of the single object at uri via
