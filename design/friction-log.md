@@ -389,6 +389,37 @@ deletion propagation, no re-transfer); the trip-return catch-up moved
 every failure injected tonight — nothing was ever lost, including
 both sides of every conflict round.
 
+## Standing automation gaps
+
+Identified while writing the design docs, confirmed by the walk;
+recorded here so the friction catalogue has exactly one home.
+
+**F32 · S2 — `squirrel verify` has no agent cadence.** Offsite
+fingerprint re-checking only happens when typed. Bitrot detection
+that depends on someone remembering it violates set-up-once-then-
+trust; the agent needs a `verify_every`-style cadence with results in
+the runs table like every other loop.
+
+**F33 · S2 — pulled durability evidence only refreshes as a side
+effect of initiating a sync.** The automatic pull rides on successful
+node syncs, so a receive-only node (htpc) never refreshes at all, and
+any node stops refreshing when nothing changes — exactly when
+`offload_max_evidence_age` starts counting against it. Evidence
+freshness needs its own cadence, not a piggyback.
+
+**F34 · S3 — the node byte-path is an unvalidated, undocumented
+out-of-band contract.** `[nodes.X] path` silently assumes an SMB/NFS
+mount or rclone-style prefix that squirrel neither validates at load
+time nor mentions when it's wrong (bytes just fail to land); the
+htpc even needs a `[nodes.nas]` entry with a mandatory `path` that no
+bytes ever traverse, purely to enable durability pulls.
+
+**F35 · S3 — cadence-only machines must still run the full agent.**
+A machine that never receives (laptop) runs the HTTP listener and
+must configure `[agent] listen` + auth token anyway, because the
+scheduler lives inside the agent. A listener that exists to be unused
+is config noise and attack surface.
+
 ## Summary and priority
 
 The engine is trustworthy; the *seams* between its subsystems and the
@@ -415,8 +446,11 @@ Suggested attack order:
 4. **Answer the two standing questions** (F16, F17, F23): per-
    (volume × destination) coverage grid and a durability/offloadable
    panel — CLI (`squirrel status`) and TUI dashboard both.
-5. **De-friction bootstrap** (F1-F4, F20, F28): cert/token/pairing
-   helpers, config check, destination reset, machine-replacement
-   runbook.
+5. **De-friction bootstrap** (F1-F4, F20, F28, F34, F35): cert/token/
+   pairing helpers, config check, destination reset,
+   machine-replacement runbook.
 6. **Unstall the scheduler** (F25): per-destination isolation +
    transfer timeouts.
+7. **Close the automation loop** (F32, F33): verify on an agent
+   cadence and evidence refresh on its own clock — both prerequisites
+   for trusting offload (theme 1) over time.

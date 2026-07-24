@@ -271,13 +271,9 @@ bootstrap the household should run itself. Today's coverage:
 | Drift detection (`scan_interval`) | ✅ agent, hub |
 | Index snapshots local + ride-along | ✅ on every successful sync |
 | Durability pull after node sync | ✅ initiator side only |
-| Offsite fingerprint re-check (`squirrel verify`) | ❌ manual only |
-| Durability refresh on a *receive-only* node (htpc) | ❌ never fires — htpc initiates no syncs, so its gate evidence only moves when someone types `peer-sync pull-durability` |
-| Offload | ❌ manual by design; the *readiness signal* should still be automatic |
-
-The two ❌-gaps that break the trust principle (verify cadence,
-receiver-side evidence refresh) are prime candidates from the first
-friction pass; the offload row needs a design decision, not just code.
+| Offsite fingerprint re-check (`squirrel verify`) | ❌ manual only ([F32](friction-log.md)) |
+| Durability refresh on a *receive-only* node (htpc) | ❌ never fires ([F33](friction-log.md)) |
+| Offload | ❌ manual by design; the *readiness signal* should still be automatic ([F17](friction-log.md)) |
 
 ## Lifecycle checkpoints
 
@@ -315,18 +311,8 @@ The moments the testbed walk has to cover, in rough story order:
   assume "can run a Docker container".
 - **Desktop app** — explicitly later; nothing here may depend on it.
 
-## Open questions surfaced while writing this
+## Open questions
 
-- A cadence-only machine (laptop) must run the full agent HTTP server
-  just to get its scheduler, and `[agent] listen` is required. A
-  listener that exists only to be unused is config noise at best.
-- The node byte-path (`[nodes.X] path`) quietly assumes an out-of-band
-  transport (SMB/NFS mount, or an rclone `remote:` prefix) that
-  squirrel neither validates at load time nor helps set up — likely
-  the roughest edge of bootstrap day.
-- `[nodes.nas]` on the htpc exists purely for durability pulls — a
-  node entry with a mandatory `path` that no bytes ever traverse.
-- Token topology (one shared agent token vs `auth.peers.*`), cert
-  generation, and fingerprint pinning are all manual today; bootstrap
-  friction will tell us how much of this wants tooling
-  (`squirrel node add`?).
+Friction and open questions are tracked exclusively in
+[`friction-log.md`](friction-log.md) — the items formerly listed here
+became F1, F3, F4, F34, and F35.

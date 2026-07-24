@@ -18,27 +18,11 @@ typing anything. A correctly configured household should be able to go
 months without running a single squirrel command — and lose nothing.
 
 The corollary: **any routine action that must be typed by hand is a
-design bug.** Known gaps against this principle (a living list — remove
-entries as they close, add new ones as they're found; the full,
-evidence-backed catalogue from walking the reference setup lives in
-[`friction-log.md`](friction-log.md)):
-
-- `squirrel verify` (offsite fingerprint re-check) has no agent cadence;
-  it only runs when typed. Bitrot checking that depends on someone
-  remembering it is not trustworthy.
-- Peer durability pulls run automatically only after a successful node
-  sync; a node that stops syncing (nothing changed) also stops
-  refreshing the evidence its offload gate depends on.
-- `offload` is manual-only. That is partly deliberate — it is the one
-  command that deletes user data — but the *decision support* should be
-  automatic: the operator should see "N GB offloadable now" without
-  computing it themselves.
-- A mirrored + crypt destination is the least-verified copy in the
-  reference setup: crypt remotes expose no hashes, so transfers compare
-  size+mtime forever, and `squirrel verify` covers only
-  content-addressed layouts — the cloudbox copy is never content-checked
-  after upload. The best-trusted offsite (browsable plain files) is
-  paradoxically the least-audited one.
+design bug.** Every known violation is catalogued with evidence and a
+severity in [`friction-log.md`](friction-log.md) — the log is the
+single home for gaps; this document states only the principles they
+are measured against. (As of the first walk, the automation-loop
+violations are F17, F21, F32, and F33.)
 
 ## 2. The CLI is for change and for questions — never for operations
 
