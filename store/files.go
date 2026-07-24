@@ -922,6 +922,23 @@ func (s *Store) ListPresentPathsUnder(ctx context.Context, volumeID int64) (map[
 	return out, rows.Err()
 }
 
+// CountPresentFilesInVolume returns the number of live (status='present')
+// file rows in the volume. The peer-sync summary uses it to report the
+// already-correct count: under the Merkle walk only differing folders
+// reach /plan, so already-correct is derived as present-total minus the
+// paths the sync acted on rather than counted from the (partial)
+// disposition list.
+func (s *Store) CountPresentFilesInVolume(ctx context.Context, volumeID int64) (int64, error) {
+	var n int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM `+fileFromJoin+`
+		 WHERE f.status = 'present' AND fo.volume_id = ?`, volumeID).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count present files in volume %d: %w", volumeID, err)
+	}
+	return n, nil
+}
+
 // ListPresentFilesInFolder returns every present file row in one
 // folder, ordered by name ascending so the caller's downstream
 // processing is deterministic. Used by the Merkle walk's initiator

@@ -28,9 +28,14 @@ type runsModel struct {
 	rows           []store.Run
 	volumesByID    map[int64]store.Volume
 	filterKind     string // empty = no filter
+	fold           bool   // collapse consecutive no-op rows (F19)
+	foldedCount    int    // no-op rows hidden by the current fold
 	loaded         bool
 	loadErr        error
 	selectedDetail *store.Run
+	// displayRuns aligns 1:1 with the table's rows: the run behind each
+	// row, or nil for a fold-marker row (which has no detail view).
+	displayRuns []*store.Run
 }
 
 type runsDataMsg struct {
@@ -55,7 +60,7 @@ func newRunsModel(s *store.Store) *runsModel {
 		Background(colourAccent).
 		Bold(false)
 	t.SetStyles(style)
-	return &runsModel{store: s, table: t}
+	return &runsModel{store: s, table: t, fold: true}
 }
 
 func (m *runsModel) Init() tea.Cmd { return m.fetch() }
@@ -102,13 +107,11 @@ func (m *runsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		switch msg.String() {
 		case "enter":
-			if len(m.rows) == 0 {
-				return m, nil
-			}
+			// A fold-marker row maps to nil in displayRuns and has no
+			// detail view; ignore enter on it.
 			idx := m.table.Cursor()
-			filtered := m.filteredRows()
-			if idx >= 0 && idx < len(filtered) {
-				r := filtered[idx]
+			if idx >= 0 && idx < len(m.displayRuns) && m.displayRuns[idx] != nil {
+				r := *m.displayRuns[idx]
 				m.selectedDetail = &r
 			}
 			return m, nil
@@ -127,6 +130,10 @@ func (m *runsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "A":
 			m.setFilter("")
 			return m, nil
+		case "f":
+			m.fold = !m.fold
+			m.applyFilter()
+			return m, nil
 		}
 	}
 	var cmd tea.Cmd
@@ -144,9 +151,18 @@ func (m *runsModel) View() string {
 	if m.selectedDetail != nil {
 		return m.renderDetail(*m.selectedDetail)
 	}
-	header := styleHeader.Render("Runs") + "  " + m.renderFilterChips()
+	header := styleHeader.Render("Runs") + "  " + m.renderFilterChips() + m.renderFoldChip()
 	return header + "\n" + m.table.View() + "\n" +
-		styleMuted.Render("i index · s sync · a audit · r restore · A all · enter detail")
+		styleMuted.Render("i index · s sync · a audit · r restore · A all · f fold · enter detail")
+}
+
+// renderFoldChip notes how many no-op rows the fold is hiding, so a folded
+// view never looks like runs simply went missing.
+func (m *runsModel) renderFoldChip() string {
+	if !m.fold || m.foldedCount == 0 {
+		return ""
+	}
+	return "  " + styleMuted.Render(fmt.Sprintf("(%d no-op rows folded — f to expand)", m.foldedCount))
 }
 
 // renderFilterChips renders the active-filter pill, or muted text when no
@@ -238,21 +254,82 @@ func (m *runsModel) applyFilter() {
 	filtered := m.filteredRows()
 	now := time.Now()
 	rows := make([]table.Row, 0, len(filtered))
-	for _, r := range filtered {
-		rows = append(rows, table.Row{
-			fmt.Sprintf("#%d", r.ID),
-			r.Kind,
-			m.volumeName(r.VolumeID),
-			nullStr(r.Destination),
-			r.Status,
-			whenAgo(r.EndedAtNs, now),
-			runDuration(r),
-			fmt.Sprintf("%d", r.FileCount),
-			shallowGlyph(r.Shallow),
-		})
+	display := make([]*store.Run, 0, len(filtered))
+	m.foldedCount = 0
+	for i := 0; i < len(filtered); {
+		// Collapse a maximal run of consecutive no-op rows into one marker,
+		// but only when there is more than one — a lone no-op isn't worth
+		// a fold line (F19).
+		if m.fold && runIsNoOp(filtered[i]) {
+			j := i
+			for j < len(filtered) && runIsNoOp(filtered[j]) {
+				j++
+			}
+			if n := j - i; n > 1 {
+				rows = append(rows, foldMarkerRow(n))
+				display = append(display, nil)
+				m.foldedCount += n
+				i = j
+				continue
+			}
+		}
+		r := filtered[i]
+		rows = append(rows, m.runTableRow(r, now))
+		display = append(display, &r)
+		i++
 	}
+	m.displayRuns = display
 	m.table.SetRows(rows)
 	m.resizeColumns()
+}
+
+// runTableRow renders one run as a table row.
+func (m *runsModel) runTableRow(r store.Run, now time.Time) table.Row {
+	return table.Row{
+		fmt.Sprintf("#%d", r.ID),
+		r.Kind,
+		m.volumeName(r.VolumeID),
+		destinationCell(r),
+		r.Status,
+		whenAgo(r.EndedAtNs, now),
+		runDuration(r),
+		fmt.Sprintf("%d", r.FileCount),
+		shallowGlyph(r.Shallow),
+	}
+}
+
+// foldMarkerRow is the placeholder shown in place of a collapsed block of
+// no-op rows. It carries the same column count as a real row so the table
+// layout stays aligned.
+func foldMarkerRow(n int) table.Row {
+	return table.Row{"⋯", "", fmt.Sprintf("%d no-op runs folded", n), "", "", "", "", "", ""}
+}
+
+// runIsNoOp reports whether a run is routine no-op noise — a clean success
+// that touched no files. Mirrors the CLI's `runs --changes` fold rule; a
+// peer-sync no-op has file_count 0, so those collapse, while bucket/index
+// no-ops (file_count counts files considered, not moved) stay visible.
+func runIsNoOp(r store.Run) bool {
+	return r.Status == store.RunStatusSuccess && r.FileCount == 0
+}
+
+// destinationCell renders the DESTINATION column, prefixing a peer-sync row
+// with its initiation-direction arrow so inbound and outbound are
+// distinguishable (F18): "→" outbound (we pushed), "←" inbound (peer
+// pushed). Only the initiator records runs.shallow, so a set flag marks the
+// pushing side (see store.Run.Shallow).
+func destinationCell(r store.Run) string {
+	if !r.Destination.Valid {
+		return nullStr(r.Destination)
+	}
+	if !r.PeerNodeID.Valid {
+		return r.Destination.String
+	}
+	arrow := "→"
+	if !r.Shallow.Valid {
+		arrow = "←"
+	}
+	return arrow + " " + r.Destination.String
 }
 
 func (m *runsModel) resizeColumns() {

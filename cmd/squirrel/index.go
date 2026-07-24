@@ -2,10 +2,13 @@ package main
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/index"
+	"github.com/mbertschler/squirrel/store"
 )
 
 // newIndexCmd returns the `squirrel index <volume>` cobra command. The
@@ -55,6 +58,11 @@ func runIndex(cmd *cobra.Command, volumeName string, progress bool, opts index.O
 	}
 	defer s.Close()
 
+	// Captured before the walk (so it reflects the prior run, not this
+	// one): its presence tells a first index from a re-index, and its
+	// timestamp feeds the catch-up note.
+	priorNs, hadPrior := priorIndexRun(cmd, s, vol.Name)
+
 	// Progress renders to stderr so a redirected stdout still captures only
 	// the final summary line. The line is erased right after Index returns
 	// (both paths) so any error list and the summary print on a clean line.
@@ -79,10 +87,67 @@ func runIndex(cmd *cobra.Command, volumeName string, progress bool, opts index.O
 	if opts.DryRun {
 		prefix = "(dry-run) "
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "%sadded=%d modified=%d unchanged=%d missing=%d errors=%d\n",
-		prefix, rep.Added, rep.Modified, rep.Unchanged, rep.Missing, rep.Errors)
+	// Naming the volume keeps back-to-back index runs legible instead of
+	// three anonymous count lines (friction F11a).
+	fmt.Fprintf(cmd.OutOrStdout(), "%s%s: added=%d modified=%d unchanged=%d missing=%d errors=%d\n",
+		prefix, vol.Name, rep.Added, rep.Modified, rep.Unchanged, rep.Missing, rep.Errors)
+	printIndexAdvisories(cmd, vol, rep, priorNs, hadPrior)
 	if rep.Errors > 0 {
 		return fmt.Errorf("encountered %d error(s) during walk", rep.Errors)
 	}
 	return nil
+}
+
+// printIndexAdvisories surfaces the two affirmative-feedback lines the
+// friction walk asked for: an empty-path warning on a first index (F8)
+// and a catch-up note after a burst of new files following a quiet gap
+// (F24). Both are advisory — neither changes the exit code.
+func printIndexAdvisories(cmd *cobra.Command, vol *config.Volume, rep index.Report, priorNs int64, hadPrior bool) {
+	if !hadPrior && rep.Errors == 0 && !rep.SawFiles() {
+		fmt.Fprintf(cmd.ErrOrStderr(),
+			"warning: volume %q at %s: no files found — new volume, empty directory, or wrong mount?\n",
+			vol.Name, vol.Path)
+		return
+	}
+	if hadPrior && rep.SawFiles() {
+		if note, ok := catchUpNote(rep.Added, time.Since(time.Unix(0, priorNs))); ok {
+			fmt.Fprintln(cmd.OutOrStdout(), note)
+		}
+	}
+}
+
+// priorIndexRun returns the start time of the most recent successful index
+// run of the volume, and whether one exists. Best-effort: any lookup miss
+// (volume never indexed, store error) reports "no prior", which is the safe
+// default for both advisories.
+func priorIndexRun(cmd *cobra.Command, s *store.Store, volName string) (int64, bool) {
+	v, err := s.GetVolumeByName(cmd.Context(), volName)
+	if err != nil {
+		return 0, false
+	}
+	run, err := s.LatestSuccessfulIndexRun(cmd.Context(), v.ID)
+	if err != nil {
+		return 0, false
+	}
+	return run.StartedAtNs, true
+}
+
+// Catch-up heuristic thresholds: a burst of new files after a long quiet
+// gap is the moment squirrel earns the most trust (a trip's worth of
+// photos landing in one tick), and it should not blend into routine churn.
+// The bounds are deliberately conservative so ordinary cadence runs stay
+// silent.
+const (
+	catchUpMinFiles = 25
+	catchUpMinQuiet = 7 * 24 * time.Hour
+)
+
+// catchUpNote returns a one-line "N new files after D days" summary when a
+// run added enough files after a long enough quiet gap, and whether it
+// applies (friction F24).
+func catchUpNote(added int, quiet time.Duration) (string, bool) {
+	if added < catchUpMinFiles || quiet < catchUpMinQuiet {
+		return "", false
+	}
+	return fmt.Sprintf("catch-up: %d new files after %d days of quiet", added, int(quiet.Hours())/24), true
 }
