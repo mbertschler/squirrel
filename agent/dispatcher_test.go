@@ -49,37 +49,60 @@ func TestSyncDispatcherRunsDestinationsConcurrently(t *testing.T) {
 	}
 }
 
-// TestSyncDispatcherOneInFlightPerDestination proves the concurrency unit
-// is the destination: a second volume targeting a destination that already
-// has a sync in flight is skipped with the per-pair "in-flight sync run"
-// log, and its runner never fires while the first is running.
-func TestSyncDispatcherOneInFlightPerDestination(t *testing.T) {
-	var calls atomic.Int32
-	entered := make(chan struct{}, 1)
-	release := make(chan struct{})
+// TestSyncDispatcherSerializesSameDestination proves the concurrency unit
+// is the destination: two volumes due to the same destination on one tick
+// both run — the second is queued behind the first, never starved — while
+// at most one is ever in flight against that destination.
+func TestSyncDispatcherSerializesSameDestination(t *testing.T) {
+	var active, maxActive atomic.Int32
+	var photosRan, docsRan atomic.Bool
+	entered := make(chan string, 2)
+	release := make(chan struct{}) // one send per sync, in completion order
 	run := func(ctx context.Context, vol *config.Volume, destName string) SyncRunReport {
-		calls.Add(1)
-		entered <- struct{}{}
+		n := active.Add(1)
+		for {
+			old := maxActive.Load()
+			if n <= old || maxActive.CompareAndSwap(old, n) {
+				break
+			}
+		}
+		switch vol.Name {
+		case "photos":
+			photosRan.Store(true)
+		case "docs":
+			docsRan.Store(true)
+		}
+		entered <- vol.Name
 		<-release
+		active.Add(-1)
 		return SyncRunReport{Status: store.RunStatusSuccess}
 	}
-	buf := &bytes.Buffer{}
-	logger := slog.New(slog.NewTextHandler(buf, nil))
-	d := newSyncDispatcher(run, logger, time.Now, 4)
-
+	d := newSyncDispatcher(run, discardLogger(), time.Now, 4)
 	d.dispatch(context.Background(), &config.Volume{Name: "photos"}, "cloudbox")
-	<-entered // the first sync has claimed cloudbox and is running
 	d.dispatch(context.Background(), &config.Volume{Name: "docs"}, "cloudbox")
 
-	if got := calls.Load(); got != 1 {
-		t.Fatalf("runner called %d times; want 1 (second dispatch to a busy destination must skip)", got)
+	first := <-entered // FIFO: photos was dispatched first
+	if first != "photos" {
+		t.Fatalf("first sync = %q; want photos (FIFO order)", first)
 	}
-	log := buf.String()
-	if !strings.Contains(log, `reason="in-flight sync run"`) || !strings.Contains(log, "volume=docs") {
-		t.Fatalf("expected a per-pair in-flight skip for docs→cloudbox, got:\n%s", log)
+	time.Sleep(20 * time.Millisecond) // give a wrongly-concurrent docs a chance to start
+	if got := active.Load(); got != 1 {
+		t.Fatalf("concurrent syncs to one destination = %d; want 1 (serialized)", got)
 	}
-	close(release)
+	release <- struct{}{} // let photos finish; the worker then dequeues docs
+	if second := <-entered; second != "docs" {
+		t.Fatalf("second sync = %q; want docs (queued, not starved)", second)
+	}
+	release <- struct{}{} // let docs finish
 	d.wait()
+
+	if !photosRan.Load() || !docsRan.Load() {
+		t.Fatalf("both volumes must run to the shared destination; photos=%v docs=%v",
+			photosRan.Load(), docsRan.Load())
+	}
+	if got := maxActive.Load(); got != 1 {
+		t.Fatalf("max concurrent syncs to one destination = %d; want 1", got)
+	}
 }
 
 // TestSyncDispatcherBoundsOverallParallelism proves the semaphore ceiling:

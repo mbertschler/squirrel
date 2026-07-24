@@ -124,10 +124,14 @@ func (f *fakeSyncRunner) Calls() []syncCall {
 // + fake sync runner. The scheduler's tick method drives behaviour
 // directly; the goroutine-driven run() loop is only used in the
 // integration test below.
-func newSchedulerFixture(t *testing.T, volumeCfg *config.Volume) *schedulerFixture {
+func newSchedulerFixture(t *testing.T, vols ...*config.Volume) *schedulerFixture {
 	t.Helper()
-	if volumeCfg.Path == "" {
-		volumeCfg.Path = t.TempDir()
+	volumes := make(map[string]*config.Volume, len(vols))
+	for _, v := range vols {
+		if v.Path == "" {
+			v.Path = t.TempDir()
+		}
+		volumes[v.Name] = v
 	}
 	dbPath := filepath.Join(t.TempDir(), "index.db")
 	s, err := store.Open(dbPath)
@@ -144,7 +148,7 @@ func newSchedulerFixture(t *testing.T, volumeCfg *config.Volume) *schedulerFixtu
 		Listen:     "127.0.0.1:0",
 		Token:      "tok",
 		Version:    "test",
-		Volumes:    map[string]*config.Volume{volumeCfg.Name: volumeCfg},
+		Volumes:    volumes,
 		Logger:     logger,
 		SyncRunner: syncRunner.Runner(),
 	}, s)
@@ -194,7 +198,6 @@ func (f *schedulerFixture) seedFile() {
 		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
 			f.t.Fatalf("write %s: %v", p, err)
 		}
-		return
 	}
 }
 
@@ -465,6 +468,41 @@ func TestSchedulerSkipsWhenInFlightSyncRun(t *testing.T) {
 	if !sawSync {
 		// The planted 'running' sync row counts as a sync; just sanity.
 		t.Fatalf("expected the planted running sync row to remain: %+v", runs)
+	}
+}
+
+// TestSchedulerTwoVolumesSameDestinationBothRun guards the starvation trap
+// (#160): the tick iterates volumes by name, so if two volumes are due to
+// the same destination on one tick the earlier one wins the destination.
+// The dispatcher must queue the later one behind it and run it — not skip
+// it every tick forever. "aaa" sorts before "zzz"; both must produce a sync
+// run to "backup".
+func TestSchedulerTwoVolumesSameDestinationBothRun(t *testing.T) {
+	f := newSchedulerFixture(t,
+		&config.Volume{Name: "aaa", SyncTo: []string{"backup"}, SyncEvery: time.Hour},
+		&config.Volume{Name: "zzz", SyncTo: []string{"backup"}, SyncEvery: time.Hour},
+	)
+	f.seedFile()
+	sch := f.scheduler()
+
+	sch.tick(context.Background())
+	sch.dispatch.wait()
+
+	var aaaRan, zzzRan bool
+	for _, c := range f.syncLog.Calls() {
+		if c.Destination != "backup" {
+			continue
+		}
+		switch c.Volume {
+		case "aaa":
+			aaaRan = true
+		case "zzz":
+			zzzRan = true
+		}
+	}
+	if !aaaRan || !zzzRan {
+		t.Fatalf("both volumes must sync to the shared destination; aaa=%v zzz=%v (calls=%+v)",
+			aaaRan, zzzRan, f.syncLog.Calls())
 	}
 }
 

@@ -23,10 +23,15 @@ const defaultMaxParallelSyncs = 4
 
 // syncDispatcher runs (volume, destination) syncs off the scheduler's tick
 // goroutine so a slow or wedged destination can never delay the tick loop,
-// index runs, peer syncs, or syncs to other destinations (#160, F25). The
-// concurrency unit is the destination: at most one sync per destination is
-// in flight at a time (inflight), and an overall semaphore (sem) bounds how
-// many run concurrently across destinations.
+// index runs, peer syncs, or syncs to other destinations (#160, F25).
+//
+// The concurrency unit is the destination: each destination has a FIFO
+// queue drained by a single worker, so at most one sync per destination is
+// in flight while a second volume due to the same destination (photos and
+// docs both push to cloudbox in the reference setup) waits its turn instead
+// of being skipped and starved — issue #160 option 4b is per-destination
+// queues, not skip-on-busy. An overall semaphore bounds how many
+// destinations transfer at once.
 //
 // The pre-sync index ordering the scheduler guarantees is unaffected: the
 // tick body still runs a volume's index to completion before it hands that
@@ -38,9 +43,20 @@ type syncDispatcher struct {
 
 	sem chan struct{}
 
-	mu       sync.Mutex
-	inflight map[string]bool
-	wg       sync.WaitGroup
+	mu    sync.Mutex
+	dests map[string]*destQueue
+	wg    sync.WaitGroup
+}
+
+// destQueue is one destination's serial pipeline: at most one sync active,
+// the rest waiting in FIFO order. queued holds every volume name active or
+// pending on this destination so a re-dispatch of a pair already in the
+// pipeline — the scheduler re-evaluates a still-unfinished pair on every
+// tick — is a quiet no-op rather than a duplicate enqueue.
+type destQueue struct {
+	pending []*config.Volume
+	queued  map[string]bool
+	active  bool
 }
 
 func newSyncDispatcher(run SyncRunner, logger *slog.Logger, now func() time.Time, maxParallel int) *syncDispatcher {
@@ -48,19 +64,20 @@ func newSyncDispatcher(run SyncRunner, logger *slog.Logger, now func() time.Time
 		maxParallel = defaultMaxParallelSyncs
 	}
 	return &syncDispatcher{
-		run:      run,
-		logger:   logger,
-		now:      now,
-		sem:      make(chan struct{}, maxParallel),
-		inflight: make(map[string]bool),
+		run:    run,
+		logger: logger,
+		now:    now,
+		sem:    make(chan struct{}, maxParallel),
+		dests:  make(map[string]*destQueue),
 	}
 }
 
-// dispatch launches the sync for (vol, destName) on destName's worker,
-// unless a sync to that destination is already in flight (a per-pair skip
-// log, matching the CLI wording) or no runner is configured. It never
-// blocks on the transfer: the rclone call runs in a goroutine bounded by
-// the semaphore, so the caller — the tick loop — returns at once.
+// dispatch enqueues the sync for (vol, destName) on destName's FIFO queue.
+// An idle destination starts its worker immediately; a busy one takes the
+// pair onto its queue to run when the current transfer finishes (deduped so
+// re-evaluation on later ticks can't queue the same pair twice). It never
+// blocks on the transfer — the tick loop returns at once, so a slow
+// destination cannot delay any other.
 func (d *syncDispatcher) dispatch(ctx context.Context, vol *config.Volume, destName string) {
 	if d.run == nil {
 		d.logger.Info("scheduler.skipped",
@@ -68,24 +85,67 @@ func (d *syncDispatcher) dispatch(ctx context.Context, vol *config.Volume, destN
 			"reason", "sync runner not configured")
 		return
 	}
-	if !d.claim(destName) {
-		d.logger.Info("scheduler.skipped",
-			"kind", "sync", "volume", vol.Name, "destination", destName,
-			"reason", "in-flight sync run")
+	d.mu.Lock()
+	q := d.dests[destName]
+	if q == nil {
+		q = &destQueue{queued: make(map[string]bool)}
+		d.dests[destName] = q
+	}
+	if q.queued[vol.Name] {
+		d.mu.Unlock() // already active or queued for this destination
 		return
 	}
-	d.logger.Info("scheduler.kicked",
-		"kind", "sync", "volume", vol.Name, "destination", destName)
+	q.queued[vol.Name] = true
+	if q.active {
+		q.pending = append(q.pending, vol)
+		d.mu.Unlock()
+		return
+	}
+	q.active = true
+	d.mu.Unlock()
 	d.wg.Add(1)
-	go d.runOne(ctx, vol, destName)
+	go d.worker(ctx, destName, vol)
 }
 
-// runOne is the per-destination worker body: take an overall slot (or bail
-// if the scheduler is shutting down), run the sync, and always release both
-// the slot and the destination claim.
-func (d *syncDispatcher) runOne(ctx context.Context, vol *config.Volume, destName string) {
+// worker drains destName's queue one sync at a time, so the destination
+// never has two transfers in flight. It exits — freeing the destination —
+// when the queue empties; on shutdown (ctx cancelled) it drains without
+// running, leaving the unfinished pairs to be re-evaluated next start.
+func (d *syncDispatcher) worker(ctx context.Context, destName string, vol *config.Volume) {
 	defer d.wg.Done()
-	defer d.release(destName)
+	for vol != nil {
+		if ctx.Err() == nil {
+			d.runOne(ctx, vol, destName)
+		}
+		vol = d.next(destName, vol.Name)
+	}
+}
+
+// next removes the just-finished volume from destName's pipeline and returns
+// the next queued volume, or nil (dropping the now-idle destination) when
+// none remain.
+func (d *syncDispatcher) next(destName, done string) *config.Volume {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	q := d.dests[destName]
+	if q == nil {
+		return nil
+	}
+	delete(q.queued, done)
+	if len(q.pending) == 0 {
+		delete(d.dests, destName)
+		return nil
+	}
+	next := q.pending[0]
+	q.pending = q.pending[1:]
+	return next
+}
+
+// runOne takes an overall parallelism slot (or bails on shutdown), runs the
+// sync, and emits the kicked/finished/error logs. A sync that stalls is
+// failed by the runner's transfer timeout (rclone is killed); its
+// diagnosable error lands here and in the run row.
+func (d *syncDispatcher) runOne(ctx context.Context, vol *config.Volume, destName string) {
 	select {
 	case d.sem <- struct{}{}:
 		defer func() { <-d.sem }()
@@ -95,14 +155,8 @@ func (d *syncDispatcher) runOne(ctx context.Context, vol *config.Volume, destNam
 	if ctx.Err() != nil {
 		return
 	}
-	d.execute(ctx, vol, destName)
-}
-
-// execute invokes the sync runner and emits the finished/error logs,
-// mirroring the scheduler's kicked/finished/error discipline. A sync that
-// stalls is failed by the runner's transfer timeout (rclone is killed);
-// its diagnosable error lands here and in the run row.
-func (d *syncDispatcher) execute(ctx context.Context, vol *config.Volume, destName string) {
+	d.logger.Info("scheduler.kicked",
+		"kind", "sync", "volume", vol.Name, "destination", destName)
 	start := d.now()
 	rep := d.run(ctx, vol, destName)
 	duration := d.now().Sub(start)
@@ -122,27 +176,9 @@ func (d *syncDispatcher) execute(ctx context.Context, vol *config.Volume, destNa
 	}
 }
 
-// claim marks destName in flight, returning false when a sync to it is
-// already running. release clears the mark.
-func (d *syncDispatcher) claim(destName string) bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.inflight[destName] {
-		return false
-	}
-	d.inflight[destName] = true
-	return true
-}
-
-func (d *syncDispatcher) release(destName string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	delete(d.inflight, destName)
-}
-
-// wait blocks until every dispatched sync has finished. The scheduler
-// calls it during shutdown, after the run context is cancelled (which
-// kills any in-flight rclone child), so it returns promptly.
+// wait blocks until every destination worker has drained. The scheduler
+// calls it during shutdown, after the run context is cancelled (which kills
+// any in-flight rclone child), so it returns promptly.
 func (d *syncDispatcher) wait() {
 	d.wg.Wait()
 }

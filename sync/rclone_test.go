@@ -18,11 +18,14 @@ import (
 // TestStallGuardFiresWithoutProgress proves the no-progress guard cancels
 // the run — and records that it fired — when no advance arrives within the
 // timeout. This is the F25 wedge: rclone alive but transferring nothing.
+// The test waits for the guard rather than racing a deadline, so the exact
+// timeout is not timing-sensitive; a generous value keeps it robust under
+// load.
 func TestStallGuardFiresWithoutProgress(t *testing.T) {
 	var cancelled atomic.Bool
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	g := newStallGuard(ctx, 30*time.Millisecond, func() {
+	g := newStallGuard(ctx, 100*time.Millisecond, func() {
 		cancelled.Store(true)
 		cancel()
 	})
@@ -36,19 +39,30 @@ func TestStallGuardFiresWithoutProgress(t *testing.T) {
 }
 
 // TestStallGuardResetsOnProgress proves a transfer that keeps advancing is
-// never killed: pokes arriving well inside the timeout keep resetting it,
-// even across a span longer than a single timeout window.
+// never killed: pokes driven off a ticker at a fraction of the stall window
+// keep resetting it across a span twice as long as one window, so only a
+// working reset explains the guard staying quiet. The wide ratio between
+// the stall timeout and the poke interval keeps scheduler jitter from
+// faking a stall.
 func TestStallGuardResetsOnProgress(t *testing.T) {
 	var cancelled atomic.Bool
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	g := newStallGuard(ctx, 100*time.Millisecond, func() {
+	const stall = 400 * time.Millisecond
+	g := newStallGuard(ctx, stall, func() {
 		cancelled.Store(true)
 		cancel()
 	})
-	for i := 0; i < 8; i++ { // 160ms total, gaps of 20ms << the 100ms bound
-		time.Sleep(20 * time.Millisecond)
-		g.advance()
+	tick := time.NewTicker(stall / 20) // pokes at 20x the resolution of the bound
+	defer tick.Stop()
+	deadline := time.After(2 * stall) // outlast a single window, so a reset is required
+	for done := false; !done; {
+		select {
+		case <-tick.C:
+			g.advance()
+		case <-deadline:
+			done = true
+		}
 	}
 	if g.fired.Load() {
 		t.Fatal("guard fired while progress was still arriving")
