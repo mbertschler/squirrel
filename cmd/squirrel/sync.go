@@ -229,7 +229,10 @@ func printSyncReport(w io.Writer, rep sync.Report, runErr error) {
 			fmt.Fprintf(w, "    versions live %s, preserved %s at %s:%s\n",
 				c.LiveBlake3Hex, c.PreservedBlake3Hex, rep.Destination, c.PreservedAtPath)
 		}
-		fmt.Fprintf(w, "    resolve with: squirrel conflicts resolve %s %s\n", rep.Volume, c.Path)
+		// Quote the args: a contested path may contain whitespace
+		// (validateRelPath allows it), which would otherwise split into
+		// several shell words when the operator copy-pastes the hint.
+		fmt.Fprintf(w, "    resolve with: squirrel conflicts resolve %q %q\n", rep.Volume, c.Path)
 	}
 	for _, ff := range r.FailedFiles {
 		// Some rclone errors (auth, listing, fatal copy) have no Object.

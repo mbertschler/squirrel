@@ -565,6 +565,61 @@ func TestNodeSyncContestedFreezeEndToEnd(t *testing.T) {
 	}
 }
 
+// TestNodeSyncContestedMirroredOnTransferFailure guards the observability
+// fix: the initiator must mirror a freeze into its own contested_paths
+// latch even when the sync fails *after* /plan. The receiver already
+// pre-staged the loser and froze the path during /plan, so recording the
+// badge only on a successful close would hide it on the losing edge
+// exactly when a sync broke mid-flight (#158, F27). A bogus rclone binary
+// fails the transfer deterministically without needing rclone installed —
+// begin + plan run over the in-process HTTP receiver.
+func TestNodeSyncContestedMirroredOnTransferFailure(t *testing.T) {
+	f, root := buildNodeFixture(t)
+	f.rcl = &Rclone{Binary: filepath.Join(root, "no-such-rclone-binary")}
+	ctx := context.Background()
+
+	// Receiver holds a local-write doc.md; the initiator diverges → conflict.
+	v, err := f.recvStore.CreateVolume(ctx, f.recvVol.Name, f.recvVol.Path)
+	if err != nil {
+		t.Fatalf("seed receiver volume: %v", err)
+	}
+	runID, err := f.recvStore.BeginIndexRun(ctx, store.RunKindIndex, v.ID, false)
+	if err != nil {
+		t.Fatalf("BeginIndexRun: %v", err)
+	}
+	_ = f.recvStore.FinishRun(ctx, runID, store.RunStatusSuccess, "", 1)
+	if err := os.WriteFile(filepath.Join(f.recvVol.Path, "doc.md"), []byte("recvr"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	receiverDigest := hashFile(t, filepath.Join(f.recvVol.Path, "doc.md"))
+	if err := f.recvStore.Upsert(ctx, store.FileRow{
+		VolumeID: v.ID, Path: "doc.md", Blake3: receiverDigest, SizeBytes: 5, MtimeNs: 50,
+		Status: store.StatusPresent, FirstSeenRunID: runID, LastSeenRunID: runID, IndexedAtNs: 50,
+	}, nil); err != nil {
+		t.Fatalf("seed receiver file row: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.initVol.Path, "doc.md"), []byte("initr"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.indexInitiator(t)
+
+	// The transfer must fail (bogus binary), so the sync returns an error.
+	_, err = SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	if err == nil {
+		t.Fatal("SyncNode succeeded, want a transfer failure")
+	}
+
+	// Despite the failure, the initiator mirrored the freeze locally — the
+	// losing edge's badge / `squirrel conflicts` signal is present.
+	initVolRow, err := f.initStore.GetVolumeByName(ctx, "pics")
+	if err != nil {
+		t.Fatalf("initiator GetVolumeByName: %v", err)
+	}
+	if _, contested, err := f.initStore.IsPathContested(ctx, initVolRow.ID, "doc.md"); err != nil || !contested {
+		t.Fatalf("initiator IsPathContested = (%v, %v), want frozen after a post-plan failure", contested, err)
+	}
+}
+
 // TestNodeSyncVerifyMismatchPartialStatus simulates rclone "succeeding"
 // but the on-disk content being wrong (the agent's re-hash will
 // catch it). We inject the mismatch by writing different content

@@ -224,6 +224,14 @@ func (d *nodeSyncDriver) run() error {
 	// them, no bytes move, and the initiator only surfaces the freeze.
 	d.report.NodeConflicts = plan.Conflicts
 	d.report.NodeContested = plan.Contested
+	// Mirror the freeze into this node's own contested_paths latch as
+	// soon as /plan has classified it, deferred so it still runs when a
+	// later phase (transfer, verify, close) fails. The receiver already
+	// pre-staged the loser and raised its own latch during /plan, so the
+	// conflict is real regardless of whether our bytes land — recording
+	// only after a successful close would hide the badge on the losing
+	// edge exactly when a sync failed mid-flight (#158, F27).
+	defer d.recordContestedLocally()
 	if !d.opts.DryRun {
 		advance, err := captureDurabilityAdvance(d.ctx, d.store, d.volID)
 		if err != nil {
@@ -240,7 +248,6 @@ func (d *nodeSyncDriver) run() error {
 	if err := d.phaseClose(); err != nil {
 		return fmt.Errorf("close: %w", err)
 	}
-	d.recordContestedLocally()
 	return nil
 }
 

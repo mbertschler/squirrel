@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -71,6 +72,47 @@ func TestCLIConflictsListAndResolve(t *testing.T) {
 
 	if out := runCLI(t, "--config", f.configPath, "conflicts"); !strings.Contains(out, "no contested paths") {
 		t.Fatalf("listing after resolve = %q, want empty", out)
+	}
+}
+
+// TestCLIRunsContestedReminder covers the reminder beneath `squirrel runs`:
+// it names volumes (never the internal id) and, under --volume, scopes to
+// that volume rather than listing freezes on unrelated ones.
+func TestCLIRunsContestedReminder(t *testing.T) {
+	tmp := t.TempDir()
+	dirA := filepath.Join(tmp, "a")
+	dirB := filepath.Join(tmp, "b")
+	for _, d := range []string{dirA, dirB} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeTestFile(t, filepath.Join(d, "f.txt"), "content")
+	}
+	f := writeConfigFor(t, map[string]string{"a": dirA, "b": dirB})
+	runCLI(t, "--config", f.configPath, "index", "a")
+	runCLI(t, "--config", f.configPath, "index", "b")
+	raiseTestContested(t, f.dbPath, "a", "f.txt")
+	raiseTestContested(t, f.dbPath, "b", "f.txt")
+
+	// Unfiltered: both volumes appear, rendered by name not numeric id.
+	out := runCLI(t, "--config", f.configPath, "runs")
+	if !strings.Contains(out, "2 contested path(s)") {
+		t.Fatalf("unfiltered reminder = %q, want both freezes", out)
+	}
+	if !strings.Contains(out, "volume=a ") || !strings.Contains(out, "volume=b ") {
+		t.Fatalf("reminder did not name both volumes: %q", out)
+	}
+	if strings.Contains(out, "volume=1") || strings.Contains(out, "volume=2") {
+		t.Fatalf("reminder leaked a numeric volume id: %q", out)
+	}
+
+	// Filtered to volume a: only a's freeze is reminded.
+	out = runCLI(t, "--config", f.configPath, "runs", "--volume", "a")
+	if !strings.Contains(out, "1 contested path(s)") || !strings.Contains(out, "volume=a ") {
+		t.Fatalf("filtered reminder = %q, want only volume a", out)
+	}
+	if strings.Contains(out, "volume=b ") {
+		t.Fatalf("filtered reminder leaked volume b: %q", out)
 	}
 }
 

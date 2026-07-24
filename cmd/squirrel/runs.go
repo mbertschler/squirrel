@@ -87,7 +87,7 @@ func runRuns(cmd *cobra.Command, volumeName string, limit int) error {
 	if err != nil {
 		return fmt.Errorf("list contested paths: %w", err)
 	}
-	printContestedReminder(cmd.OutOrStdout(), contested)
+	printContestedReminder(cmd.OutOrStdout(), contested, opts.VolumeID, volumes)
 	return nil
 }
 
@@ -95,16 +95,29 @@ func runRuns(cmd *cobra.Command, volumeName string, limit int) error {
 // runs listing (#158, F27). Like the alarms reminder, a single old
 // conflict run scrolls away, so the audit surface repeats the standing
 // condition until a human resolves it — and points at the dedicated
-// `squirrel conflicts` question-command for the detail.
-func printContestedReminder(w io.Writer, contested []store.ContestedPath) {
-	if len(contested) == 0 {
+// `squirrel conflicts` question-command for the detail. When the listing
+// was scoped with --volume (filterVolumeID non-nil), the reminder is
+// scoped to match rather than reporting freezes on unrelated volumes.
+// Volumes render by name via the shared label map, never by internal id.
+func printContestedReminder(w io.Writer, contested []store.ContestedPath, filterVolumeID *int64, volumes map[int64]string) {
+	scoped := contested
+	if filterVolumeID != nil {
+		scoped = scoped[:0:0]
+		for _, c := range contested {
+			if c.VolumeID == *filterVolumeID {
+				scoped = append(scoped, c)
+			}
+		}
+	}
+	if len(scoped) == 0 {
 		return
 	}
 	fmt.Fprintf(w, "\n%d contested path(s) frozen — inspect with `squirrel conflicts`, clear with `squirrel conflicts resolve`:\n",
-		len(contested))
-	for _, c := range contested {
-		fmt.Fprintf(w, "  CONTESTED volume=%d %s since %s\n",
-			c.VolumeID, c.Path, formatStarted(c.RaisedAtNs))
+		len(scoped))
+	for _, c := range scoped {
+		fmt.Fprintf(w, "  CONTESTED volume=%s %s since %s\n",
+			volumeLabel(sql.NullInt64{Int64: c.VolumeID, Valid: true}, volumes),
+			c.Path, formatStarted(c.RaisedAtNs))
 	}
 }
 
