@@ -120,6 +120,15 @@ type Report struct {
 	RunID        int64
 	RcloneResult RunResult
 	Status       string // success / partial / failed
+	// AlreadyCorrect counts the paths the destination already held
+	// correctly, so a no-op-because-in-sync is distinguishable from a
+	// no-op-because-empty in the summary (transferred=0 alone is
+	// ambiguous — friction F7). For rclone bucket pushes and restores it
+	// is rclone's already-matching count; for peer syncs the handler
+	// derives it as present-total minus the paths the sync acted on
+	// (the Merkle walk never sends identical folders to /plan, so it
+	// cannot be counted from the disposition list alone).
+	AlreadyCorrect int64
 	// Verification is the handler's typed durability report for this
 	// push: which comparison backed it, what the tool counted, and —
 	// via Verified() — whether the destination's copy was
@@ -490,6 +499,10 @@ func beginRestoreRun(ctx context.Context, s *store.Store, dryRun bool, volID int
 // to the rclone outcome on this very run.
 func finishRun(ctx context.Context, s *store.Store, dryRun bool, runID int64, rep *Report) {
 	rep.Status = deriveStatus(rep.RcloneResult)
+	// rclone's "checks" are the files it found already matching at the
+	// destination and did not transfer — exactly the already-correct
+	// count the summary reports (F7). Peer syncs set this themselves.
+	rep.AlreadyCorrect = rep.RcloneResult.Checked
 	if dryRun || runID == 0 {
 		return
 	}
