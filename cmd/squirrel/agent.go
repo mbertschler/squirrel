@@ -318,24 +318,23 @@ func buildSchedulerDurabilityPuller(cfg *config.Config, s *store.Store) agent.Du
 // finishDurabilityPullRun records the pull's 'pull-durability' audit note and
 // finishes its run, then returns the scheduler-facing report. A refused
 // rewind lands as 'partial' (surfaced, but never applied — the agent does not
-// escalate); a transport/merge failure as 'failed'. Bookkeeping errors are
-// folded into the report so the scheduler logs them without masking a pull
-// error that already occurred.
+// escalate); a transport/merge failure as 'failed'. The pull error and any
+// bookkeeping errors (audit-note append, run finish) are joined so a failure
+// to record or finish the run — which would otherwise strand a 'running' row
+// — always reaches the scheduler's error log rather than hiding behind an
+// already-set pull error.
 func finishDurabilityPullRun(ctx context.Context, s *store.Store, runID int64, volume, peer string, rep sync.DurabilityPullReport, pullErr error) agent.DurabilityPullReport {
 	status, errMsg := durabilityPullStatus(rep, pullErr)
 	note := fmt.Sprintf("volume=%s peer=%s fetched=%d applied=%d dropped=%d rewinds=%d",
 		volume, peer, rep.Fetched, rep.Applied, rep.Dropped, len(rep.Rewinds))
-	out := agent.DurabilityPullReport{
-		RunID: runID, Status: status, Err: pullErr,
+	auditErr := s.AppendRunAudit(ctx, store.RunAuditEntry{RunID: runID, Transition: store.TransitionPullDurability, Note: note})
+	finErr := s.FinishRun(ctx, runID, status, errMsg, int64(rep.Applied))
+	return agent.DurabilityPullReport{
+		RunID:   runID,
+		Status:  status,
+		Err:     errors.Join(pullErr, auditErr, finErr),
 		Fetched: rep.Fetched, Applied: rep.Applied, Dropped: rep.Dropped, Rewinds: len(rep.Rewinds),
 	}
-	if auditErr := s.AppendRunAudit(ctx, store.RunAuditEntry{RunID: runID, Transition: store.TransitionPullDurability, Note: note}); auditErr != nil && out.Err == nil {
-		out.Err = auditErr
-	}
-	if finErr := s.FinishRun(ctx, runID, status, errMsg, int64(rep.Applied)); finErr != nil && out.Err == nil {
-		out.Err = finErr
-	}
-	return out
 }
 
 // durabilityPullStatus maps a pull outcome to (run status, run error

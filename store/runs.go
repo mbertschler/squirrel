@@ -180,7 +180,10 @@ func (s *Store) BeginRemoteVerifyRun(ctx context.Context) (int64, error) {
 // pull as a kind='audit' run; the pulled volume and peer land in the run's
 // 'pull-durability' runs_audit note. See beginVolumelessAuditRun.
 func (s *Store) BeginDurabilityPullRun(ctx context.Context) (int64, error) {
-	return s.beginVolumelessAuditRun(ctx, "durability-pull")
+	// "pull-durability" matches the runs_audit transition
+	// (TransitionPullDurability) and the scheduler's log kind, so the run,
+	// its note, and the scheduler line all correlate under one name.
+	return s.beginVolumelessAuditRun(ctx, "pull-durability")
 }
 
 // BeginPeerSyncRun is BeginRun's sibling for kind='sync' rows tied to a
