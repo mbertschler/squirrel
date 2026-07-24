@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -100,23 +101,48 @@ func TestRemoteMarkerMismatchAlwaysRefuses(t *testing.T) {
 }
 
 // TestRemoteMarkerReadErrorRefusesWithoutWriting is the safety-critical
-// case: a read that fails for any reason other than a definite "not
-// found" (here a simulated transient failure) must refuse the sync even
-// under --init, never mistaking a reachability blip for a fresh root and
-// clobbering a marker it could not read.
+// case: a read that fails for any reason other than a canonical "not
+// found" must refuse the sync even under --init, never mistaking a
+// reachability blip for a fresh root and clobbering a marker it could
+// not read. "host not found" is the trap — it contains the substring
+// "not found" yet is a DNS failure, not an absent object.
 func TestRemoteMarkerReadErrorRefusesWithoutWriting(t *testing.T) {
-	f := setupRemoteMarkerFixture(t)
-	dest := f.cfg.Destinations["offsite"]
-	t.Setenv("RCLONE_FAKE_CAT_FAIL", "Failed to cat: connection refused")
-	err := ensureRemoteDestinationMarker(context.Background(), f.store, f.rcl, dest, "fresh", true)
-	if err == nil || strings.Contains(err.Error(), "--init") {
-		t.Fatalf("a transient read error must refuse hard, got %v", err)
+	for _, catErr := range []string{
+		"Failed to open: host not found",
+		"Failed to cat: connection refused",
+	} {
+		t.Run(catErr, func(t *testing.T) {
+			f := setupRemoteMarkerFixture(t)
+			dest := f.cfg.Destinations["offsite"]
+			t.Setenv("RCLONE_FAKE_CAT_FAIL", catErr)
+			err := ensureRemoteDestinationMarker(context.Background(), f.store, f.rcl, dest, "fresh", true)
+			if err == nil || strings.Contains(err.Error(), "--init") {
+				t.Fatalf("a transient read error must refuse hard, got %v", err)
+			}
+			if _, statErr := os.Stat(f.remotePath("fresh", volmark.MarkerName)); statErr == nil {
+				t.Fatalf("a transient error must not bootstrap the marker")
+			}
+		})
 	}
-	if !strings.Contains(err.Error(), "connection refused") {
-		t.Fatalf("error should surface the underlying failure, got %v", err)
+}
+
+// TestIsNotFoundErrClassification pins the tightened classifier: only
+// rclone's canonical absence messages count as "path absent"; a
+// "not found"-bearing network error (DNS) does not.
+func TestIsNotFoundErrClassification(t *testing.T) {
+	cases := map[string]bool{
+		"object not found":                    true,
+		"directory not found":                 true,
+		"failed to open: Object Not Found":    true,
+		"host not found":                      false,
+		"lookup remote.invalid: no such host": false,
+		"connection refused":                  false,
+		"AccessDenied: 403":                   false,
 	}
-	if _, statErr := os.Stat(f.remotePath("fresh", volmark.MarkerName)); statErr == nil {
-		t.Fatalf("a transient error must not bootstrap the marker")
+	for msg, want := range cases {
+		if got := isNotFoundErr(errors.New(msg)); got != want {
+			t.Errorf("isNotFoundErr(%q) = %v, want %v", msg, got, want)
+		}
 	}
 }
 

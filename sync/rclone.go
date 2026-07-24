@@ -382,13 +382,18 @@ func (r *Rclone) catRemote(ctx context.Context, uri string, extraArgs ...string)
 }
 
 // isNotFoundErr reports whether an rclone error denotes an absent path
-// rather than a transient or permission failure. rclone surfaces
-// fs.ErrorObjectNotFound ("object not found") and fs.ErrorDirNotFound
-// ("directory not found") across every backend the marker gate targets;
-// matching "not found" keeps the classification conservative — an auth
-// or network error never carries that phrase, so it stays a hard error.
+// rather than a transient, network, or permission failure. It matches
+// only rclone's canonical absence messages — fs.ErrorObjectNotFound
+// ("object not found") and fs.ErrorDirNotFound ("directory not found"),
+// surfaced across every backend the marker gate targets. Requiring the
+// canonical phrasing rather than a bare "not found" substring keeps a
+// DNS "host not found" or a connection error from being misread as
+// absence: those propagate as hard errors and refuse the sync, per the
+// refuse-over-wrong-write invariant.
 func isNotFoundErr(err error) bool {
-	return strings.Contains(strings.ToLower(err.Error()), "not found")
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "object not found") ||
+		strings.Contains(msg, "directory not found")
 }
 
 // listSnapshots returns the snapshot filenames directly under dirURI via
