@@ -48,9 +48,21 @@ type Options struct {
 	// target is structurally incapable of ever satisfying the durability
 	// gate (see checkTargetsCanGate). A required target absent from the
 	// map — a peer-relayed target this node has no local destination for —
-	// is left to the per-file gate; a nil map skips the pre-check
-	// entirely. It never changes a per-file gate decision.
+	// is assessed against RelayedCaps instead; a nil map skips the
+	// local half of the pre-check. It never changes a per-file gate
+	// decision.
 	RequireDests map[string]*config.Destination
+	// RelayedCaps carries the owning peers' advertised gating capability
+	// for peer-relayed required targets — the ones with no local
+	// destination config — gathered by the caller from the durability
+	// exchange (#145). It lets the same up-front pre-check fail fast on a
+	// relayed target that can never gate, naming the owning peer. Strictly
+	// best-effort: a relayed target with no entry (peer unreachable, or
+	// predating the capability field) falls through to the per-file gate,
+	// so absent or stale capability info never turns a genuinely-pending
+	// state into an abort. A nil slice skips the relayed half of the
+	// pre-check.
+	RelayedCaps []RelayedTargetCapability
 	// MaxEvidenceAge, when positive, refuses any required target whose
 	// durability evidence was last re-verified longer ago than this in
 	// wall-clock time (issue #131). Zero disables the time-based
@@ -150,7 +162,7 @@ func Offload(ctx context.Context, s *store.Store, root string, opts Options) (re
 	if err != nil {
 		return Report{}, err
 	}
-	if err := checkTargetsCanGate(opts.Require, opts.RequireDests); err != nil {
+	if err := checkTargetsCanGate(opts.Require, opts.RequireDests, opts.RelayedCaps); err != nil {
 		return Report{}, err
 	}
 	vol, err := resolveVolume(ctx, s, opts.Name, root)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"regexp"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/offload"
+	"github.com/mbertschler/squirrel/sync"
 )
 
 // newOffloadCmd returns the `squirrel offload <volume> [path...]` cobra
@@ -61,12 +63,18 @@ func runOffload(cmd *cobra.Command, volumeName string, paths []string, olderThan
 	}
 	defer s.Close()
 
+	relayedCaps, warns := gatherRelayedOffloadCaps(cmd.Context(), cfg, vol)
+	for _, w := range warns {
+		fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s\n", w)
+	}
+
 	rep, err := offload.Offload(cmd.Context(), s, vol.Path, offload.Options{
 		Name:           volumeName,
 		Paths:          paths,
 		OlderThan:      olderThan,
 		Require:        vol.OffloadRequires,
 		RequireDests:   requiredDestinations(cfg, vol.OffloadRequires),
+		RelayedCaps:    relayedCaps,
 		MaxEvidenceAge: vol.OffloadMaxEvidenceAge,
 		VerifyCadenced: verifyCadencedTargets(cfg, vol.OffloadRequires),
 		DryRun:         dryRun,
@@ -84,7 +92,9 @@ func runOffload(cmd *cobra.Command, volumeName string, paths []string, olderThan
 // requiredDestinations resolves the volume's offload_requires target names
 // to their local destination configs, for the offload capability
 // pre-check. Names with no local destination — peer-relayed targets this
-// node cannot see — are omitted; the per-file gate handles those.
+// node cannot see — are omitted; their capability is instead gathered from
+// the owning peer (gatherRelayedOffloadCaps), falling back to the per-file
+// gate when no peer can be reached.
 func requiredDestinations(cfg *config.Config, require []string) map[string]*config.Destination {
 	out := make(map[string]*config.Destination, len(require))
 	for _, name := range require {
@@ -124,6 +134,73 @@ func verifyCadencedTargets(cfg *config.Config, require []string) map[string]bool
 		}
 		if eff > 0 {
 			out[name] = true
+		}
+	}
+	return out
+}
+
+// gatherRelayedOffloadCaps does the best-effort peer half of the offload
+// capability pre-check (#145): for each peer-relayed required target (an
+// offload_requires name that is neither a local destination nor a local
+// node), it asks the peers this volume syncs to whether they can ever gate
+// it, so a relayed target that can never gate aborts up front instead of
+// sitting not-durable per file forever. Returns the gathered verdicts plus
+// human-readable advisories for any peer that could not be reached — those
+// targets simply fall back to the per-file gate, never a hard block.
+func gatherRelayedOffloadCaps(ctx context.Context, cfg *config.Config, vol *config.Volume) ([]offload.RelayedTargetCapability, []string) {
+	targets := peerRelayedTargets(cfg, vol)
+	if len(targets) == 0 {
+		return nil, nil
+	}
+	nodes := syncToNodes(cfg, vol)
+	if len(nodes) == 0 {
+		return nil, nil
+	}
+	caps, softErrs := sync.GatherRelayedCapabilities(ctx, vol.Name, nodes, targets)
+	out := make([]offload.RelayedTargetCapability, 0, len(caps))
+	for _, c := range caps {
+		out = append(out, offload.RelayedTargetCapability{
+			Target:  c.Target,
+			Peer:    c.Peer,
+			CanGate: c.CanGate,
+			Reason:  c.Reason,
+		})
+	}
+	warns := make([]string, 0, len(softErrs))
+	for _, e := range softErrs {
+		warns = append(warns, "offload capability pre-check skipped for "+e+" (falling back to the per-file gate)")
+	}
+	return out, warns
+}
+
+// peerRelayedTargets returns the offload_requires names that resolve to
+// neither a local destination nor a local node: the peer-relayed targets
+// whose gating capability this node can only learn from the peer that owns
+// them. A local node target is excluded — this node pushes to it directly
+// and records content-verified (peer-blake3) evidence, so it is always
+// capable and needs no probe.
+func peerRelayedTargets(cfg *config.Config, vol *config.Volume) map[string]struct{} {
+	out := make(map[string]struct{})
+	for _, name := range vol.OffloadRequires {
+		if _, isDest := cfg.Destinations[name]; isDest {
+			continue
+		}
+		if _, isNode := cfg.Nodes[name]; isNode {
+			continue
+		}
+		out[name] = struct{}{}
+	}
+	return out
+}
+
+// syncToNodes returns the peer nodes this volume syncs to, in config order:
+// the peers whose relayed durability (and now capability) this node pulls.
+// A sync_to entry naming a destination rather than a node is skipped.
+func syncToNodes(cfg *config.Config, vol *config.Volume) []*config.Node {
+	var out []*config.Node
+	for _, name := range vol.SyncTo {
+		if node, ok := cfg.Nodes[name]; ok {
+			out = append(out, node)
 		}
 	}
 	return out

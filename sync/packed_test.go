@@ -41,6 +41,9 @@ zstd_level     = 3
 password = "obscured-pw"
 `, threshold), "/data")
 	t.Setenv("RCLONE_FAKE_CRYPT_SUFFIX", cryptDataSuffix)
+	// The crypt suffix is now in force, so the marker must be re-seeded
+	// at the suffixed path the overlay resolves to.
+	f.seedMarker(t, "pics", "docs")
 	return f
 }
 
@@ -530,14 +533,100 @@ func TestPackedWatermarkGuardRefusesMirror(t *testing.T) {
 	}
 }
 
-// TestPackedDryRunRefused: the packed push has no dry-run mode yet.
-func TestPackedDryRunRefused(t *testing.T) {
+// TestPackedDryRunPreview: --dry-run reports the object-vs-pack routing a
+// real push would take — large content as would-be objects on
+// RcloneResult, small content as the pack-side PackPreview — without
+// assembling or uploading any pack and without writing a runs row.
+func TestPackedDryRunPreview(t *testing.T) {
+	f := setupPackedFixture(t, "16B")
+	f.write(t, "big.bin", strings.Repeat("B", 64)) // >= threshold -> object
+	f.write(t, "small.txt", "tiny")                // < threshold -> pack
+	f.index(t)
+
+	rep, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, f.pair, Options{DryRun: true})
+	if err != nil {
+		t.Fatalf("dry-run: %v (rep=%+v)", err, rep)
+	}
+	if rep.RunID != 0 || rep.Status != store.RunStatusSuccess {
+		t.Fatalf("rep = run=%d status=%q, want run=0 success", rep.RunID, rep.Status)
+	}
+	if rep.Verification.Verified() || rep.Verification.Method != VerifyMethodPresenceSize || rep.Verification.Files != 2 {
+		t.Fatalf("Verification = %+v, want unverified %q with files=2", rep.Verification, VerifyMethodPresenceSize)
+	}
+	// Object side: the large file would upload as a per-hash object.
+	if rep.RcloneResult.Transferred != 1 || rep.RcloneResult.Checked != 0 || rep.RcloneResult.Bytes != 64 {
+		t.Fatalf("object side = objects=%d skipped=%d bytes=%d, want 1/0/64",
+			rep.RcloneResult.Transferred, rep.RcloneResult.Checked, rep.RcloneResult.Bytes)
+	}
+	// Pack side: the small file would be bundled into one pack.
+	p := rep.PackPreview
+	if p.Contents != 1 || p.Bytes != 4 || p.Packs != 1 || p.SizeBand != f.pair.Destination.PackSize {
+		t.Fatalf("PackPreview = %+v, want 1 content / 4 bytes / 1 pack / band %d", p, f.pair.Destination.PackSize)
+	}
+
+	// No runs row, no upload records, no pack rows, no artifacts on the remote.
+	runs, _ := f.store.ListRuns(context.Background(), store.ListRunsOpts{})
+	for _, r := range runs {
+		if r.Kind == store.RunKindSync {
+			t.Fatalf("dry-run wrote a sync runs row: %+v", r)
+		}
+	}
+	bigRow, err := f.store.GetByPath(context.Background(), f.volumeID(t), "big.bin")
+	if err != nil {
+		t.Fatalf("GetByPath big: %v", err)
+	}
+	if has, _ := f.store.HasRemoteObject(context.Background(), bigRow.ContentID, "offsite"); has {
+		t.Fatalf("dry-run recorded a remote object for big.bin")
+	}
+	smallRow, err := f.store.GetByPath(context.Background(), f.volumeID(t), "small.txt")
+	if err != nil {
+		t.Fatalf("GetByPath small: %v", err)
+	}
+	if has, _ := f.store.HasPackMember(context.Background(), smallRow.ContentID); has {
+		t.Fatalf("dry-run recorded a pack member for small.txt")
+	}
+	if _, err := os.Stat(f.remoteBlob(ObjectsDirName, blake3Hex(strings.Repeat("B", 64)))); err == nil {
+		t.Fatalf("dry-run uploaded an object")
+	}
+	if entries, err := os.ReadDir(f.remotePath(PacksDirName)); err == nil && len(entries) > 0 {
+		t.Fatalf("dry-run wrote pack artifacts: %v", entries)
+	}
+}
+
+// TestPackedDryRunRefusesLayoutFlip: the watermark guard runs in
+// --dry-run too, so a mirror-era history (a recorded last success with no
+// placement map) is refused in preview exactly as in a real push — and
+// the refusal writes no runs row.
+func TestPackedDryRunRefusesLayoutFlip(t *testing.T) {
 	f := setupPackedFixture(t, "1MiB")
 	f.write(t, "a.txt", "tiny")
 	f.index(t)
-	_, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, f.pair, Options{DryRun: true})
-	if err == nil || !strings.Contains(err.Error(), "dry-run") {
-		t.Fatalf("expected dry-run refusal, got %v", err)
+
+	ctx := context.Background()
+	mirrorRun, err := f.store.BeginRun(ctx, store.RunKindSync, f.volumeID(t), "offsite", false)
+	if err != nil {
+		t.Fatalf("seed mirror run: %v", err)
+	}
+	if err := f.store.FinishRun(ctx, mirrorRun, store.RunStatusSuccess, "", 1); err != nil {
+		t.Fatalf("finish mirror run: %v", err)
+	}
+
+	rep, err := RunPair(ctx, f.store, Tools{Rclone: f.rcl}, f.pair, Options{DryRun: true})
+	if err == nil || !strings.Contains(err.Error(), "not packed") {
+		t.Fatalf("expected dry-run layout-flip refusal, got %v", err)
+	}
+	if rep.RunID != 0 {
+		t.Fatalf("RunID = %d, want 0 (a refused dry-run writes no runs row)", rep.RunID)
+	}
+	runs, _ := f.store.ListRuns(ctx, store.ListRunsOpts{})
+	syncRuns := 0
+	for _, r := range runs {
+		if r.Kind == store.RunKindSync {
+			syncRuns++
+		}
+	}
+	if syncRuns != 1 {
+		t.Fatalf("sync runs = %d, want 1 (only the seed; dry-run wrote none)", syncRuns)
 	}
 }
 
@@ -759,4 +848,23 @@ func decompress(t *testing.T, compressed []byte) []byte {
 		t.Fatalf("decompress: %v", err)
 	}
 	return out
+}
+
+// compress zstd-compresses raw into a single complete frame — the inverse of
+// decompress, used to rebuild a pack after tampering with one member's
+// uncompressed bytes.
+func compress(t *testing.T, raw []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw, err := zstd.NewWriter(&buf)
+	if err != nil {
+		t.Fatalf("zstd writer: %v", err)
+	}
+	if _, err := zw.Write(raw); err != nil {
+		t.Fatalf("zstd write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zstd close: %v", err)
+	}
+	return buf.Bytes()
 }

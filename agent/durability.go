@@ -42,9 +42,15 @@ func (r *peerSyncRouter) handleDurability(w http.ResponseWriter, req *http.Reque
 // empty component list rather than an error — "no recorded durability"
 // is a valid answer.
 func (r *peerSyncRouter) durabilityResponse(ctx context.Context, volumeName string) (syncproto.DurabilityResponse, error) {
+	// Capability is a structural property of the config, independent of any
+	// recorded evidence — so it is advertised even for a volume with no
+	// store row yet (never indexed or synced on this node). That is exactly
+	// the crypt-mirror case a relayed pre-check must catch: incapable, and
+	// with no components it would otherwise never have anything to report.
+	caps := r.destinationCapabilities(volumeName)
 	v, err := r.srv.store.GetVolumeByName(ctx, volumeName)
 	if store.IsNotFound(err) {
-		return syncproto.DurabilityResponse{}, nil
+		return syncproto.DurabilityResponse{Capabilities: caps}, nil
 	}
 	if err != nil {
 		return syncproto.DurabilityResponse{}, fmt.Errorf("lookup volume: %w", err)
@@ -74,8 +80,9 @@ func (r *peerSyncRouter) durabilityResponse(ctx context.Context, volumeName stri
 		return node.Name, nil
 	}
 	resp := syncproto.DurabilityResponse{
-		Components: make([]syncproto.DurabilityComponent, 0, len(rows)),
-		Freshness:  make([]syncproto.DurabilityFreshness, 0, len(fresh)),
+		Components:   make([]syncproto.DurabilityComponent, 0, len(rows)),
+		Freshness:    make([]syncproto.DurabilityFreshness, 0, len(fresh)),
+		Capabilities: caps,
 	}
 	for _, row := range rows {
 		name, err := resolve(row.OriginNodeID)
@@ -105,4 +112,41 @@ func (r *peerSyncRouter) durabilityResponse(ctx context.Context, volumeName stri
 		})
 	}
 	return resp, nil
+}
+
+// destinationCapabilities advertises, for each destination this node
+// syncs the volume to, whether it can ever gate offload — the raw
+// config.Destination.CanEverGateOffload verdict. A peer gating on a
+// relayed required target reads this to fail fast when the owning
+// destination is structurally incapable (#145). The set is scoped to the
+// volume's sync_to destinations (the ones this node's content for the
+// volume actually lands on), so a puller only ever hears about targets
+// relevant to that volume; node targets in sync_to and names with no
+// local destination resolve to nothing and are skipped. Returns nil when
+// the volume is unknown or names no local destinations — a puller then
+// falls back to the per-file gate.
+func (r *peerSyncRouter) destinationCapabilities(volumeName string) []syncproto.DestinationCapability {
+	vol, ok := r.volumes[volumeName]
+	if !ok {
+		return nil
+	}
+	var caps []syncproto.DestinationCapability
+	seen := make(map[string]struct{}, len(vol.SyncTo))
+	for _, name := range vol.SyncTo {
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		d, ok := r.srv.cfg.Destinations[name]
+		if !ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		canGate, reason := d.CanEverGateOffload()
+		caps = append(caps, syncproto.DestinationCapability{
+			Destination: name,
+			CanGate:     canGate,
+			Reason:      reason,
+		})
+	}
+	return caps
 }

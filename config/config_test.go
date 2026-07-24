@@ -124,10 +124,15 @@ password = { env = "NAS_PASSWORD" }
 		t.Fatalf("password not resolved: %v", d.Params)
 	}
 	section := d.RcloneSection()
-	for _, want := range []string{"[nas]", "type = sftp", "host = nas.local", "user = martin", "password = hunter2"} {
+	// rclone's sftp option is `pass`, obscured — never `password`, and never
+	// the plaintext in the clear (friction log F5).
+	for _, want := range []string{"[nas]", "type = sftp", "host = nas.local", "user = martin", "pass = " + rcloneObscure("hunter2")} {
 		if !strings.Contains(section, want) {
 			t.Fatalf("section missing %q:\n%s", want, section)
 		}
+	}
+	if strings.Contains(section, "hunter2") {
+		t.Fatalf("plaintext sftp password leaked into the section:\n%s", section)
 	}
 }
 
@@ -286,6 +291,54 @@ offload_requires = ["nas", "nas"]
 	}
 }
 
+// TestLoadRejectsCryptMirrorOffloadRequires: naming a locally-configured
+// crypt mirror in offload_requires is unsatisfiable by construction (the
+// crypt overlay hides the content hash, so the push is never content-verified
+// and the mirror layout keeps no fingerprint to upgrade). Config load rejects
+// it fail-early rather than leaving a gate that waits forever (F21), and the
+// message points at the layouts that do produce evidence.
+func TestLoadRejectsCryptMirrorOffloadRequires(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.cloudbox]
+type = "sftp"
+host = "host.example"
+user = "u"
+root = "/data"
+password = "transport-pw"
+
+[destinations.cloudbox.crypt]
+password = "obscured-pw"
+
+[volumes.pictures]
+path = "/tmp/pictures"
+sync_to = ["cloudbox"]
+offload_requires = ["cloudbox"]
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "can never satisfy the durability gate") {
+		t.Fatalf("expected crypt-mirror offload_requires rejection, got %v", err)
+	}
+}
+
+// TestLoadAcceptsPlainMirrorOffloadRequires: a plain (non-crypt) mirror is
+// now an evidence-producing target — a BLAKE3-verified sync advances its
+// durability vector — so naming one in offload_requires must load cleanly.
+func TestLoadAcceptsPlainMirrorOffloadRequires(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.usb]
+type = "local"
+root = "/media/usb"
+
+[volumes.docs]
+path = "/tmp/docs"
+sync_to = ["usb"]
+offload_requires = ["usb"]
+`)
+	if _, err := Load(p); err != nil {
+		t.Fatalf("Load with plain-mirror offload_requires: %v", err)
+	}
+}
+
 // TestLoadOffloadMaxEvidenceAge: the optional staleness knob parses as a
 // duration; absent it defaults to zero (the time-based policy disabled).
 func TestLoadOffloadMaxEvidenceAge(t *testing.T) {
@@ -436,7 +489,7 @@ root   = "/p"
 		wants []string
 	}{
 		{"s3", []string{"[s3]", "type = s3", "provider = AWS", "bucket = squirrel", "region = eu-central-1", "access_key_id = AK123", "secret_access_key = sssh"}},
-		{"b2", []string{"[b2]", "type = b2", "bucket = squirrel", "account_id = 0001", "application_key = appkey"}},
+		{"b2", []string{"[b2]", "type = b2", "bucket = squirrel", "account = 0001", "key = appkey"}},
 		{"gcs", []string{"[gcs]", "type = gcs", "bucket = squirrel"}},
 	}
 	for _, c := range cases {
@@ -602,21 +655,23 @@ password2 = "obscured-salt"
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	want := `[offsite]
-type = sftp
-host = host.example
-user = u
-blake3sum_command = b3sum
-password = transport-pw
-
-[offsite-crypt]
-type = crypt
-remote = offsite:/data
-filename_encryption = off
-directory_name_encryption = false
-password = obscured-pw
-password2 = obscured-salt
-`
+	// The sftp transport secret renders as rclone's `pass`, obscured; the
+	// crypt overlay's password is a user-supplied obscured value passed
+	// through verbatim.
+	want := "[offsite]\n" +
+		"type = sftp\n" +
+		"host = host.example\n" +
+		"user = u\n" +
+		"blake3sum_command = b3sum\n" +
+		"pass = " + rcloneObscure("transport-pw") + "\n" +
+		"\n" +
+		"[offsite-crypt]\n" +
+		"type = crypt\n" +
+		"remote = offsite:/data\n" +
+		"filename_encryption = off\n" +
+		"directory_name_encryption = false\n" +
+		"password = obscured-pw\n" +
+		"password2 = obscured-salt\n"
 	if got := cfg.Destinations["offsite"].RcloneSection(); got != want {
 		t.Fatalf("RcloneSection:\n%s\nwant:\n%s", got, want)
 	}

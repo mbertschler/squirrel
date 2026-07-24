@@ -55,10 +55,13 @@ what's missing.
   mirrored destination to `content-addressed` (or back) is not supported — point
   the new layout at a fresh destination or root. The push detects a mirrored
   history and refuses.
-- **[`squirrel restore`](/squirrel/guides/restore/) refuses the layout** for now;
-  recovery tooling ships separately. The format is deliberately simple enough to
+- **[`squirrel restore`](/squirrel/guides/restore/) restores the layout**: it
+  resolves each present path to its content hash from the local index, fetches
+  the per-hash object through the same rclone (`crypt`) read path the push uses,
+  and re-hashes it before writing. When the local index itself is lost, the
+  format is deliberately simple enough to
   [recover without squirrel](/squirrel/reference/formats/#disaster-recovery-without-squirrel).
-- **`--dry-run` is not supported yet.**
+- **`--dry-run` is not supported yet on the push** (it previews restore).
 
 ## Offsite verification
 

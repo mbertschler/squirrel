@@ -34,6 +34,12 @@ type migration struct {
 // `func(ctx, db) error` shape. The slice MUST stay strictly ascending by
 // version; runMigrations relies on that order and a guard inside the
 // loop rejects misordered slices before they run.
+//
+// Convention for new migrations: every new CREATE TABLE MUST be declared
+// STRICT and use only INTEGER/TEXT/BLOB column types (no TIMESTAMP /
+// BOOLEAN / DATETIME / VARCHAR / REAL). See AGENTS.md "Schema & migrations".
+// The existing tables predate this and are not STRICT yet — their bulk
+// conversion is a separate migration PR, not something to do ad hoc here.
 func buildMigrations(mctx migrationCtx) []migration {
 	return []migration{
 		{version: 3, up: migrateV2ToV3},
