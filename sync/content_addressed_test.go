@@ -632,20 +632,85 @@ func TestContentAddressedWatermarkGuard(t *testing.T) {
 	}
 }
 
-func TestContentAddressedDryRunRefused(t *testing.T) {
+// TestContentAddressedDryRunPreview: --dry-run reports the object count
+// and bytes a real push would upload, transfers nothing, and writes no
+// runs row — the mirror dry-run contract (RunID == 0, no new rows, an
+// unverified result) applied to the content-addressed layout.
+func TestContentAddressedDryRunPreview(t *testing.T) {
 	f := setupContentAddressedFixture(t)
 	f.write(t, "a.txt", "alpha")
+	f.write(t, "b.txt", "beta")
 	f.index(t)
 
-	_, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, f.pair, Options{DryRun: true})
-	if err == nil || !strings.Contains(err.Error(), "dry-run") {
-		t.Fatalf("expected dry-run refusal, got %v", err)
+	rep, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, f.pair, Options{DryRun: true})
+	if err != nil {
+		t.Fatalf("dry-run: %v (rep=%+v)", err, rep)
 	}
+	if rep.RunID != 0 {
+		t.Fatalf("RunID = %d, want 0 (dry-run writes no runs row)", rep.RunID)
+	}
+	if rep.Status != store.RunStatusSuccess {
+		t.Fatalf("Status = %q, want success", rep.Status)
+	}
+	if rep.Verification.Verified() || rep.Verification.Method != VerifyMethodPresenceSize {
+		t.Fatalf("Verification = %+v, want unverified %q", rep.Verification, VerifyMethodPresenceSize)
+	}
+	if rep.Verification.Files != 2 || rep.RcloneResult.Transferred != 2 || rep.RcloneResult.Checked != 0 {
+		t.Fatalf("counts = files=%d objects=%d skipped=%d, want 2/2/0", rep.Verification.Files, rep.RcloneResult.Transferred, rep.RcloneResult.Checked)
+	}
+	if rep.RcloneResult.Bytes != int64(len("alpha")+len("beta")) {
+		t.Fatalf("Bytes = %d, want %d", rep.RcloneResult.Bytes, len("alpha")+len("beta"))
+	}
+
+	// No runs row, no upload records, no objects on the remote.
 	runs, _ := f.store.ListRuns(context.Background(), store.ListRunsOpts{})
 	for _, r := range runs {
 		if r.Kind == store.RunKindSync {
 			t.Fatalf("dry-run wrote a sync runs row: %+v", r)
 		}
+	}
+	for name, content := range map[string]string{"a.txt": "alpha", "b.txt": "beta"} {
+		row, err := f.store.GetByPath(context.Background(), f.volumeID(t), name)
+		if err != nil {
+			t.Fatalf("GetByPath %s: %v", name, err)
+		}
+		if has, _ := f.store.HasRemoteObject(context.Background(), row.ContentID, "offsite"); has {
+			t.Fatalf("dry-run recorded a remote object for %s", name)
+		}
+		if _, err := os.Stat(f.remoteBlob(ObjectsDirName, blake3Hex(content))); err == nil {
+			t.Fatalf("dry-run uploaded an object for %s", name)
+		}
+	}
+}
+
+// TestContentAddressedDryRunSkipsRecorded: after a real push, a dry-run
+// counts content the destination already holds as skipped rather than a
+// would-upload — the same new-content selection the real push computes,
+// exercised through the watermark read a dry-run still performs.
+func TestContentAddressedDryRunSkipsRecorded(t *testing.T) {
+	f := setupContentAddressedFixture(t)
+	f.write(t, "a.txt", "alpha")
+	f.index(t)
+	if _, err := f.sync(t); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+
+	// A new path carrying already-recorded content, plus one new file.
+	f.write(t, "copy.txt", "alpha")
+	f.write(t, "b.txt", "beta")
+	f.index(t)
+	rep, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, f.pair, Options{DryRun: true})
+	if err != nil {
+		t.Fatalf("dry-run: %v", err)
+	}
+	if rep.RunID != 0 {
+		t.Fatalf("RunID = %d, want 0", rep.RunID)
+	}
+	if rep.RcloneResult.Transferred != 1 || rep.RcloneResult.Checked != 1 {
+		t.Fatalf("objects=%d skipped=%d, want 1/1 (beta new, alpha already recorded)", rep.RcloneResult.Transferred, rep.RcloneResult.Checked)
+	}
+	if rep.RcloneResult.Bytes != int64(len("beta")) {
+		t.Fatalf("Bytes = %d, want %d", rep.RcloneResult.Bytes, len("beta"))
 	}
 }
 

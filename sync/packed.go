@@ -73,6 +73,25 @@ func encodePlacementMap(placements []PlacementEntry) ([]byte, error) {
 	return out, nil
 }
 
+// PackPreview reports the pack side of a packed --dry-run push: the
+// content that would be bundled into packs rather than uploaded as
+// per-hash objects. It is populated only by a packed dry-run; zero-valued
+// for every other push (a real packed push and a content-addressed
+// dry-run both leave it zero, reporting only through RcloneResult).
+//
+// Bytes is the uncompressed member total — the compressed pack size is
+// unknown until a pack is assembled, which a dry-run must not do — and
+// Packs is the resulting upper-bound pack count: the same size-band walk
+// buildOnePack uses, run over uncompressed sizes. Compression only shrinks
+// the output, so a real run never produces more packs than this. SizeBand
+// echoes the destination's pack_size, the target compressed pack size.
+type PackPreview struct {
+	Contents int64 // members that would be newly packed
+	Bytes    int64 // their total uncompressed bytes
+	Packs    int64 // upper-bound pack count over the uncompressed total
+	SizeBand int64 // destination pack_size (target compressed pack size)
+}
+
 // packedHandler pushes a volume to a packed rclone destination. Content at
 // or above dest.PackThreshold lands as a per-hash object exactly as the
 // content-addressed layout does (reusing contentPusher's object path);
@@ -112,7 +131,7 @@ func (h *packedHandler) Push(ctx context.Context, opts Options) (Report, error) 
 		return rep, err
 	}
 	if opts.DryRun {
-		return rep, fmt.Errorf("destination %q: the packed push has no dry-run mode yet — run without --dry-run", h.dest.Name)
+		return rep, h.previewDryRun(ctx, &rep, volID)
 	}
 	// shallow=true: neither the per-object copyto nor the pack copyto
 	// carries a BLAKE3 end-to-end check, and the audit trail stays honest.
@@ -133,6 +152,60 @@ func (h *packedHandler) Push(ctx context.Context, opts Options) (Report, error) 
 	finishHandlerRun(ctx, h.store, &rep, err)
 	opts.Snapshot.afterSync(ctx, &rep, h.vol, h.dest)
 	return rep, err
+}
+
+// previewDryRun reports what a real packed push would do — which content
+// would upload as per-hash objects vs. be bundled into packs — without
+// assembling or uploading any pack and without writing a runs row:
+// rep.RunID stays 0 and no packs, pack_members, remote_*, objects, or
+// pack artifacts are written. It computes the same delta and routing the
+// real push does (watermark → delta → routeBySize); the object side lands
+// on rep.RcloneResult exactly as the content-addressed preview reports it,
+// the pack side on rep.PackPreview. The watermark check still reads the
+// destination, so a layout-flip is refused here too.
+func (h *packedHandler) previewDryRun(ctx context.Context, rep *Report, volID int64) error {
+	watermark, err := h.watermark(ctx, volID)
+	if err != nil {
+		return err
+	}
+	delta, err := h.store.ListPathDeltaSince(ctx, volID, watermark)
+	if err != nil {
+		return fmt.Errorf("compute path delta since run %d: %w", watermark, err)
+	}
+	rep.Verification.Files = int64(len(delta))
+	large, small, err := h.routeBySize(ctx, rep, plannedUploads(delta))
+	if err != nil {
+		return err
+	}
+	if err := h.previewObjectUploads(ctx, rep, large); err != nil {
+		return err
+	}
+	rep.PackPreview = h.previewPacks(small)
+	rep.Status = store.RunStatusSuccess
+	return nil
+}
+
+// previewPacks summarises the small (pack-routed) content routeBySize
+// selected, without assembling a pack. small is already hash-sorted, so
+// the size-band walk mirrors buildOnePack's — accumulate members until the
+// running total reaches PackSize, then close a pack — but over uncompressed
+// sizes, yielding an upper-bound pack count (see PackPreview).
+func (h *packedHandler) previewPacks(small []store.PathDelta) PackPreview {
+	p := PackPreview{SizeBand: h.dest.PackSize}
+	for i := 0; i < len(small); {
+		var packBytes int64
+		for i < len(small) {
+			packBytes += small[i].SizeBytes
+			p.Contents++
+			p.Bytes += small[i].SizeBytes
+			i++
+			if packBytes >= h.dest.PackSize {
+				break
+			}
+		}
+		p.Packs++
+	}
+	return p
 }
 
 // push runs the transactional landing: delta → objects (large) + packs

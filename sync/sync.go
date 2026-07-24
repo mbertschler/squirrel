@@ -119,6 +119,12 @@ type Report struct {
 	// for other handler types; objects whose backend exposed no checksum
 	// surface in Warnings instead.
 	Fingerprints int64
+	// PackPreview is populated only by a packed --dry-run push: the
+	// pack-side routing of the preview (content that would be bundled into
+	// packs, the upper-bound pack count, and the pack-size band). The
+	// object side of the preview rides on RcloneResult, as it does for the
+	// content-addressed dry-run. Zero-valued for every other push.
+	PackPreview PackPreview
 	// NodeReceiverRunID is set on a successful node-sync handshake and
 	// echoed in the CLI output so the operator can join the two halves
 	// of one logical sync against the receiver's `squirrel runs`
