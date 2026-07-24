@@ -182,16 +182,45 @@ func (h *contentAddressedHandler) push(ctx context.Context, rep *Report, volID, 
 	if err := h.uploadSegment(ctx, delta, runID); err != nil {
 		return err
 	}
-	// presence+size is not a content-verified method (crypt remotes
-	// expose no hashes): the component advances so a later scan-back
-	// fingerprint can upgrade it, but the offload gate holds this target
-	// out until a verified fingerprint backs the gated object.
-	if err := h.store.AdvanceDestinationVectorTo(ctx, volID, h.dest.Name, store.VerifyMethodPresenceSize, advance); err != nil {
+	// presence+size is not a content-verified method (crypt remotes expose
+	// no hashes): the component advances so the offload gate's per-object
+	// scan-back can back it locally. When this run's capture leaves the
+	// whole (volume, destination) pair with a verified fingerprint behind
+	// every present content, the advance is instead stamped
+	// fingerprint-verified — the content-verified method that also relays
+	// over the durability pull (see the durability-vector upgrade in
+	// store). A single still-pending object holds it at presence+size.
+	method, err := h.advanceMethod(ctx, volID, len(advance))
+	if err != nil {
+		return err
+	}
+	if err := h.store.AdvanceDestinationVectorTo(ctx, volID, h.dest.Name, method, advance); err != nil {
 		return fmt.Errorf("advance destination vector for %s: %w", h.dest.Name, err)
 	}
 	rep.Status = store.RunStatusSuccess
 	rep.Verification.Bytes = rep.RcloneResult.Bytes
 	return nil
+}
+
+// advanceMethod chooses the method the content-addressed push advances its
+// durability vector with: fingerprint-verified when every present content
+// of the volume already carries a verified provider fingerprint on this
+// destination (the whole-state check, not just this run's uploads), and
+// presence+size otherwise. advanceLen is the size of the advance snapshot;
+// an empty snapshot advances nothing, so the method is immaterial and the
+// pending query is skipped.
+func (h *contentPusher) advanceMethod(ctx context.Context, volID int64, advanceLen int) (string, error) {
+	if advanceLen == 0 {
+		return store.VerifyMethodPresenceSize, nil
+	}
+	pending, err := h.store.CountVolumeContentsPendingFingerprint(ctx, volID, h.dest.Name)
+	if err != nil {
+		return "", err
+	}
+	if pending == 0 {
+		return store.VerifyMethodFingerprint, nil
+	}
+	return store.VerifyMethodPresenceSize, nil
 }
 
 // watermark resolves the run id the delta starts after: the last

@@ -7,8 +7,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/mbertschler/squirrel/config"
+	"github.com/mbertschler/squirrel/store"
 	"github.com/mbertschler/squirrel/syncproto"
 )
 
@@ -90,6 +92,54 @@ func TestDurabilityEndpointListsComponents(t *testing.T) {
 		if got[k] != w {
 			t.Fatalf("component %s = %d, want %d (full: %+v)", k, got[k], w, got)
 		}
+	}
+}
+
+// TestDurabilityEndpointRelaysVerifyCadence: the responder relays its
+// effective verify cadence per destination (a per-destination verify_every
+// or the [agent] default) so a puller can apply the fingerprint-verified
+// cadence coupling against the responder's own re-confirmation schedule. A
+// destination with no cadence (a mirror, or one that declares none) relays
+// zero, which the puller reads as fail-closed (issue #155).
+func TestDurabilityEndpointRelaysVerifyCadence(t *testing.T) {
+	ctx := context.Background()
+	vol := &config.Volume{Name: "pics", Path: t.TempDir()}
+	srv := newTestServer(t, Config{
+		Volumes: map[string]*config.Volume{vol.Name: vol},
+		Destinations: map[string]*config.Destination{
+			"s3archive": {Layout: config.LayoutPacked, VerifyEvery: 168 * time.Hour},
+			"mirror":    {Layout: config.LayoutMirror},
+		},
+	})
+
+	v, err := srv.store.CreateVolume(ctx, vol.Name, vol.Path)
+	if err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	self, err := srv.store.GetSelfNode(ctx)
+	if err != nil {
+		t.Fatalf("GetSelfNode: %v", err)
+	}
+	if err := srv.store.UpsertDestinationRunIDVerified(ctx, v.ID, "s3archive", self.ID, 7, store.VerifyMethodFingerprint, false); err != nil {
+		t.Fatalf("seed s3archive: %v", err)
+	}
+	if err := srv.store.UpsertDestinationRunIDVerified(ctx, v.ID, "mirror", self.ID, 3, store.VerifyMethodBlake3, false); err != nil {
+		t.Fatalf("seed mirror: %v", err)
+	}
+
+	var resp syncproto.DurabilityResponse
+	if code := postDurability(t, srv, syncproto.DurabilityRequest{Volume: "pics"}, &resp); code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	got := map[string]int64{}
+	for _, c := range resp.Components {
+		got[c.Destination] = c.VerifyEveryNs
+	}
+	if got["s3archive"] != int64(168*time.Hour) {
+		t.Fatalf("s3archive verify_every_ns = %d, want %d", got["s3archive"], int64(168*time.Hour))
+	}
+	if got["mirror"] != 0 {
+		t.Fatalf("mirror verify_every_ns = %d, want 0 (no cadence)", got["mirror"])
 	}
 }
 

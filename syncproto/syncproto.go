@@ -396,13 +396,25 @@ type DurabilityResponse struct {
 // verification time is unknown (a pre-v23 responder, or evidence never
 // re-verified); the puller treats that as fail-closed. The responder's
 // own verification instant, never fresher than this hop's pull.
+//
+// VerifyEveryNs is the responder's effective verify cadence (in
+// nanoseconds) for Destination — a per-destination verify_every or the
+// [agent] default — relayed so the puller can hold the cadence coupling
+// the offload gate requires of a fingerprint-verified component: that
+// evidence counts as content-verified only while it keeps being
+// re-confirmed. The puller keeps a relayed VerifyMethodFingerprint
+// component content-verified only when this is positive; a zero (an older
+// responder that never sends it, or a destination the responder configures
+// with no cadence) fails the coupling closed. Mirrors VerifiedAtNs: relayed
+// verbatim, absence is the safe direction. Immaterial for any other method.
 type DurabilityComponent struct {
-	Destination  string `json:"destination"`
-	OriginNode   string `json:"origin_node"`
-	OriginRun    int64  `json:"origin_run"`
-	UpdatedAtNs  int64  `json:"updated_at_ns"`
-	VerifyMethod string `json:"verify_method,omitempty"`
-	VerifiedAtNs int64  `json:"verified_at_ns,omitempty"`
+	Destination   string `json:"destination"`
+	OriginNode    string `json:"origin_node"`
+	OriginRun     int64  `json:"origin_run"`
+	UpdatedAtNs   int64  `json:"updated_at_ns"`
+	VerifyMethod  string `json:"verify_method,omitempty"`
+	VerifiedAtNs  int64  `json:"verified_at_ns,omitempty"`
+	VerifyEveryNs int64  `json:"verify_every_ns,omitempty"`
 }
 
 // DurabilityFreshness is one origin-space freshness coordinate: the
