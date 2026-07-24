@@ -174,6 +174,17 @@ func (s *Server) Handler() http.Handler { return s.handler }
 // dial.
 func (s *Server) HasTLS() bool { return s.cfg.TLSCert != "" }
 
+// CertFingerprint returns the sha256: pin of the agent's configured TLS
+// certificate — the value the startup banner prints so an operator can see
+// what peers must pin. It errors when the agent serves plain HTTP (no cert)
+// or the certificate file cannot be read.
+func (s *Server) CertFingerprint() (string, error) {
+	if s.cfg.TLSCert == "" {
+		return "", errors.New("agent: no TLS certificate configured")
+	}
+	return FingerprintCertFile(s.cfg.TLSCert)
+}
+
 // Addr returns the configured listen address verbatim. For `:0`-style
 // binds the kernel-assigned port is only knowable from the net.Listener
 // the caller hands to Serve; this accessor is for the startup banner.

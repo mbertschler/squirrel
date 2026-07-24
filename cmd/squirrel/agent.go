@@ -24,9 +24,10 @@ const agentVersion = "0.0.0-dev"
 
 // newAgentCmd returns the `squirrel agent` cobra command. It starts the
 // HTTP server declared by the `[agent]` config block and blocks until
-// the cobra context (wired to SIGINT/SIGTERM in main) is cancelled.
+// the cobra context (wired to SIGINT/SIGTERM in main) is cancelled. The
+// `cert` child is a one-shot bootstrap helper and does not start a server.
 func newAgentCmd() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "agent",
 		Short: "Run the squirrel agent (HTTP server + scheduled audits + cadence-driven index/sync)",
 		Args:  cobra.NoArgs,
@@ -34,6 +35,8 @@ func newAgentCmd() *cobra.Command {
 			return runAgent(cmd)
 		},
 	}
+	cmd.AddCommand(newAgentCertCmd())
+	return cmd
 }
 
 func runAgent(cmd *cobra.Command) error {
@@ -226,9 +229,21 @@ func logAgentStartup(logger *slog.Logger, srv *agent.Server, addr string) {
 	if srv.HasTLS() {
 		scheme = "https"
 	}
-	logger.Info("agent listening",
+	attrs := []any{
 		"addr", addr,
 		"scheme", scheme,
 		"version", agentVersion,
-	)
+	}
+	// Surfacing the fingerprint at startup (F1) lets an operator read the
+	// pin peers must put in [nodes.X.tls] straight from the agent's log,
+	// without a separate command. A read failure is non-fatal — the agent
+	// still serves — so it is logged as a warning attribute, not an error.
+	if srv.HasTLS() {
+		if fp, err := srv.CertFingerprint(); err == nil {
+			attrs = append(attrs, "cert_fingerprint", fp)
+		} else {
+			attrs = append(attrs, "cert_fingerprint_error", err.Error())
+		}
+	}
+	logger.Info("agent listening", attrs...)
 }
