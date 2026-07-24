@@ -89,7 +89,11 @@ issue we should open for that item.
     — sync writes into `<dest.root>/<volume>/` and restore writes into
     `vol.Path`; nothing validates that those locations are the squirrel-
     owned tree we think they are.
-    → tracked in [#64](https://github.com/mbertschler/squirrel/issues/64)
+    → resolved by [#64](https://github.com/mbertschler/squirrel/issues/64)
+    (marker mechanism, local destinations, and restore) and
+    [#150](https://github.com/mbertschler/squirrel/issues/150) (remote
+    rclone destinations across the mirror, content-addressed, and packed
+    layouts)
 
 ### Medium
 
@@ -706,7 +710,16 @@ rclone overwrites them.
   message and a `--init` workaround.
 - A regression test asserts the marker is created on first sync.
 
-**Issue:** [#64 — sync: require .squirrel-volume markers on destination and source to gate against misconfiguration](https://github.com/mbertschler/squirrel/issues/64)
+**Status:** Resolved. #64 shipped the marker mechanism, local-destination
+gating, and the restore source-side check. #150 extended enforcement to
+remote rclone destinations (`sftp`, `s3`, `b2`, `gcs`) — read/written
+through the same overlay the transfer uses — across the mirror,
+content-addressed, and packed layouts, with the marker filtered out of
+every transfer, comparison, and restore. A read that fails for any reason
+other than a definite "not found" refuses without writing, so a
+reachability blip cannot be mistaken for a fresh root.
+
+**Issue:** [#64 — sync: require .squirrel-volume markers on destination and source to gate against misconfiguration](https://github.com/mbertschler/squirrel/issues/64); [#150 — sync: enforce .squirrel-volume markers on remote rclone destinations](https://github.com/mbertschler/squirrel/issues/150)
 
 ---
 

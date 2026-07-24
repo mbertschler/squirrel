@@ -41,6 +41,9 @@ zstd_level     = 3
 password = "obscured-pw"
 `, threshold), "/data")
 	t.Setenv("RCLONE_FAKE_CRYPT_SUFFIX", cryptDataSuffix)
+	// The crypt suffix is now in force, so the marker must be re-seeded
+	// at the suffixed path the overlay resolves to.
+	f.seedMarker(t, "pics", "docs")
 	return f
 }
 

@@ -356,6 +356,41 @@ func (r *Rclone) copyTo(ctx context.Context, src, dst string, extraArgs ...strin
 	return err
 }
 
+// errRemoteNotFound signals that an rclone read addressed a path the
+// backend reports as absent (object or directory not found), as opposed
+// to a transient, auth, or misconfiguration failure. The destination
+// marker gate treats it as "no marker yet" (eligible for --init
+// bootstrap); every other error refuses the sync without writing, so a
+// reachability blip can never be mistaken for a fresh root.
+var errRemoteNotFound = errors.New("rclone: remote path not found")
+
+// catRemote reads the full contents of the single object at uri via
+// `rclone cat`. A definite backend "not found" is mapped to
+// errRemoteNotFound so callers can distinguish a genuinely missing file
+// from a failure that must not be read as absence. extraArgs carries
+// per-destination flags such as the --checkers cap.
+func (r *Rclone) catRemote(ctx context.Context, uri string, extraArgs ...string) ([]byte, error) {
+	args := append([]string{"cat"}, extraArgs...)
+	out, err := r.runPlain(ctx, append(args, uri)...)
+	if err != nil {
+		if isNotFoundErr(err) {
+			return nil, errRemoteNotFound
+		}
+		return nil, err
+	}
+	return out, nil
+}
+
+// isNotFoundErr reports whether an rclone error denotes an absent path
+// rather than a transient or permission failure. rclone surfaces
+// fs.ErrorObjectNotFound ("object not found") and fs.ErrorDirNotFound
+// ("directory not found") across every backend the marker gate targets;
+// matching "not found" keeps the classification conservative — an auth
+// or network error never carries that phrase, so it stays a hard error.
+func isNotFoundErr(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "not found")
+}
+
 // listSnapshots returns the snapshot filenames directly under dirURI via
 // `rclone lsf`. A missing directory yields an empty list, not an error:
 // the first ride-along to a volume legitimately finds nothing there yet,

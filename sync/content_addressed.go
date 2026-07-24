@@ -102,6 +102,19 @@ type contentPusher struct {
 	dest  *config.Destination
 }
 
+// ensureMarker gates a remote content-layout push on the destination's
+// per-volume .squirrel-volume marker, exactly as the mirror layout does
+// (the marker sits at the volume root regardless of layout). Local
+// content-addressed and packed destinations are intentionally left
+// ungated here: they carry no such gate today, so extending it to them
+// is a separate parity concern — this closes only the remote gap (#150).
+func (h *contentPusher) ensureMarker(ctx context.Context, init bool) error {
+	if h.dest.Type == "local" {
+		return nil
+	}
+	return ensureRemoteDestinationMarker(ctx, h.store, h.rcl, h.dest, h.vol.Name, init)
+}
+
 // contentAddressedHandler pushes a volume to a content-addressed rclone
 // destination: per-hash `rclone copyto` for each content object the
 // destination lacks, then the run's manifest segment. The landing is
@@ -131,6 +144,9 @@ func (h *contentAddressedHandler) Push(ctx context.Context, opts Options) (Repor
 	}
 	if opts.DryRun {
 		return rep, fmt.Errorf("destination %q: the content-addressed push has no dry-run mode yet — run without --dry-run", h.dest.Name)
+	}
+	if err := h.ensureMarker(ctx, opts.Init); err != nil {
+		return rep, err
 	}
 	// shallow=true on the runs row: the per-object transfers carry no
 	// BLAKE3 end-to-end check (crypt remotes expose no hashes), and the

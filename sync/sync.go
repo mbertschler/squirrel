@@ -244,15 +244,14 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 		return rep, err
 	}
 
-	// Marker gate for local destinations. Remote destinations skip
-	// this check for now — reading/writing a marker through rclone
-	// adds out-of-band exec invocations that aren't worth the
-	// complexity until we hit a real misconfiguration on a remote.
-	// The dry-run path also skips: it never writes, and refusing a
-	// dry-run on an uninitialised destination would prevent the
-	// "preview what would happen" workflow.
-	if !opts.DryRun && dest.Type == "local" {
-		if err := ensureDestinationMarker(ctx, s, dest, vol.Name, opts.Init); err != nil {
+	// Marker gate. Local destinations validate the marker on the
+	// filesystem; remote rclone destinations (sftp/s3/b2/gcs) read and,
+	// with --init, write it through the same overlay the transfer uses.
+	// The dry-run path skips: it never writes, and refusing a dry-run on
+	// an uninitialised destination would prevent the "preview what would
+	// happen" workflow.
+	if !opts.DryRun {
+		if err := ensureDestinationMarker(ctx, s, rcl, dest, vol.Name, opts.Init); err != nil {
 			return rep, err
 		}
 	}
@@ -500,19 +499,28 @@ func validateLocalVolumeMarker(vol *config.Volume) error {
 	return fmt.Errorf("volume %q marker check: %w", vol.Name, err)
 }
 
-// ensureDestinationMarker validates (or, with Init, writes) the
-// .squirrel-volume marker at <dest.Root>/<vol.Name>/. The directory
-// is created on first --init so the marker can land even when the
-// destination tree is empty; on every subsequent sync the marker must
-// already match the volume name. A mismatched marker is always
-// refused, regardless of Init: that path almost certainly points at a
-// different squirrel volume, and overwriting its marker would erase
-// the trail that distinguishes the two.
+// ensureDestinationMarker validates (or, with init, writes) the
+// .squirrel-volume marker at the destination's per-volume root. It is
+// the single gate against pushing to a wrong or unmounted root: a
+// matching marker passes, a missing marker is bootstrapped only under
+// init (refused otherwise, in case the root is a typo or the remote is
+// unreachable), and a marker naming a different volume is always
+// refused — overwriting it would erase the trail that distinguishes the
+// two volumes.
 //
-// Restricted to dest.Type=="local" for now; remote destinations need
-// a separate rclone-mediated read/write path and are tracked as a
-// follow-up.
-func ensureDestinationMarker(ctx context.Context, s *store.Store, dest *config.Destination, volumeName string, init bool) error {
+// Local destinations reach the marker on the filesystem; remote rclone
+// destinations reach it through the same overlay their transfers use.
+func ensureDestinationMarker(ctx context.Context, s *store.Store, rcl *Rclone, dest *config.Destination, volumeName string, init bool) error {
+	if dest.Type != "local" {
+		return ensureRemoteDestinationMarker(ctx, s, rcl, dest, volumeName, init)
+	}
+	return ensureLocalDestinationMarker(ctx, s, dest, volumeName, init)
+}
+
+// ensureLocalDestinationMarker is the filesystem gate for local
+// destinations. The directory is created on first --init so the marker
+// can land even when the destination tree is empty.
+func ensureLocalDestinationMarker(ctx context.Context, s *store.Store, dest *config.Destination, volumeName string, init bool) error {
 	root := filepath.Join(dest.Root, volumeName)
 	err := volmark.Validate(root, volumeName)
 	if err == nil {
@@ -530,18 +538,99 @@ func ensureDestinationMarker(ctx context.Context, s *store.Store, dest *config.D
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return fmt.Errorf("destination %q: mkdir %s: %w", dest.Name, root, err)
 	}
-	self, err := s.GetSelfNode(ctx)
+	m, err := selfMarker(ctx, s, volumeName)
 	if err != nil {
-		return fmt.Errorf("destination %q: resolve self node: %w", dest.Name, err)
+		return fmt.Errorf("destination %q: %w", dest.Name, err)
 	}
-	if err := volmark.Write(root, volmark.Marker{
-		Volume:    volumeName,
-		Node:      self.Name,
-		CreatedAt: time.Now().UTC().Format(time.RFC3339),
-	}); err != nil {
+	if err := volmark.Write(root, m); err != nil {
 		return fmt.Errorf("destination %q: %w", dest.Name, err)
 	}
 	return nil
+}
+
+// ensureRemoteDestinationMarker is the rclone-mediated gate for remote
+// destinations (sftp/s3/b2/gcs). It reads the marker at the per-volume
+// root through remoteSubpathURI — the same overlay the layout's
+// transfers use, so a crypt destination's marker rides the encrypted
+// path too — and applies the identical rules as the local gate. A read
+// that fails for any reason other than a definite "not found" refuses
+// without writing: the invariant favours refusing over risking a write
+// to the wrong root.
+func ensureRemoteDestinationMarker(ctx context.Context, s *store.Store, rcl *Rclone, dest *config.Destination, volumeName string, init bool) error {
+	markerURI := remoteSubpathURI(dest, path.Join(volumeName, volmark.MarkerName))
+	data, err := rcl.catRemote(ctx, markerURI, checkersArgs(dest)...)
+	switch {
+	case err == nil:
+		return validateRemoteMarker(dest, markerURI, volumeName, data)
+	case !errors.Is(err, errRemoteNotFound):
+		return fmt.Errorf("destination %q: read %s at %s: %w", dest.Name, volmark.MarkerName, markerURI, err)
+	case !init:
+		return fmt.Errorf("destination %q at %s has no %s marker — re-run with --init to bootstrap (refusing in case the root is a typo)", dest.Name, markerURI, volmark.MarkerName)
+	default:
+		return writeRemoteMarker(ctx, s, rcl, dest, markerURI, volumeName)
+	}
+}
+
+// validateRemoteMarker applies the volume-name gate to a marker read
+// from a remote destination. A mismatch is always refused (the root
+// almost certainly holds a different squirrel volume); a malformed
+// marker surfaces as an error rather than being silently overwritten.
+func validateRemoteMarker(dest *config.Destination, markerURI, volumeName string, data []byte) error {
+	m, err := volmark.Parse(data)
+	if err != nil {
+		return fmt.Errorf("destination %q: %w at %s", dest.Name, err, markerURI)
+	}
+	if m.Volume != volumeName {
+		return fmt.Errorf("destination %q: %s at %s names %q, want %q (refuse to sync over a different volume's tree)",
+			dest.Name, volmark.MarkerName, markerURI, m.Volume, volumeName)
+	}
+	return nil
+}
+
+// writeRemoteMarker bootstraps the destination's per-volume marker over
+// rclone: it renders the marker bytes locally (byte-identical to a local
+// marker) and copyto's them to markerURI through the destination's
+// overlay, so a later read decrypts and validates cleanly.
+func writeRemoteMarker(ctx context.Context, s *store.Store, rcl *Rclone, dest *config.Destination, markerURI, volumeName string) error {
+	m, err := selfMarker(ctx, s, volumeName)
+	if err != nil {
+		return fmt.Errorf("destination %q: %w", dest.Name, err)
+	}
+	data, err := volmark.Marshal(m)
+	if err != nil {
+		return fmt.Errorf("destination %q: %w", dest.Name, err)
+	}
+	tmp, err := os.CreateTemp("", "squirrel-volume-*")
+	if err != nil {
+		return fmt.Errorf("destination %q: stage marker: %w", dest.Name, err)
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("destination %q: stage marker: %w", dest.Name, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("destination %q: stage marker: %w", dest.Name, err)
+	}
+	if err := rcl.copyTo(ctx, tmp.Name(), markerURI, checkersArgs(dest)...); err != nil {
+		return fmt.Errorf("destination %q: write %s to %s: %w", dest.Name, volmark.MarkerName, markerURI, err)
+	}
+	return nil
+}
+
+// selfMarker builds the marker to stamp on first --init: the volume
+// name plus the writing node and time, so an operator inspecting the
+// marker later can answer "who claimed this root, and when?"
+func selfMarker(ctx context.Context, s *store.Store, volumeName string) (volmark.Marker, error) {
+	self, err := s.GetSelfNode(ctx)
+	if err != nil {
+		return volmark.Marker{}, fmt.Errorf("resolve self node: %w", err)
+	}
+	return volmark.Marker{
+		Volume:    volumeName,
+		Node:      self.Name,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	}, nil
 }
 
 func deriveStatus(r RunResult) string {

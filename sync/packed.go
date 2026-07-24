@@ -114,6 +114,9 @@ func (h *packedHandler) Push(ctx context.Context, opts Options) (Report, error) 
 	if opts.DryRun {
 		return rep, fmt.Errorf("destination %q: the packed push has no dry-run mode yet — run without --dry-run", h.dest.Name)
 	}
+	if err := h.ensureMarker(ctx, opts.Init); err != nil {
+		return rep, err
+	}
 	// shallow=true: neither the per-object copyto nor the pack copyto
 	// carries a BLAKE3 end-to-end check, and the audit trail stays honest.
 	runID, err := beginSyncRunGuarded(ctx, h.store, false, store.SyncRunSpec{
