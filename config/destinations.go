@@ -369,9 +369,13 @@ func optionalZstdLevel(raw map[string]any, key string, def int) (int, error) {
 }
 
 // resolveCrypt validates the optional `crypt` sub-table of a destination.
-// A missing key yields nil (no encryption overlay). The two password
-// fields go through the same secret resolution as destination credentials;
-// password is required, password2 (the salt) is optional.
+// A missing key yields nil (no encryption overlay). The two password fields
+// go through the same secret resolution as destination credentials;
+// password is required, password2 (the salt) is optional. Values are
+// plaintext by default and squirrel obscures them into rclone's wire form
+// at resolution time (retiring the manual `rclone obscure` step); a
+// `obscured = true` marker keeps a pre-obscured value verbatim for configs
+// written before this behaviour.
 func resolveCrypt(raw map[string]any, typ string) (*Crypt, error) {
 	v, ok := raw["crypt"]
 	if !ok {
@@ -387,23 +391,63 @@ func resolveCrypt(raw map[string]any, typ string) (*Crypt, error) {
 	if !ok {
 		return nil, errors.New("crypt must be a table, e.g. [destinations.<name>.crypt]")
 	}
-	password, err := resolveSecret(table, "password")
+	alreadyObscured, err := cryptObscuredFlag(table)
 	if err != nil {
-		return nil, fmt.Errorf("crypt: %w", err)
-	}
-	if password == "" {
-		return nil, errors.New("crypt.password is required (rclone-obscured; generate with `rclone obscure`)")
-	}
-	password2, err := resolveSecret(table, "password2")
-	if err != nil {
-		return nil, fmt.Errorf("crypt: %w", err)
+		return nil, err
 	}
 	for k := range table {
-		if k != "password" && k != "password2" {
+		if k != "password" && k != "password2" && k != "obscured" {
 			return nil, fmt.Errorf("crypt: unknown field %q", k)
 		}
 	}
+	password, err := resolveCryptSecret(table, "password", alreadyObscured)
+	if err != nil {
+		return nil, err
+	}
+	if password == "" {
+		return nil, errors.New("crypt.password is required (plaintext by default; set `obscured = true` to supply a pre-obscured value)")
+	}
+	password2, err := resolveCryptSecret(table, "password2", alreadyObscured)
+	if err != nil {
+		return nil, err
+	}
 	return &Crypt{Password: password, Password2: password2}, nil
+}
+
+// cryptObscuredFlag reads the optional `obscured` marker. Its default —
+// false — means the password fields carry plaintext squirrel obscures
+// itself; true means they already hold rclone-obscured values and must be
+// passed through verbatim (the migration path for configs written before
+// squirrel obscured on their behalf).
+func cryptObscuredFlag(table map[string]any) (bool, error) {
+	v, ok := table["obscured"]
+	if !ok {
+		return false, nil
+	}
+	b, ok := v.(bool)
+	if !ok {
+		return false, errors.New("crypt.obscured must be a boolean")
+	}
+	return b, nil
+}
+
+// resolveCryptSecret resolves one crypt password field (literal or
+// { env = "VAR" }) and, unless it is flagged already-obscured, obscures the
+// plaintext into rclone's wire form. An empty/absent field stays empty — an
+// absent salt is legal, and an absent password is caught by the caller.
+func resolveCryptSecret(table map[string]any, key string, alreadyObscured bool) (string, error) {
+	val, err := resolveSecret(table, key)
+	if err != nil {
+		return "", fmt.Errorf("crypt: %w", err)
+	}
+	if val == "" || alreadyObscured {
+		return val, nil
+	}
+	obscured, err := obscureRclone(val)
+	if err != nil {
+		return "", fmt.Errorf("crypt.%s: %w", key, err)
+	}
+	return obscured, nil
 }
 
 // validateCryptRemoteNames rejects a config where one destination's crypt

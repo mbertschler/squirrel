@@ -231,12 +231,15 @@ const (
 // filename_encryption is fixed off, keeping the destination tree layout
 // identical to an unencrypted destination.
 type Crypt struct {
-	// Password is the content-encryption password in rclone-obscured form,
-	// the same representation rclone's own crypt config stores (generate
-	// one with `rclone obscure`). Accepts a literal or { env = "VAR" }.
+	// Password is the content-encryption password already in rclone-obscured
+	// form — the representation rclone's own crypt config stores and rclone
+	// renders into rclone.conf. The config accepts plaintext (a literal or
+	// { env = "VAR" }) and squirrel obscures it at load time; a config that
+	// still supplies a pre-obscured value sets `obscured = true` so it is
+	// stored here verbatim.
 	Password string
-	// Password2 is the salt, also rclone-obscured. Optional but
-	// recommended, matching rclone's crypt config.
+	// Password2 is the salt, in the same obscured form as Password.
+	// Optional but recommended, matching rclone's crypt config.
 	Password2 string
 }
 

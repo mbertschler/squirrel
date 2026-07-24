@@ -96,8 +96,9 @@ destination). See [Encrypted (crypt)](/squirrel/layouts/encrypted/).
 
 | Key | Meaning |
 |---|---|
-| `password` | rclone-obscured value (`rclone obscure <plaintext>`). Secret. |
-| `password2` | rclone-obscured salt; optional but recommended. Secret. |
+| `password` | Plaintext encryption password; squirrel obscures it at render time. Secret. |
+| `password2` | Plaintext salt; optional but recommended. Secret. |
+| `obscured` | `true` if `password`/`password2` are already rclone-obscured (renders them verbatim; default `false`). |
 
 Filenames are **not** encrypted (`filename_encryption = off`, fixed by design).
 

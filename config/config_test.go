@@ -562,6 +562,7 @@ root = "/data"
 password = "transport-pw"
 
 [destinations.offsite.crypt]
+obscured  = true
 password  = { env = "CRYPT_PASSWORD" }
 password2 = "obscured-salt"
 `)
@@ -595,6 +596,7 @@ root = "/data"
 password = "transport-pw"
 
 [destinations.offsite.crypt]
+obscured  = true
 password  = "obscured-pw"
 password2 = "obscured-salt"
 `)
@@ -663,6 +665,7 @@ user = "u"
 root = "/data"
 
 [destinations.offsite.crypt]
+obscured = true
 password = "obscured-pw"
 `)
 	cfg, err := Load(p)
