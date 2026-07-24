@@ -174,7 +174,7 @@ func (f *schedulerFixture) scheduler() *scheduler {
 	return &scheduler{
 		store:     f.srv.store,
 		volumes:   f.srv.cfg.Volumes,
-		syncRun:   f.srv.cfg.SyncRunner,
+		dispatch:  newSyncDispatcher(f.srv.cfg.SyncRunner, f.srv.cfg.Logger, f.clock.Now, defaultMaxParallelSyncs),
 		logger:    f.srv.cfg.Logger,
 		locks:     f.srv.router,
 		tickEvery: time.Second,
@@ -310,6 +310,7 @@ func TestSchedulerSyncRunsPreSyncIndexFirst(t *testing.T) {
 	ctx := context.Background()
 
 	sch.tick(ctx)
+	sch.dispatch.wait() // syncs run on per-destination workers; drain them
 
 	runs, err := f.store.ListRuns(ctx, store.ListRunsOpts{})
 	if err != nil {
@@ -437,6 +438,7 @@ func TestSchedulerSkipsWhenInFlightSyncRun(t *testing.T) {
 
 	sch := f.scheduler()
 	sch.tick(context.Background())
+	sch.dispatch.wait()
 
 	if got := len(f.syncLog.Calls()); got != 0 {
 		t.Fatalf("sync invoked %d times despite running sync row; want 0", got)
@@ -517,6 +519,7 @@ func TestSchedulerCadenceUsesLastFinished(t *testing.T) {
 
 	// Tick 1: nothing prior → fires.
 	sch.tick(ctx)
+	sch.dispatch.wait()
 	if got := len(f.syncLog.Calls()); got != 1 {
 		t.Fatalf("after tick 1: sync calls = %d; want 1", got)
 	}
@@ -524,6 +527,7 @@ func TestSchedulerCadenceUsesLastFinished(t *testing.T) {
 	// Advance 30min, still under cadence → does not fire.
 	f.clock.Add(30 * time.Minute)
 	sch.tick(ctx)
+	sch.dispatch.wait()
 	if got := len(f.syncLog.Calls()); got != 1 {
 		t.Fatalf("after tick 2 (under cadence): sync calls = %d; want 1", got)
 	}
@@ -531,6 +535,7 @@ func TestSchedulerCadenceUsesLastFinished(t *testing.T) {
 	// Advance another hour, past cadence → fires again.
 	f.clock.Add(time.Hour)
 	sch.tick(ctx)
+	sch.dispatch.wait()
 	if got := len(f.syncLog.Calls()); got != 2 {
 		t.Fatalf("after tick 3 (over cadence): sync calls = %d; want 2", got)
 	}
@@ -562,6 +567,7 @@ func TestSchedulerFailedSyncStillConsumesCadence(t *testing.T) {
 	ctx := context.Background()
 
 	sch.tick(ctx)
+	sch.dispatch.wait()
 	if calls.Load() != 1 {
 		t.Fatalf("tick 1 sync calls = %d; want 1", calls.Load())
 	}
@@ -569,6 +575,7 @@ func TestSchedulerFailedSyncStillConsumesCadence(t *testing.T) {
 	// Within cadence → no re-fire even though the prior run failed.
 	f.clock.Add(10 * time.Minute)
 	sch.tick(ctx)
+	sch.dispatch.wait()
 	if calls.Load() != 1 {
 		t.Fatalf("under-cadence tick after failure called sync %d times; want 1 (no special retry)",
 			calls.Load())
@@ -577,6 +584,7 @@ func TestSchedulerFailedSyncStillConsumesCadence(t *testing.T) {
 	// Past cadence → re-fires (regardless of prior failure).
 	f.clock.Add(time.Hour)
 	sch.tick(ctx)
+	sch.dispatch.wait()
 	if calls.Load() != 2 {
 		t.Fatalf("past-cadence tick after failure called sync %d times; want 2", calls.Load())
 	}
@@ -598,6 +606,7 @@ func TestSchedulerBothCadencesShareIndexRun(t *testing.T) {
 	ctx := context.Background()
 
 	sch.tick(ctx)
+	sch.dispatch.wait()
 
 	runs, _ := f.store.ListRuns(ctx, store.ListRunsOpts{})
 	var indexCount int
@@ -627,11 +636,13 @@ func TestSchedulerStandaloneIndexAfterSyncCadenceWaits(t *testing.T) {
 	ctx := context.Background()
 
 	sch.tick(ctx) // fires sync + pre-sync index.
+	sch.dispatch.wait()
 
 	// 10min later → under index_every from the pre-sync index, no
 	// standalone fires.
 	f.clock.Add(10 * time.Minute)
 	sch.tick(ctx)
+	sch.dispatch.wait()
 	runs, _ := f.store.ListRuns(ctx, store.ListRunsOpts{})
 	var indexCount int
 	for _, r := range runs {
@@ -647,6 +658,7 @@ func TestSchedulerStandaloneIndexAfterSyncCadenceWaits(t *testing.T) {
 	// due yet because sync_every is 1h).
 	f.clock.Add(10 * time.Minute) // total 20min since pre-sync.
 	sch.tick(ctx)
+	sch.dispatch.wait()
 	runs, _ = f.store.ListRuns(ctx, store.ListRunsOpts{})
 	indexCount = 0
 	for _, r := range runs {
@@ -792,9 +804,12 @@ func TestSchedulerDropsSyncWhenRunnerNil(t *testing.T) {
 	})
 	f.seedFile()
 	sch := f.scheduler()
-	sch.syncRun = nil
+	// A dispatcher with no runner is the index-only-host case (no rclone
+	// wired): sync-triggering paths log a skip and create no sync rows.
+	sch.dispatch = newSyncDispatcher(nil, f.srv.cfg.Logger, f.clock.Now, defaultMaxParallelSyncs)
 
 	sch.tick(context.Background())
+	sch.dispatch.wait()
 
 	if !f.containsLogLine("scheduler.skipped", "kind=sync", "sync runner not configured") {
 		t.Fatalf("missing nil-runner skip log:\n%s", f.logBuf.String())

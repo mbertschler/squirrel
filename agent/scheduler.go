@@ -30,7 +30,7 @@ const DefaultSchedulerTick = 30 * time.Second
 type scheduler struct {
 	store     *store.Store
 	volumes   map[string]*config.Volume
-	syncRun   SyncRunner
+	dispatch  *syncDispatcher
 	logger    *slog.Logger
 	locks     lockHolder
 	tickEvery time.Duration
@@ -60,7 +60,7 @@ func newScheduler(srv *Server, tickEvery time.Duration, now func() time.Time) *s
 	return &scheduler{
 		store:     srv.store,
 		volumes:   srv.cfg.Volumes,
-		syncRun:   srv.cfg.SyncRunner,
+		dispatch:  newSyncDispatcher(srv.cfg.SyncRunner, srv.cfg.Logger, now, defaultMaxParallelSyncs),
 		logger:    srv.cfg.Logger,
 		locks:     srv.router,
 		tickEvery: tickEvery,
@@ -103,9 +103,12 @@ func (s *scheduler) run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			// Drain in-flight hooks before returning so Serve's shutdown
-			// wait doesn't race a hook goroutine writing its outcome.
+			// Drain in-flight hooks and per-destination sync workers before
+			// returning so Serve's shutdown wait doesn't race a goroutine
+			// writing its outcome. ctx is already cancelled, so any rclone
+			// child has been killed and the workers return promptly.
 			s.hooks.wait()
+			s.dispatch.wait()
 			return
 		case <-t.C:
 			s.tick(ctx)
@@ -460,17 +463,21 @@ func indexRunStatus(rep index.Report, err error) (string, bool) {
 	return store.RunStatusSuccess, true
 }
 
-// runSync kicks one (volume, destination) sync via the configured
-// SyncRunner. The pre-check against the runs table is the in-flight
-// detection the issue specifies; the SyncRunner's downstream call
-// (sync.RunPair) adds its own atomic BeginSyncRunIfClear gate, so a
-// race that sneaks past the pre-check still produces a clean skip
-// rather than a duplicate run.
+// runSync evaluates the per-pair in-flight gate, then hands the sync to
+// the per-destination dispatcher (#160). The DB check catches a sync of
+// this exact pair already running — a concurrent CLI `squirrel sync`, or a
+// stale row not yet reaped — producing the same clean per-pair skip the
+// serial scheduler did; the dispatcher additionally serialises different
+// volumes that target the same destination and confines a slow transfer to
+// its own worker. The SyncRunner's downstream call (sync.RunPair) adds its
+// own atomic BeginSyncRunIfClear gate, so a race that sneaks past the
+// pre-check still produces a clean skip rather than a duplicate run.
 //
-// A nil SyncRunner surfaces as a clean skip rather than an error so
-// an agent running pure index-only schedules can omit the sync wiring
-// (and the rclone dependency that comes with it) without the
-// scheduler logging at error level on each tick.
+// Dispatch is non-blocking: a slow or wedged destination is confined to its
+// own worker and never stalls the tick loop or syncs to other destinations,
+// which is the freeze F25 recorded. A nil SyncRunner surfaces as a clean
+// skip inside the dispatcher so an agent running pure index-only schedules
+// can omit the sync wiring without logging at error level each tick.
 func (s *scheduler) runSync(ctx context.Context, vol *config.Volume, volumeID int64, destName string) {
 	running, err := s.store.HasRunningRun(ctx, store.RunKindSync, volumeID, destName)
 	if err != nil {
@@ -485,29 +492,5 @@ func (s *scheduler) runSync(ctx context.Context, vol *config.Volume, volumeID in
 			"reason", "in-flight sync run")
 		return
 	}
-	if s.syncRun == nil {
-		s.logger.Info("scheduler.skipped",
-			"kind", "sync", "volume", vol.Name, "destination", destName,
-			"reason", "sync runner not configured")
-		return
-	}
-	s.logger.Info("scheduler.kicked",
-		"kind", "sync", "volume", vol.Name, "destination", destName)
-	start := s.now()
-	rep := s.syncRun(ctx, vol, destName)
-	duration := s.now().Sub(start)
-	status := rep.Status
-	if status == "" {
-		status = store.RunStatusFailed
-	}
-	s.logger.Info("scheduler.finished",
-		"kind", "sync", "volume", vol.Name, "destination", destName,
-		"run_id", rep.RunID, "status", status,
-		"duration_ms", duration.Milliseconds(),
-	)
-	if rep.Err != nil {
-		s.logger.Error("scheduler.error",
-			"kind", "sync", "volume", vol.Name, "destination", destName,
-			"run_id", rep.RunID, "err", rep.Err.Error())
-	}
+	s.dispatch.dispatch(ctx, vol, destName)
 }
