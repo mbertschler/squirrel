@@ -450,12 +450,45 @@ func TestPackedWatermarkGuardRefusesMirror(t *testing.T) {
 	if err := f.store.FinishRun(ctx, mirrorRun, store.RunStatusSuccess, "", 1); err != nil {
 		t.Fatalf("finish mirror run: %v", err)
 	}
+	// A real mirror era leaves files under the root, so the root is
+	// non-empty — a genuine layout conflict, not a wiped destination.
+	seedRemoteFile(t, f, "pics", "a.txt")
 	rep, err := f.sync(t)
 	if err == nil || !strings.Contains(err.Error(), "not packed") {
 		t.Fatalf("expected packed-history refusal, got %v", err)
 	}
 	if rep.Status != store.RunStatusFailed {
 		t.Fatalf("Status = %q, want failed", rep.Status)
+	}
+}
+
+// TestPackedFreshStartOnEmptyRoot is the packed analogue of the F20 fix: a
+// prior success recorded under this destination name, but an empty remote
+// root, is a fresh start rather than a refusal.
+func TestPackedFreshStartOnEmptyRoot(t *testing.T) {
+	f := setupPackedFixture(t, "1MiB")
+	f.write(t, "a.txt", "tiny")
+	f.index(t)
+
+	ctx := context.Background()
+	staleRun, err := f.store.BeginRun(ctx, store.RunKindSync, f.volumeID(t), "offsite", false)
+	if err != nil {
+		t.Fatalf("seed stale run: %v", err)
+	}
+	if err := f.store.FinishRun(ctx, staleRun, store.RunStatusSuccess, "", 1); err != nil {
+		t.Fatalf("finish stale run: %v", err)
+	}
+	// Remote root left empty — the guard reads it as a fresh start.
+
+	rep, err := f.sync(t)
+	if err != nil {
+		t.Fatalf("fresh-start sync failed: %v (rep=%+v)", err, rep)
+	}
+	if rep.Status != store.RunStatusSuccess {
+		t.Fatalf("Status = %q, want success", rep.Status)
+	}
+	if _, err := os.Stat(f.remoteBlob(PacksDirName, fmt.Sprintf("map-%d", rep.RunID))); err != nil {
+		t.Fatalf("fresh start wrote no placement map: %v", err)
 	}
 }
 

@@ -388,6 +388,27 @@ func (r *Rclone) deleteFile(ctx context.Context, fileURI string) error {
 	return err
 }
 
+// remoteRootEmpty reports whether rootURI holds no files, listing it
+// recursively via `rclone lsf -R --files-only`. A missing root (rclone
+// exits non-zero with empty output, as when the directory was never
+// created) counts as empty, mirroring listSnapshots' treatment of an
+// absent snapshot directory. The layout guards use it to recognise a
+// wiped or repointed destination — including one whose recorded state was
+// cleared by `squirrel destination reset` — as a fresh start rather than
+// a layout conflict. A genuine listing error (non-empty stderr, empty
+// stdout) surfaces so the caller can stay fail-closed and refuse.
+func (r *Rclone) remoteRootEmpty(ctx context.Context, rootURI string, extraArgs ...string) (bool, error) {
+	args := append([]string{"lsf", "-R", "--files-only"}, extraArgs...)
+	out, err := r.runPlain(ctx, append(args, rootURI)...)
+	if err != nil {
+		if len(bytes.TrimSpace(out)) == 0 {
+			return true, nil
+		}
+		return false, err
+	}
+	return len(bytes.TrimSpace(out)) == 0, nil
+}
+
 // statRemote returns the size of the single object at uri via
 // `rclone lsjson --stat`. The content-addressed push uses it to confirm
 // presence and size of each uploaded object and manifest segment;
