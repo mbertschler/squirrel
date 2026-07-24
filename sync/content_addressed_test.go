@@ -32,7 +32,11 @@ import (
 // $RCLONE_FAKE_HASH_PREFIX simulating remote-side tampering,
 // $RCLONE_FAKE_HASH_VALUE forcing an exact value, and
 // $RCLONE_FAKE_NO_HASHES a backend that exposes no checksums;
-// $RCLONE_FAKE_EMPTY_LISTING a directory lsjson that returns no entries.
+// $RCLONE_FAKE_EMPTY_LISTING a directory lsjson that returns no entries;
+// $RCLONE_FAKE_CAT_FAIL / $RCLONE_FAKE_STAT_FAIL inject a transient error
+// into cat / lsjson --stat; and $RCLONE_FAKE_BUCKET_ABSENCE models the
+// bucket backends' zero-exit empty/null reply for a missing object
+// (versus sftp's canonical not-found exit).
 const fakeRcloneScript = `#!/bin/sh
 {
   printf 'argv:'
@@ -95,10 +99,27 @@ copyto)
   dst=$(resolve "$a2")
   mkdir -p "$(dirname "$dst")" && cp "$(resolve "$a1")" "$dst"
   ;;
+cat)
+  if [ -n "$RCLONE_FAKE_CAT_FAIL" ]; then echo "$RCLONE_FAKE_CAT_FAIL" >&2; exit 1; fi
+  f=$(resolve "$a1")
+  if [ ! -f "$f" ]; then
+    # Bucket backends (s3/b2/gcs) cat a missing key as empty stdout on a
+    # zero exit; sftp errors with a canonical "not found".
+    if [ -n "$RCLONE_FAKE_BUCKET_ABSENCE" ]; then exit 0; fi
+    echo "object not found: $a1" >&2; exit 3
+  fi
+  cat "$f"
+  ;;
 lsjson)
   if [ "$stat" = 1 ]; then
+    if [ -n "$RCLONE_FAKE_STAT_FAIL" ]; then echo "$RCLONE_FAKE_STAT_FAIL" >&2; exit 1; fi
     f=$(resolve "$a1")
-    if [ ! -f "$f" ]; then echo "object not found: $a1" >&2; exit 3; fi
+    if [ ! -f "$f" ]; then
+      # Bucket backends report a missing key as a "null" stat on a zero
+      # exit; sftp errors with a canonical "not found".
+      if [ -n "$RCLONE_FAKE_BUCKET_ABSENCE" ]; then printf 'null\n'; exit 0; fi
+      echo "object not found: $a1" >&2; exit 3
+    fi
     entry_json "$f"; printf '\n'
   else
     dir=$(resolve "$a1")
@@ -153,6 +174,9 @@ password = "obscured-pw"
 	// scan-back and verify list from. The shim appends the suffix on
 	// overlay writes so those listings see what real rclone would.
 	t.Setenv("RCLONE_FAKE_CRYPT_SUFFIX", cryptDataSuffix)
+	// The crypt suffix is now in force, so the marker must be re-seeded
+	// at the suffixed path the overlay resolves to.
+	f.seedMarker(t, "pics", "docs")
 	return f
 }
 
@@ -181,6 +205,9 @@ func setupCAFixture(t *testing.T, destBlock, strip string) *caFixture {
 	t.Setenv("RCLONE_FAKE_HASH_VALUE", "")
 	t.Setenv("RCLONE_FAKE_HASH_PREFIX", "")
 	t.Setenv("RCLONE_FAKE_CRYPT_SUFFIX", "")
+	t.Setenv("RCLONE_FAKE_CAT_FAIL", "")
+	t.Setenv("RCLONE_FAKE_STAT_FAIL", "")
+	t.Setenv("RCLONE_FAKE_BUCKET_ABSENCE", "")
 
 	root := t.TempDir()
 	volPath := filepath.Join(root, "src")
@@ -221,7 +248,29 @@ sync_to = ["offsite"]
 	if err := os.WriteFile(rcl.Config, []byte{}, 0o600); err != nil {
 		t.Fatalf("seed rclone.conf: %v", err)
 	}
-	return &caFixture{store: s, rcl: rcl, cfg: cfg, pair: pairs[0], fakeRoot: fakeRoot, logPath: logPath}
+	f := &caFixture{store: s, rcl: rcl, cfg: cfg, pair: pairs[0], fakeRoot: fakeRoot, logPath: logPath}
+	// Pre-bootstrap the per-volume markers so the remote-marker gate
+	// (#150) lets these pushes through, mirroring how syncFixture seeds
+	// the local mirror marker. The crypt-suffix env is still empty here,
+	// so a crypt fixture re-seeds after setting it (see
+	// setupContentAddressedFixture / setupPackedFixture); the plain
+	// re-seed is idempotent, and any extra file at the volume root is
+	// never enumerated by the object/segment listings.
+	f.seedMarker(t, "pics", "docs")
+	return f
+}
+
+// seedMarker bootstraps the per-volume .squirrel-volume marker on the
+// fixture's fake remote via the real rclone-mediated write path, so it
+// lands at exactly the URI the push later reads (honouring the crypt
+// suffix in force when called).
+func (f *caFixture) seedMarker(t *testing.T, volumes ...string) {
+	t.Helper()
+	for _, v := range volumes {
+		if err := ensureRemoteDestinationMarker(context.Background(), f.store, f.rcl, f.cfg.Destinations["offsite"], v, true); err != nil {
+			t.Fatalf("seed remote marker for %q: %v", v, err)
+		}
+	}
 }
 
 func (f *caFixture) write(t *testing.T, name, content string) {

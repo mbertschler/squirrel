@@ -136,6 +136,9 @@ func (h *packedHandler) Push(ctx context.Context, opts Options) (Report, error) 
 	if opts.DryRun {
 		return rep, h.previewDryRun(ctx, &rep, volID)
 	}
+	if err := h.ensureMarker(ctx, opts.Init); err != nil {
+		return rep, err
+	}
 	// shallow=true: neither the per-object copyto nor the pack copyto
 	// carries a BLAKE3 end-to-end check, and the audit trail stays honest.
 	runID, err := beginSyncRunGuarded(ctx, h.store, false, store.SyncRunSpec{
