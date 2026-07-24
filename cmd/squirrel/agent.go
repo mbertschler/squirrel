@@ -169,6 +169,10 @@ func resolveSchedulerRclone(cmd *cobra.Command, cfg *config.Config) (*sync.Rclon
 	if err != nil {
 		return nil, fmt.Errorf("scheduler needs rclone for scheduled syncs: %w", err)
 	}
+	// Bound every automatic transfer by the no-progress guard so a wedged
+	// endpoint fails its own run instead of hanging forever (#160, F25).
+	// Foreground `squirrel sync` leaves this unset — a human can interrupt.
+	rcl.StallTimeout = sync.DefaultStallTimeout
 	pairs, err := sync.PairsFor(cfg, "", "")
 	if err != nil {
 		return nil, fmt.Errorf("scheduler rclone preflight: %w", err)

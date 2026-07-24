@@ -7,12 +7,72 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/runevents"
 )
+
+// TestStallGuardFiresWithoutProgress proves the no-progress guard cancels
+// the run — and records that it fired — when no advance arrives within the
+// timeout. This is the F25 wedge: rclone alive but transferring nothing.
+// The test waits for the guard rather than racing a deadline, so the exact
+// timeout is not timing-sensitive; a generous value keeps it robust under
+// load.
+func TestStallGuardFiresWithoutProgress(t *testing.T) {
+	var cancelled atomic.Bool
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	g := newStallGuard(ctx, 100*time.Millisecond, func() {
+		cancelled.Store(true)
+		cancel()
+	})
+	g.wait() // blocks until watch returns; with no poke it fires first
+	if !g.fired.Load() {
+		t.Fatal("guard did not fire after the stall timeout elapsed with no progress")
+	}
+	if !cancelled.Load() {
+		t.Fatal("guard fired but never cancelled the run context")
+	}
+}
+
+// TestStallGuardResetsOnProgress proves a transfer that keeps advancing is
+// never killed: pokes driven off a ticker at a fraction of the stall window
+// keep resetting it across a span twice as long as one window, so only a
+// working reset explains the guard staying quiet. The wide ratio between
+// the stall timeout and the poke interval keeps scheduler jitter from
+// faking a stall.
+func TestStallGuardResetsOnProgress(t *testing.T) {
+	var cancelled atomic.Bool
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const stall = 400 * time.Millisecond
+	g := newStallGuard(ctx, stall, func() {
+		cancelled.Store(true)
+		cancel()
+	})
+	tick := time.NewTicker(stall / 20) // pokes at 20x the resolution of the bound
+	defer tick.Stop()
+	deadline := time.After(2 * stall) // outlast a single window, so a reset is required
+	for done := false; !done; {
+		select {
+		case <-tick.C:
+			g.advance()
+		case <-deadline:
+			done = true
+		}
+	}
+	if g.fired.Load() {
+		t.Fatal("guard fired while progress was still arriving")
+	}
+	cancel() // finishing the run stops the guard cleanly
+	g.wait()
+	if cancelled.Load() {
+		t.Fatal("guard cancelled the run despite steady progress")
+	}
+}
 
 // requireRclone skips the test if rclone is not on PATH. The wrapper tests
 // exercise the real binary against a local-filesystem destination; if a
@@ -58,7 +118,7 @@ func TestParseJSONLogCapturesObjectlessErrors(t *testing.T) {
 		`{"stats":{"errors":1,"fatalError":true,"totalTransfers":0,"totalChecks":0,"bytes":0}}`,
 	}, "\n")
 	var r RunResult
-	parseJSONLog(strings.NewReader(stream), &r, nil)
+	parseJSONLog(strings.NewReader(stream), &r, nil, nil)
 
 	if len(r.FailedFiles) != 2 {
 		t.Fatalf("FailedFiles = %+v, want 2 (auth + reading; retry summaries dropped)", r.FailedFiles)
@@ -85,7 +145,7 @@ func TestParseJSONLogCapturesFatalLevelAndRawStderr(t *testing.T) {
 		`{"stats":{"errors":0,"fatalError":true,"totalTransfers":0,"totalChecks":0,"bytes":0}}`,
 	}, "\n")
 	var r RunResult
-	parseJSONLog(strings.NewReader(stream), &r, nil)
+	parseJSONLog(strings.NewReader(stream), &r, nil, nil)
 
 	if len(r.FailedFiles) != 1 || !strings.Contains(r.FailedFiles[0].Message, "NoCredentialProviders") {
 		t.Fatalf("FailedFiles = %+v, want the fatal-level message captured", r.FailedFiles)
@@ -105,8 +165,7 @@ func TestParseJSONLogStderrBounded(t *testing.T) {
 		lines = append(lines, fmt.Sprintf("stderr line %04d", i))
 	}
 	var r RunResult
-	parseJSONLog(strings.NewReader(strings.Join(lines, "\n")), &r, nil)
-
+	parseJSONLog(strings.NewReader(strings.Join(lines, "\n")), &r, nil, nil)
 	if len(r.Stderr) == 0 {
 		t.Fatal("Stderr empty, want the tail of the stream")
 	}
@@ -153,7 +212,7 @@ func TestParseJSONLogDetectsHashFallback(t *testing.T) {
 		`{"stats":{"errors":0,"fatalError":false,"totalTransfers":2,"totalChecks":0,"bytes":10}}`,
 	}, "\n")
 	var r RunResult
-	parseJSONLog(strings.NewReader(stream), &r, nil)
+	parseJSONLog(strings.NewReader(stream), &r, nil, nil)
 
 	if !r.HashFallback {
 		t.Fatalf("HashFallback = false, want true (no-common-hash notice should be detected)")
@@ -168,7 +227,7 @@ func TestParseJSONLogDetectsHashFallback(t *testing.T) {
 func TestParseJSONLogNoFalseHashFallback(t *testing.T) {
 	stream := `{"stats":{"errors":0,"fatalError":false,"totalTransfers":2,"totalChecks":1,"bytes":10}}`
 	var r RunResult
-	parseJSONLog(strings.NewReader(stream), &r, nil)
+	parseJSONLog(strings.NewReader(stream), &r, nil, nil)
 	if r.HashFallback {
 		t.Fatalf("HashFallback = true on a clean run, want false")
 	}
@@ -187,7 +246,7 @@ func TestParseJSONLogEmitsProgressWithByteTotal(t *testing.T) {
 	var events []runevents.Progress
 	parseJSONLog(strings.NewReader(stream), &r, func(p runevents.Progress) {
 		events = append(events, p)
-	})
+	}, nil)
 	if len(events) != 2 {
 		t.Fatalf("progress events = %d, want 2", len(events))
 	}
