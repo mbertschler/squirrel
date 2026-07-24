@@ -53,6 +53,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newAgentCmd())
 	root.AddCommand(newAuditCmd())
 	root.AddCommand(newVerifyCmd())
+	root.AddCommand(newConflictsCmd())
 	root.AddCommand(newPeerSyncCmd())
 	root.AddCommand(newTUICmd())
 	root.AddCommand(newDBCmd())

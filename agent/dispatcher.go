@@ -184,7 +184,19 @@ func (d *syncDispatcher) runOne(ctx context.Context, vol *config.Volume, destNam
 		"kind", "sync", "volume", vol.Name, "destination", destName,
 		"run_id", rep.RunID, "status", status,
 		"duration_ms", duration.Milliseconds(),
+		"conflicts", rep.Conflicts, "contested", rep.Contested,
 	)
+	// A conflict signal on this (initiating) machine, not just the hub: a
+	// divergent edit was preserved or a frozen path refused, and a human
+	// must eventually resolve it (#158, F27). Logged at warn so it stands
+	// out from the routine finished line in the scheduler's own output.
+	if rep.Conflicts > 0 || rep.Contested > 0 {
+		d.logger.Warn("scheduler.conflict",
+			"kind", "sync", "volume", vol.Name, "destination", destName,
+			"run_id", rep.RunID,
+			"conflicts", rep.Conflicts, "contested", rep.Contested,
+		)
+	}
 	if rep.Err != nil {
 		d.logger.Error("scheduler.error",
 			"kind", "sync", "volume", vol.Name, "destination", destName,

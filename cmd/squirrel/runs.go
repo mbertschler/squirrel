@@ -54,7 +54,11 @@ func runRuns(cmd *cobra.Command, volumeName string, limit int, onlyFailed, onlyC
 	}
 	defer s.Close()
 
-	runs, conflicts, err := gatherRuns(cmd, s, volumeName, limit, onlyFailed, onlyChanges)
+	volumeID, err := resolveVolumeFilter(cmd, s, volumeName)
+	if err != nil {
+		return err
+	}
+	runs, conflicts, err := gatherRuns(cmd, s, volumeID, limit, onlyFailed, onlyChanges)
 	if err != nil {
 		return err
 	}
@@ -74,7 +78,42 @@ func runRuns(cmd *cobra.Command, volumeName string, limit int, onlyFailed, onlyC
 		return fmt.Errorf("list destination alarms: %w", err)
 	}
 	printActiveAlarms(cmd.OutOrStdout(), alarms)
+	contested, err := s.ListContestedPaths(cmd.Context())
+	if err != nil {
+		return fmt.Errorf("list contested paths: %w", err)
+	}
+	printContestedReminder(cmd.OutOrStdout(), contested, volumeID, volumes)
 	return nil
+}
+
+// printContestedReminder surfaces standing contested freezes beneath the
+// runs listing (#158, F27). Like the alarms reminder, a single old
+// conflict run scrolls away, so the audit surface repeats the standing
+// condition until a human resolves it — and points at the dedicated
+// `squirrel conflicts` question-command for the detail. When the listing
+// was scoped with --volume (filterVolumeID non-nil), the reminder is
+// scoped to match rather than reporting freezes on unrelated volumes.
+// Volumes render by name via the shared label map, never by internal id.
+func printContestedReminder(w io.Writer, contested []store.ContestedPath, filterVolumeID *int64, volumes map[int64]string) {
+	scoped := contested
+	if filterVolumeID != nil {
+		scoped = scoped[:0:0]
+		for _, c := range contested {
+			if c.VolumeID == *filterVolumeID {
+				scoped = append(scoped, c)
+			}
+		}
+	}
+	if len(scoped) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "\n%d contested path(s) frozen — inspect with `squirrel conflicts`, clear with `squirrel conflicts resolve`:\n",
+		len(scoped))
+	for _, c := range scoped {
+		fmt.Fprintf(w, "  CONTESTED volume=%s %s since %s\n",
+			volumeLabel(sql.NullInt64{Int64: c.VolumeID, Valid: true}, volumes),
+			c.Path, formatStarted(c.RaisedAtNs))
+	}
 }
 
 // printActiveAlarms surfaces standing per-destination alarms beneath the
@@ -95,7 +134,25 @@ func printActiveAlarms(w io.Writer, alarms []store.DestinationAlarm) {
 	}
 }
 
-// gatherRuns resolves the optional volume filter, fetches runs, applies the
+// resolveVolumeFilter resolves an optional --volume name to its id, shared by
+// the runs query and the standing-condition reminders printed beneath the
+// listing so both are scoped the same way. An empty name means every volume
+// and yields nil.
+func resolveVolumeFilter(cmd *cobra.Command, s *store.Store, volumeName string) (*int64, error) {
+	if volumeName == "" {
+		return nil, nil
+	}
+	v, err := s.GetVolumeByName(cmd.Context(), volumeName)
+	if err != nil {
+		if store.IsNotFound(err) {
+			return nil, fmt.Errorf("no volume named %q", volumeName)
+		}
+		return nil, fmt.Errorf("lookup volume %q: %w", volumeName, err)
+	}
+	return &v.ID, nil
+}
+
+// gatherRuns fetches runs under an already-resolved volume filter, applies the
 // --failed/--changes predicates, and returns the rows to display plus the
 // conflict counts for their CONFLICTS column. When a predicate is active the
 // fetch is unbounded (opts.Limit=0) so the SQL LIMIT can't cap before the
@@ -107,21 +164,11 @@ func printActiveAlarms(w io.Writer, alarms []store.DestinationAlarm) {
 // the CONFLICTS column only covers the displayed rows. This keeps the id set
 // handed to the count query small (and the query itself batches ids), so a
 // large peer-sync history can't overflow SQLite's bound-parameter cap.
-func gatherRuns(cmd *cobra.Command, s *store.Store, volumeName string, limit int, onlyFailed, onlyChanges bool) ([]store.Run, map[int64]int, error) {
+func gatherRuns(cmd *cobra.Command, s *store.Store, volumeID *int64, limit int, onlyFailed, onlyChanges bool) ([]store.Run, map[int64]int, error) {
 	filtering := onlyFailed || onlyChanges
-	opts := store.ListRunsOpts{Limit: limit, Descending: true}
+	opts := store.ListRunsOpts{Limit: limit, Descending: true, VolumeID: volumeID}
 	if filtering {
 		opts.Limit = 0
-	}
-	if volumeName != "" {
-		v, err := s.GetVolumeByName(cmd.Context(), volumeName)
-		if err != nil {
-			if store.IsNotFound(err) {
-				return nil, nil, fmt.Errorf("no volume named %q", volumeName)
-			}
-			return nil, nil, fmt.Errorf("lookup volume %q: %w", volumeName, err)
-		}
-		opts.VolumeID = &v.ID
 	}
 	runs, err := s.ListRuns(cmd.Context(), opts)
 	if err != nil {
@@ -240,11 +287,22 @@ func loadNodeNames(cmd *cobra.Command, s *store.Store, runs []store.Run) (map[in
 	return out, nil
 }
 
-// loadConflictCounts derives the conflict count for every peer-sync
-// run in the listing via one grouped query against `files`. The v6
-// schema doesn't carry the count on the run row itself; every
-// conflict inserts one row under `.squirrel-conflicts/run-<id>/`, so
-// the prefix-count is the audit number we want.
+// loadConflictCounts derives the conflict count for every peer-sync run in
+// the listing. The schema doesn't carry the count on the run row itself,
+// so it comes from two derivations merged per run:
+//
+//   - Receiver side: every conflict inserts one row under
+//     `.squirrel-conflicts/run-<id>/`, so the prefix-count is the number
+//     of losers this run preserved.
+//   - Initiator side: the conflict was frozen on a *remote* receiver, so
+//     no local `.squirrel-conflicts/` rows exist; instead the run raised
+//     local contested_paths latches (one per conflict + contested
+//     refusal), so the raised-by-run count is the initiator's signal
+//     (#158, F27).
+//
+// A run is one side of a sync, so at most one derivation is non-zero for
+// it; taking the max yields the right figure without double-counting the
+// rare case where both happen to fire on the same id.
 func loadConflictCounts(cmd *cobra.Command, s *store.Store, runs []store.Run) (map[int64]int, error) {
 	var peerSyncIDs []int64
 	for _, r := range runs {
@@ -255,9 +313,22 @@ func loadConflictCounts(cmd *cobra.Command, s *store.Store, runs []store.Run) (m
 	if len(peerSyncIDs) == 0 {
 		return map[int64]int{}, nil
 	}
-	counts, err := s.CountFilesFirstSeenByRunWithPathPrefix(cmd.Context(), peerSyncIDs, sync.ConflictsDirName)
+	preserved, err := s.CountFilesFirstSeenByRunWithPathPrefix(cmd.Context(), peerSyncIDs, sync.ConflictsDirName)
 	if err != nil {
 		return nil, fmt.Errorf("conflict counts: %w", err)
+	}
+	frozen, err := s.CountContestedRaisedByRun(cmd.Context(), peerSyncIDs)
+	if err != nil {
+		return nil, fmt.Errorf("contested counts: %w", err)
+	}
+	counts := make(map[int64]int, len(preserved)+len(frozen))
+	for id, n := range preserved {
+		counts[id] = n
+	}
+	for id, n := range frozen {
+		if n > counts[id] {
+			counts[id] = n
+		}
 	}
 	return counts, nil
 }

@@ -114,6 +114,11 @@ type nodeSyncDriver struct {
 	// receiverRunID is filled in after the begin handshake; rclone +
 	// verify + close reference it.
 	receiverRunID int64
+	// peerNodeID is the local nodes-row id of the destination peer,
+	// resolved at /begin. Recorded on any contested_paths latch this run
+	// raises locally so the initiator's `squirrel conflicts` can name the
+	// peer the freeze lives on.
+	peerNodeID int64
 	// protocolVersion is the plan-exchange version negotiated at
 	// /begin. Defaults to ProtocolVersionFlat so a missing field in
 	// the receiver's response (older agent) keeps today's behaviour.
@@ -215,9 +220,19 @@ func (d *nodeSyncDriver) run() error {
 	// Conflicts flow through the transfer path: the receiver has
 	// already pre-staged each loser under .squirrel-conflicts/ and
 	// the original path is empty, so rclone treats the entry like a
-	// fresh transfer.
+	// fresh transfer. Contested paths are frozen: the receiver refused
+	// them, no bytes move, and the initiator only surfaces the freeze.
 	d.report.NodeConflicts = plan.Conflicts
+	d.report.NodeContested = plan.Contested
 	d.recordAlreadyCorrect(plan)
+	// Mirror the freeze into this node's own contested_paths latch as
+	// soon as /plan has classified it, deferred so it still runs when a
+	// later phase (transfer, verify, close) fails. The receiver already
+	// pre-staged the loser and raised its own latch during /plan, so the
+	// conflict is real regardless of whether our bytes land — recording
+	// only after a successful close would hide the badge on the losing
+	// edge exactly when a sync failed mid-flight (#158, F27).
+	defer d.recordContestedLocally()
 	if !d.opts.DryRun {
 		advance, err := captureDurabilityAdvance(d.ctx, d.store, d.volID)
 		if err != nil {
@@ -235,6 +250,64 @@ func (d *nodeSyncDriver) run() error {
 		return fmt.Errorf("close: %w", err)
 	}
 	return nil
+}
+
+// recordContestedLocally mirrors the receiver-reported conflicts and
+// contested refusals into this node's own contested_paths latch, so the
+// losing/edge machine answers "am I safe?" from its local index — a badge
+// in its TUI and a row in its `squirrel conflicts`, not just a line on the
+// hub (#158, F27). Both a conflict (this node's bytes won live, the prior
+// version was preserved) and a contested refusal (a frozen path declined
+// this node's divergent bytes) leave the household master contested until
+// a human resolves it, so both raise a marker. Raises are idempotent and
+// best-effort: a failure here is logged into the report's warnings and
+// never flips the sync's status — the authoritative freeze already lives
+// on the receiver.
+func (d *nodeSyncDriver) recordContestedLocally() {
+	if d.opts.DryRun {
+		return
+	}
+	for _, c := range d.report.NodeConflicts {
+		d.raiseContestedMarker(c.Path, c.InitiatorBlake3Hex, c.ReceiverBlake3Hex, c.PreservedAtPath)
+	}
+	for _, c := range d.report.NodeContested {
+		d.raiseContestedMarker(c.Path, c.LiveBlake3Hex, c.PreservedBlake3Hex, c.PreservedAtPath)
+	}
+}
+
+// raiseContestedMarker records one local freeze. liveHex is the winning
+// version (this node's own bytes for a conflict, the frozen winner for a
+// contested refusal) and preservedHex the loser; a bad hex digest is
+// dropped to nil so a marker is still recorded rather than lost. Errors
+// are surfaced as a report warning, never fatal.
+func (d *nodeSyncDriver) raiseContestedMarker(path, liveHex, preservedHex, preservedAt string) {
+	err := d.store.RaiseContested(d.ctx, store.ContestedPath{
+		VolumeID:        d.volID,
+		Path:            path,
+		LiveBlake3:      decodeHexOrNil(liveHex),
+		PreservedBlake3: decodeHexOrNil(preservedHex),
+		PreservedAtPath: preservedAt,
+		PeerNodeID:      d.peerNodeID,
+		RaisedRunID:     d.report.RunID,
+	})
+	if err != nil {
+		d.report.Warnings = append(d.report.Warnings,
+			fmt.Sprintf("record contested %s locally: %v", path, err))
+	}
+}
+
+// decodeHexOrNil decodes a 64-char lowercase-hex digest to raw bytes,
+// returning nil for an empty or malformed value so the caller records a
+// marker with an unknown-digest field rather than dropping the freeze.
+func decodeHexOrNil(hexStr string) []byte {
+	if hexStr == "" {
+		return nil
+	}
+	b, err := hex.DecodeString(hexStr)
+	if err != nil || len(b) != 32 {
+		return nil
+	}
+	return b
 }
 
 // recordAlreadyCorrect derives the count of paths the receiver already
@@ -272,6 +345,7 @@ func (d *nodeSyncDriver) phaseBegin() error {
 	if err != nil {
 		return fmt.Errorf("record peer node: %w", err)
 	}
+	d.peerNodeID = peer.ID
 	self, err := d.store.GetSelfNode(d.ctx)
 	if err != nil {
 		return fmt.Errorf("look up self node: %w", err)
@@ -300,7 +374,7 @@ func (d *nodeSyncDriver) phaseBegin() error {
 		InitiatorNodeName: self.Name,
 		InitiatorRunID:    runID,
 		DedupStrategy:     d.node.DedupStrategy,
-		ProtocolVersion:   syncproto.ProtocolVersionMerkleWalk,
+		ProtocolVersion:   syncproto.ProtocolVersionContested,
 	})
 	if err != nil {
 		return err

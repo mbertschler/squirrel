@@ -172,6 +172,16 @@ type Report struct {
 	// and the new BLAKE3 plus the receiver-relative preserved path so
 	// the CLI can render a meaningful "review at <path>" pointer.
 	NodeConflicts []syncproto.ConflictDetail
+	// NodeContested is non-empty when the receiver refused one or more
+	// paths with the `contested` disposition: paths frozen by a prior
+	// conflict whose divergent re-assertion is declined until an operator
+	// resolves it (#158, F27). The initiator's bytes for these paths did
+	// NOT land — both existing versions stay preserved on the receiver.
+	// Each record carries the frozen winner + preserved-loser digests and
+	// the receiver-relative preserved location so the initiator mirrors
+	// the freeze into its own contested marker and points the operator at
+	// both versions.
+	NodeContested []syncproto.ContestedDetail
 	// SnapshotErr captures a failure to take the post-sync index
 	// snapshot or to ride it along to the destination (#75). It is
 	// strictly defense-in-depth: a snapshot failure must not flip a

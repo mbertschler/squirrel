@@ -70,6 +70,11 @@ type dashboardData struct {
 	// mismatch latches one until cleared; the dashboard shows them so the
 	// trust surface answers "am I safe?" with a red panel, not silence.
 	alarms []store.DestinationAlarm
+	// contested are the standing contested-path freezes (#158, F27). A
+	// peer-sync conflict latches one until an operator resolves it; the
+	// dashboard shows them as a badge on *this* machine — the losing edge,
+	// not only the hub — so a silently diverging file surfaces.
+	contested []store.ContestedPath
 }
 
 type dashboardDataMsg struct {
@@ -147,6 +152,9 @@ func (m *dashboardModel) View() string {
 	if alarms := m.renderAlarms(); alarms != "" {
 		sections = append(sections, alarms)
 	}
+	if contested := m.renderContested(); contested != "" {
+		sections = append(sections, contested)
+	}
 	sections = append(sections,
 		m.renderActiveRuns(),
 		m.renderCoverage(),
@@ -177,6 +185,41 @@ func (m *dashboardModel) renderAlarms() string {
 	}
 	colours := []lipgloss.Color{colourFailure, "", "", "", ""}
 	return header + "\n" + renderTable(rows, colours)
+}
+
+// renderContested shows standing contested-path freezes (#158, F27) as a
+// badge just below the alarms, because a divergent edit frozen on this
+// machine is part of the "am I safe?" answer the trust surface must not
+// bury. Returns "" when nothing is frozen so the section is absent on a
+// healthy install. The count in the header is the badge the losing edge
+// needs — the hub is no longer the only place the conflict is visible.
+func (m *dashboardModel) renderContested() string {
+	if len(m.data.contested) == 0 {
+		return ""
+	}
+	header := styleErr.Render(fmt.Sprintf("Contested paths (%d)", len(m.data.contested)))
+	rows := [][]string{{"VOLUME", "PATH", "PRESERVED AT", "SINCE"}}
+	for _, c := range m.data.contested {
+		rows = append(rows, []string{
+			m.volumeName(sql.NullInt64{Int64: c.VolumeID, Valid: true}),
+			c.Path,
+			contestedPreservedCell(c.PreservedAtPath),
+			whenAgo(sql.NullInt64{Int64: c.RaisedAtNs, Valid: true}, m.data.now),
+		})
+	}
+	colours := []lipgloss.Color{colourFailure, "", "", ""}
+	hint := styleMuted.Render("resolve with `squirrel conflicts resolve <volume> <path>`")
+	return header + "\n" + renderTable(rows, colours) + "\n" + hint
+}
+
+// contestedPreservedCell renders the preserved-loser location, or a dash
+// when the freeze record carries none (an initiator that learned of the
+// freeze without a preserved path).
+func contestedPreservedCell(p string) string {
+	if p == "" {
+		return "—"
+	}
+	return p
 }
 
 func (m *dashboardModel) renderAgentBlock() string {
@@ -409,6 +452,10 @@ func loadDashboardData(ctx context.Context, s *store.Store, cfg *config.Config, 
 	if err != nil {
 		return dashboardData{}, fmt.Errorf("list alarms: %w", err)
 	}
+	contested, err := s.ListContestedPaths(ctx)
+	if err != nil {
+		return dashboardData{}, fmt.Errorf("list contested paths: %w", err)
+	}
 	var coverage status.Report
 	if cfg != nil {
 		if coverage, err = status.BuildWithOptions(ctx, s, cfg, status.Options{SkipOffloadReadiness: skipReadiness}); err != nil {
@@ -432,5 +479,6 @@ func loadDashboardData(ctx context.Context, s *store.Store, cfg *config.Config, 
 		recentRuns: recent,
 		coverage:   coverage,
 		alarms:     alarms,
+		contested:  contested,
 	}, nil
 }

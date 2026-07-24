@@ -10,7 +10,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 25
+const SchemaVersion = 26
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -67,6 +67,7 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 23, up: migrateV22ToV23},
 		{version: 24, up: migrateV23ToV24},
 		{version: 25, up: migrateV24ToV25},
+		{version: 26, up: migrateV25ToV26},
 	}
 }
 
@@ -2176,6 +2177,70 @@ func createDestinationAlarmsV25(ctx context.Context, tx *sql.Tx) error {
 	) STRICT`
 	if _, err := tx.ExecContext(ctx, ddl); err != nil {
 		return fmt.Errorf("create destination_alarms: %w", err)
+	}
+	return nil
+}
+
+// --- v25 → v26 ---
+
+// migrateV25ToV26 adds the contested_paths standing-state latch (#158,
+// F27): the per-(volume, path) freeze that stops divergent edits from
+// ping-ponging forever. A conflict raises a row; while it stands, the
+// receiver refuses to re-supersede the path (the `contested` disposition)
+// and the initiators surface a badge, so both versions stay preserved
+// exactly once instead of a fresh `.squirrel-conflicts/run-N/` copy every
+// cadence tick. Like destination_alarms (v25) and peer_sync_state, it is
+// derived standing state: the permanent forensic record of every conflict
+// lives in runs/runs_audit and the preserved bytes on disk, so clearing
+// the latch (an explicit `squirrel conflicts resolve`) loses no history.
+//
+// The table is written on every node. On the receiver a row records the
+// authoritative freeze; on an initiator a row mirrors what the receiver
+// reported so its own `squirrel conflicts` and TUI badge answer "am I
+// safe?" from its local index (no fleet view needed). STRICT per the
+// new-table convention; additive, so no rebuild of any existing table.
+func migrateV25ToV26(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := createContestedPathsV26(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (26)`); err != nil {
+		return fmt.Errorf("record schema v26: %w", err)
+	}
+	return tx.Commit()
+}
+
+// createContestedPathsV26 creates the contested-freeze latch. The PK is
+// (volume_id, path): at most one active freeze per path, which the raise
+// path keeps idempotent so "contested since" stays stable across repeated
+// conflicts. live_blake3 is the frozen winner and preserved_blake3 the
+// loser; the classifier compares an incoming digest against live_blake3 to
+// tell the winner re-asserting (allowed) from a divergent re-assertion
+// (refused). peer_node_id is nullable — the initiator that caused the
+// freeze on the receiver, or the destination peer on an initiator — and
+// raised_run_id is a real FK to the run that raised it. No secondary
+// index: reads are PK lookups or a full scan of the handful of rows in
+// alarm, so an index would go unused and violate the
+// low-cardinality-index guidance.
+func createContestedPathsV26(ctx context.Context, tx *sql.Tx) error {
+	const ddl = `CREATE TABLE contested_paths (
+		volume_id         INTEGER NOT NULL REFERENCES volumes(id),
+		path              TEXT    NOT NULL,
+		live_blake3       BLOB    CHECK (live_blake3      IS NULL OR length(live_blake3)      = 32),
+		preserved_blake3  BLOB    CHECK (preserved_blake3 IS NULL OR length(preserved_blake3) = 32),
+		preserved_at_path TEXT,
+		peer_node_id      INTEGER REFERENCES nodes(id),
+		raised_run_id     INTEGER NOT NULL REFERENCES runs(id),
+		raised_at_ns      INTEGER NOT NULL,
+		PRIMARY KEY (volume_id, path)
+	) STRICT`
+	if _, err := tx.ExecContext(ctx, ddl); err != nil {
+		return fmt.Errorf("create contested_paths: %w", err)
 	}
 	return nil
 }

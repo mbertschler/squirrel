@@ -67,6 +67,20 @@ const DispositionSupersede = "supersede"
 // declared content origin.
 const DispositionConflict = "conflict"
 
+// DispositionContested — the path is frozen: a prior conflict at this
+// path raised a contested latch on the receiver (see
+// store.ContestedPath), and this initiator's bytes differ from the
+// frozen winner. Rather than mint yet another `.squirrel-conflicts/`
+// copy every cadence tick (the F27 ping-pong), the receiver refuses to
+// re-supersede: no bytes move, no new row is written, and both existing
+// versions stay preserved (the winner live at the path, the loser under
+// `.squirrel-conflicts/`). The initiator surfaces the refusal to its
+// operator; only an explicit `squirrel conflicts resolve` clears the
+// latch and lets syncs flow again. The disposition is version-gated —
+// only sent to an initiator that negotiated ProtocolVersionContested;
+// an older initiator falls back to the legacy `conflict` disposition.
+const DispositionContested = "contested"
+
 // DispositionCopyFromExisting — receiver has no live row at this path
 // but holds the requested blake3 at a different path in the same volume.
 // Instead of forcing the initiator to re-transfer the bytes over the
@@ -104,6 +118,16 @@ const ProtocolVersionFlat = 1
 // files to /plan. The classifier behind /plan is unchanged; this is a
 // scope reduction on the input, not a new disposition.
 const ProtocolVersionMerkleWalk = 2
+
+// ProtocolVersionContested adds the contested-freeze disposition (#158,
+// F27): once a path is frozen, the receiver answers a divergent
+// re-assertion with DispositionContested instead of minting another
+// `.squirrel-conflicts/` copy. The version gate keeps an older initiator
+// safe — it never learns the `contested` disposition it can't interpret,
+// so the receiver falls back to the legacy `conflict` for that peer. The
+// folder walk is unchanged from v2; this only widens the /plan verdict
+// set for initiators that opt in.
+const ProtocolVersionContested = 3
 
 // BeginRequest opens a peer-sync session.
 type BeginRequest struct {
@@ -263,6 +287,15 @@ type PlanResponse struct {
 	// has already pre-staged the loser under .squirrel-conflicts/ and
 	// the initiator's bytes are still in scope for the rclone transfer.
 	Conflicts []ConflictDetail `json:"conflicts,omitempty"`
+	// Contested captures the paths whose disposition was "contested":
+	// frozen by a prior conflict, so this initiator's divergent bytes
+	// were refused rather than superseding (no new copy minted). Each
+	// entry carries the frozen winner + preserved-loser digests and the
+	// receiver-relative location the loser is preserved at, so the
+	// initiator can raise its own local contested marker and its CLI can
+	// point the operator at both versions. Only populated for an
+	// initiator that negotiated ProtocolVersionContested.
+	Contested []ContestedDetail `json:"contested,omitempty"`
 }
 
 // PlanDisposition is the receiver's verdict on one path.
@@ -295,6 +328,21 @@ type ConflictDetail struct {
 	InitiatorBlake3Hex string `json:"initiator_blake3"`
 	ReceiverBlake3Hex  string `json:"receiver_blake3"`
 	Reason             string `json:"reason"`
+	PreservedAtPath    string `json:"preserved_at_path,omitempty"`
+}
+
+// ContestedDetail names a path whose disposition was "contested" and
+// surfaces the two frozen versions plus where the loser is preserved, so
+// the initiator's CLI and its local contested marker describe the same
+// state the receiver already froze. LiveBlake3Hex is the frozen winner
+// (live at the path on the receiver); PreservedBlake3Hex is the loser
+// held under .squirrel-conflicts/; PreservedAtPath is that loser's
+// receiver-relative path. The initiator's own refused digest is the
+// entry it sent, so it isn't echoed here.
+type ContestedDetail struct {
+	Path               string `json:"path"`
+	LiveBlake3Hex      string `json:"live_blake3,omitempty"`
+	PreservedBlake3Hex string `json:"preserved_blake3,omitempty"`
 	PreservedAtPath    string `json:"preserved_at_path,omitempty"`
 }
 

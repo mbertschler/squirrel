@@ -222,7 +222,13 @@ func buildSchedulerSyncRunner(cfg *config.Config, s *store.Store, rcl *sync.Rclo
 			opts.Snapshot = sync.NewSnapshotter(s, rcl, snapshotConfig(cfg, s.Path()))
 		}
 		rep, runErr := sync.RunPair(ctx, s, tools, pair, opts)
-		return agent.SyncRunReport{RunID: rep.RunID, Status: rep.Status, Err: runErr}
+		return agent.SyncRunReport{
+			RunID:     rep.RunID,
+			Status:    rep.Status,
+			Err:       runErr,
+			Conflicts: len(rep.NodeConflicts),
+			Contested: len(rep.NodeContested),
+		}
 	}
 }
 
