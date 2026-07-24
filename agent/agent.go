@@ -54,9 +54,11 @@ type SyncRunReport struct {
 	Err    error
 }
 
-// Config configures one agent listener. Fields are validated by New; all
-// of them are required except TLSCert/TLSKey (which must be set together
-// or not at all — empty pair means plain HTTP).
+// Config configures one agent. Fields are validated by New: Version is
+// always required; Listen is optional (empty selects listener-less,
+// scheduler-only mode, F35); Token is required only when Listen is set (an
+// HTTP surface needs a bearer token); TLSCert/TLSKey must be set together
+// or not at all — empty pair means plain HTTP.
 type Config struct {
 	// Listen is the bind address passed to net.Listen, e.g. "0.0.0.0:8443".
 	Listen string
@@ -191,10 +193,11 @@ func (s *Server) CertFingerprint() (string, error) {
 func (s *Server) Addr() string { return s.cfg.Listen }
 
 func validateConfig(cfg Config) error {
-	if cfg.Listen == "" {
-		return errors.New("agent: Config.Listen is required")
-	}
-	if cfg.Token == "" {
+	// An empty Listen selects listener-less mode (F35): the agent runs only
+	// its background schedulers, so neither a bind address nor a bearer
+	// token is required. A token is required only when there is an HTTP
+	// surface to protect.
+	if cfg.Listen != "" && cfg.Token == "" {
 		return errors.New("agent: Config.Token is required")
 	}
 	if (cfg.TLSCert == "") != (cfg.TLSKey == "") {

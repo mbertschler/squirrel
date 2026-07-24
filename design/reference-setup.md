@@ -187,9 +187,9 @@ db        = "~/.squirrel/index.db"
 node_name = "laptop"
 
 [agent]
-listen = "127.0.0.1:8443"   # never receives; agent runs only for the cadences
-[agent.auth]
-token = { env = "SQUIRREL_AGENT_TOKEN" }
+# No `listen`: this roaming laptop never receives peer syncs, so the agent
+# runs the sync/index schedulers *without* an HTTP listener (F35). With no
+# listener there is nothing to authenticate, so no [agent.auth] token either.
 
 [volumes.photos]
 path                     = "~/Pictures"

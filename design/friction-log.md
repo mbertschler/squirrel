@@ -416,7 +416,7 @@ bytes ever traverse, purely to enable durability pulls.
 *Partially addressed in #171: `squirrel config check` now stats and
 flags a missing node byte-path; load-time validation is still absent.*
 
-**F35 · S3 — cadence-only machines must still run the full agent.**
+**F35 · S3 — ~~cadence-only machines must still run the full agent.~~ (fixed in #175)**
 A machine that never receives (laptop) runs the HTTP listener and
 must configure `[agent] listen` + auth token anyway, because the
 scheduler lives inside the agent. A listener that exists to be unused
