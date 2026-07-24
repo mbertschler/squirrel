@@ -67,7 +67,11 @@ Properties match the content-addressed layout:
 - Verification is presence+size (recorded shallow).
 - The layout is chosen at first use and refuses to run against a
   differently-shaped history.
-- `--dry-run` is not supported yet.
-- [`squirrel restore`](/squirrel/guides/restore/) **refuses the layout** —
-  recovery tooling ships separately, and the format is simple enough to
-  [recover without squirrel](/squirrel/reference/formats/#disaster-recovery-without-squirrel).
+- `--dry-run` is not supported yet on the push.
+- [`squirrel restore`](/squirrel/guides/restore/) **restores the layout**: it
+  resolves each present path to its content in the local index, fetches each
+  pack once to serve all its members, and re-hashes every extracted member
+  before writing. Cold tiers (Glacier / Deep Archive) need a manual thaw first;
+  see the [restore guide](/squirrel/guides/restore/#content-addressed-and-packed-destinations).
+  When the local index is lost, the format still
+  [recovers without squirrel](/squirrel/reference/formats/#disaster-recovery-without-squirrel).

@@ -775,3 +775,22 @@ func decompress(t *testing.T, compressed []byte) []byte {
 	}
 	return out
 }
+
+// compress zstd-compresses raw into a single complete frame — the inverse of
+// decompress, used to rebuild a pack after tampering with one member's
+// uncompressed bytes.
+func compress(t *testing.T, raw []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw, err := zstd.NewWriter(&buf)
+	if err != nil {
+		t.Fatalf("zstd writer: %v", err)
+	}
+	if _, err := zw.Write(raw); err != nil {
+		t.Fatalf("zstd write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zstd close: %v", err)
+	}
+	return buf.Bytes()
+}

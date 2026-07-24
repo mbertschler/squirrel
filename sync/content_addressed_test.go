@@ -754,14 +754,6 @@ func TestContentAddressedDryRunRefusesLayoutFlip(t *testing.T) {
 	}
 }
 
-func TestRestoreRefusesContentAddressedDestination(t *testing.T) {
-	f := setupContentAddressedFixture(t)
-	_, err := Restore(context.Background(), f.store, f.rcl, f.pair.Volume, f.pair.Destination, RestoreOptions{})
-	if err == nil || !strings.Contains(err.Error(), "content-addressed") {
-		t.Fatalf("expected content-addressed restore refusal, got %v", err)
-	}
-}
-
 // TestContentAddressedCrossVolumeDedup: objects/ is destination-global,
 // matching remote_objects' (content, destination) key — a second volume
 // carrying already-recorded content uploads nothing, and its manifest
