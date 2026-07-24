@@ -550,6 +550,68 @@ func (r *Rclone) copyTo(ctx context.Context, src, dst string, extraArgs ...strin
 	return err
 }
 
+// catRemote reads the full contents of the single object at uri via
+// `rclone cat`. It is called only after statRemoteExists has confirmed
+// the object is present, so any error here — including a race where the
+// object vanished between the stat and the read — is surfaced verbatim
+// and the caller refuses. Absence is deliberately decided by the stat,
+// not by cat's exit: bucket backends (s3/b2/gcs) return an empty body on
+// a zero exit for a missing key, which cat cannot tell apart from a
+// genuinely empty object. extraArgs carries per-destination flags such
+// as the --checkers cap.
+func (r *Rclone) catRemote(ctx context.Context, uri string, extraArgs ...string) ([]byte, error) {
+	args := append([]string{"cat"}, extraArgs...)
+	return r.runPlain(ctx, append(args, uri)...)
+}
+
+// isNotFoundErr reports whether an rclone error denotes an absent path
+// rather than a transient, network, or permission failure. It matches
+// only rclone's canonical absence messages — fs.ErrorObjectNotFound
+// ("object not found") and fs.ErrorDirNotFound ("directory not found"),
+// surfaced across every backend the marker gate targets. Requiring the
+// canonical phrasing rather than a bare "not found" substring keeps a
+// DNS "host not found" or a connection error from being misread as
+// absence: those propagate as hard errors and refuse the sync, per the
+// refuse-over-wrong-write invariant.
+func isNotFoundErr(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "object not found") ||
+		strings.Contains(msg, "directory not found")
+}
+
+// statRemoteExists reports whether a single object exists at uri via
+// `rclone lsjson --stat`, classifying the outcome three ways so the
+// marker gate can tell a genuinely-absent marker from an unreachable
+// one:
+//
+//   - (true, nil): the stat returned an object.
+//   - (false, nil): the backend definitively reports absence — an empty
+//     or "null" stat body on a zero exit (how the bucket backends
+//     s3/b2/gcs report a missing key) or a canonical "not found" exit
+//     (how sftp reports it).
+//   - (false, err): any other failure (transient, auth, DNS). The caller
+//     must refuse rather than mistake unreachability for absence.
+//
+// Unlike statRemote, which returns the object size and folds absence into
+// an error, this preserves the absent/unreachable distinction the
+// refuse-over-wrong-write invariant depends on. extraArgs carries
+// per-destination flags such as the --checkers cap.
+func (r *Rclone) statRemoteExists(ctx context.Context, uri string, extraArgs ...string) (bool, error) {
+	args := append([]string{"lsjson", "--stat"}, extraArgs...)
+	out, err := r.runPlain(ctx, append(args, uri)...)
+	if err != nil {
+		if isNotFoundErr(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	trimmed := bytes.TrimSpace(out)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return false, nil
+	}
+	return true, nil
+}
+
 // listSnapshots returns the snapshot filenames directly under dirURI via
 // `rclone lsf`. A missing directory yields an empty list, not an error:
 // the first ride-along to a volume legitimately finds nothing there yet,

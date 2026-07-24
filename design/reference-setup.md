@@ -56,15 +56,25 @@ so nothing ever tries.
 | **docs** | laptop, homepc, nas (master) | laptop/homepc → nas → cloudbox + s3archive + kopia-mirror; homepc also → usb | never — small enough to keep everywhere |
 | **media** | nas (master), htpc | nas → htpc; nas → cloudbox + s3archive | htpc offloads watched items once s3archive holds them |
 
-Offload gates deliberately name only targets that *produce durability
-evidence* — content-addressed/packed destinations and peer nodes the
-offloading machine itself pushes to. A crypt mirror (cloudbox) never
-yields evidence today (friction log F21), so naming it in
-`offload_requires` waits forever; and a receive-only node (htpc)
-cannot credit its *upstream* peer, so its gate rests on the offsites
-the hub pushes to, reached via the durability pull. Media therefore
-also rides to s3archive: an offloadable volume must live on at least
-one evidence-producing target.
+Offload gates may name only targets that *produce durability evidence*.
+Four shapes do: content-addressed and packed destinations (presence+size,
+upgraded to content-verified by the scan-back fingerprint), peer nodes the
+offloading machine itself pushes to (`peer-blake3`), kopia repositories
+(`kopia-verify`), and — since #156 — a **plain (non-crypt) mirror synced
+with BLAKE3 verification**, whose full `--checksum` compare is end-to-end
+content verification and advances the vector with the `blake3` method
+(rclone's `--checksum` BLAKE3 comparison). A **crypt** mirror is the one shape that
+never yields evidence: the overlay hides the content hash, so rclone falls
+back to size+mtime forever, and the mirror layout keeps no fingerprint to
+upgrade it (friction log F21). Naming a locally-configured crypt mirror in
+`offload_requires` is therefore rejected at config load as an unsatisfiable
+policy (#156) — fail-early, not the wait-forever gate the walk hit with the
+laptop gating on the crypt-mirror cloudbox.
+
+A receive-only node (htpc) cannot credit its *upstream* peer, so its gate
+rests on the offsites the hub pushes to, reached via the durability pull.
+Media therefore also rides to s3archive: an offloadable volume must live on
+at least one evidence-producing target.
 
 The offload story is the crown jewel and the reason this topology is
 worth its complexity: the laptop never talks to cloudbox or s3archive,

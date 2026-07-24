@@ -1,0 +1,39 @@
+name: Release
+
+# Semver tags are the source of truth for the tool's release version
+# (see .goreleaser.yaml). Pushing a vX.Y.Z tag builds the cross-platform
+# CLI binaries and publishes them as a GitHub Release.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+# GoReleaser needs write access to create the release and upload assets.
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    name: goreleaser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # GoReleaser needs the full history + tags to compute the
+          # version and build the changelog.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

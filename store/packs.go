@@ -131,6 +131,19 @@ func (s *Store) GetPackByKey(ctx context.Context, packKey []byte) (Pack, error) 
 	return p, err
 }
 
+// GetPack returns the pack row for a pack id, or sql.ErrNoRows when no
+// pack with that id was recorded. Restore uses it to resolve a
+// pack_members row's pack_id back to the pack_key that names the pack at
+// the destination.
+func (s *Store) GetPack(ctx context.Context, id int64) (Pack, error) {
+	var p Pack
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, pack_key, size_bytes, member_count, created_run_id
+		FROM packs WHERE id = ?
+	`, id).Scan(&p.ID, &p.PackKey, &p.SizeBytes, &p.MemberCount, &p.CreatedRunID)
+	return p, err
+}
+
 // ListPackMembers returns every member of one pack, ordered by byte offset
 // so the enumeration follows the pack's uncompressed tar layout.
 func (s *Store) ListPackMembers(ctx context.Context, packID int64) ([]PackMember, error) {

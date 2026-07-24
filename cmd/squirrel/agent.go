@@ -17,11 +17,6 @@ import (
 	"github.com/mbertschler/squirrel/sync"
 )
 
-// agentVersion is the value reported by GET /v1/health. A real release
-// would inject this via -ldflags at build time; the placeholder is
-// adequate for the unreleased peer-sync work.
-const agentVersion = "0.0.0-dev"
-
 // newAgentCmd returns the `squirrel agent` cobra command. It starts the
 // HTTP server declared by the `[agent]` config block and blocks until
 // the cobra context (wired to SIGINT/SIGTERM in main) is cancelled.
@@ -64,8 +59,9 @@ func runAgent(cmd *cobra.Command) error {
 		PeerTokens:   cfg.Agent.PeerTokens,
 		TLSCert:      cfg.Agent.TLSCert,
 		TLSKey:       cfg.Agent.TLSKey,
-		Version:      agentVersion,
+		Version:      version,
 		Volumes:      cfg.Volumes,
+		Destinations: cfg.Destinations,
 		SyncRunner:   buildSchedulerSyncRunner(cfg, s, rcl),
 		ScanInterval: cfg.Agent.ScanInterval,
 		ScanStrategy: cfg.Agent.ScanStrategy,
@@ -255,6 +251,6 @@ func logAgentStartup(logger *slog.Logger, srv *agent.Server, addr string) {
 	logger.Info("agent listening",
 		"addr", addr,
 		"scheme", scheme,
-		"version", agentVersion,
+		"version", version,
 	)
 }

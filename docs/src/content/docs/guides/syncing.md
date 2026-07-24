@@ -53,16 +53,18 @@ squirrel sync pictures --to mirror          # every time after
 
 `--init` authorises the one-time first-use setup, by destination type:
 
-- **`local`** — writes a `.squirrel-volume` marker under the destination's volume
-  directory. Every later sync **requires** that marker and refuses if it is
+- **`local` and remote rclone** (`sftp`, `s3`, `b2`, `gcs`) — write a
+  `.squirrel-volume` marker under the destination's volume directory (on the
+  filesystem for local, over rclone through the same overlay the transfer uses
+  for remotes). Every later sync **requires** that marker and refuses if it is
   missing (a missing marker after the fact almost always means the root is wrong
-  — an unmounted disk or a typo). A marker that names a *different* volume is
-  always refused, with or without `--init`.
+  — an unmounted disk, a typo, or an unreachable remote). A marker that names a
+  *different* volume is always refused, with or without `--init`. This holds
+  across the mirror, content-addressed, and packed layouts: the marker sits at
+  the volume root regardless of layout, and is filtered out of every
+  transfer, comparison, and restore.
 - **`kopia`** — permits `kopia repository create` when connecting finds no
   repository.
-- **Remote rclone** (`sftp`, `s3`, `b2`, `gcs`) — do **not** yet enforce a
-  marker, so they don't currently require `--init`; marker support for them is a
-  tracked follow-up.
 
 ### Why a flag rather than auto-create
 

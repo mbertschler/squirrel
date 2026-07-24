@@ -286,6 +286,13 @@ func printSyncSummaryLine(w io.Writer, rep sync.Report, src, dst string) {
 			r.Transferred, r.Checked, r.DisplayErrors(), r.Bytes,
 			rep.Verification.Files, rep.Fingerprints, rep.RunID,
 		)
+		// A packed dry-run reports its pack-side routing here; the
+		// object side rode the objects=/bytes= counters above. Only a
+		// packed dry-run sets SizeBand, so this line is preview-only.
+		if p := rep.PackPreview; p.SizeBand > 0 {
+			fmt.Fprintf(w, "  would pack %d content(s) (%d uncompressed byte(s)) into ~%d pack(s), each targeting %d compressed byte(s)\n",
+				p.Contents, p.Bytes, p.Packs, p.SizeBand)
+		}
 	default:
 		fmt.Fprintf(w, "%s → %s  status=%s transferred=%d already_correct=%d errors=%d bytes=%d run=%d\n",
 			src, dst, rep.Status,
