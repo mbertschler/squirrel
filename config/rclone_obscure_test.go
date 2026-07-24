@@ -4,6 +4,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/base64"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -62,6 +63,25 @@ func TestRcloneObscureGolden(t *testing.T) {
 	const want = "AAAAAAAAAAAAAAAAAAAAACyuxxYwjZo"
 	if got := rcloneObscure("hunter2"); got != want {
 		t.Fatalf("rcloneObscure(\"hunter2\") = %q, want %q", got, want)
+	}
+}
+
+// TestRcloneObscureMatchesRclone cross-checks the output against the real
+// `rclone reveal`, proving squirrel speaks rclone's dialect rather than only
+// agreeing with the Go reveal reimplemented above. Skipped when rclone is not
+// installed.
+func TestRcloneObscureMatchesRclone(t *testing.T) {
+	bin, err := exec.LookPath("rclone")
+	if err != nil {
+		t.Skip("rclone not on PATH")
+	}
+	const plaintext = "correct horse battery staple"
+	out, err := exec.Command(bin, "reveal", rcloneObscure(plaintext)).Output()
+	if err != nil {
+		t.Fatalf("rclone reveal: %v", err)
+	}
+	if got := strings.TrimRight(string(out), "\n"); got != plaintext {
+		t.Fatalf("rclone reveal = %q, want %q", got, plaintext)
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/runevents"
+	"github.com/mbertschler/squirrel/volmark"
 )
 
 // MinRcloneVersion is the lowest rclone version this binary supports.
@@ -448,6 +450,56 @@ func (r *Rclone) listSnapshots(ctx context.Context, dirURI string) ([]string, er
 func (r *Rclone) deleteFile(ctx context.Context, fileURI string) error {
 	_, err := r.runPlain(ctx, "deletefile", fileURI)
 	return err
+}
+
+// remoteRootEmpty reports whether rootURI holds no files, listing it
+// recursively via `rclone lsf -R --files-only`. Only rclone's canonical
+// "directory not found" (a root that was never created) — accepting the
+// "object not found" phrasing too — counts as an empty/fresh root. Every
+// other error (auth, network, permission) surfaces so the layout guards
+// stay fail-closed and refuse rather than mistaking a broken probe for a
+// wiped destination: runPlain carries stderr only in the returned error,
+// not in stdout, so an empty stdout alone must never be read as "empty".
+// The guards use the empty result to recognise a wiped or repointed
+// destination — including one whose recorded state was cleared by
+// `squirrel destination reset` — as a fresh start rather than a layout
+// conflict.
+//
+// Per-volume markers (volmark.MarkerName) do not count as content. A root
+// that was wiped and re-bootstrapped carries a marker again — the marker gate
+// writes one on `--init` before any layout guard runs — so counting markers
+// would make the fresh-start recognition unreachable in exactly the situation
+// it exists for. Anything else present, including a single stray file, still
+// reads as non-empty and keeps the caller's refusal.
+func (r *Rclone) remoteRootEmpty(ctx context.Context, rootURI string, extraArgs ...string) (bool, error) {
+	args := append([]string{"lsf", "-R", "--files-only"}, extraArgs...)
+	out, err := r.runPlain(ctx, append(args, rootURI)...)
+	if err != nil {
+		if isRemoteNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if name := strings.TrimSpace(line); name != "" && path.Base(name) != volmark.MarkerName {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// isRemoteNotFound reports whether err is rclone's canonical
+// "directory not found" (or "object not found") — the only listing failure
+// the layout guard reads as an empty, fresh root. Any other error must
+// surface so the guard fails closed. #150's isNotFoundErr is not on this
+// branch, so the canonical-phrase check lives here; runPlain formats
+// rclone's stderr into the error string, so matching err.Error() catches it.
+func isRemoteNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "directory not found") || strings.Contains(msg, "object not found")
 }
 
 // statRemote returns the size of the single object at uri via

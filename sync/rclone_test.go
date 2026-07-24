@@ -344,6 +344,7 @@ root = "/data"
 password = "transport-pw"
 
 [destinations.offsite.crypt]
+obscured  = true
 password  = "obscured-pw"
 password2 = "obscured-salt"
 `)

@@ -93,6 +93,26 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	}
 }
 
+// RunSchedulers runs the background scan + cadence loops without binding
+// an HTTP listener — the listener-less agent mode (F35) for cadence-only
+// machines that never receive peer syncs. It blocks until ctx is
+// cancelled, then waits for an in-flight loop tick to finish its volume,
+// mirroring Serve's shutdown discipline minus the HTTP server. The two
+// loops are gated exactly as under Serve (scan only when ScanInterval is
+// set; scheduler only when a volume declares a cadence), so an agent with
+// nothing scheduled runs no goroutines and simply waits for cancellation.
+func (s *Server) RunSchedulers(ctx context.Context) error {
+	loopCtx, cancelLoops := context.WithCancel(ctx)
+	defer cancelLoops()
+	var loopWG sync.WaitGroup
+	s.startScanLoop(loopCtx, &loopWG, s.scanLogger())
+	s.startSchedulerLoop(loopCtx, &loopWG)
+	<-ctx.Done()
+	cancelLoops()
+	loopWG.Wait()
+	return nil
+}
+
 // startScanLoop spins up the drift-detection scheduler in a sibling
 // goroutine, but only when ScanInterval is set. The WaitGroup lets
 // Serve block on the loop's clean exit during shutdown so a tick

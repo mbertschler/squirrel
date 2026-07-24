@@ -64,7 +64,6 @@ func TestNewRejectsBadConfig(t *testing.T) {
 		cfg  Config
 		want string
 	}{
-		{"no listen", Config{Token: "t", Version: "v"}, "Listen is required"},
 		{"no token", Config{Listen: ":0", Version: "v"}, "Token is required"},
 		{"half tls", Config{Listen: ":0", Token: "t", TLSCert: "c", Version: "v"}, "must be set together"},
 		{"no version", Config{Listen: ":0", Token: "t"}, "Version is required"},
@@ -76,6 +75,43 @@ func TestNewRejectsBadConfig(t *testing.T) {
 				t.Fatalf("expected %q in error, got %v", c.want, err)
 			}
 		})
+	}
+}
+
+// TestNewListenerLess covers F35: an empty Listen (and no Token) is a
+// valid scheduler-only agent, and the server reports no listener/TLS.
+func TestNewListenerLess(t *testing.T) {
+	srv, err := New(Config{Version: "v"}, openTestStore(t))
+	if err != nil {
+		t.Fatalf("New (listener-less): %v", err)
+	}
+	if srv.Addr() != "" {
+		t.Fatalf("Addr = %q, want empty for a listener-less agent", srv.Addr())
+	}
+	if srv.HasTLS() {
+		t.Fatal("listener-less agent unexpectedly reports TLS")
+	}
+}
+
+// TestRunSchedulersReturnsOnCancel pins that the listener-less run path
+// blocks until its context is cancelled and then returns cleanly, without
+// ever binding a listener.
+func TestRunSchedulersReturnsOnCancel(t *testing.T) {
+	srv, err := New(Config{Version: "v"}, openTestStore(t))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.RunSchedulers(ctx) }()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RunSchedulers: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunSchedulers did not return after context cancel")
 	}
 }
 
