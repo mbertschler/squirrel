@@ -121,6 +121,22 @@ func (d *syncDispatcher) worker(ctx context.Context, destName string, vol *confi
 	}
 }
 
+// inFlight reports whether (destName, volName) is currently active or queued
+// on destName's pipeline. The scheduler consults it alongside the runs table
+// so a pair whose dispatch from an earlier tick is still working — but whose
+// run row is not yet visible — is recognised as in flight and not dragged
+// through a redundant pre-sync index every tick (#160). Safe for concurrent
+// use; a nil-runner dispatcher (no dests) always reports false.
+func (d *syncDispatcher) inFlight(destName, volName string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	q := d.dests[destName]
+	if q == nil {
+		return false
+	}
+	return q.queued[volName]
+}
+
 // next removes the just-finished volume from destName's pipeline and returns
 // the next queued volume, or nil (dropping the now-idle destination) when
 // none remain.

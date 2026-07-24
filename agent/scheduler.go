@@ -234,42 +234,87 @@ func (s *scheduler) resolveVolume(ctx context.Context, name, absPath string) (st
 	return created, nil
 }
 
-// maybeRunSync evaluates the sync_every cadence and, if any destination
-// is due, runs a pre-sync index and then the per-destination syncs.
-// Returns true when the scheduler took any sync-related action (kicked,
-// skipped, or errored) so the caller can suppress a redundant
-// standalone-index check.
+// maybeRunSync evaluates the sync_every cadence and, for the destinations
+// that are due and not already syncing, runs a pre-sync index and then hands
+// each pair to the per-destination dispatcher. Returns true when the
+// scheduler took any sync-related action (kicked, skipped, or errored) so the
+// caller can suppress a redundant standalone-index check.
 //
 // Invariant: a scheduled sync always runs an index immediately before
-// pushing. If the pre-sync index fails or is skipped, no syncs run
-// this tick — the next tick re-evaluates.
+// pushing. If the pre-sync index fails or is skipped, no syncs run this tick
+// — the next tick re-evaluates.
+//
+// A due destination whose (volume, destination) sync from an earlier tick is
+// still in flight is dropped before the pre-sync index runs. Dispatch is
+// asynchronous (#160), so without this the tick loop would re-index the source
+// on every 30s tick for the entire duration of a slow multi-hour push —
+// burning I/O and flooding the never-pruned runs audit trail with a
+// kind='index' row per tick. When every due destination is already syncing,
+// the pre-sync index is skipped entirely: there is no new push for it to
+// precede, and the in-flight pushes were each already preceded by their own.
 func (s *scheduler) maybeRunSync(ctx context.Context, vol *config.Volume, volumeID int64) bool {
 	if vol.SyncEvery == 0 {
 		return false
 	}
-	var dueDests []string
+	dueDests := s.dueSyncDests(ctx, vol, volumeID)
+	if len(dueDests) == 0 {
+		return false
+	}
+	dispatchable := s.dispatchableSyncDests(ctx, vol, volumeID, dueDests)
+	if len(dispatchable) == 0 {
+		// Every due destination is already syncing (each skip logged per
+		// pair). Report the sync action so the standalone-index branch stays
+		// suppressed — otherwise its own re-index would reintroduce the exact
+		// per-tick flood this guard exists to prevent.
+		return true
+	}
+	if !s.maybeRunIndex(ctx, vol, volumeID, "pre-sync", 0) {
+		return true
+	}
+	for _, destName := range dispatchable {
+		s.dispatch.dispatch(ctx, vol, destName)
+	}
+	return true
+}
+
+// dueSyncDests returns the destinations on the volume's sync_to whose
+// sync_every cadence has elapsed. A per-destination lookup error is logged and
+// that destination is dropped from this tick's evaluation (the next tick
+// re-evaluates), never aborting the others.
+func (s *scheduler) dueSyncDests(ctx context.Context, vol *config.Volume, volumeID int64) []string {
+	var due []string
 	for _, destName := range vol.SyncTo {
-		due, err := s.syncDue(ctx, volumeID, destName, vol.SyncEvery)
+		ok, err := s.syncDue(ctx, volumeID, destName, vol.SyncEvery)
 		if err != nil {
 			s.logger.Error("scheduler.error",
 				"kind", "sync", "volume", vol.Name, "destination", destName,
 				"err", err.Error())
 			continue
 		}
-		if due {
-			dueDests = append(dueDests, destName)
+		if ok {
+			due = append(due, destName)
 		}
 	}
-	if len(dueDests) == 0 {
-		return false
-	}
-	if !s.maybeRunIndex(ctx, vol, volumeID, "pre-sync", 0) {
-		return true
-	}
+	return due
+}
+
+// dispatchableSyncDests filters dueDests to the pairs the dispatcher can start
+// now, dropping any whose sync is already in flight and logging the same
+// per-pair scheduler.skipped the serial scheduler emitted — so an operator
+// still sees why a due destination isn't moving, it just no longer drags a
+// redundant pre-sync index along with it.
+func (s *scheduler) dispatchableSyncDests(ctx context.Context, vol *config.Volume, volumeID int64, dueDests []string) []string {
+	var dispatchable []string
 	for _, destName := range dueDests {
-		s.runSync(ctx, vol, volumeID, destName)
+		if s.syncInFlight(ctx, vol, volumeID, destName) {
+			s.logger.Info("scheduler.skipped",
+				"kind", "sync", "volume", vol.Name, "destination", destName,
+				"reason", "in-flight sync run")
+			continue
+		}
+		dispatchable = append(dispatchable, destName)
 	}
-	return true
+	return dispatchable
 }
 
 // syncDue computes (now - last_finished) ≥ cadence for the (volume,
@@ -463,34 +508,28 @@ func indexRunStatus(rep index.Report, err error) (string, bool) {
 	return store.RunStatusSuccess, true
 }
 
-// runSync evaluates the per-pair in-flight gate, then hands the sync to
-// the per-destination dispatcher (#160). The DB check catches a sync of
-// this exact pair already running — a concurrent CLI `squirrel sync`, or a
-// stale row not yet reaped — producing the same clean per-pair skip the
-// serial scheduler did; the dispatcher additionally serialises different
-// volumes that target the same destination and confines a slow transfer to
-// its own worker. The SyncRunner's downstream call (sync.RunPair) adds its
-// own atomic BeginSyncRunIfClear gate, so a race that sneaks past the
-// pre-check still produces a clean skip rather than a duplicate run.
-//
-// Dispatch is non-blocking: a slow or wedged destination is confined to its
-// own worker and never stalls the tick loop or syncs to other destinations,
-// which is the freeze F25 recorded. A nil SyncRunner surfaces as a clean
-// skip inside the dispatcher so an agent running pure index-only schedules
-// can omit the sync wiring without logging at error level each tick.
-func (s *scheduler) runSync(ctx context.Context, vol *config.Volume, volumeID int64, destName string) {
+// syncInFlight reports whether a sync of this exact (volume, destination) pair
+// is already active — a stale row, a concurrent CLI `squirrel sync`, or (the
+// common case) a dispatch from an earlier tick still working. It consults two
+// sources so neither a not-yet-visible run row nor a just-drained queue slot
+// can fool it: the dispatcher's in-memory queue (set the instant a pair is
+// enqueued, before its run row exists) and the runs table (authoritative once
+// the row is written, and the signal that also catches a stale row or a
+// concurrent CLI sync). The downstream dispatch and sync.RunPair's atomic
+// BeginSyncRunIfClear gate remain the final guard against a duplicate run, so
+// this check only needs to be good enough to suppress a redundant pre-sync
+// index. A store error is treated as in-flight so a transient DB hiccup skips
+// this tick rather than racing a duplicate push.
+func (s *scheduler) syncInFlight(ctx context.Context, vol *config.Volume, volumeID int64, destName string) bool {
+	if s.dispatch.inFlight(destName, vol.Name) {
+		return true
+	}
 	running, err := s.store.HasRunningRun(ctx, store.RunKindSync, volumeID, destName)
 	if err != nil {
 		s.logger.Error("scheduler.error",
 			"kind", "sync", "volume", vol.Name, "destination", destName,
 			"err", err.Error())
-		return
+		return true
 	}
-	if running {
-		s.logger.Info("scheduler.skipped",
-			"kind", "sync", "volume", vol.Name, "destination", destName,
-			"reason", "in-flight sync run")
-		return
-	}
-	s.dispatch.dispatch(ctx, vol, destName)
+	return running
 }
