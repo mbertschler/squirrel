@@ -48,8 +48,14 @@ func TestGenerateSelfSignedCert(t *testing.T) {
 }
 
 func TestGenerateSelfSignedCertUnique(t *testing.T) {
-	a, _ := GenerateSelfSignedCert("nas")
-	b, _ := GenerateSelfSignedCert("nas")
+	a, err := GenerateSelfSignedCert("nas")
+	if err != nil {
+		t.Fatalf("GenerateSelfSignedCert: %v", err)
+	}
+	b, err := GenerateSelfSignedCert("nas")
+	if err != nil {
+		t.Fatalf("GenerateSelfSignedCert: %v", err)
+	}
 	if a.Fingerprint == b.Fingerprint {
 		t.Fatal("two generations produced the same fingerprint")
 	}

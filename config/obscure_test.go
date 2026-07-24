@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/base64"
@@ -51,15 +52,40 @@ func TestObscureRcloneRoundTrips(t *testing.T) {
 // is byte-identical and the "unexpected rewrite is a signal" invariant
 // holds. Two different plaintexts must not share an IV (keystream reuse).
 func TestObscureRcloneDeterministic(t *testing.T) {
-	a1, _ := obscureRclone("secret")
-	a2, _ := obscureRclone("secret")
+	a1, err := obscureRclone("secret")
+	if err != nil {
+		t.Fatalf("obscureRclone(secret): %v", err)
+	}
+	a2, err := obscureRclone("secret")
+	if err != nil {
+		t.Fatalf("obscureRclone(secret): %v", err)
+	}
 	if a1 != a2 {
 		t.Fatalf("obscureRclone is not deterministic: %q vs %q", a1, a2)
 	}
-	b, _ := obscureRclone("other")
-	if a1[:22] == b[:22] {
-		t.Fatalf("distinct plaintexts share an IV prefix (keystream reuse): %q / %q", a1, b)
+	b, err := obscureRclone("other")
+	if err != nil {
+		t.Fatalf("obscureRclone(other): %v", err)
 	}
+	// Compare the decoded leading IV bytes, not the base64 text: a base64
+	// prefix comparison could mask a real IV collision or trip on unrelated
+	// encoding differences.
+	if bytes.Equal(obscuredIV(t, a1), obscuredIV(t, b)) {
+		t.Fatalf("distinct plaintexts share an IV (keystream reuse): %q / %q", a1, b)
+	}
+}
+
+// obscuredIV decodes an obscured value and returns its leading IV block.
+func obscuredIV(t *testing.T, obscured string) []byte {
+	t.Helper()
+	raw, err := base64.RawURLEncoding.DecodeString(obscured)
+	if err != nil {
+		t.Fatalf("base64 decode: %v", err)
+	}
+	if len(raw) < aes.BlockSize {
+		t.Fatalf("obscured value too short for an IV: %d bytes", len(raw))
+	}
+	return raw[:aes.BlockSize]
 }
 
 // TestObscureRcloneMatchesRclone cross-checks the output against the real

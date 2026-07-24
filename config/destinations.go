@@ -393,7 +393,7 @@ func resolveCrypt(raw map[string]any, typ string) (*Crypt, error) {
 	}
 	alreadyObscured, err := cryptObscuredFlag(table)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("crypt: %w", err)
 	}
 	for k := range table {
 		if k != "password" && k != "password2" && k != "obscured" {
@@ -426,7 +426,9 @@ func cryptObscuredFlag(table map[string]any) (bool, error) {
 	}
 	b, ok := v.(bool)
 	if !ok {
-		return false, errors.New("crypt.obscured must be a boolean")
+		// The caller wraps this with the "crypt:" prefix every other
+		// resolveCrypt error carries, so the message stays bare here.
+		return false, errors.New("obscured must be a boolean")
 	}
 	return b, nil
 }

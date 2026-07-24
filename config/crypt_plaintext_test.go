@@ -73,7 +73,7 @@ root = "/data"
 obscured = "yes"
 password = "hunter2"
 `))
-	if err == nil || !strings.Contains(err.Error(), "crypt.obscured must be a boolean") {
+	if err == nil || !strings.Contains(err.Error(), "crypt: obscured must be a boolean") {
 		t.Fatalf("expected obscured-must-be-bool error, got %v", err)
 	}
 }
