@@ -21,7 +21,7 @@ rclone 1.74.1, SeaweedFS 3.80, kopia 0.21.1, testbed of 2026-07-23.
 
 ## Checkpoint 1 — bootstrap day
 
-**F1 · S2 — TLS cert + fingerprint setup is entirely DIY.** Pinning is
+**F1 · S2 — ~~TLS cert + fingerprint setup is entirely DIY.~~ (fixed in #171)** Pinning is
 the documented trust anchor for LAN agents, but there is no help
 producing its ingredients: the operator must know the right openssl
 incantations for cert+key *and* for the `sha256:<hex of DER>` pin
@@ -29,13 +29,13 @@ incantations for cert+key *and* for the `sha256:<hex of DER>` pin
 nor any command covers this. A `squirrel agent cert` (generate) +
 printed fingerprint at agent startup would remove a whole error class.
 
-**F2 · S3 — crypt passwords must be pre-obscured with rclone by hand.**
+**F2 · S3 — ~~crypt passwords must be pre-obscured with rclone by hand.~~ (fixed in #171)**
 Squirrel owns rclone.conf and hides rclone everywhere else, but crypt
 config leaks the `rclone obscure` step (4 manual invocations for two
 crypt destinations). Accepting plaintext-via-env and obscuring
 internally would match the "squirrel owns the rclone surface" stance.
 
-**F3 · S2 — the peer-token matrix is easy to wire wrong.** One
+**F3 · S2 — ~~the peer-token matrix is easy to wire wrong.~~ (`squirrel node pair`, #171)** One
 nas↔htpc relationship needs four token bindings across two files
 (each side's `[agent.auth.peers.X]` entry must equal the *other*
 side's `[nodes.Y].auth.bearer`). Nothing validates the pairing until
@@ -43,7 +43,7 @@ a sync fails at runtime with 401. Writing these four configs, the
 cross-referencing was the single most error-prone part — and there is
 no `squirrel node add` / pairing flow to generate matching halves.
 
-**F4 · S2 — a freshly configured machine reports nothing.** The
+**F4 · S2 — ~~a freshly configured machine reports nothing.~~ (`squirrel config check`, #171)** The
 natural first command after writing config (`squirrel volumes`) prints
 an empty list with exit 0: it reads the *database*, not the config, so
 declared-but-never-indexed volumes are invisible. Config-parse success
@@ -211,7 +211,7 @@ TUI-side folding of consecutive no-ops would restore the audit trail's
 readability. (The `runs` help text also still says "List index runs";
 it lists every kind.)
 
-**F20 · S2 — recovering a wrecked destination has no supported path.**
+**F20 · S2 — ~~recovering a wrecked destination has no supported path.~~ (`squirrel destination reset` + empty-root guard, #176)**
 After the F12 bug era the packed-layout guard refused every further
 s3archive sync ("its history is not packed … point the layout at a
 fresh destination or root"). But the guard keys on the pair's *run
@@ -343,7 +343,7 @@ content-verified method and relay that — the schema already carries
 
 ## Checkpoint 8 — restore day
 
-**F28 · S2 — a dead edge machine has no supported restore path.** The
+**F28 · S2 — ~~a dead edge machine has no supported restore path.~~ (reverse-peer-push runbook + restore signpost, #176)** The
 laptop syncs only to the nas (a node), and `restore` refuses nodes
 outright ("restore from node destinations is not supported" — clear,
 at least). The machinery for the recovery *exists* — a reverse peer
@@ -421,8 +421,10 @@ mount or rclone-style prefix that squirrel neither validates at load
 time nor mentions when it's wrong (bytes just fail to land); the
 htpc even needs a `[nodes.nas]` entry with a mandatory `path` that no
 bytes ever traverse, purely to enable durability pulls.
+*Partially addressed in #171: `squirrel config check` now stats and
+flags a missing node byte-path; load-time validation is still absent.*
 
-**F35 · S3 — cadence-only machines must still run the full agent.**
+**F35 · S3 — ~~cadence-only machines must still run the full agent.~~ (fixed in #175)**
 A machine that never receives (laptop) runs the HTTP listener and
 must configure `[agent] listen` + auth token anyway, because the
 scheduler lives inside the agent. A listener that exists to be unused

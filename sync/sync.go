@@ -745,6 +745,22 @@ func remoteSubpathURI(dest *config.Destination, subpath string) string {
 	}
 }
 
+// freshStartOnEmptyRoot reports whether a missing layout marker (a manifest
+// segment or pack placement map absent at the last recorded success) should
+// be read as a fresh start rather than a layout conflict. It is true only
+// when dest's configured root holds no files on the remote — a wiped or
+// repointed destination, or one whose recorded state was cleared by
+// `squirrel destination reset` — so the name-keyed run history no longer
+// describes anything on disk and a fresh full push is safe (it skips
+// nothing). A non-empty root, or any error probing it, returns false so the
+// caller keeps its refusal: fail-closed, because refusing a real
+// layout-switch is recoverable while a delta against a stale watermark
+// silently skips content.
+func freshStartOnEmptyRoot(ctx context.Context, rcl *Rclone, dest *config.Destination) bool {
+	empty, err := rcl.remoteRootEmpty(ctx, remoteSubpathURI(dest, ""), checkersArgs(dest)...)
+	return err == nil && empty
+}
+
 // destinationVolumeURI returns the rclone destination spec for the given
 // volume under dest.
 func destinationVolumeURI(dest *config.Destination, volumeName string) string {

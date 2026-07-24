@@ -112,7 +112,7 @@ password  = { env = "OFFSITE_CRYPT_PASSWORD" }
 password2 = { env = "OFFSITE_CRYPT_SALT" }    # salt — optional but recommended
 ```
 
-`password` and `password2` are **rclone-obscured** values, the same representation `rclone config` stores for its own crypt remotes — generate one with `rclone obscure <plaintext>`. Both accept a literal or `{ env = "VAR" }`. Squirrel renders two sections into its `rclone.conf` — the underlying remote plus a crypt remote wrapping it — and addresses all sync and restore transfers through the crypt remote. Keep the passwords safe: restoring from an encrypted destination requires them.
+`password` and `password2` are **plaintext** (a literal or `{ env = "VAR" }`); squirrel obscures them into rclone's on-disk form when it renders `rclone.conf`, so you never run `rclone obscure` yourself. A config written before this behaviour, whose values are already obscured, keeps them verbatim by adding `obscured = true` to the crypt block. Squirrel renders two sections into its `rclone.conf` — the underlying remote plus a crypt remote wrapping it — and addresses all sync and restore transfers through the crypt remote. Keep the passwords safe: restoring from an encrypted destination requires them.
 
 Two properties to be aware of:
 

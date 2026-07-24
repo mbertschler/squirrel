@@ -195,9 +195,11 @@ func pickSingleRestoreDestination(cfg *config.Config, vol *config.Volume) (*conf
 	}
 	dest, ok := cfg.Destinations[vol.SyncTo[0]]
 	if !ok {
-		// sync_to may name a node, not a bucket; restore doesn't yet
-		// pull from peer nodes, so surface that mismatch explicitly.
-		return nil, fmt.Errorf("volume %q syncs only to %q which is not a bucket destination — restore from node destinations is not supported", vol.Name, vol.SyncTo[0])
+		// sync_to may name a node, not a bucket; restore doesn't pull from
+		// peer nodes. Rebuilding an edge machine from its hub is a reverse
+		// peer push driven from the hub — the same mechanism nas→htpc uses
+		// daily — not a restore, so point there rather than dead-ending.
+		return nil, fmt.Errorf("volume %q syncs only to peer node %q; restore pulls from bucket destinations, not nodes — to rebuild this machine from its hub, drive a reverse peer push from the hub (see the machine-replacement runbook: the Recovery guide, guides/recovery)", vol.Name, vol.SyncTo[0])
 	}
 	return dest, nil
 }

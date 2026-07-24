@@ -26,6 +26,7 @@ squirrel runs fail <id>
 squirrel hooks                       [--volume NAME] [--limit N]
 squirrel volumes
 squirrel restore <volume>            [--from NAME] [--to PATH] [--shallow] [--dry-run] [--in-place]
+squirrel destination reset <dest>    [--yes] [--dry-run]
 squirrel audit   [<volume>]          [--deep | --folders]
 squirrel peer-sync history <volume> <peer>
 squirrel peer-sync pull-durability <volume> <peer> [--allow-rewind]
@@ -226,6 +227,36 @@ Exactly one positional — the volume name. See [Restoring](/squirrel/guides/res
 Restore from an [encrypted (`crypt`)](/squirrel/layouts/encrypted/) destination
 is always a size+mtime comparison (recorded shallow) even without `--shallow`,
 because rclone crypt remotes don't expose content hashes.
+
+---
+
+## squirrel destination
+
+**Manage a destination's recorded state.**
+
+On its own it prints help. See [Recovery & disaster runbooks](/squirrel/guides/recovery/).
+
+### squirrel destination reset
+
+**Forget a destination's recorded upload and durability state (audit-preserving).**
+
+```
+squirrel destination reset <destination>
+```
+
+One positional — the destination name. Clears the `remote_objects`/`remote_packs`
+upload ledgers, the durability vector, and the push-freshness rows for the
+destination, so the next sync treats it as fresh and re-uploads. The runs table
+and the append-only durability advance log are preserved, and the reset is
+recorded as an audit run; the remote bytes are untouched.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--yes` | `false` | Confirm the reset; required to actually clear state. |
+| `--dry-run` | `false` | Print what would be cleared without changing anything. |
+
+Use it to recover a wrecked or repointed destination — see
+[Resetting a wrecked destination](/squirrel/guides/recovery/#resetting-a-wrecked-destination).
 
 ---
 

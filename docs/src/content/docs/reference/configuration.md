@@ -96,8 +96,9 @@ destination). See [Encrypted (crypt)](/squirrel/layouts/encrypted/).
 
 | Key | Meaning |
 |---|---|
-| `password` | rclone-obscured value (`rclone obscure <plaintext>`). Secret. |
-| `password2` | rclone-obscured salt; optional but recommended. Secret. |
+| `password` | Plaintext encryption password; squirrel obscures it at render time. Secret. |
+| `password2` | Plaintext salt; optional but recommended. Secret. |
+| `obscured` | `true` if `password`/`password2` are already rclone-obscured (renders them verbatim; default `false`). |
 
 Filenames are **not** encrypted (`filename_encryption = off`, fixed by design).
 
@@ -137,11 +138,17 @@ unattended cadence (`index_every`, `sync_every`), scheduled audits, and an
 optional agent-specific `db` path (which takes precedence over the top-level `db`
 when the agent runs).
 
+`listen` is optional. When set (e.g. `0.0.0.0:8443`), the agent binds an HTTP
+server for peer syncs and the health endpoint, and a bearer token is required.
+When omitted, the agent runs its schedulers only — the *listener-less* mode for
+cadence-only machines that never receive peer syncs; `[agent.auth]` is then
+optional. See [The agent](/squirrel/guides/agent/#listener-less-cadence-only-machines).
+
 | Key | Required | Meaning |
 |---|---|---|
-| `listen` | yes | Bind address, e.g. `0.0.0.0:8443`. |
+| `listen` | no | Bind address, e.g. `0.0.0.0:8443`. Omit for listener-less, scheduler-only mode (above). |
 | `db` | no | Agent-specific index path; wins over the top-level `db`. |
-| `auth.token` | yes | Shared bearer token. |
+| `auth.token` | with `listen` | Shared bearer token. Required only when the agent binds an HTTP surface. |
 | `scan_interval` | no | Drift-scan cadence over every hosted volume. Off when absent. |
 | `scan_strategy` | no | `shallow` (default) or `deep` (re-hash everything — bit-rot detection). |
 | `verify_every` | no | Fleet-wide default verify cadence applied to every content-addressed/packed destination that declares no `verify_every` of its own. Off when absent. |

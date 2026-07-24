@@ -19,9 +19,10 @@ import (
 
 // newAgentCmd returns the `squirrel agent` cobra command. It starts the
 // HTTP server declared by the `[agent]` config block and blocks until
-// the cobra context (wired to SIGINT/SIGTERM in main) is cancelled.
+// the cobra context (wired to SIGINT/SIGTERM in main) is cancelled. The
+// `cert` child is a one-shot bootstrap helper and does not start a server.
 func newAgentCmd() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "agent",
 		Short: "Run the squirrel agent (HTTP server + scheduled audits + cadence-driven index/sync)",
 		Args:  cobra.NoArgs,
@@ -29,6 +30,8 @@ func newAgentCmd() *cobra.Command {
 			return runAgent(cmd)
 		},
 	}
+	cmd.AddCommand(newAgentCertCmd())
+	return cmd
 }
 
 func runAgent(cmd *cobra.Command) error {
@@ -72,6 +75,24 @@ func runAgent(cmd *cobra.Command) error {
 	if err != nil {
 		return err
 	}
+	return serveAgent(cmd, cfg, srv, logger)
+}
+
+// serveAgent dispatches the built server to its run path: the listener-less
+// scheduler-only run (F35) when [agent] listen is empty, or the HTTP server
+// otherwise. Split from runAgent so the setup phase stays compact.
+func serveAgent(cmd *cobra.Command, cfg *config.Config, srv *agent.Server, logger *slog.Logger) error {
+	// Listener-less mode (F35): no `listen`, so run the schedulers without an
+	// HTTP server. Refuse an agent that would do nothing at all — a
+	// scheduler-only agent with no cadences and no scan is silent
+	// degradation, not a valid config.
+	if cfg.Agent.Listen == "" {
+		if !agent.ScheduledWorkInConfig(cfg) {
+			return fmt.Errorf("listener-less agent has nothing to run: set [agent] listen to receive peer syncs, or configure a cadence (a volume's sync_every, index_every, or hook.interval, a destination's verify_every, a node's pull_durability_every, or [agent] scan_interval or verify_every) in %s", cfg.Path)
+		}
+		logSchedulerOnlyStartup(logger)
+		return srv.RunSchedulers(cmd.Context())
+	}
 	// Bind first so a port-in-use (or any other listen failure) surfaces
 	// as a CLI error and never logs a misleading "agent listening" line.
 	// We also log the listener's resolved Addr so `:0` (and other
@@ -83,6 +104,13 @@ func runAgent(cmd *cobra.Command) error {
 	}
 	logAgentStartup(logger, srv, ln.Addr().String())
 	return srv.Serve(cmd.Context(), ln)
+}
+
+// logSchedulerOnlyStartup emits the listener-less counterpart of the
+// "agent listening" banner so a journal shows the agent came up in
+// scheduler-only mode with no bound port.
+func logSchedulerOnlyStartup(logger *slog.Logger) {
+	logger.Info("agent scheduler running", "listener", "disabled", "version", version)
 }
 
 // openAgentStore extends the standard resolveDBPath precedence with the
@@ -358,9 +386,21 @@ func logAgentStartup(logger *slog.Logger, srv *agent.Server, addr string) {
 	if srv.HasTLS() {
 		scheme = "https"
 	}
-	logger.Info("agent listening",
+	attrs := []any{
 		"addr", addr,
 		"scheme", scheme,
 		"version", version,
-	)
+	}
+	// Surfacing the fingerprint at startup (F1) lets an operator read the
+	// pin peers must put in [nodes.X.tls] straight from the agent's log,
+	// without a separate command. A read failure is non-fatal — the agent
+	// still serves — so it is logged as a warning attribute, not an error.
+	if srv.HasTLS() {
+		if fp, err := srv.CertFingerprint(); err == nil {
+			attrs = append(attrs, "cert_fingerprint", fp)
+		} else {
+			attrs = append(attrs, "cert_fingerprint_error", err.Error())
+		}
+	}
+	logger.Info("agent listening", attrs...)
 }

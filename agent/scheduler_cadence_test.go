@@ -78,6 +78,62 @@ func TestSchedulerAnyScheduledWork(t *testing.T) {
 	}
 }
 
+// TestScheduledWorkInConfig is the config-side half of the same gate, which
+// the CLI uses to refuse a do-nothing listener-less agent (F35). It must
+// agree with anyScheduledWork on every cadence — in particular a
+// receive-only machine (the reference htpc: no volume cadence, no scan, no
+// listener) whose sole work is a peer pull_durability_every, or a
+// verify-only machine, since refusing either would keep exactly the nodes
+// F32/F33 exist to serve from ever starting.
+func TestScheduledWorkInConfig(t *testing.T) {
+	idleVol := map[string]*config.Volume{"idle": {Name: "idle"}}
+	for _, tc := range []struct {
+		name string
+		cfg  *config.Config
+		want bool
+	}{
+		{"nil config", nil, false},
+		{"no agent block", &config.Config{Volumes: idleVol}, false},
+		{"idle", &config.Config{Agent: &config.Agent{}, Volumes: idleVol}, false},
+		{"scan interval", &config.Config{Agent: &config.Agent{ScanInterval: time.Hour}}, true},
+		{"volume sync cadence", &config.Config{
+			Agent:   &config.Agent{},
+			Volumes: map[string]*config.Volume{"pics": {Name: "pics", SyncEvery: time.Hour}},
+		}, true},
+		{"per-destination verify cadence", &config.Config{
+			Agent:        &config.Agent{},
+			Volumes:      idleVol,
+			Destinations: map[string]*config.Destination{"s3archive": {Name: "s3archive", Layout: config.LayoutPacked, VerifyEvery: time.Hour}},
+		}, true},
+		{"agent-default verify cadence", &config.Config{
+			Agent:        &config.Agent{VerifyEvery: time.Hour},
+			Volumes:      idleVol,
+			Destinations: map[string]*config.Destination{"s3archive": {Name: "s3archive", Layout: config.LayoutContentAddressed}},
+		}, true},
+		{"verify default on an unverifiable layout", &config.Config{
+			Agent:        &config.Agent{VerifyEvery: time.Hour},
+			Volumes:      idleVol,
+			Destinations: map[string]*config.Destination{"cloudbox": {Name: "cloudbox", Layout: config.LayoutMirror}},
+		}, false},
+		{"receive-only pull cadence", &config.Config{
+			Agent:   &config.Agent{},
+			Volumes: idleVol,
+			Nodes:   map[string]*config.Node{"nas": {Name: "nas", PullDurabilityEvery: 24 * time.Hour}},
+		}, true},
+		{"peer node without a pull cadence", &config.Config{
+			Agent:   &config.Agent{},
+			Volumes: idleVol,
+			Nodes:   map[string]*config.Node{"nas": {Name: "nas"}},
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ScheduledWorkInConfig(tc.cfg); got != tc.want {
+				t.Fatalf("ScheduledWorkInConfig = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestSchedulerVerifyCadence walks the verify cadence across ticks: first
 // tick kicks (never verified), a within-cadence tick skips, a past-cadence
 // tick re-fires. The kicked/finished discipline is asserted from the log.

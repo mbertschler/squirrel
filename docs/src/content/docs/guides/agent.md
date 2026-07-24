@@ -31,8 +31,32 @@ The agent requires an `[agent]` block in config.
   evidence fresh unattended.
 - **Hook firing** — fires per-volume [hooks](/squirrel/guides/hooks/) on change
   (after each successful index run) and on their `interval`.
-- **HTTP server** — exposes a health endpoint and drives the state the
-  [TUI](/squirrel/guides/tui/) and desktop app read.
+- **HTTP server** — exposes a health endpoint, serves peer syncs, and drives
+  the state the [TUI](/squirrel/guides/tui/) and desktop app read. Only when
+  `[agent] listen` is set (see below).
+
+## Listener-less (cadence-only) machines
+
+A machine that only *originates* content — a roaming laptop that pushes to a
+hub and never receives peer syncs — has no reason to run an HTTP listener. Omit
+`[agent] listen` and the agent runs its schedulers (index/sync/audit cadences)
+**without binding a listener**; with no listener there is nothing to
+authenticate, so `[agent.auth]` is optional too.
+
+```toml
+[agent]
+# no `listen`: schedulers only, no HTTP server
+
+[volumes.photos]
+path       = "~/Pictures"
+sync_to    = ["nas"]
+sync_every = "1h"
+```
+
+When `listen` *is* set, behaviour is unchanged: the agent runs the schedulers
+**and** the HTTP server (and then a bearer token is required). A listener-less
+agent with no cadence and no `scan_interval` has nothing to do and refuses to
+start, rather than idling silently.
 
 ## Database path precedence
 

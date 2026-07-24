@@ -90,9 +90,11 @@ type DurabilityPullReport struct {
 	Rewinds int
 }
 
-// Config configures one agent listener. Fields are validated by New; all
-// of them are required except TLSCert/TLSKey (which must be set together
-// or not at all — empty pair means plain HTTP).
+// Config configures one agent. Fields are validated by New: Version is
+// always required; Listen is optional (empty selects listener-less,
+// scheduler-only mode, F35); Token is required only when Listen is set (an
+// HTTP surface needs a bearer token); TLSCert/TLSKey must be set together
+// or not at all — empty pair means plain HTTP.
 type Config struct {
 	// Listen is the bind address passed to net.Listen, e.g. "0.0.0.0:8443".
 	Listen string
@@ -243,16 +245,28 @@ func (s *Server) Handler() http.Handler { return s.handler }
 // dial.
 func (s *Server) HasTLS() bool { return s.cfg.TLSCert != "" }
 
+// CertFingerprint returns the sha256: pin of the agent's configured TLS
+// certificate — the value the startup banner prints so an operator can see
+// what peers must pin. It errors when the agent serves plain HTTP (no cert)
+// or the certificate file cannot be read.
+func (s *Server) CertFingerprint() (string, error) {
+	if s.cfg.TLSCert == "" {
+		return "", errors.New("agent: no TLS certificate configured")
+	}
+	return FingerprintCertFile(s.cfg.TLSCert)
+}
+
 // Addr returns the configured listen address verbatim. For `:0`-style
 // binds the kernel-assigned port is only knowable from the net.Listener
 // the caller hands to Serve; this accessor is for the startup banner.
 func (s *Server) Addr() string { return s.cfg.Listen }
 
 func validateConfig(cfg Config) error {
-	if cfg.Listen == "" {
-		return errors.New("agent: Config.Listen is required")
-	}
-	if cfg.Token == "" {
+	// An empty Listen selects listener-less mode (F35): the agent runs only
+	// its background schedulers, so neither a bind address nor a bearer
+	// token is required. A token is required only when there is an HTTP
+	// surface to protect.
+	if cfg.Listen != "" && cfg.Token == "" {
 		return errors.New("agent: Config.Token is required")
 	}
 	if (cfg.TLSCert == "") != (cfg.TLSKey == "") {

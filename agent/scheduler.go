@@ -146,6 +146,36 @@ func (s *scheduler) anyScheduledWork() bool {
 	return s.anyScheduledVolume() || len(s.verifyEvery) > 0 || len(s.pullEvery) > 0
 }
 
+// ScheduledWorkInConfig answers anyScheduledWork's question straight from a
+// config, before any Server exists: does this config give the schedulers
+// anything to do — a drift scan, a volume cadence, a destination verify
+// cadence (F32), or a peer durability-pull cadence (F33)?
+//
+// The CLI consults it to refuse a listener-less agent that would idle
+// silently (F35). It reads the same cadences through the same resolvers as
+// the scheduler's own gate, so the two cannot drift: a receive-only machine
+// whose only work is a pull_durability_every has real work and must start,
+// even though it declares no volume cadence at all.
+func ScheduledWorkInConfig(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	var scanInterval, verifyDefault time.Duration
+	if cfg.Agent != nil {
+		scanInterval, verifyDefault = cfg.Agent.ScanInterval, cfg.Agent.VerifyEvery
+	}
+	if scanInterval > 0 {
+		return true
+	}
+	for _, v := range cfg.Volumes {
+		if volumeHasCadence(v) {
+			return true
+		}
+	}
+	return len(resolveVerifyCadences(cfg.Destinations, verifyDefault)) > 0 ||
+		len(resolvePullCadences(cfg.Nodes)) > 0
+}
+
 // volumeHasCadence reports whether a volume opts into any scheduler-driven
 // cadence: a sync, a standalone index, or an interval hook. The interval
 // hook counts on its own — a volume can want periodic verification of its
