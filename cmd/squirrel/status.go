@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"text/tabwriter"
@@ -32,7 +33,17 @@ func newStatusCmd() *cobra.Command {
 			if len(args) == 1 {
 				volume = args[0]
 			}
-			return runStatus(cmd, volume)
+			err := runStatus(cmd, volume)
+			// SilenceErrors keeps the scriptable green/amber/red exit-code
+			// signal (an exitCodeError) from leaking a cobra "Error:" line. But
+			// it also silences genuine failures — an unknown volume, a missing
+			// config, a store error — which must still reach the user, so print
+			// those here. The exit-code signal stays silent.
+			var ec exitCodeError
+			if err != nil && !errors.As(err, &ec) {
+				fmt.Fprintln(cmd.ErrOrStderr(), cmd.ErrPrefix(), err.Error())
+			}
+			return err
 		},
 	}
 	return cmd

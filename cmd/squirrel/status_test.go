@@ -89,20 +89,30 @@ func TestCLIStatusAfterSyncIsGreen(t *testing.T) {
 }
 
 // TestCLIStatusUnknownVolume errors clearly on a volume not in config.
+// SilenceErrors (needed to keep the amber/red exit-code signal quiet) must
+// not swallow this genuine error: it has to reach the user's stderr, not
+// just the returned error value.
 func TestCLIStatusUnknownVolume(t *testing.T) {
 	cfg := writeStatusConfig(t)
-	_, err := runCLIExpectErr(t, "--config", cfg, "status", "nope")
+	out, err := runCLIExpectErr(t, "--config", cfg, "status", "nope")
 	if err == nil || !strings.Contains(err.Error(), `unknown volume "nope"`) {
 		t.Fatalf("expected unknown-volume error, got %v", err)
+	}
+	if !strings.Contains(out, `unknown volume "nope"`) {
+		t.Fatalf("error must reach the user, not be silenced:\n%s", out)
 	}
 }
 
 // TestCLIStatusRequiresConfig: status is a question about configured
-// coverage, so a missing config is a clear error, not an empty grid.
+// coverage, so a missing config is a clear error, not an empty grid — and
+// the message must be printed, not silently swallowed by SilenceErrors.
 func TestCLIStatusRequiresConfig(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "no-config.toml")
-	_, err := runCLIExpectErr(t, "--config", missing, "status")
+	out, err := runCLIExpectErr(t, "--config", missing, "status")
 	if err == nil || !strings.Contains(err.Error(), "no config at") {
 		t.Fatalf("expected missing-config error, got %v", err)
+	}
+	if !strings.Contains(out, "no config at") {
+		t.Fatalf("error must reach the user, not be silenced:\n%s", out)
 	}
 }
