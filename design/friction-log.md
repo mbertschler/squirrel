@@ -62,7 +62,13 @@ same verbatim-name pattern makes `b2` look broken too (squirrel writes
 unverified, no b2 endpoint in the testbed. s3/gcs names happen to
 match. Needs its own fix PR + a test that pins squirrel's rendered
 keys to rclone's real option schema. Testbed worked around via
-`key_file` auth (rclone's real name, works).
+`key_file` auth (rclone's real name, works). *Fixed in #153:* sftp
+renders `pass`, obscured at render time (rclone's obscure algorithm
+reimplemented in Go under the fixed published key, with a deterministic
+zero IV so rclone.conf stays byte-stable and rclone still reveals it);
+b2 renders `account`/`key`; and `TestRcloneSectionKeysMatchRcloneSchema`
+pins every rclone-backed type's rendered keys to rclone's real option
+names so a new backend can't repeat the class.
 
 **F6 · S1 — a failing rclone destination is undiagnosable from
 squirrel's output.** The scheduler log and the CLI both surface only
@@ -376,7 +382,9 @@ operator clears it.
 
 **F31 · S3 — disaster recovery works but only as archaeology.** Every
 piece proved out: mirror restore was byte-identical (crypt decrypt
-included), packed/kopia refusals point at their exact recovery
+included), content-addressed and packed restore both round-trip from
+the local index (re-hashing every fetched object and pack member, one
+fetch per pack), the kopia refusal points at its exact recovery
 procedure, ride-along index snapshots rotate on the offsite and the
 fetched catalog answers `runs`/`query` immediately. What's missing is
 the connective tissue: a "your NAS died" runbook (or `squirrel

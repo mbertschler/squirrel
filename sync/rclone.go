@@ -21,6 +21,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/runevents"
@@ -31,6 +33,26 @@ import (
 // --hash blake3 flag used by sync would be rejected by rclone.
 var MinRcloneVersion = Version{Major: 1, Minor: 66}
 
+// DefaultStallTimeout is the no-progress bound the agent scheduler applies
+// to every automatic rclone transfer (see Rclone.StallTimeout). Ten
+// minutes is comfortably longer than the longest legitimate gap between
+// progress reports — hashing one very large file for a --checksum
+// comparison surfaces no transfer/check advance until it completes — while
+// bounding a wedged endpoint far below the "indefinite" hang F25 recorded.
+// A dark endpoint usually fails sooner via rclone's own --contimeout /
+// --timeout; the guard covers the live-but-stuck case those don't.
+const DefaultStallTimeout = 10 * time.Minute
+
+// rcloneConnectTimeout and rcloneIOTimeout are passed as --contimeout and
+// --timeout on every streaming transfer so a dead or unresponsive endpoint
+// self-terminates instead of hanging. They match rclone's own defaults but
+// are set explicitly so the bound is guaranteed applied and lives in one
+// tunable place (#160, F25).
+const (
+	rcloneConnectTimeout = "1m"
+	rcloneIOTimeout      = "5m"
+)
+
 // Rclone is a configured rclone wrapper. Binary is the resolved executable
 // path; Config is the path to the squirrel-managed rclone.conf written by
 // WriteRcloneConfig. All Run invocations pass --config Config so the user's
@@ -38,6 +60,17 @@ var MinRcloneVersion = Version{Major: 1, Minor: 66}
 type Rclone struct {
 	Binary string
 	Config string
+	// StallTimeout, when > 0, bounds a streaming transfer (RunWithProgress)
+	// by progress rather than by total wall-clock: if rclone reports no
+	// advance in transferred+checked+bytes for this long, the child is
+	// killed and the run fails with a diagnosable "stalled" error. It is the
+	// squirrel-side backstop for a connection that stays alive but stops
+	// making progress — the storage-full S3 hang of F25 that tripped neither
+	// --contimeout nor --timeout. Zero (the default, used by the foreground
+	// CLI where a human can interrupt) disables the guard; the agent
+	// scheduler sets it to DefaultStallTimeout so an unattended cadence can
+	// never wedge forever.
+	StallTimeout time.Duration
 }
 
 // Find locates the rclone binary on PATH. The returned Rclone has Config
@@ -280,7 +313,7 @@ type FailedFile struct {
 const maxFailedFiles = 100
 
 // maxStderrCapture bounds RunResult.Stderr. rclone's fatal diagnostics are
-// a line or two; 4 KiB keeps a useful head of a chattier failure without
+// a line or two; 4 KiB keeps a useful tail of a chattier failure without
 // letting a misbehaving child stream unbounded bytes into the run row.
 const maxStderrCapture = 4 << 10
 
@@ -308,23 +341,18 @@ func (r *Rclone) RunWithProgress(ctx context.Context, onProgress func(runevents.
 	if r.Config == "" {
 		return RunResult{}, errors.New("rclone wrapper: Config not set (call WriteRcloneConfig first)")
 	}
-	full := append([]string{
-		"--config", r.Config,
-		"--use-json-log",
-		"--log-level", "INFO",
-		"--stats", "1s",
-	}, args...)
-	cmd := exec.CommandContext(ctx, r.Binary, full...)
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return RunResult{}, fmt.Errorf("rclone stderr pipe: %w", err)
+	// A per-run cancel backs the no-progress guard: rclone's own timeouts
+	// bound a dead connection, the guard bounds a live-but-wedged one (F25).
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var guard *stallGuard
+	if r.StallTimeout > 0 {
+		guard = newStallGuard(runCtx, r.StallTimeout, cancel)
 	}
-	stdout, err := cmd.StdoutPipe()
+
+	cmd, stderr, stdout, err := r.startRclone(runCtx, args)
 	if err != nil {
-		return RunResult{}, fmt.Errorf("rclone stdout pipe: %w", err)
-	}
-	if err := cmd.Start(); err != nil {
-		return RunResult{}, fmt.Errorf("rclone start: %w", err)
+		return RunResult{}, err
 	}
 
 	var (
@@ -334,7 +362,7 @@ func (r *Rclone) RunWithProgress(ctx context.Context, onProgress func(runevents.
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		parseJSONLog(stderr, &result, onProgress)
+		parseJSONLog(stderr, &result, onProgress, guard.advance)
 	}()
 	go func() {
 		defer wg.Done()
@@ -345,11 +373,134 @@ func (r *Rclone) RunWithProgress(ctx context.Context, onProgress func(runevents.
 	wg.Wait()
 
 	waitErr := cmd.Wait()
+	cancel()
+	guard.wait()
 	if waitErr != nil {
 		result.FatalError = result.Errors == 0
-		return result, rcloneExitError(waitErr, result.Stderr)
+		return result, rcloneRunError(waitErr, result.Stderr, guard, r.StallTimeout)
 	}
 	return result, nil
+}
+
+// startRclone assembles the full argument list — config, JSON logging,
+// per-second stats, and the connect/IO timeouts every transfer carries
+// (#160, F25) — and starts the child on runCtx, returning its stderr and
+// stdout pipes. runCtx backs both the caller's cancellation and the stall
+// guard's kill.
+func (r *Rclone) startRclone(runCtx context.Context, args []string) (*exec.Cmd, io.Reader, io.Reader, error) {
+	full := append([]string{
+		"--config", r.Config,
+		"--use-json-log",
+		"--log-level", "INFO",
+		"--stats", "1s",
+		"--contimeout", rcloneConnectTimeout,
+		"--timeout", rcloneIOTimeout,
+	}, args...)
+	cmd := exec.CommandContext(runCtx, r.Binary, full...)
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("rclone stderr pipe: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("rclone stdout pipe: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, nil, nil, fmt.Errorf("rclone start: %w", err)
+	}
+	return cmd, stderr, stdout, nil
+}
+
+// stallGuard kills a running rclone child when a streaming transfer stops
+// making progress for longer than timeout. rclone's --contimeout/--timeout
+// bound a dead connection; the guard is the squirrel-side backstop for a
+// connection that stays alive yet stops advancing — the storage-full hang
+// of F25 that tripped neither. It is driven off rclone's periodic --stats
+// events (via notifyAdvance): any growth in transferred+checked+bytes
+// resets the timer, so a slow-but-moving transfer of a large volume is
+// never killed while a wedged one is.
+type stallGuard struct {
+	timeout time.Duration
+	cancel  context.CancelFunc
+	poke    chan struct{}
+	done    chan struct{}
+	fired   atomic.Bool
+}
+
+func newStallGuard(ctx context.Context, timeout time.Duration, cancel context.CancelFunc) *stallGuard {
+	g := &stallGuard{
+		timeout: timeout,
+		cancel:  cancel,
+		poke:    make(chan struct{}, 1),
+		done:    make(chan struct{}),
+	}
+	go g.watch(ctx)
+	return g
+}
+
+// advance signals progress from the stats-reader goroutine. Non-blocking:
+// a pending poke already carries the reset, so a dropped signal is
+// harmless. Safe on a nil guard so the disabled path needs no branch.
+func (g *stallGuard) advance() {
+	if g == nil {
+		return
+	}
+	select {
+	case g.poke <- struct{}{}:
+	default:
+	}
+}
+
+// watch resets its timer on every progress poke and, when the timer
+// expires with no intervening progress, records the stall and cancels the
+// run context — which makes exec.CommandContext kill the rclone child. It
+// returns when ctx is done (the run finished or was cancelled elsewhere).
+func (g *stallGuard) watch(ctx context.Context) {
+	defer close(g.done)
+	timer := time.NewTimer(g.timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-g.poke:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(g.timeout)
+		case <-timer.C:
+			g.fired.Store(true)
+			g.cancel()
+			return
+		}
+	}
+}
+
+// wait blocks until the watch goroutine has returned so the caller can read
+// fired without a race. Safe on a nil guard.
+func (g *stallGuard) wait() {
+	if g == nil {
+		return
+	}
+	<-g.done
+}
+
+// rcloneRunError builds the error for a non-zero rclone exit. When the
+// stall guard fired, the exit is a kill squirrel caused, so we say so
+// plainly (folding in the captured stderr tail, #157) rather than
+// surfacing a bare "signal: killed"; otherwise it defers to
+// rcloneExitError.
+func rcloneRunError(waitErr error, stderrTail string, guard *stallGuard, timeout time.Duration) error {
+	if guard != nil && guard.fired.Load() {
+		if tail := strings.TrimSpace(stderrTail); tail != "" {
+			return fmt.Errorf("rclone stalled: no progress for %s, killed: %w: %s", timeout, waitErr, tail)
+		}
+		return fmt.Errorf("rclone stalled: no progress for %s, killed: %w", timeout, waitErr)
+	}
+	return rcloneExitError(waitErr, stderrTail)
 }
 
 // rcloneExitError wraps a non-zero rclone exit, folding in the captured
@@ -397,6 +548,68 @@ func (r *Rclone) copyTo(ctx context.Context, src, dst string, extraArgs ...strin
 	args := append([]string{"copyto"}, extraArgs...)
 	_, err := r.runPlain(ctx, append(args, src, dst)...)
 	return err
+}
+
+// catRemote reads the full contents of the single object at uri via
+// `rclone cat`. It is called only after statRemoteExists has confirmed
+// the object is present, so any error here — including a race where the
+// object vanished between the stat and the read — is surfaced verbatim
+// and the caller refuses. Absence is deliberately decided by the stat,
+// not by cat's exit: bucket backends (s3/b2/gcs) return an empty body on
+// a zero exit for a missing key, which cat cannot tell apart from a
+// genuinely empty object. extraArgs carries per-destination flags such
+// as the --checkers cap.
+func (r *Rclone) catRemote(ctx context.Context, uri string, extraArgs ...string) ([]byte, error) {
+	args := append([]string{"cat"}, extraArgs...)
+	return r.runPlain(ctx, append(args, uri)...)
+}
+
+// isNotFoundErr reports whether an rclone error denotes an absent path
+// rather than a transient, network, or permission failure. It matches
+// only rclone's canonical absence messages — fs.ErrorObjectNotFound
+// ("object not found") and fs.ErrorDirNotFound ("directory not found"),
+// surfaced across every backend the marker gate targets. Requiring the
+// canonical phrasing rather than a bare "not found" substring keeps a
+// DNS "host not found" or a connection error from being misread as
+// absence: those propagate as hard errors and refuse the sync, per the
+// refuse-over-wrong-write invariant.
+func isNotFoundErr(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "object not found") ||
+		strings.Contains(msg, "directory not found")
+}
+
+// statRemoteExists reports whether a single object exists at uri via
+// `rclone lsjson --stat`, classifying the outcome three ways so the
+// marker gate can tell a genuinely-absent marker from an unreachable
+// one:
+//
+//   - (true, nil): the stat returned an object.
+//   - (false, nil): the backend definitively reports absence — an empty
+//     or "null" stat body on a zero exit (how the bucket backends
+//     s3/b2/gcs report a missing key) or a canonical "not found" exit
+//     (how sftp reports it).
+//   - (false, err): any other failure (transient, auth, DNS). The caller
+//     must refuse rather than mistake unreachability for absence.
+//
+// Unlike statRemote, which returns the object size and folds absence into
+// an error, this preserves the absent/unreachable distinction the
+// refuse-over-wrong-write invariant depends on. extraArgs carries
+// per-destination flags such as the --checkers cap.
+func (r *Rclone) statRemoteExists(ctx context.Context, uri string, extraArgs ...string) (bool, error) {
+	args := append([]string{"lsjson", "--stat"}, extraArgs...)
+	out, err := r.runPlain(ctx, append(args, uri)...)
+	if err != nil {
+		if isNotFoundErr(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	trimmed := bytes.TrimSpace(out)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return false, nil
+	}
+	return true, nil
 }
 
 // listSnapshots returns the snapshot filenames directly under dirURI via
@@ -554,9 +767,10 @@ func isErrorLevel(level string) bool {
 // that never reaches the JSON log still carries its reason (#157,
 // F6/F15). onProgress, if non-nil, is invoked once per stats event so
 // callers can drive a live UI.
-func parseJSONLog(r io.Reader, result *RunResult, onProgress func(runevents.Progress)) {
+func parseJSONLog(r io.Reader, result *RunResult, onProgress func(runevents.Progress), onAdvance func()) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var lastProgressTotal int64
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -579,6 +793,7 @@ func parseJSONLog(r io.Reader, result *RunResult, onProgress func(runevents.Prog
 		}
 		if ev.Stats != nil {
 			applyStatsEvent(result, ev.Stats, onProgress)
+			notifyAdvance(result, &lastProgressTotal, onAdvance)
 			continue
 		}
 		if isErrorLevel(ev.Level) && !isRetrySummary(ev.Msg) {
@@ -593,6 +808,24 @@ func parseJSONLog(r io.Reader, result *RunResult, onProgress func(runevents.Prog
 				})
 			}
 		}
+	}
+}
+
+// notifyAdvance pokes the stall guard whenever the running total of
+// transferred+checked+bytes has grown since the last stats event, so a
+// transfer that is slow but genuinely moving keeps resetting the guard's
+// timer while a wedged one — rclone still emitting per-second stats, but
+// with flat counters — lets it fire. Checks count as progress so a long
+// verification pass over an already-populated destination is not mistaken
+// for a stall.
+func notifyAdvance(result *RunResult, last *int64, onAdvance func()) {
+	if onAdvance == nil {
+		return
+	}
+	total := result.Transferred + result.Checked + result.Bytes
+	if total > *last {
+		*last = total
+		onAdvance()
 	}
 }
 
@@ -621,15 +854,12 @@ func applyStatsEvent(result *RunResult, st *rcloneStats, onProgress func(runeven
 	}
 }
 
-// appendStderr accumulates a non-JSON stderr line into result.Stderr up to
-// maxStderrCapture bytes. Once the cap is reached further lines are
-// dropped — the head of a fatal diagnostic is what identifies the failure,
-// so keeping the first bytes is more useful than a tail. Blank lines are
-// skipped so the capture stays dense.
+// appendStderr accumulates a non-JSON stderr line into result.Stderr,
+// keeping the last maxStderrCapture bytes. rclone prints its fatal error
+// line last, so the tail is the most diagnostic slice to retain when a
+// chatty run overflows the bound; older lines are trimmed from the front.
+// Blank lines are skipped so the capture stays dense.
 func appendStderr(result *RunResult, line []byte) {
-	if len(result.Stderr) >= maxStderrCapture {
-		return
-	}
 	trimmed := strings.TrimSpace(string(line))
 	if trimmed == "" {
 		return
@@ -639,6 +869,6 @@ func appendStderr(result *RunResult, line []byte) {
 	}
 	result.Stderr += trimmed
 	if len(result.Stderr) > maxStderrCapture {
-		result.Stderr = result.Stderr[:maxStderrCapture]
+		result.Stderr = result.Stderr[len(result.Stderr)-maxStderrCapture:]
 	}
 }

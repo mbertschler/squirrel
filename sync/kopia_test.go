@@ -611,3 +611,20 @@ func TestKopiaAdvanceScopedToCapturedPresentSet(t *testing.T) {
 		t.Fatalf("verify method = %q, want %q", vector[0].VerifyMethod, store.VerifyMethodKopia)
 	}
 }
+
+// TestStripANSI covers F11c: kopia paints its output for a terminal, and
+// those escape sequences must not leak into the error folded into
+// squirrel's structured log / runs.error column.
+func TestStripANSI(t *testing.T) {
+	cases := map[string]string{
+		"\x1b[31merror:\x1b[0m disk full":      "error: disk full",
+		"plain message":                        "plain message",
+		"\x1b[1;33mwarn\x1b[0m \x1b[2Kcleared": "warn cleared",
+		"":                                     "",
+	}
+	for in, want := range cases {
+		if got := stripANSI(in); got != want {
+			t.Errorf("stripANSI(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

@@ -224,6 +224,7 @@ func (d *nodeSyncDriver) run() error {
 	// them, no bytes move, and the initiator only surfaces the freeze.
 	d.report.NodeConflicts = plan.Conflicts
 	d.report.NodeContested = plan.Contested
+	d.recordAlreadyCorrect(plan)
 	// Mirror the freeze into this node's own contested_paths latch as
 	// soon as /plan has classified it, deferred so it still runs when a
 	// later phase (transfer, verify, close) fails. The receiver already
@@ -307,6 +308,29 @@ func decodeHexOrNil(hexStr string) []byte {
 		return nil
 	}
 	return b
+}
+
+// recordAlreadyCorrect derives the count of paths the receiver already
+// held correctly for the summary (F7). Under the Merkle walk only
+// differing folders reach /plan, so the identical-folder files never
+// appear as dispositions; already-correct is therefore present-total
+// minus the paths the sync acted on (every non-already-correct
+// disposition). Best-effort: a count error leaves the field zero rather
+// than failing the sync over a cosmetic number.
+func (d *nodeSyncDriver) recordAlreadyCorrect(plan syncproto.PlanResponse) {
+	actionable := 0
+	for _, disp := range plan.Dispositions {
+		if disp.Disposition != syncproto.DispositionAlreadyCorrect {
+			actionable++
+		}
+	}
+	present, err := d.store.CountPresentFilesInVolume(d.ctx, d.volID)
+	if err != nil {
+		return
+	}
+	if ac := present - int64(actionable); ac > 0 {
+		d.report.AlreadyCorrect = ac
+	}
 }
 
 // phaseBegin opens a session with the receiver. The initiator's own

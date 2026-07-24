@@ -46,6 +46,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newRunsCmd())
 	root.AddCommand(newHooksCmd())
 	root.AddCommand(newVolumesCmd())
+	root.AddCommand(newStatusCmd())
 	root.AddCommand(newSyncCmd())
 	root.AddCommand(newRestoreCmd())
 	root.AddCommand(newOffloadCmd())
@@ -56,6 +57,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newPeerSyncCmd())
 	root.AddCommand(newTUICmd())
 	root.AddCommand(newDBCmd())
+	root.AddCommand(newVersionCmd())
 	return root
 }
 

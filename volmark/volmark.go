@@ -72,14 +72,43 @@ func Read(root string) (*Marker, error) {
 		}
 		return nil, fmt.Errorf("read marker: %w", err)
 	}
+	m, err := Parse(data)
+	if err != nil {
+		return nil, fmt.Errorf("%w at %s", err, Path(root))
+	}
+	return m, nil
+}
+
+// Parse decodes marker bytes and enforces the required volume field. It
+// is the format's single decoder: Read composes it with a filesystem
+// read, and callers that already hold the marker bytes (for instance a
+// marker fetched over rclone from a remote destination) parse them
+// directly without touching the local disk.
+func Parse(data []byte) (*Marker, error) {
 	var m Marker
 	if err := json.Unmarshal(data, &m); err != nil {
-		return nil, fmt.Errorf("parse marker at %s: %w", Path(root), err)
+		return nil, fmt.Errorf("parse marker: %w", err)
 	}
 	if m.Volume == "" {
-		return nil, fmt.Errorf("parse marker at %s: missing volume field", Path(root))
+		return nil, errors.New("parse marker: missing volume field")
 	}
 	return &m, nil
+}
+
+// Marshal renders m as the canonical marker file bytes (indented JSON
+// with a trailing newline). It is the format's single encoder: Write
+// composes it with an atomic filesystem write, and callers writing a
+// marker through another transport (rclone copyto to a remote root) use
+// the same bytes so a remote marker is byte-identical to a local one.
+func Marshal(m Marker) ([]byte, error) {
+	if m.Volume == "" {
+		return nil, fmt.Errorf("volmark.Marshal: volume must be non-empty")
+	}
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("volmark.Marshal: %w", err)
+	}
+	return append(data, '\n'), nil
 }
 
 // Write atomically writes m to <root>/.squirrel-volume via a sibling
@@ -88,17 +117,13 @@ func Read(root string) (*Marker, error) {
 // silent create-on-write since the marker lives at the volume root,
 // which the caller has already validated.
 func Write(root string, m Marker) error {
-	if m.Volume == "" {
-		return fmt.Errorf("volmark.Write: volume must be non-empty")
+	data, err := Marshal(m)
+	if err != nil {
+		return err
 	}
 	if _, err := os.Stat(root); err != nil {
 		return fmt.Errorf("volmark.Write: stat root %s: %w", root, err)
 	}
-	data, err := json.MarshalIndent(m, "", "  ")
-	if err != nil {
-		return fmt.Errorf("volmark.Write: marshal: %w", err)
-	}
-	data = append(data, '\n')
 	tmp, err := os.CreateTemp(root, ".squirrel-volume.*")
 	if err != nil {
 		return fmt.Errorf("volmark.Write: create temp: %w", err)

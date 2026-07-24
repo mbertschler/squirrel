@@ -15,29 +15,35 @@ import (
 
 // newRunsCmd returns the `squirrel runs` cobra command. It lists rows from
 // the runs table, most-recent first, with optional volume filtering and a
-// configurable cap. Runs of every status (running, success, failed, partial)
-// are surfaced so the user can see in-flight or failed indexing alongside
-// successful ones.
+// configurable cap. Runs of every kind (index, sync, audit, restore,
+// offload) and every status (running, success, failed, partial, refused,
+// aborted) are surfaced so in-flight, failed, or refused work shows up
+// alongside successful runs. --failed and --changes narrow steady-state
+// noise (friction F19).
 func newRunsCmd() *cobra.Command {
 	var (
-		volumeName string
-		limit      int
+		volumeName  string
+		limit       int
+		onlyFailed  bool
+		onlyChanges bool
 	)
 	cmd := &cobra.Command{
 		Use:   "runs",
-		Short: "List index runs (most recent first)",
+		Short: "List runs of every kind (most recent first)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runRuns(cmd, volumeName, limit)
+			return runRuns(cmd, volumeName, limit, onlyFailed, onlyChanges)
 		},
 	}
 	cmd.Flags().StringVar(&volumeName, "volume", "", "filter to runs against this volume name")
 	cmd.Flags().IntVar(&limit, "limit", 20, "maximum number of runs to show (0 for no limit)")
+	cmd.Flags().BoolVar(&onlyFailed, "failed", false, "show only runs that need attention (failed, refused, aborted, or partial)")
+	cmd.Flags().BoolVar(&onlyChanges, "changes", false, "hide clean no-op runs; show only runs that moved content or need attention")
 	cmd.AddCommand(newRunsFailCmd())
 	return cmd
 }
 
-func runRuns(cmd *cobra.Command, volumeName string, limit int) error {
+func runRuns(cmd *cobra.Command, volumeName string, limit int, onlyFailed, onlyChanges bool) error {
 	cfg, err := tryLoadConfig(cmd)
 	if err != nil {
 		return err
@@ -48,18 +54,11 @@ func runRuns(cmd *cobra.Command, volumeName string, limit int) error {
 	}
 	defer s.Close()
 
-	opts := store.ListRunsOpts{Limit: limit, Descending: true}
-	if volumeName != "" {
-		v, err := s.GetVolumeByName(cmd.Context(), volumeName)
-		if err != nil {
-			if store.IsNotFound(err) {
-				return fmt.Errorf("no volume named %q", volumeName)
-			}
-			return fmt.Errorf("lookup volume %q: %w", volumeName, err)
-		}
-		opts.VolumeID = &v.ID
+	volumeID, err := resolveVolumeFilter(cmd, s, volumeName)
+	if err != nil {
+		return err
 	}
-	runs, err := s.ListRuns(cmd.Context(), opts)
+	runs, conflicts, err := gatherRuns(cmd, s, volumeID, limit, onlyFailed, onlyChanges)
 	if err != nil {
 		return err
 	}
@@ -68,10 +67,6 @@ func runRuns(cmd *cobra.Command, volumeName string, limit int) error {
 		return err
 	}
 	nodes, err := loadNodeNames(cmd, s, runs)
-	if err != nil {
-		return err
-	}
-	conflicts, err := loadConflictCounts(cmd, s, runs)
 	if err != nil {
 		return err
 	}
@@ -87,7 +82,7 @@ func runRuns(cmd *cobra.Command, volumeName string, limit int) error {
 	if err != nil {
 		return fmt.Errorf("list contested paths: %w", err)
 	}
-	printContestedReminder(cmd.OutOrStdout(), contested, opts.VolumeID, volumes)
+	printContestedReminder(cmd.OutOrStdout(), contested, volumeID, volumes)
 	return nil
 }
 
@@ -137,6 +132,131 @@ func printActiveAlarms(w io.Writer, alarms []store.DestinationAlarm) {
 			a.Destination, a.Kind,
 			formatStarted(a.RaisedAtNs), a.RaisedRunID, a.Detail)
 	}
+}
+
+// resolveVolumeFilter resolves an optional --volume name to its id, shared by
+// the runs query and the standing-condition reminders printed beneath the
+// listing so both are scoped the same way. An empty name means every volume
+// and yields nil.
+func resolveVolumeFilter(cmd *cobra.Command, s *store.Store, volumeName string) (*int64, error) {
+	if volumeName == "" {
+		return nil, nil
+	}
+	v, err := s.GetVolumeByName(cmd.Context(), volumeName)
+	if err != nil {
+		if store.IsNotFound(err) {
+			return nil, fmt.Errorf("no volume named %q", volumeName)
+		}
+		return nil, fmt.Errorf("lookup volume %q: %w", volumeName, err)
+	}
+	return &v.ID, nil
+}
+
+// gatherRuns fetches runs under an already-resolved volume filter, applies the
+// --failed/--changes predicates, and returns the rows to display plus the
+// conflict counts for their CONFLICTS column. When a predicate is active the
+// fetch is unbounded (opts.Limit=0) so the SQL LIMIT can't cap before the
+// predicate runs and silently drop matches; the result is truncated to limit
+// after filtering instead.
+//
+// Conflict counts are loaded only where they are actually needed, never
+// across the whole unbounded fetch: --failed needs none for filtering, and
+// the CONFLICTS column only covers the displayed rows. This keeps the id set
+// handed to the count query small (and the query itself batches ids), so a
+// large peer-sync history can't overflow SQLite's bound-parameter cap.
+func gatherRuns(cmd *cobra.Command, s *store.Store, volumeID *int64, limit int, onlyFailed, onlyChanges bool) ([]store.Run, map[int64]int, error) {
+	filtering := onlyFailed || onlyChanges
+	opts := store.ListRunsOpts{Limit: limit, Descending: true, VolumeID: volumeID}
+	if filtering {
+		opts.Limit = 0
+	}
+	runs, err := s.ListRuns(cmd.Context(), opts)
+	if err != nil {
+		return nil, nil, err
+	}
+	if filtering {
+		filterConflicts, err := conflictCountsForFilter(cmd, s, runs, onlyFailed)
+		if err != nil {
+			return nil, nil, err
+		}
+		runs = filterRuns(runs, filterConflicts, onlyFailed, onlyChanges)
+		if limit > 0 && len(runs) > limit {
+			runs = runs[:limit]
+		}
+	}
+	// Load the CONFLICTS-column counts for exactly the displayed rows.
+	conflicts, err := loadConflictCounts(cmd, s, runs)
+	if err != nil {
+		return nil, nil, err
+	}
+	return runs, conflicts, nil
+}
+
+// conflictCountsForFilter loads only the conflict counts the active filter
+// needs. --failed consults none — an attention-worthy run is unconditionally
+// kept — so it returns an empty map. --changes needs them only for the
+// ambiguous rows (a clean success that touched no files), so it counts just
+// those rather than the whole unbounded fetch.
+func conflictCountsForFilter(cmd *cobra.Command, s *store.Store, runs []store.Run, onlyFailed bool) (map[int64]int, error) {
+	if onlyFailed {
+		return map[int64]int{}, nil
+	}
+	var candidates []store.Run
+	for _, r := range runs {
+		if r.Status == store.RunStatusSuccess && r.FileCount == 0 {
+			candidates = append(candidates, r)
+		}
+	}
+	return loadConflictCounts(cmd, s, candidates)
+}
+
+// filterRuns applies the --failed / --changes predicates in one pass,
+// preserving the descending order the store returned.
+func filterRuns(runs []store.Run, conflicts map[int64]int, onlyFailed, onlyChanges bool) []store.Run {
+	out := make([]store.Run, 0, len(runs))
+	for _, r := range runs {
+		if onlyFailed && !runNeedsAttention(r.Status) {
+			continue
+		}
+		if onlyChanges && !runIsInteresting(r, conflicts) {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// runNeedsAttention reports whether a run ended in a state an operator
+// should look at: a mid-flight failure, a preflight refusal, a reaped
+// (aborted) run, or a partial completion.
+func runNeedsAttention(status string) bool {
+	switch status {
+	case store.RunStatusFailed, store.RunStatusRefused, store.RunStatusAborted, store.RunStatusPartial:
+		return true
+	}
+	return false
+}
+
+// runIsInteresting reports whether a run is worth showing under --changes:
+// anything needing attention, still running, that touched files, or that
+// resolved conflicts. A clean success that touched nothing is the routine
+// no-op the filter hides.
+//
+// runs.file_count conflates transferred with already-correct for bucket and
+// index runs (it is the total files considered, not the delta), so an
+// in-sync bucket sync or an all-unchanged re-index still shows here — the
+// filter deliberately errs toward showing rather than risk hiding a run
+// that moved content. It reliably folds peer-sync no-ops, whose file_count
+// is the receiver-verified (i.e. transferred) count and so is zero when
+// nothing moved.
+func runIsInteresting(r store.Run, conflicts map[int64]int) bool {
+	if r.Status != store.RunStatusSuccess {
+		return true
+	}
+	if r.FileCount > 0 {
+		return true
+	}
+	return conflicts[r.ID] > 0
 }
 
 // loadNodeNames builds an id→name map for the peer_node_id values
@@ -259,10 +379,25 @@ func peerLabel(r store.Run, nodes map[int64]string) string {
 	if !ok {
 		name = fmt.Sprintf("id=%d", r.PeerNodeID.Int64)
 	}
+	label := peerDirectionArrow(r) + " " + name
 	if r.CorrelatedRunID.Valid {
-		return fmt.Sprintf("%s correlated=%d", name, r.CorrelatedRunID.Int64)
+		return fmt.Sprintf("%s correlated=%d", label, r.CorrelatedRunID.Int64)
 	}
-	return name
+	return label
+}
+
+// peerDirectionArrow labels which way a peer-sync ran so inbound and
+// outbound are distinguishable in the audit trail (friction F18): the
+// destination column holds a peer name in both directions. Only the
+// initiator records runs.shallow — BeginSyncRunIfClear sets it, while the
+// receiver's BeginPeerSyncRun leaves it NULL (see store.Run.Shallow) — so a
+// set shallow flag marks the row as the side that pushed. "→" is outbound
+// (we pushed to the peer), "←" inbound (the peer pushed to us).
+func peerDirectionArrow(r store.Run) string {
+	if r.Shallow.Valid {
+		return "→"
+	}
+	return "←"
 }
 
 // conflictLabel formats the per-run conflict count for the listing.

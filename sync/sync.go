@@ -120,6 +120,15 @@ type Report struct {
 	RunID        int64
 	RcloneResult RunResult
 	Status       string // success / partial / failed
+	// AlreadyCorrect counts the paths the destination already held
+	// correctly, so a no-op-because-in-sync is distinguishable from a
+	// no-op-because-empty in the summary (transferred=0 alone is
+	// ambiguous — friction F7). For rclone bucket pushes and restores it
+	// is rclone's already-matching count; for peer syncs the handler
+	// derives it as present-total minus the paths the sync acted on
+	// (the Merkle walk never sends identical folders to /plan, so it
+	// cannot be counted from the disposition list alone).
+	AlreadyCorrect int64
 	// Verification is the handler's typed durability report for this
 	// push: which comparison backed it, what the tool counted, and —
 	// via Verified() — whether the destination's copy was
@@ -141,6 +150,12 @@ type Report struct {
 	// for other handler types; objects whose backend exposed no checksum
 	// surface in Warnings instead.
 	Fingerprints int64
+	// PackPreview is populated only by a packed --dry-run push: the
+	// pack-side routing of the preview (content that would be bundled into
+	// packs, an estimated pack count, and the pack-size band). The
+	// object side of the preview rides on RcloneResult, as it does for the
+	// content-addressed dry-run. Zero-valued for every other push.
+	PackPreview PackPreview
 	// NodeReceiverRunID is set on a successful node-sync handshake and
 	// echoed in the CLI output so the operator can join the two halves
 	// of one logical sync against the receiver's `squirrel runs`
@@ -276,15 +291,14 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 		return rep, err
 	}
 
-	// Marker gate for local destinations. Remote destinations skip
-	// this check for now — reading/writing a marker through rclone
-	// adds out-of-band exec invocations that aren't worth the
-	// complexity until we hit a real misconfiguration on a remote.
-	// The dry-run path also skips: it never writes, and refusing a
-	// dry-run on an uninitialised destination would prevent the
-	// "preview what would happen" workflow.
-	if !opts.DryRun && dest.Type == "local" {
-		if merr := ensureDestinationMarker(ctx, s, dest, vol.Name, opts.Init); merr != nil {
+	// Marker gate. Local destinations validate the marker on the
+	// filesystem; remote rclone destinations (sftp/s3/b2/gcs) read and,
+	// with --init, write it through the same overlay the transfer uses.
+	// The dry-run path skips: it never writes, and refusing a dry-run on
+	// an uninitialised destination would prevent the "preview what would
+	// happen" workflow.
+	if !opts.DryRun {
+		if merr := ensureDestinationMarker(ctx, s, rcl, dest, vol.Name, opts.Init); merr != nil {
 			// A marker refusal fires before the sync run is allocated, so
 			// record it as its own terminal 'refused' run — otherwise a
 			// month-dead backup disk produces zero red anywhere but agent
@@ -500,6 +514,10 @@ func beginRestoreRun(ctx context.Context, s *store.Store, dryRun bool, volID int
 // to the rclone outcome on this very run.
 func finishRun(ctx context.Context, s *store.Store, dryRun bool, runID int64, rep *Report) {
 	rep.Status = deriveStatus(rep.RcloneResult)
+	// rclone's "checks" are the files it found already matching at the
+	// destination and did not transfer — exactly the already-correct
+	// count the summary reports (F7). Peer syncs set this themselves.
+	rep.AlreadyCorrect = rep.RcloneResult.Checked
 	if dryRun || runID == 0 {
 		return
 	}
@@ -566,19 +584,28 @@ func validateLocalVolumeMarker(vol *config.Volume) error {
 	return fmt.Errorf("volume %q marker check: %w", vol.Name, err)
 }
 
-// ensureDestinationMarker validates (or, with Init, writes) the
-// .squirrel-volume marker at <dest.Root>/<vol.Name>/. The directory
-// is created on first --init so the marker can land even when the
-// destination tree is empty; on every subsequent sync the marker must
-// already match the volume name. A mismatched marker is always
-// refused, regardless of Init: that path almost certainly points at a
-// different squirrel volume, and overwriting its marker would erase
-// the trail that distinguishes the two.
+// ensureDestinationMarker validates (or, with init, writes) the
+// .squirrel-volume marker at the destination's per-volume root. It is
+// the single gate against pushing to a wrong or unmounted root: a
+// matching marker passes, a missing marker is bootstrapped only under
+// init (refused otherwise, in case the root is a typo or the remote is
+// unreachable), and a marker naming a different volume is always
+// refused — overwriting it would erase the trail that distinguishes the
+// two volumes.
 //
-// Restricted to dest.Type=="local" for now; remote destinations need
-// a separate rclone-mediated read/write path and are tracked as a
-// follow-up.
-func ensureDestinationMarker(ctx context.Context, s *store.Store, dest *config.Destination, volumeName string, init bool) error {
+// Local destinations reach the marker on the filesystem; remote rclone
+// destinations reach it through the same overlay their transfers use.
+func ensureDestinationMarker(ctx context.Context, s *store.Store, rcl *Rclone, dest *config.Destination, volumeName string, init bool) error {
+	if dest.Type != "local" {
+		return ensureRemoteDestinationMarker(ctx, s, rcl, dest, volumeName, init)
+	}
+	return ensureLocalDestinationMarker(ctx, s, dest, volumeName, init)
+}
+
+// ensureLocalDestinationMarker is the filesystem gate for local
+// destinations. The directory is created on first --init so the marker
+// can land even when the destination tree is empty.
+func ensureLocalDestinationMarker(ctx context.Context, s *store.Store, dest *config.Destination, volumeName string, init bool) error {
 	root := filepath.Join(dest.Root, volumeName)
 	err := volmark.Validate(root, volumeName)
 	if err == nil {
@@ -596,18 +623,115 @@ func ensureDestinationMarker(ctx context.Context, s *store.Store, dest *config.D
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return fmt.Errorf("destination %q: mkdir %s: %w", dest.Name, root, err)
 	}
-	self, err := s.GetSelfNode(ctx)
+	m, err := selfMarker(ctx, s, volumeName)
 	if err != nil {
-		return fmt.Errorf("destination %q: resolve self node: %w", dest.Name, err)
+		return fmt.Errorf("destination %q: %w", dest.Name, err)
 	}
-	if err := volmark.Write(root, volmark.Marker{
-		Volume:    volumeName,
-		Node:      self.Name,
-		CreatedAt: time.Now().UTC().Format(time.RFC3339),
-	}); err != nil {
+	if err := volmark.Write(root, m); err != nil {
 		return fmt.Errorf("destination %q: %w", dest.Name, err)
 	}
 	return nil
+}
+
+// ensureRemoteDestinationMarker is the rclone-mediated gate for remote
+// destinations (sftp/s3/b2/gcs). It probes the marker at the per-volume
+// root through remoteSubpathURI — the same overlay the layout's
+// transfers use, so a crypt destination's marker rides the encrypted
+// path too — and applies the identical rules as the local gate.
+// Presence is decided by a stat (statRemoteExists), not by the read:
+// only a definite absence is eligible for an --init bootstrap, a present
+// marker is read and validated (a mismatch is always refused and never
+// overwritten), and a probe that fails for any other reason refuses
+// without writing — the invariant favours refusing over risking a write
+// to the wrong root.
+func ensureRemoteDestinationMarker(ctx context.Context, s *store.Store, rcl *Rclone, dest *config.Destination, volumeName string, init bool) error {
+	markerURI := remoteSubpathURI(dest, path.Join(volumeName, volmark.MarkerName))
+	// Absence is decided by a stat, not by cat's exit: bucket backends
+	// (s3/b2/gcs) return an empty body on a zero exit for a missing
+	// object, indistinguishable from an empty file, so inferring absence
+	// from cat would refuse a fresh --init with a confusing parse error.
+	// A stat that fails for any reason other than a definite absence
+	// refuses without writing — a reachability blip must never be read
+	// as a fresh root.
+	present, err := rcl.statRemoteExists(ctx, markerURI, checkersArgs(dest)...)
+	if err != nil {
+		return fmt.Errorf("destination %q: stat %s at %s: %w", dest.Name, volmark.MarkerName, markerURI, err)
+	}
+	if !present {
+		if !init {
+			return fmt.Errorf("destination %q at %s has no %s marker — re-run with --init to bootstrap (refusing in case the root is a typo)", dest.Name, markerURI, volmark.MarkerName)
+		}
+		return writeRemoteMarker(ctx, s, rcl, dest, markerURI, volumeName)
+	}
+	// Present: read and validate. A volume mismatch or a corrupt/empty
+	// marker always refuses and is never overwritten, even under --init.
+	data, err := rcl.catRemote(ctx, markerURI, checkersArgs(dest)...)
+	if err != nil {
+		return fmt.Errorf("destination %q: read %s at %s: %w", dest.Name, volmark.MarkerName, markerURI, err)
+	}
+	return validateRemoteMarker(dest, markerURI, volumeName, data)
+}
+
+// validateRemoteMarker applies the volume-name gate to a marker read
+// from a remote destination. A mismatch is always refused (the root
+// almost certainly holds a different squirrel volume); a malformed
+// marker surfaces as an error rather than being silently overwritten.
+func validateRemoteMarker(dest *config.Destination, markerURI, volumeName string, data []byte) error {
+	m, err := volmark.Parse(data)
+	if err != nil {
+		return fmt.Errorf("destination %q: %w at %s", dest.Name, err, markerURI)
+	}
+	if m.Volume != volumeName {
+		return fmt.Errorf("destination %q: %s at %s names %q, want %q (refuse to sync over a different volume's tree)",
+			dest.Name, volmark.MarkerName, markerURI, m.Volume, volumeName)
+	}
+	return nil
+}
+
+// writeRemoteMarker bootstraps the destination's per-volume marker over
+// rclone: it renders the marker bytes locally (byte-identical to a local
+// marker) and copyto's them to markerURI through the destination's
+// overlay, so a later read decrypts and validates cleanly.
+func writeRemoteMarker(ctx context.Context, s *store.Store, rcl *Rclone, dest *config.Destination, markerURI, volumeName string) error {
+	m, err := selfMarker(ctx, s, volumeName)
+	if err != nil {
+		return fmt.Errorf("destination %q: %w", dest.Name, err)
+	}
+	data, err := volmark.Marshal(m)
+	if err != nil {
+		return fmt.Errorf("destination %q: %w", dest.Name, err)
+	}
+	tmp, err := os.CreateTemp("", "squirrel-volume-*")
+	if err != nil {
+		return fmt.Errorf("destination %q: stage marker: %w", dest.Name, err)
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("destination %q: stage marker: %w", dest.Name, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("destination %q: stage marker: %w", dest.Name, err)
+	}
+	if err := rcl.copyTo(ctx, tmp.Name(), markerURI, checkersArgs(dest)...); err != nil {
+		return fmt.Errorf("destination %q: write %s to %s: %w", dest.Name, volmark.MarkerName, markerURI, err)
+	}
+	return nil
+}
+
+// selfMarker builds the marker to stamp on first --init: the volume
+// name plus the writing node and time, so an operator inspecting the
+// marker later can answer "who claimed this root, and when?"
+func selfMarker(ctx context.Context, s *store.Store, volumeName string) (volmark.Marker, error) {
+	self, err := s.GetSelfNode(ctx)
+	if err != nil {
+		return volmark.Marker{}, fmt.Errorf("resolve self node: %w", err)
+	}
+	return volmark.Marker{
+		Volume:    volumeName,
+		Node:      self.Name,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	}, nil
 }
 
 func deriveStatus(r RunResult) string {
@@ -890,34 +1014,30 @@ type RestoreOptions struct {
 	InPlace bool
 }
 
-// Restore reverses Sync: it copies from the destination's per-volume tree
-// back to the local filesystem. Like Sync it records a runs row, but with
-// kind='restore'. Restore is the opposite of additive — the rclone copy
-// will overwrite whatever exists at the target path on a hash mismatch.
-// Callers are expected to point ToPath at an empty / scratch directory
-// unless they explicitly intend to restore in place.
+// Restore reverses Sync back to the local filesystem, recording a
+// kind='restore' runs row. The mirror layout copies the destination's
+// per-volume tree down with rclone; the content-addressed and packed
+// layouts (which have no mirrored tree) resolve each present path to its
+// content hash in the local index, fetch the per-hash object or pack
+// member, and re-hash it before writing. Restore is read-only against both
+// the index and the destination — it never uploads, never mutates content
+// rows — but the rclone mirror path will overwrite whatever exists at the
+// target on a hash mismatch, so callers point ToPath at an empty / scratch
+// directory unless they explicitly intend to restore in place.
 func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, dest *config.Destination, opts RestoreOptions) (rep Report, err error) {
 	rep = Report{Volume: vol.Name, Destination: dest.Name}
 	if dest.Type == "kopia" {
 		return rep, fmt.Errorf("destination %q is a kopia repository — restore from it with the kopia CLI (`kopia snapshot restore`)", dest.Name)
 	}
-	if dest.Layout == config.LayoutContentAddressed {
-		return rep, fmt.Errorf("destination %q uses the content-addressed layout — its restore tooling ships separately; the data is recoverable by replaying the manifest segments under %s/%s/ against the destination-root %s/ (see the README's manifest format)", dest.Name, vol.Name, ManifestDirName, ObjectsDirName)
-	}
-	if dest.Layout == config.LayoutPacked {
-		return rep, fmt.Errorf("destination %q uses the packed layout — its restore tooling ships separately; the data is recoverable by replaying the manifest segments under %s/%s/ together with the placement maps under %s/ against the packs and objects at the destination root (see the README's packed layout section)", dest.Name, vol.Name, ManifestDirName, PacksDirName)
-	}
-	if w := cryptVerificationWarning(dest, opts.Shallow); w != "" {
-		rep.Warnings = append(rep.Warnings, w)
-	}
+	archive := dest.Layout == config.LayoutContentAddressed || dest.Layout == config.LayoutPacked
 
 	// "In-place" is the dangerous direction: writing into the live
 	// volume path. Unsetting ToPath is the canonical request, but a
 	// caller who explicitly passes ToPath == vol.Path is asking for
 	// the same thing and must go through the same gates — otherwise
 	// `--to <vol.Path>` would silently bypass the marker check, the
-	// non-empty refusal, AND --backup-dir, reintroducing exactly the
-	// data-loss path this PR is trying to close.
+	// non-empty refusal, AND the overwrite backup, reintroducing exactly
+	// the data-loss path this guard is trying to close.
 	targetInPlace, err := isInPlaceRestore(vol, opts.ToPath)
 	if err != nil {
 		return rep, err
@@ -926,10 +1046,9 @@ func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volum
 	// Local target marker check: when restoring into the live volume
 	// path, insist on a marker that names this volume. A missing or
 	// mismatched marker is the strongest signal we have that vol.Path
-	// is a typo or unrelated tree, and overwriting it via rclone
-	// would be irreversible. A genuine scratch --to bypasses the
-	// check because the operator is explicitly redirecting to an
-	// unrelated directory.
+	// is a typo or unrelated tree, and overwriting it would be
+	// irreversible. A genuine scratch --to bypasses the check because
+	// the operator is explicitly redirecting to an unrelated directory.
 	if !opts.DryRun && targetInPlace {
 		if err := validateLocalVolumeMarker(vol); err != nil {
 			return rep, err
@@ -938,10 +1057,10 @@ func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volum
 
 	// In-place overwrite gate: a non-empty live vol.Path is the
 	// most likely realistic data-loss path in squirrel today (user
-	// runs `restore` to recover what they think is missing, rclone
-	// happily replaces local edits with the destination's view). When
-	// InPlace is unset and the directory carries anything beyond the
-	// marker/history subtree, refuse with the --in-place hint.
+	// runs `restore` to recover what they think is missing, and the
+	// destination's view replaces local edits). When InPlace is unset
+	// and the directory carries anything beyond the marker/history
+	// subtree, refuse with the --in-place hint.
 	if !opts.DryRun && targetInPlace && !opts.InPlace {
 		hasContent, err := localVolumeHasContent(vol.Path)
 		if err != nil {
@@ -952,20 +1071,37 @@ func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volum
 		}
 	}
 
-	// We deliberately don't require an existing index for restore: the
-	// destination is the source of truth in this direction, and a fresh
+	// We deliberately don't require an existing index for the mirror
+	// pull: the destination is the source of truth there, and a fresh
 	// laptop may have no DB rows yet. We still create a volumes row so
-	// the runs row's FK resolves.
+	// the runs row's FK resolves. (The archive pull does need the index
+	// — that is where path→hash lives — but a fresh volume simply
+	// resolves to zero present rows and restores nothing.)
 	v, err := getOrCreateVolumeForRestore(ctx, s, vol)
 	if err != nil {
 		return rep, err
 	}
 
-	runID, err := beginRestoreRun(ctx, s, opts.DryRun, v.ID, dest.Name, EffectiveShallow(dest, opts.Shallow))
+	// The archive layouts re-hash every extracted content locally, so the
+	// pull is content-verified regardless of --shallow or a crypt overlay;
+	// the mirror pull records rclone's effective comparison instead.
+	shallow := EffectiveShallow(dest, opts.Shallow)
+	if archive {
+		shallow = false
+	}
+	runID, err := beginRestoreRun(ctx, s, opts.DryRun, v.ID, dest.Name, shallow)
 	if err != nil {
 		return rep, err
 	}
 
+	if archive {
+		err = restoreArchive(ctx, s, rcl, vol, dest, v.ID, runID, targetInPlace, opts, &rep)
+		return rep, err
+	}
+
+	if w := cryptVerificationWarning(dest, opts.Shallow); w != "" {
+		rep.Warnings = append(rep.Warnings, w)
+	}
 	err = runRcloneOperation(ctx, s, rcl, opts.DryRun, runID, &rep, nil,
 		func(runID int64) ([]string, error) {
 			return buildRestoreArgs(vol, dest, runID, opts), nil

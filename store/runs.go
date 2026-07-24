@@ -400,11 +400,31 @@ func (s *Store) GetRun(ctx context.Context, id int64) (Run, error) {
 // from the sync-package directory naming convention.
 func (s *Store) CountFilesFirstSeenByRunWithPathPrefix(ctx context.Context, runIDs []int64, pathPrefix string) (map[int64]int, error) {
 	out := make(map[int64]int, len(runIDs))
+	// Batch the id set: each query binds len(chunk)+2 parameters, so an
+	// unbatched call over a large peer-sync history would overflow SQLite's
+	// bound-parameter cap (SQLITE_MAX_VARIABLE_NUMBER) and fail with "too
+	// many SQL variables". 400 keeps every query well under any cap.
+	const idsPerQuery = 400
+	for start := 0; start < len(runIDs); start += idsPerQuery {
+		end := start + idsPerQuery
+		if end > len(runIDs) {
+			end = len(runIDs)
+		}
+		if err := s.countFilesFirstSeenChunk(ctx, runIDs[start:end], pathPrefix, out); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// countFilesFirstSeenChunk runs the grouped count for one id batch and folds
+// the results into out. Non-zero counts only; absent keys mean zero.
+func (s *Store) countFilesFirstSeenChunk(ctx context.Context, runIDs []int64, pathPrefix string, out map[int64]int) error {
 	if len(runIDs) == 0 {
-		return out, nil
+		return nil
 	}
 	placeholders := strings.Repeat("?,", len(runIDs)-1) + "?"
-	args := make([]any, 0, len(runIDs)+1)
+	args := make([]any, 0, len(runIDs)+2)
 	for _, id := range runIDs {
 		args = append(args, id)
 	}
@@ -416,18 +436,18 @@ func (s *Store) CountFilesFirstSeenByRunWithPathPrefix(ctx context.Context, runI
 		   AND (fo.path = ? OR fo.path LIKE ? ESCAPE '\')
 		 GROUP BY f.first_seen_run_id`, args...)
 	if err != nil {
-		return nil, fmt.Errorf("count files by run: %w", err)
+		return fmt.Errorf("count files by run: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var id int64
 		var n int
 		if err := rows.Scan(&id, &n); err != nil {
-			return nil, fmt.Errorf("scan count row: %w", err)
+			return fmt.Errorf("scan count row: %w", err)
 		}
 		out[id] = n
 	}
-	return out, rows.Err()
+	return rows.Err()
 }
 
 // escapeLikePrefix escapes %, _ and \ in s so it can be embedded into a

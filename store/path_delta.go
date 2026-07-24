@@ -48,6 +48,24 @@ func (s *Store) ListPathDeltaSince(ctx context.Context, volumeID, sinceRunID int
 	`, scanPathDelta, volumeID, sinceRunID)
 }
 
+// ListPresentContent returns the volume's live 'present' rows — the paths
+// whose current content has local bytes and therefore has a copy at a
+// destination — as (path, content) references ordered by path. The
+// reserved sync subtrees are excluded (they never travel to a
+// destination), matching ListPathDeltaSince. Restore of a content-addressed
+// or packed destination uses this to resolve each requested path to the
+// content hash it must fetch from objects/ or a pack.
+func (s *Store) ListPresentContent(ctx context.Context, volumeID int64) ([]PathDelta, error) {
+	return queryRows(ctx, s.db, `
+		SELECT `+pathFromFolderAndName+`, f.content_id, c.blake3, c.size_bytes, f.mtime_ns, f.status
+		FROM `+fileFromJoin+`
+		WHERE fo.volume_id = ?
+		  AND f.status = 'present'
+		  AND `+reservedSubtreeFilter+`
+		ORDER BY `+pathFromFolderAndName+`
+	`, scanPathDelta, volumeID)
+}
+
 func scanPathDelta(s rowScanner) (PathDelta, error) {
 	var d PathDelta
 	err := s.Scan(&d.Path, &d.ContentID, &d.Blake3, &d.SizeBytes, &d.MtimeNs, &d.Status)

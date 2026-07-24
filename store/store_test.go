@@ -2523,6 +2523,42 @@ func TestCountFilesFirstSeenByRunWithPathPrefix(t *testing.T) {
 	}
 }
 
+// TestCountFilesFirstSeenBatchesLargeIDSet guards the Copilot #179 fix: an
+// id set far larger than SQLite's bound-parameter cap must be batched, not
+// fail with "too many SQL variables". A real matching row buried among the
+// synthetic ids confirms the per-batch results still merge correctly.
+func TestCountFilesFirstSeenBatchesLargeIDSet(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	volID := makeVolume(t, s, "/v")
+	run := makeRun(t, s, volID)
+	if err := s.Upsert(ctx, FileRow{
+		VolumeID: volID, Path: ".squirrel-conflicts/run-1/a", Blake3: digest(0x42),
+		SizeBytes: 1, MtimeNs: 1, Status: StatusPresent,
+		FirstSeenRunID: run, LastSeenRunID: run, IndexedAtNs: 1,
+	}, nil); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	// Far more ids than any SQLITE_MAX_VARIABLE_NUMBER a single query could
+	// bind; the real run id is appended after 5000 synthetic non-matches.
+	ids := make([]int64, 0, 5001)
+	for i := int64(1); i <= 5000; i++ {
+		ids = append(ids, i*1000)
+	}
+	ids = append(ids, run)
+	counts, err := s.CountFilesFirstSeenByRunWithPathPrefix(ctx, ids, ".squirrel-conflicts")
+	if err != nil {
+		t.Fatalf("large id set errored (batching regressed?): %v", err)
+	}
+	if counts[run] != 1 {
+		t.Fatalf("counts[run] = %d, want 1", counts[run])
+	}
+}
+
 // TestListPresentByOrigin pins the two filter modes: valid nodeID
 // returns rows attributed to that peer, NULL nodeID returns rows
 // without provenance (local writes). Superseded and missing rows

@@ -31,16 +31,23 @@ type DestinationAlarm struct {
 }
 
 // RaiseDestinationAlarm latches an alarm on destination when none is
-// already active. The raise is idempotent: an existing alarm keeps its
+// already active and reports whether this call actually created the latch
+// (raised == true). The raise is idempotent: an existing alarm keeps its
 // original raised-at timestamp and run so a repeated detection does not
-// reset "in alarm since" or append a duplicate audit row. An 'alarm-raise'
-// runs_audit entry is written against raisedRunID (in the same transaction
-// as the latch insert) only when a fresh latch is created, keeping the
-// append-only trail to one row per distinct alarm episode.
-func (s *Store) RaiseDestinationAlarm(ctx context.Context, destination, kind, detail string, raisedRunID int64) error {
+// reset "in alarm since" or append a duplicate audit row, and raised comes
+// back false. An 'alarm-raise' runs_audit entry is written against
+// raisedRunID (in the same transaction as the latch insert) only on the
+// creating call, keeping the append-only trail to one row per alarm episode.
+//
+// raised is derived from the INSERT's RowsAffected inside the same atomic
+// ON CONFLICT DO NOTHING statement, so it is race-free: concurrent verify
+// runs contend on the destination PRIMARY KEY and exactly one sees
+// RowsAffected == 1. Callers must key their "newly raised" UX off this
+// return, never off a separate pre-read.
+func (s *Store) RaiseDestinationAlarm(ctx context.Context, destination, kind, detail string, raisedRunID int64) (raised bool, err error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin raise alarm %q: %w", destination, err)
+		return false, fmt.Errorf("begin raise alarm %q: %w", destination, err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -51,25 +58,25 @@ func (s *Store) RaiseDestinationAlarm(ctx context.Context, destination, kind, de
 		ON CONFLICT(destination) DO NOTHING
 	`, destination, kind, detail, raisedRunID, atNs)
 	if err != nil {
-		return fmt.Errorf("raise alarm %q: %w", destination, err)
+		return false, fmt.Errorf("raise alarm %q: %w", destination, err)
 	}
 	inserted, err := res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("raise alarm %q rows affected: %w", destination, err)
+		return false, fmt.Errorf("raise alarm %q rows affected: %w", destination, err)
 	}
 	if inserted == 0 {
 		// Already in alarm: keep the original latch untouched.
-		return tx.Commit()
+		return false, tx.Commit()
 	}
 	note := fmt.Sprintf("destination=%s %s", destination, detail)
 	if err := appendRunAuditTx(ctx, tx,
 		RunAuditEntry{RunID: raisedRunID, Transition: TransitionAlarmRaise, Note: note}, atNs); err != nil {
-		return err
+		return false, err
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit raise alarm %q: %w", destination, err)
+		return false, fmt.Errorf("commit raise alarm %q: %w", destination, err)
 	}
-	return nil
+	return true, nil
 }
 
 // ClearDestinationAlarm clears the active alarm on destination, if any,

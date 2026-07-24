@@ -15,8 +15,12 @@ func TestDestinationAlarmLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginRemoteVerifyRun: %v", err)
 	}
-	if err := s.RaiseDestinationAlarm(ctx, "offsite", AlarmKindVerifyMismatch, "mismatched=1 missing=0", first); err != nil {
+	raised, err := s.RaiseDestinationAlarm(ctx, "offsite", AlarmKindVerifyMismatch, "mismatched=1 missing=0", first)
+	if err != nil {
 		t.Fatalf("RaiseDestinationAlarm: %v", err)
+	}
+	if !raised {
+		t.Fatal("first raise reported not-raised, want a fresh latch")
 	}
 	got, err := s.GetDestinationAlarm(ctx, "offsite")
 	if err != nil {
@@ -33,8 +37,12 @@ func TestDestinationAlarmLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginRemoteVerifyRun: %v", err)
 	}
-	if err := s.RaiseDestinationAlarm(ctx, "offsite", AlarmKindVerifyMismatch, "mismatched=2 missing=1", second); err != nil {
+	reraised, err := s.RaiseDestinationAlarm(ctx, "offsite", AlarmKindVerifyMismatch, "mismatched=2 missing=1", second)
+	if err != nil {
 		t.Fatalf("re-raise: %v", err)
+	}
+	if reraised {
+		t.Fatal("second raise reported a fresh latch, want not-raised (idempotent)")
 	}
 	got, err = s.GetDestinationAlarm(ctx, "offsite")
 	if err != nil {
