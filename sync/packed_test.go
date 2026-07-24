@@ -519,6 +519,43 @@ func TestPackedDryRunPreview(t *testing.T) {
 	}
 }
 
+// TestPackedDryRunRefusesLayoutFlip: the watermark guard runs in
+// --dry-run too, so a mirror-era history (a recorded last success with no
+// placement map) is refused in preview exactly as in a real push — and
+// the refusal writes no runs row.
+func TestPackedDryRunRefusesLayoutFlip(t *testing.T) {
+	f := setupPackedFixture(t, "1MiB")
+	f.write(t, "a.txt", "tiny")
+	f.index(t)
+
+	ctx := context.Background()
+	mirrorRun, err := f.store.BeginRun(ctx, store.RunKindSync, f.volumeID(t), "offsite", false)
+	if err != nil {
+		t.Fatalf("seed mirror run: %v", err)
+	}
+	if err := f.store.FinishRun(ctx, mirrorRun, store.RunStatusSuccess, "", 1); err != nil {
+		t.Fatalf("finish mirror run: %v", err)
+	}
+
+	rep, err := RunPair(ctx, f.store, Tools{Rclone: f.rcl}, f.pair, Options{DryRun: true})
+	if err == nil || !strings.Contains(err.Error(), "not packed") {
+		t.Fatalf("expected dry-run layout-flip refusal, got %v", err)
+	}
+	if rep.RunID != 0 {
+		t.Fatalf("RunID = %d, want 0 (a refused dry-run writes no runs row)", rep.RunID)
+	}
+	runs, _ := f.store.ListRuns(ctx, store.ListRunsOpts{})
+	syncRuns := 0
+	for _, r := range runs {
+		if r.Kind == store.RunKindSync {
+			syncRuns++
+		}
+	}
+	if syncRuns != 1 {
+		t.Fatalf("sync runs = %d, want 1 (only the seed; dry-run wrote none)", syncRuns)
+	}
+}
+
 // TestPackedRefusesReservedVolumeName: a volume named like a destination
 // root directory (objects/ or packs/) is refused.
 func TestPackedRefusesReservedVolumeName(t *testing.T) {

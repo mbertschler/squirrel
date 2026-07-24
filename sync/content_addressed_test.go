@@ -714,6 +714,46 @@ func TestContentAddressedDryRunSkipsRecorded(t *testing.T) {
 	}
 }
 
+// TestContentAddressedDryRunRefusesLayoutFlip: the watermark guard runs
+// in --dry-run too, so a mirror-era history (a recorded last success with
+// no manifest segment) is refused in preview exactly as in a real push —
+// and the refusal writes no runs row. Without this the dry-run could
+// silently diff against the wrong baseline and under-report the upload,
+// the same content-loss trap the real-push guard closes.
+func TestContentAddressedDryRunRefusesLayoutFlip(t *testing.T) {
+	f := setupContentAddressedFixture(t)
+	f.write(t, "a.txt", "alpha")
+	f.index(t)
+
+	ctx := context.Background()
+	mirrorRun, err := f.store.BeginRun(ctx, store.RunKindSync, f.volumeID(t), "offsite", false)
+	if err != nil {
+		t.Fatalf("seed mirror-era run: %v", err)
+	}
+	if err := f.store.FinishRun(ctx, mirrorRun, store.RunStatusSuccess, "", 1); err != nil {
+		t.Fatalf("finish mirror-era run: %v", err)
+	}
+
+	rep, err := RunPair(ctx, f.store, Tools{Rclone: f.rcl}, f.pair, Options{DryRun: true})
+	if err == nil || !strings.Contains(err.Error(), "does not look content-addressed") {
+		t.Fatalf("expected dry-run layout-flip refusal, got %v", err)
+	}
+	if rep.RunID != 0 {
+		t.Fatalf("RunID = %d, want 0 (a refused dry-run writes no runs row)", rep.RunID)
+	}
+	// Only the seeded mirror-era run exists; the refused dry-run added none.
+	runs, _ := f.store.ListRuns(ctx, store.ListRunsOpts{})
+	syncRuns := 0
+	for _, r := range runs {
+		if r.Kind == store.RunKindSync {
+			syncRuns++
+		}
+	}
+	if syncRuns != 1 {
+		t.Fatalf("sync runs = %d, want 1 (only the seed; dry-run wrote none)", syncRuns)
+	}
+}
+
 func TestRestoreRefusesContentAddressedDestination(t *testing.T) {
 	f := setupContentAddressedFixture(t)
 	_, err := Restore(context.Background(), f.store, f.rcl, f.pair.Volume, f.pair.Destination, RestoreOptions{})
