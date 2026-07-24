@@ -710,6 +710,7 @@ func (s *scheduler) runDurabilityPull(ctx context.Context, vol *config.Volume, p
 		"kind", "pull-durability", "volume", vol.Name, "peer", peer,
 		"run_id", rep.RunID, "status", status,
 		"fetched", rep.Fetched, "applied", rep.Applied, "dropped", rep.Dropped,
+		"rewinds", rep.Rewinds,
 		"duration_ms", duration.Milliseconds())
 	if rep.Err != nil {
 		s.logger.Error("scheduler.error",

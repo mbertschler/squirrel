@@ -237,8 +237,8 @@ func TestSchedulerDurabilityPullPartialOnRewind(t *testing.T) {
 	sch.pullEvery = map[string]time.Duration{"nas": time.Hour}
 
 	sch.tick(context.Background())
-	if !f.containsLogLine("scheduler.finished", "kind=pull-durability", "status=partial", "run_id=8") {
-		t.Fatalf("missing partial pull finished log:\n%s", f.logBuf.String())
+	if !f.containsLogLine("scheduler.finished", "kind=pull-durability", "status=partial", "run_id=8", "rewinds=1") {
+		t.Fatalf("missing partial pull finished log (with refused-rewind count):\n%s", f.logBuf.String())
 	}
 }
 
