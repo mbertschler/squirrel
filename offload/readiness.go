@@ -48,8 +48,10 @@ type ReadinessReport struct {
 // read-only introspection surface at any time.
 //
 // The gate is evaluated exactly as Offload's dry-run path evaluates it —
-// same loadGate, same candidate selection, same per-file check — so the
-// totals match what an offload would actually move.
+// same loadGate, same present-and-not-reserved candidate predicate, same
+// per-file check — so the totals match what an offload would actually move.
+// Totals are order-independent, so this walks the index map in a single
+// pass rather than building and sorting an intermediate candidate slice.
 func Readiness(ctx context.Context, s *store.Store, opts ReadinessOptions) (ReadinessReport, error) {
 	if len(opts.Require) == 0 {
 		return ReadinessReport{Applicable: false}, nil
@@ -63,18 +65,13 @@ func Readiness(ctx context.Context, s *store.Store, opts ReadinessOptions) (Read
 	if err != nil {
 		return ReadinessReport{}, err
 	}
-	candidates, _ := selectCandidates(rows, nil, 0, now)
-	return tallyReadiness(ctx, g, candidates)
-}
-
-// tallyReadiness runs the gate over every candidate and accumulates the
-// present and offloadable totals. Split from Readiness so the loop body
-// stays small and the context-cancellation check has one home.
-func tallyReadiness(ctx context.Context, g *gate, candidates []store.FileRow) (ReadinessReport, error) {
 	rep := ReadinessReport{Applicable: true}
-	for _, row := range candidates {
+	for p, row := range rows {
 		if err := ctx.Err(); err != nil {
 			return ReadinessReport{}, err
+		}
+		if row.Status != store.StatusPresent || underReservedSubtree(p) {
+			continue
 		}
 		rep.PresentFiles++
 		rep.PresentBytes += row.SizeBytes

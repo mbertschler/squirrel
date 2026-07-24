@@ -66,7 +66,8 @@ func LastSyncLabel(t TargetStatus) string {
 }
 
 // StateLabel names the coverage state, most-specific first: standing states
-// outrank a failed transfer, which outranks freshness.
+// outrank the latest terminal outcome (a failed or partial run — both more
+// recent than any success), which outranks freshness.
 func StateLabel(t TargetStatus) string {
 	switch t.Standing {
 	case StandingAlarm:
@@ -76,8 +77,11 @@ func StateLabel(t TargetStatus) string {
 	case StandingNeedsBootstrap:
 		return "needs-init"
 	}
-	if t.LastOutcome == "failed" {
+	switch t.LastOutcome {
+	case "failed":
 		return "failed"
+	case "partial":
+		return "partial"
 	}
 	if !t.SyncTarget {
 		return "—"

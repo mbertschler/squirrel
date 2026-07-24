@@ -19,12 +19,34 @@ import (
 // destination that has effectively stopped (red).
 const lateFactor = 3
 
-// Build produces the status Report for this node: every config-declared
-// volume with its per-target coverage and durability. It is read-only —
-// no run rows, no disk reads, no mutation — so it is safe to call from any
-// introspection surface at any time. cfg is the source of truth for which
-// volumes and targets should exist; the store supplies the observations.
+// Options tunes Build.
+type Options struct {
+	// SkipOffloadReadiness omits the per-volume offload-readiness tally.
+	// offload.Readiness loads the whole volume index and runs the gate over
+	// every present file, so on large volumes it is the report's dominant
+	// cost. The TUI dashboard sets it on its one-second tick (and refreshes
+	// the tally on a slower cadence into its own cache) so the coverage and
+	// durability grid stays responsive; the CLI `squirrel status` leaves it
+	// off so the "N offloadable now" figure is always current. When set, a
+	// volume's Offload still reports Applicable from its config policy, just
+	// with zero counts.
+	SkipOffloadReadiness bool
+}
+
+// Build produces the status Report for this node with readiness computed —
+// the CLI's view and the default. See BuildWithOptions for the tunable
+// form the TUI uses.
 func Build(ctx context.Context, s *store.Store, cfg *config.Config) (Report, error) {
+	return BuildWithOptions(ctx, s, cfg, Options{})
+}
+
+// BuildWithOptions produces the status Report for this node: every
+// config-declared volume with its per-target coverage and durability. It is
+// read-only — no run rows, no disk reads, no mutation — so it is safe to
+// call from any introspection surface at any time. cfg is the source of
+// truth for which volumes and targets should exist; the store supplies the
+// observations.
+func BuildWithOptions(ctx context.Context, s *store.Store, cfg *config.Config, opts Options) (Report, error) {
 	rep := Report{Now: time.Now()}
 	self, err := s.GetSelfNode(ctx)
 	if err != nil {
@@ -36,7 +58,7 @@ func Build(ctx context.Context, s *store.Store, cfg *config.Config) (Report, err
 	}
 	alarmByDest := indexAlarms(alarms)
 	for _, name := range sortedVolumeNames(cfg) {
-		vs, err := buildVolume(ctx, s, cfg, self, alarmByDest, cfg.Volumes[name], rep.Now)
+		vs, err := buildVolume(ctx, s, cfg, self, alarmByDest, cfg.Volumes[name], rep.Now, opts)
 		if err != nil {
 			return Report{}, err
 		}
@@ -70,8 +92,11 @@ func sortedVolumeNames(cfg *config.Config) []string {
 // buildVolume assembles one volume's status. A volume with no index row
 // (declared but never indexed) still lists its planned targets so the
 // grid shows the configured coverage rather than a blank line.
-func buildVolume(ctx context.Context, s *store.Store, cfg *config.Config, self store.Node, alarmByDest map[string]store.DestinationAlarm, vol *config.Volume, now time.Time) (VolumeStatus, error) {
+func buildVolume(ctx context.Context, s *store.Store, cfg *config.Config, self store.Node, alarmByDest map[string]store.DestinationAlarm, vol *config.Volume, now time.Time, opts Options) (VolumeStatus, error) {
 	vs := VolumeStatus{Name: vol.Name, Path: vol.Path}
+	// Applicable reflects the config policy, not whether a tally ran, so a
+	// never-indexed or skip-readiness volume still reports "has a policy".
+	vs.Offload.Applicable = len(vol.OffloadRequires) > 0
 	dbVol, err := s.GetVolumeByName(ctx, vol.Name)
 	if store.IsNotFound(err) {
 		vs.Targets, err = buildTargets(ctx, s, cfg, self, alarmByDest, vol, 0, false, 0, now)
@@ -92,6 +117,9 @@ func buildVolume(ctx context.Context, s *store.Store, cfg *config.Config, self s
 	vs.Targets, err = buildTargets(ctx, s, cfg, self, alarmByDest, vol, dbVol.ID, true, selfMax, now)
 	if err != nil {
 		return VolumeStatus{}, err
+	}
+	if opts.SkipOffloadReadiness {
+		return vs, nil
 	}
 	readiness, err := offload.Readiness(ctx, s, offload.ReadinessOptions{
 		VolumeID: dbVol.ID, Require: vol.OffloadRequires, MaxEvidenceAge: vol.OffloadMaxEvidenceAge,
@@ -200,9 +228,11 @@ func isBootstrapRefusal(errVal sql.NullString) bool {
 	return errVal.Valid && strings.Contains(errVal.String, "--init")
 }
 
-// syncLevel scores the coverage dimension: standing states first, then a
-// failed transfer, then freshness relative to the pair's own cadence. A
-// relayed target (not pushed to by this node) has no coverage dimension —
+// syncLevel scores the coverage dimension: standing states first, then the
+// latest terminal outcome (a failed run is red, a partial run at least
+// amber — both are more recent than any success, so they must not be
+// masked by freshness), then freshness relative to the pair's own cadence.
+// A relayed target (not pushed to by this node) has no coverage dimension —
 // its safety is entirely its durability — so it reads neutral.
 func syncLevel(ts TargetStatus, lastTerminal *store.Run) Level {
 	switch ts.Standing {
@@ -211,8 +241,13 @@ func syncLevel(ts TargetStatus, lastTerminal *store.Run) Level {
 	case StandingNeedsBootstrap:
 		return LevelWarn
 	}
-	if lastTerminal != nil && lastTerminal.Status == store.RunStatusFailed {
-		return LevelCritical
+	if lastTerminal != nil {
+		switch lastTerminal.Status {
+		case store.RunStatusFailed:
+			return LevelCritical
+		case store.RunStatusPartial:
+			return LevelWarn
+		}
 	}
 	if !ts.SyncTarget {
 		return LevelNeutral

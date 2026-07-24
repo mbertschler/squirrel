@@ -37,7 +37,21 @@ type dashboardModel struct {
 	loaded      bool
 	loadErr     error
 	agentStatus agentStatus
+
+	// readinessByVol caches the last computed offload-readiness tally per
+	// volume name. The coverage/durability grid rebuilds every one-second
+	// tick with readiness skipped (its dominant cost — a whole-index gate
+	// pass); the tally is refreshed on the slower readinessRefreshTicks
+	// cadence and overlaid onto the grid at render time, so "N offloadable
+	// now" stays visible without paying for it every tick.
+	readinessByVol      map[string]status.OffloadReadiness
+	ticksSinceReadiness int
 }
+
+// readinessRefreshTicks is how many one-second ticks pass between
+// offload-readiness recomputations. Coverage and durability still refresh
+// every tick; only the expensive gate-pass tally is throttled.
+const readinessRefreshTicks = 15
 
 // dashboardData is the snapshot rendered by the dashboard. Built fresh on
 // each tick — there is no incremental update path, since the queries are
@@ -61,6 +75,10 @@ type dashboardData struct {
 type dashboardDataMsg struct {
 	data dashboardData
 	err  error
+	// readinessFresh is true when this fetch recomputed the offload tally
+	// (a slow-cadence tick), so the receiver should refresh its cache from
+	// data.coverage; a fast tick leaves it false and the cache stands.
+	readinessFresh bool
 }
 
 type agentStatus struct {
@@ -81,7 +99,10 @@ func newDashboardModel(s *store.Store, cfg *config.Config) *dashboardModel {
 func (m *dashboardModel) attachClient(c *agentClient) { m.client = c }
 
 func (m *dashboardModel) Init() tea.Cmd {
-	return tea.Batch(m.fetchData(), m.probeAgent())
+	// Recompute readiness on (re)activation so the tally is current the
+	// moment the user opens the dashboard, then throttle on the tick path.
+	m.ticksSinceReadiness = 0
+	return tea.Batch(m.fetchData(true), m.probeAgent())
 }
 
 func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -90,12 +111,20 @@ func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		return m, nil
 	case tickMsg:
-		return m, tea.Batch(m.fetchData(), m.probeAgent())
+		m.ticksSinceReadiness++
+		refresh := m.ticksSinceReadiness >= readinessRefreshTicks
+		if refresh {
+			m.ticksSinceReadiness = 0
+		}
+		return m, tea.Batch(m.fetchData(refresh), m.probeAgent())
 	case dashboardDataMsg:
 		m.loaded = true
 		m.loadErr = msg.err
 		if msg.err == nil {
 			m.data = msg.data
+			if msg.readinessFresh {
+				m.cacheReadiness(msg.data.coverage)
+			}
 		}
 		return m, nil
 	case agentStatusMsg:
@@ -213,12 +242,19 @@ func (m *dashboardModel) renderCoverage() string {
 	return strings.Join(blocks, "\n\n")
 }
 
-// renderVolumeCoverage renders one volume's coverage block.
+// renderVolumeCoverage renders one volume's coverage block. The
+// offload-readiness figure comes from the throttled cache (the grid itself
+// rebuilds every tick with readiness skipped), falling back to the volume's
+// own tally when the cache has no entry yet.
 func (m *dashboardModel) renderVolumeCoverage(v status.VolumeStatus) string {
 	dot := lipgloss.NewStyle().Foreground(levelColour(v.Level())).Render("●")
 	title := fmt.Sprintf("%s %s  %s", dot, v.Name, styleMuted.Render(v.Path))
+	offload := v.Offload
+	if cached, ok := m.readinessByVol[v.Name]; ok {
+		offload = cached
+	}
 	meta := styleMuted.Render(fmt.Sprintf("index %s · %s",
-		status.IndexLabel(v), status.OffloadLabel(v.Offload)))
+		status.IndexLabel(v), status.OffloadLabel(offload)))
 	if len(v.Targets) == 0 {
 		return title + "\n" + meta + "\n" + styleMuted.Render("  no targets configured")
 	}
@@ -309,14 +345,29 @@ func (m *dashboardModel) volumeName(id sql.NullInt64) string {
 	return fmt.Sprintf("vol#%d", id.Int64)
 }
 
-func (m *dashboardModel) fetchData() tea.Cmd {
+// fetchData loads the dashboard snapshot. withReadiness selects whether the
+// coverage build pays for the offload-readiness tally: false on the
+// one-second tick (the grid still refreshes; the cached tally is overlaid
+// at render), true on the slow cadence and on activation.
+func (m *dashboardModel) fetchData(withReadiness bool) tea.Cmd {
 	return func() tea.Msg {
 		// Use a tight per-fetch deadline so a stuck DB doesn't freeze the UI.
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		data, err := loadDashboardData(ctx, m.store, m.cfg)
-		return dashboardDataMsg{data: data, err: err}
+		data, err := loadDashboardData(ctx, m.store, m.cfg, !withReadiness)
+		return dashboardDataMsg{data: data, err: err, readinessFresh: withReadiness && err == nil}
 	}
+}
+
+// cacheReadiness refreshes the per-volume offload tally from a report that
+// was built with readiness computed. Fast-tick reports carry only the
+// policy flag (zero counts) and must not overwrite this cache.
+func (m *dashboardModel) cacheReadiness(rep status.Report) {
+	cache := make(map[string]status.OffloadReadiness, len(rep.Volumes))
+	for _, v := range rep.Volumes {
+		cache[v.Name] = v.Offload
+	}
+	m.readinessByVol = cache
 }
 
 func (m *dashboardModel) probeAgent() tea.Cmd {
@@ -342,7 +393,9 @@ func (m *dashboardModel) probeAgent() tea.Cmd {
 // the recent-runs window still surfaces correctly. The coverage build is
 // skipped when no config is loaded — it needs sync_to / offload_requires /
 // cadences — leaving the grid to render its own "no config" hint.
-func loadDashboardData(ctx context.Context, s *store.Store, cfg *config.Config) (dashboardData, error) {
+// skipReadiness omits the expensive offload-readiness tally (see fetchData
+// and readinessRefreshTicks).
+func loadDashboardData(ctx context.Context, s *store.Store, cfg *config.Config, skipReadiness bool) (dashboardData, error) {
 	now := time.Now()
 	vols, err := s.ListVolumes(ctx)
 	if err != nil {
@@ -358,7 +411,7 @@ func loadDashboardData(ctx context.Context, s *store.Store, cfg *config.Config) 
 	}
 	var coverage status.Report
 	if cfg != nil {
-		if coverage, err = status.Build(ctx, s, cfg); err != nil {
+		if coverage, err = status.BuildWithOptions(ctx, s, cfg, status.Options{SkipOffloadReadiness: skipReadiness}); err != nil {
 			return dashboardData{}, fmt.Errorf("build coverage: %w", err)
 		}
 	}

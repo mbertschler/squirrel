@@ -98,6 +98,27 @@ func TestEvidenceStale(t *testing.T) {
 	}
 }
 
+func TestSyncLevelTerminalOutcome(t *testing.T) {
+	age := func(d time.Duration) *time.Duration { return &d }
+	// A fresh success would be OK, but a more-recent failed/partial terminal
+	// run must not be masked by that freshness.
+	fresh := TargetStatus{SyncTarget: true, LastSyncAgo: age(time.Minute), Cadence: time.Hour}
+	cases := []struct {
+		name     string
+		terminal *store.Run
+		want     Level
+	}{
+		{"failed outranks fresh success", &store.Run{Status: store.RunStatusFailed}, LevelCritical},
+		{"partial is at least amber", &store.Run{Status: store.RunStatusPartial}, LevelWarn},
+		{"success uses freshness", &store.Run{Status: store.RunStatusSuccess}, LevelOK},
+	}
+	for _, c := range cases {
+		if got := syncLevel(fresh, c.terminal); got != c.want {
+			t.Errorf("%s: syncLevel = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
 func TestLevelExitCode(t *testing.T) {
 	cases := map[Level]int{LevelNeutral: 0, LevelOK: 0, LevelWarn: 1, LevelCritical: 2}
 	for l, want := range cases {
@@ -149,6 +170,7 @@ func TestStateLabel(t *testing.T) {
 		{"alarm", TargetStatus{Standing: StandingAlarm}, "alarm"},
 		{"needs-init", TargetStatus{Standing: StandingNeedsBootstrap}, "needs-init"},
 		{"failed", TargetStatus{LastOutcome: "failed", SyncTarget: true}, "failed"},
+		{"partial", TargetStatus{LastOutcome: "partial", SyncTarget: true, LastSyncAgo: age(time.Minute), SyncLevel: LevelWarn}, "partial"},
 		{"relayed", TargetStatus{SyncTarget: false, Required: true}, "—"},
 		{"never", TargetStatus{SyncTarget: true}, "never-synced"},
 		{"ok", TargetStatus{SyncTarget: true, LastSyncAgo: age(time.Minute), SyncLevel: LevelOK}, "ok"},

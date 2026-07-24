@@ -58,7 +58,7 @@ func TestLoadDashboardDataPartitionsRuns(t *testing.T) {
 	// cfg is nil here: this test pins the run-partitioning behaviour, which
 	// is independent of the config-driven coverage grid (that is exercised
 	// against the shared status layer in the status package's own tests).
-	data, err := loadDashboardData(ctx, s, nil)
+	data, err := loadDashboardData(ctx, s, nil, false)
 	if err != nil {
 		t.Fatalf("loadDashboardData: %v", err)
 	}

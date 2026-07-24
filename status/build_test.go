@@ -201,6 +201,70 @@ func TestBuildNeverIndexed(t *testing.T) {
 	if vs.Level() != LevelWarn {
 		t.Errorf("volume level = %v, want amber", vs.Level())
 	}
+	// No offload policy configured here, so it must not claim one.
+	if vs.Offload.Applicable {
+		t.Errorf("offload should not be applicable without a policy")
+	}
+}
+
+// TestBuildNeverIndexedReportsPolicy: a never-indexed volume that DOES
+// declare offload_requires must report Applicable so the surface shows its
+// policy state, not "no policy" (Copilot review on #177).
+func TestBuildNeverIndexedReportsPolicy(t *testing.T) {
+	s := setupStore(t)
+	ctx := context.Background()
+	cfg := cfgFor("photos", "/does/not/matter", []string{"nas"}, []string{"nas", "s3archive"}, nil, []string{"nas"})
+	rep, err := Build(ctx, s, cfg)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	vs := rep.Volumes[0]
+	if vs.Indexed {
+		t.Errorf("volume should not be indexed")
+	}
+	if !vs.Offload.Applicable {
+		t.Errorf("offload should be applicable — the config declares offload_requires")
+	}
+	if vs.Offload.OffloadableFiles != 0 || vs.Offload.PresentFiles != 0 {
+		t.Errorf("never-indexed volume should report zero counts: %+v", vs.Offload)
+	}
+}
+
+// TestBuildSkipOffloadReadiness: the TUI tick path skips the whole-index
+// gate pass but still reports the policy flag; the CLI path computes the
+// counts. Both see the same coverage/durability grid.
+func TestBuildSkipOffloadReadiness(t *testing.T) {
+	s := setupStore(t)
+	ctx := context.Background()
+	root, idx := indexTree(t, s, "photos")
+	v, _ := s.GetVolumeByName(ctx, "photos")
+	self, _ := s.GetSelfNode(ctx)
+	if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, "dest", self.ID, idx.RunID, store.VerifyMethodBlake3, false); err != nil {
+		t.Fatalf("seed vector: %v", err)
+	}
+	recordSuccessfulSync(t, s, v.ID, "dest")
+	cfg := cfgFor("photos", root, []string{"dest"}, []string{"dest"}, []string{"dest"}, nil)
+
+	skipped, err := BuildWithOptions(ctx, s, cfg, Options{SkipOffloadReadiness: true})
+	if err != nil {
+		t.Fatalf("BuildWithOptions(skip): %v", err)
+	}
+	so := skipped.Volumes[0].Offload
+	if !so.Applicable || so.OffloadableFiles != 0 || so.PresentFiles != 0 {
+		t.Errorf("skip-readiness offload = %+v, want applicable with zero counts", so)
+	}
+	full, err := Build(ctx, s, cfg)
+	if err != nil {
+		t.Fatalf("Build(full): %v", err)
+	}
+	fo := full.Volumes[0].Offload
+	if !fo.Applicable || fo.OffloadableFiles != 3 || fo.PresentFiles != 3 {
+		t.Errorf("full offload = %+v, want 3 offloadable of 3 present", fo)
+	}
+	// The coverage grid is identical regardless of the readiness option.
+	if len(skipped.Volumes[0].Targets) != len(full.Volumes[0].Targets) {
+		t.Errorf("target count differs between skip and full builds")
+	}
 }
 
 // TestBuildRelayedRequiredTarget: a target named only in offload_requires
