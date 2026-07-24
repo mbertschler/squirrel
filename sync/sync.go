@@ -549,26 +549,42 @@ func ensureLocalDestinationMarker(ctx context.Context, s *store.Store, dest *con
 }
 
 // ensureRemoteDestinationMarker is the rclone-mediated gate for remote
-// destinations (sftp/s3/b2/gcs). It reads the marker at the per-volume
+// destinations (sftp/s3/b2/gcs). It probes the marker at the per-volume
 // root through remoteSubpathURI — the same overlay the layout's
 // transfers use, so a crypt destination's marker rides the encrypted
-// path too — and applies the identical rules as the local gate. A read
-// that fails for any reason other than a definite "not found" refuses
-// without writing: the invariant favours refusing over risking a write
+// path too — and applies the identical rules as the local gate.
+// Presence is decided by a stat (statRemoteExists), not by the read:
+// only a definite absence is eligible for an --init bootstrap, a present
+// marker is read and validated (a mismatch is always refused and never
+// overwritten), and a probe that fails for any other reason refuses
+// without writing — the invariant favours refusing over risking a write
 // to the wrong root.
 func ensureRemoteDestinationMarker(ctx context.Context, s *store.Store, rcl *Rclone, dest *config.Destination, volumeName string, init bool) error {
 	markerURI := remoteSubpathURI(dest, path.Join(volumeName, volmark.MarkerName))
-	data, err := rcl.catRemote(ctx, markerURI, checkersArgs(dest)...)
-	switch {
-	case err == nil:
-		return validateRemoteMarker(dest, markerURI, volumeName, data)
-	case !errors.Is(err, errRemoteNotFound):
-		return fmt.Errorf("destination %q: read %s at %s: %w", dest.Name, volmark.MarkerName, markerURI, err)
-	case !init:
-		return fmt.Errorf("destination %q at %s has no %s marker — re-run with --init to bootstrap (refusing in case the root is a typo)", dest.Name, markerURI, volmark.MarkerName)
-	default:
+	// Absence is decided by a stat, not by cat's exit: bucket backends
+	// (s3/b2/gcs) return an empty body on a zero exit for a missing
+	// object, indistinguishable from an empty file, so inferring absence
+	// from cat would refuse a fresh --init with a confusing parse error.
+	// A stat that fails for any reason other than a definite absence
+	// refuses without writing — a reachability blip must never be read
+	// as a fresh root.
+	present, err := rcl.statRemoteExists(ctx, markerURI, checkersArgs(dest)...)
+	if err != nil {
+		return fmt.Errorf("destination %q: stat %s at %s: %w", dest.Name, volmark.MarkerName, markerURI, err)
+	}
+	if !present {
+		if !init {
+			return fmt.Errorf("destination %q at %s has no %s marker — re-run with --init to bootstrap (refusing in case the root is a typo)", dest.Name, markerURI, volmark.MarkerName)
+		}
 		return writeRemoteMarker(ctx, s, rcl, dest, markerURI, volumeName)
 	}
+	// Present: read and validate. A volume mismatch or a corrupt/empty
+	// marker always refuses and is never overwritten, even under --init.
+	data, err := rcl.catRemote(ctx, markerURI, checkersArgs(dest)...)
+	if err != nil {
+		return fmt.Errorf("destination %q: read %s at %s: %w", dest.Name, volmark.MarkerName, markerURI, err)
+	}
+	return validateRemoteMarker(dest, markerURI, volumeName, data)
 }
 
 // validateRemoteMarker applies the volume-name gate to a marker read

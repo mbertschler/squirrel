@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -100,29 +101,93 @@ func TestRemoteMarkerMismatchAlwaysRefuses(t *testing.T) {
 	}
 }
 
-// TestRemoteMarkerReadErrorRefusesWithoutWriting is the safety-critical
-// case: a read that fails for any reason other than a canonical "not
-// found" must refuse the sync even under --init, never mistaking a
-// reachability blip for a fresh root and clobbering a marker it could
-// not read. "host not found" is the trap — it contains the substring
-// "not found" yet is a DNS failure, not an absent object.
-func TestRemoteMarkerReadErrorRefusesWithoutWriting(t *testing.T) {
-	for _, catErr := range []string{
-		"Failed to open: host not found",
-		"Failed to cat: connection refused",
+// TestRemoteMarkerStatErrorRefusesWithoutWriting is the safety-critical
+// case: the presence probe (lsjson --stat) failing for any reason other
+// than a canonical "not found" must refuse the sync even under --init,
+// never mistaking a reachability blip for a fresh root and writing a
+// marker against an unreachable host. "host not found" is the trap — it
+// contains the substring "not found" yet is a DNS failure, not an absent
+// object.
+func TestRemoteMarkerStatErrorRefusesWithoutWriting(t *testing.T) {
+	for _, probeErr := range []string{
+		"Failed to stat: host not found",
+		"Failed to stat: connection refused",
 	} {
-		t.Run(catErr, func(t *testing.T) {
+		t.Run(probeErr, func(t *testing.T) {
 			f := setupRemoteMarkerFixture(t)
 			dest := f.cfg.Destinations["offsite"]
-			t.Setenv("RCLONE_FAKE_CAT_FAIL", catErr)
+			t.Setenv("RCLONE_FAKE_STAT_FAIL", probeErr)
 			err := ensureRemoteDestinationMarker(context.Background(), f.store, f.rcl, dest, "fresh", true)
 			if err == nil || strings.Contains(err.Error(), "--init") {
-				t.Fatalf("a transient read error must refuse hard, got %v", err)
+				t.Fatalf("a transient probe error must refuse hard, got %v", err)
 			}
 			if _, statErr := os.Stat(f.remotePath("fresh", volmark.MarkerName)); statErr == nil {
 				t.Fatalf("a transient error must not bootstrap the marker")
 			}
 		})
+	}
+}
+
+// TestRemoteMarkerBucketAbsenceInitBootstraps models the bucket backends
+// (s3/b2/gcs): `rclone cat` of a missing object exits 0 with empty
+// stdout and `lsjson --stat` reports a "null" body, rather than sftp's
+// canonical "not found" exit. Absence must still be detected from the
+// stat, so a fresh sync without --init refuses with the bootstrap hint
+// (never a parse error from cat's empty reply), --init bootstraps the
+// marker, and every later sync then validates clean.
+func TestRemoteMarkerBucketAbsenceInitBootstraps(t *testing.T) {
+	f := setupRemoteMarkerFixture(t)
+	dest := f.cfg.Destinations["offsite"]
+	t.Setenv("RCLONE_FAKE_BUCKET_ABSENCE", "1")
+	ctx := context.Background()
+
+	err := ensureRemoteDestinationMarker(ctx, f.store, f.rcl, dest, "fresh", false)
+	if err == nil || !strings.Contains(err.Error(), "--init") || !strings.Contains(err.Error(), volmark.MarkerName) {
+		t.Fatalf("want an --init hint naming %s, got %v", volmark.MarkerName, err)
+	}
+	if strings.Contains(err.Error(), "parse marker") {
+		t.Fatalf("a bucket-style absence must not surface as a parse error: %v", err)
+	}
+	if _, statErr := os.Stat(f.remotePath("fresh", volmark.MarkerName)); statErr == nil {
+		t.Fatalf("a refused check must not write the marker")
+	}
+
+	if err := ensureRemoteDestinationMarker(ctx, f.store, f.rcl, dest, "fresh", true); err != nil {
+		t.Fatalf("init on a bucket-absence remote: %v", err)
+	}
+	if _, err := os.Stat(f.remotePath("fresh", volmark.MarkerName)); err != nil {
+		t.Fatalf("marker not written on --init: %v", err)
+	}
+	if err := ensureRemoteDestinationMarker(ctx, f.store, f.rcl, dest, "fresh", false); err != nil {
+		t.Fatalf("validate after init: %v", err)
+	}
+}
+
+// TestRemoteMarkerPresentReadErrorRefuses covers the present-marker read
+// path: once the stat confirms a marker is there, a cat that fails
+// (transient) must refuse — and must never overwrite the present marker,
+// even under --init.
+func TestRemoteMarkerPresentReadErrorRefuses(t *testing.T) {
+	f := setupRemoteMarkerFixture(t)
+	dest := f.cfg.Destinations["offsite"]
+	ctx := context.Background()
+	if err := ensureRemoteDestinationMarker(ctx, f.store, f.rcl, dest, "fresh", true); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+	before, err := os.ReadFile(f.remotePath("fresh", volmark.MarkerName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RCLONE_FAKE_CAT_FAIL", "Failed to open: connection refused")
+	if err := ensureRemoteDestinationMarker(ctx, f.store, f.rcl, dest, "fresh", true); err == nil || strings.Contains(err.Error(), "--init") {
+		t.Fatalf("a present-marker read failure must refuse hard, got %v", err)
+	}
+	after, err := os.ReadFile(f.remotePath("fresh", volmark.MarkerName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("a read failure must not overwrite the present marker")
 	}
 }
 

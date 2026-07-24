@@ -32,7 +32,11 @@ import (
 // $RCLONE_FAKE_HASH_PREFIX simulating remote-side tampering,
 // $RCLONE_FAKE_HASH_VALUE forcing an exact value, and
 // $RCLONE_FAKE_NO_HASHES a backend that exposes no checksums;
-// $RCLONE_FAKE_EMPTY_LISTING a directory lsjson that returns no entries.
+// $RCLONE_FAKE_EMPTY_LISTING a directory lsjson that returns no entries;
+// $RCLONE_FAKE_CAT_FAIL / $RCLONE_FAKE_STAT_FAIL inject a transient error
+// into cat / lsjson --stat; and $RCLONE_FAKE_BUCKET_ABSENCE models the
+// bucket backends' zero-exit empty/null reply for a missing object
+// (versus sftp's canonical not-found exit).
 const fakeRcloneScript = `#!/bin/sh
 {
   printf 'argv:'
@@ -98,13 +102,24 @@ copyto)
 cat)
   if [ -n "$RCLONE_FAKE_CAT_FAIL" ]; then echo "$RCLONE_FAKE_CAT_FAIL" >&2; exit 1; fi
   f=$(resolve "$a1")
-  if [ ! -f "$f" ]; then echo "object not found: $a1" >&2; exit 3; fi
+  if [ ! -f "$f" ]; then
+    # Bucket backends (s3/b2/gcs) cat a missing key as empty stdout on a
+    # zero exit; sftp errors with a canonical "not found".
+    if [ -n "$RCLONE_FAKE_BUCKET_ABSENCE" ]; then exit 0; fi
+    echo "object not found: $a1" >&2; exit 3
+  fi
   cat "$f"
   ;;
 lsjson)
   if [ "$stat" = 1 ]; then
+    if [ -n "$RCLONE_FAKE_STAT_FAIL" ]; then echo "$RCLONE_FAKE_STAT_FAIL" >&2; exit 1; fi
     f=$(resolve "$a1")
-    if [ ! -f "$f" ]; then echo "object not found: $a1" >&2; exit 3; fi
+    if [ ! -f "$f" ]; then
+      # Bucket backends report a missing key as a "null" stat on a zero
+      # exit; sftp errors with a canonical "not found".
+      if [ -n "$RCLONE_FAKE_BUCKET_ABSENCE" ]; then printf 'null\n'; exit 0; fi
+      echo "object not found: $a1" >&2; exit 3
+    fi
     entry_json "$f"; printf '\n'
   else
     dir=$(resolve "$a1")
@@ -191,6 +206,8 @@ func setupCAFixture(t *testing.T, destBlock, strip string) *caFixture {
 	t.Setenv("RCLONE_FAKE_HASH_PREFIX", "")
 	t.Setenv("RCLONE_FAKE_CRYPT_SUFFIX", "")
 	t.Setenv("RCLONE_FAKE_CAT_FAIL", "")
+	t.Setenv("RCLONE_FAKE_STAT_FAIL", "")
+	t.Setenv("RCLONE_FAKE_BUCKET_ABSENCE", "")
 
 	root := t.TempDir()
 	volPath := filepath.Join(root, "src")

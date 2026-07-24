@@ -356,29 +356,18 @@ func (r *Rclone) copyTo(ctx context.Context, src, dst string, extraArgs ...strin
 	return err
 }
 
-// errRemoteNotFound signals that an rclone read addressed a path the
-// backend reports as absent (object or directory not found), as opposed
-// to a transient, auth, or misconfiguration failure. The destination
-// marker gate treats it as "no marker yet" (eligible for --init
-// bootstrap); every other error refuses the sync without writing, so a
-// reachability blip can never be mistaken for a fresh root.
-var errRemoteNotFound = errors.New("rclone: remote path not found")
-
 // catRemote reads the full contents of the single object at uri via
-// `rclone cat`. A definite backend "not found" is mapped to
-// errRemoteNotFound so callers can distinguish a genuinely missing file
-// from a failure that must not be read as absence. extraArgs carries
-// per-destination flags such as the --checkers cap.
+// `rclone cat`. It is called only after statRemoteExists has confirmed
+// the object is present, so any error here — including a race where the
+// object vanished between the stat and the read — is surfaced verbatim
+// and the caller refuses. Absence is deliberately decided by the stat,
+// not by cat's exit: bucket backends (s3/b2/gcs) return an empty body on
+// a zero exit for a missing key, which cat cannot tell apart from a
+// genuinely empty object. extraArgs carries per-destination flags such
+// as the --checkers cap.
 func (r *Rclone) catRemote(ctx context.Context, uri string, extraArgs ...string) ([]byte, error) {
 	args := append([]string{"cat"}, extraArgs...)
-	out, err := r.runPlain(ctx, append(args, uri)...)
-	if err != nil {
-		if isNotFoundErr(err) {
-			return nil, errRemoteNotFound
-		}
-		return nil, err
-	}
-	return out, nil
+	return r.runPlain(ctx, append(args, uri)...)
 }
 
 // isNotFoundErr reports whether an rclone error denotes an absent path
@@ -394,6 +383,39 @@ func isNotFoundErr(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "object not found") ||
 		strings.Contains(msg, "directory not found")
+}
+
+// statRemoteExists reports whether a single object exists at uri via
+// `rclone lsjson --stat`, classifying the outcome three ways so the
+// marker gate can tell a genuinely-absent marker from an unreachable
+// one:
+//
+//   - (true, nil): the stat returned an object.
+//   - (false, nil): the backend definitively reports absence — an empty
+//     or "null" stat body on a zero exit (how the bucket backends
+//     s3/b2/gcs report a missing key) or a canonical "not found" exit
+//     (how sftp reports it).
+//   - (false, err): any other failure (transient, auth, DNS). The caller
+//     must refuse rather than mistake unreachability for absence.
+//
+// Unlike statRemote, which returns the object size and folds absence into
+// an error, this preserves the absent/unreachable distinction the
+// refuse-over-wrong-write invariant depends on. extraArgs carries
+// per-destination flags such as the --checkers cap.
+func (r *Rclone) statRemoteExists(ctx context.Context, uri string, extraArgs ...string) (bool, error) {
+	args := append([]string{"lsjson", "--stat"}, extraArgs...)
+	out, err := r.runPlain(ctx, append(args, uri)...)
+	if err != nil {
+		if isNotFoundErr(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	trimmed := bytes.TrimSpace(out)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return false, nil
+	}
+	return true, nil
 }
 
 // listSnapshots returns the snapshot filenames directly under dirURI via
