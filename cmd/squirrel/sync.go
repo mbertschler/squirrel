@@ -223,6 +223,14 @@ func printSyncReport(w io.Writer, rep sync.Report, runErr error) {
 			fmt.Fprintf(w, "    preserved at %s:%s\n", rep.Destination, c.PreservedAtPath)
 		}
 	}
+	for _, c := range rep.NodeContested {
+		fmt.Fprintf(w, "  contested %s: frozen by a prior conflict — bytes refused, not delivered\n", c.Path)
+		if c.PreservedAtPath != "" {
+			fmt.Fprintf(w, "    versions live %s, preserved %s at %s:%s\n",
+				c.LiveBlake3Hex, c.PreservedBlake3Hex, rep.Destination, c.PreservedAtPath)
+		}
+		fmt.Fprintf(w, "    resolve with: squirrel conflicts resolve %s %s\n", rep.Volume, c.Path)
+	}
 	for _, ff := range r.FailedFiles {
 		// Some rclone errors (auth, listing, fatal copy) have no Object.
 		// Render those as a bare "error: ..." rather than "error : ...".

@@ -313,6 +313,22 @@ re-supersede a path whose live row lost a conflict since your last
 delivery without operator action), and a `squirrel conflicts`
 question-command to list unresolved ones.
 
+*Resolved (#158, contested-freeze, option 2a).* A conflict now raises a
+`contested_paths` latch on the receiver (schema v26); while it stands the
+`/plan` classifier answers a divergent re-assertion from any peer with a
+new `contested` disposition (version-gated for older peers) instead of
+minting another `.squirrel-conflicts/run-N/` copy — the flip-flop stops at
+the first conflict, preserved once. Both versions stay reachable (winner
+live, loser under `.squirrel-conflicts/`). Conflict/contested counts flow
+into `SyncRunReport`, the initiators' run rows (the CONFLICTS column), a
+`scheduler.conflict` warn line, and a "Contested paths" TUI badge — each
+node mirrors the freeze into its own latch, so the losing edge sees it too,
+not only the hub. `squirrel conflicts` lists the frozen paths and
+`squirrel conflicts resolve <volume> <path>` clears the latch (the explicit
+human act that unfreezes; squirrel never resolves on its own). Adopting the
+non-live version stays a deliberate `restore`, not something resolve does
+silently.
+
 **F29 · S1 — relayed offload against a cold archive is structurally
 unreachable, so no machine in the reference household can offload
 anything.** The endgame of the whole design — htpc/laptop dropping

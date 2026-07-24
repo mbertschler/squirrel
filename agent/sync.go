@@ -401,7 +401,7 @@ func (r *peerSyncRouter) finishBegin(ctx context.Context, body syncproto.BeginRe
 // know is clamped down to ProtocolVersionMerkleWalk rather than
 // rejected, so a partial rollout doesn't break syncs.
 func negotiateProtocol(requested int) int {
-	const receiverMax = syncproto.ProtocolVersionMerkleWalk
+	const receiverMax = syncproto.ProtocolVersionContested
 	if requested <= 0 {
 		return syncproto.ProtocolVersionFlat
 	}
@@ -574,7 +574,51 @@ func (r *peerSyncRouter) planSession(ctx context.Context, sess *peerSession, ent
 		})
 	}
 	resp.Conflicts = collectConflicts(sess)
+	contested, err := r.collectContested(ctx, sess, entries)
+	if err != nil {
+		return syncproto.PlanResponse{}, err
+	}
+	resp.Contested = contested
 	return resp, nil
+}
+
+// collectContested builds the wire-format contested list from the entries
+// classified as `contested`, in the order the initiator sent them. Each
+// path is frozen, so its contested_paths latch supplies the two versions
+// and the preserved-loser location the initiator mirrors into its own
+// marker and renders. A latch that vanished between classify and here
+// (an operator resolved it mid-plan) is skipped rather than erroring —
+// the next sync re-plans cleanly.
+func (r *peerSyncRouter) collectContested(ctx context.Context, sess *peerSession, entries []syncproto.IndexEntry) ([]syncproto.ContestedDetail, error) {
+	var out []syncproto.ContestedDetail
+	for _, e := range entries {
+		if sess.dispositions[e.Path].disposition != syncproto.DispositionContested {
+			continue
+		}
+		latch, err := r.srv.store.GetContestedPath(ctx, sess.volumeID, e.Path)
+		if err != nil {
+			if store.IsNotFound(err) {
+				continue
+			}
+			return nil, fmt.Errorf("look up contested %s: %w", e.Path, err)
+		}
+		out = append(out, syncproto.ContestedDetail{
+			Path:               e.Path,
+			LiveBlake3Hex:      hexOrEmpty(latch.LiveBlake3),
+			PreservedBlake3Hex: hexOrEmpty(latch.PreservedBlake3),
+			PreservedAtPath:    latch.PreservedAtPath,
+		})
+	}
+	return out, nil
+}
+
+// hexOrEmpty renders a raw digest as lowercase hex, or "" for a nil digest
+// (the "unknown winner" latch case), keeping the wire field omittable.
+func hexOrEmpty(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	return hex.EncodeToString(b)
 }
 
 // handlePlanFolders implements POST /v1/sync/plan-folders: look up the
@@ -804,20 +848,30 @@ func collectConflicts(sess *peerSession) []syncproto.ConflictDetail {
 // strategy is "off" (initiator opted out).
 func (r *peerSyncRouter) classify(ctx context.Context, sess *peerSession, relPath string, entry *sessionEntry) (string, error) {
 	existing, err := r.srv.store.GetByPath(ctx, sess.volumeID, relPath)
-	if err != nil {
-		if store.IsNotFound(err) {
-			return r.classifyMissingPath(ctx, sess, entry)
-		}
+	liveFound := err == nil && existing.Status == store.StatusPresent
+	if err != nil && !store.IsNotFound(err) {
 		return "", err
 	}
-	if existing.Status != store.StatusPresent {
-		// A live row in 'missing' status is treated as "no file here";
-		// the initiator's bytes are new content. Dedup still applies —
-		// the bytes may exist at another path.
-		return r.classifyMissingPath(ctx, sess, entry)
-	}
-	if bytesEqual(existing.Blake3, entry.blake3) {
+	if liveFound && bytesEqual(existing.Blake3, entry.blake3) {
 		return syncproto.DispositionAlreadyCorrect, nil
+	}
+	// The initiator's bytes differ from any live row here (or there is no
+	// live row). Before deciding Supersede/Conflict/Transfer, check the
+	// contested freeze: a path frozen by a prior conflict refuses a
+	// divergent re-assertion from any peer, so the flip-flop stops at the
+	// first conflict instead of minting a fresh copy every cadence tick.
+	// The frozen winner re-asserting its own digest is *not* refused — it
+	// falls through so a /close that never committed can re-establish it.
+	if contested, err := r.contestedRefusal(ctx, sess, relPath, entry); err != nil {
+		return "", err
+	} else if contested {
+		return syncproto.DispositionContested, nil
+	}
+	if !liveFound {
+		// No live row (or a 'missing'/'offloaded' one): the initiator's
+		// bytes are new content here. Dedup still applies — the bytes may
+		// exist at another path.
+		return r.classifyMissingPath(ctx, sess, entry)
 	}
 	// Different blake3 at this path. Provenance decides the verdict
 	// (Supersede / Conflict). Content at a path takes precedence over
@@ -829,6 +883,28 @@ func (r *peerSyncRouter) classify(ctx context.Context, sess *peerSession, relPat
 		entry.conflictReason = reason
 	}
 	return disp, nil
+}
+
+// contestedRefusal reports whether relPath is frozen and this initiator's
+// bytes should be refused with the `contested` disposition. It returns
+// false — letting normal classification proceed — when the path isn't
+// frozen, when the initiator's digest matches the frozen winner (the
+// winner re-asserting, which must be allowed to re-land), or when the
+// session negotiated a protocol older than ProtocolVersionContested (an
+// initiator that can't interpret the disposition falls back to the legacy
+// `conflict`, keeping older peers safe per the version gate).
+func (r *peerSyncRouter) contestedRefusal(ctx context.Context, sess *peerSession, relPath string, entry *sessionEntry) (bool, error) {
+	if sess.protocolVersion < syncproto.ProtocolVersionContested {
+		return false, nil
+	}
+	liveBlake3, contested, err := r.srv.store.IsPathContested(ctx, sess.volumeID, relPath)
+	if err != nil {
+		return false, err
+	}
+	if !contested {
+		return false, nil
+	}
+	return !bytesEqual(entry.blake3, liveBlake3), nil
 }
 
 // classifyMissingPath is the no-live-row branch of classify: try to
@@ -1188,6 +1264,22 @@ func (r *peerSyncRouter) preStageConflicts(ctx context.Context, sess *peerSessio
 			return fmt.Errorf("record conflict pre-stage for %s: %w", path, err)
 		}
 		entry.preservedAtPath = preservedRel
+		// Freeze the path so the next cadence tick refuses a divergent
+		// re-assertion instead of minting another `.squirrel-conflicts/`
+		// copy (#158, F27). The winner is the initiator's bytes (landing
+		// live on /close); the loser is the just-preserved prior row.
+		// Idempotent: a path already frozen keeps its original latch.
+		if err := r.srv.store.RaiseContested(ctx, store.ContestedPath{
+			VolumeID:        sess.volumeID,
+			Path:            path,
+			LiveBlake3:      entry.blake3,
+			PreservedBlake3: entry.priorRow.Blake3,
+			PreservedAtPath: preservedRel,
+			PeerNodeID:      sess.peerNodeID,
+			RaisedRunID:     sess.receiverRunID,
+		}); err != nil {
+			return fmt.Errorf("raise contested for %s: %w", path, err)
+		}
 	}
 	return nil
 }

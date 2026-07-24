@@ -47,6 +47,16 @@ const (
 	// NULL) or against the run that raised it when an operator acks
 	// (operator set). The note carries the destination.
 	TransitionAlarmClear = "alarm-clear"
+	// TransitionContestedRaise records a contested_paths latch being
+	// raised against the sync run that hit the conflict (#158, F27): the
+	// freeze that stops the divergent-edit ping-pong. The note carries the
+	// volume-relative path. Written once per distinct freeze episode.
+	TransitionContestedRaise = "contested-raise"
+	// TransitionContestedClear records a contested_paths latch being
+	// cleared by an explicit `squirrel conflicts resolve` (operator set),
+	// against the run that raised it. The note carries the path. This is
+	// the deliberate human act that unfreezes the path.
+	TransitionContestedClear = "contested-clear"
 )
 
 // RunAudit is one row of the insert-only runs_audit log: a single

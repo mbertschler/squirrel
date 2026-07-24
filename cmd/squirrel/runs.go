@@ -83,7 +83,29 @@ func runRuns(cmd *cobra.Command, volumeName string, limit int) error {
 		return fmt.Errorf("list destination alarms: %w", err)
 	}
 	printActiveAlarms(cmd.OutOrStdout(), alarms)
+	contested, err := s.ListContestedPaths(cmd.Context())
+	if err != nil {
+		return fmt.Errorf("list contested paths: %w", err)
+	}
+	printContestedReminder(cmd.OutOrStdout(), contested)
 	return nil
+}
+
+// printContestedReminder surfaces standing contested freezes beneath the
+// runs listing (#158, F27). Like the alarms reminder, a single old
+// conflict run scrolls away, so the audit surface repeats the standing
+// condition until a human resolves it — and points at the dedicated
+// `squirrel conflicts` question-command for the detail.
+func printContestedReminder(w io.Writer, contested []store.ContestedPath) {
+	if len(contested) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "\n%d contested path(s) frozen — inspect with `squirrel conflicts`, clear with `squirrel conflicts resolve`:\n",
+		len(contested))
+	for _, c := range contested {
+		fmt.Fprintf(w, "  CONTESTED volume=%d %s since %s\n",
+			c.VolumeID, c.Path, formatStarted(c.RaisedAtNs))
+	}
 }
 
 // printActiveAlarms surfaces standing per-destination alarms beneath the
@@ -132,11 +154,22 @@ func loadNodeNames(cmd *cobra.Command, s *store.Store, runs []store.Run) (map[in
 	return out, nil
 }
 
-// loadConflictCounts derives the conflict count for every peer-sync
-// run in the listing via one grouped query against `files`. The v6
-// schema doesn't carry the count on the run row itself; every
-// conflict inserts one row under `.squirrel-conflicts/run-<id>/`, so
-// the prefix-count is the audit number we want.
+// loadConflictCounts derives the conflict count for every peer-sync run in
+// the listing. The schema doesn't carry the count on the run row itself,
+// so it comes from two derivations merged per run:
+//
+//   - Receiver side: every conflict inserts one row under
+//     `.squirrel-conflicts/run-<id>/`, so the prefix-count is the number
+//     of losers this run preserved.
+//   - Initiator side: the conflict was frozen on a *remote* receiver, so
+//     no local `.squirrel-conflicts/` rows exist; instead the run raised
+//     local contested_paths latches (one per conflict + contested
+//     refusal), so the raised-by-run count is the initiator's signal
+//     (#158, F27).
+//
+// A run is one side of a sync, so at most one derivation is non-zero for
+// it; taking the max yields the right figure without double-counting the
+// rare case where both happen to fire on the same id.
 func loadConflictCounts(cmd *cobra.Command, s *store.Store, runs []store.Run) (map[int64]int, error) {
 	var peerSyncIDs []int64
 	for _, r := range runs {
@@ -147,9 +180,22 @@ func loadConflictCounts(cmd *cobra.Command, s *store.Store, runs []store.Run) (m
 	if len(peerSyncIDs) == 0 {
 		return map[int64]int{}, nil
 	}
-	counts, err := s.CountFilesFirstSeenByRunWithPathPrefix(cmd.Context(), peerSyncIDs, sync.ConflictsDirName)
+	preserved, err := s.CountFilesFirstSeenByRunWithPathPrefix(cmd.Context(), peerSyncIDs, sync.ConflictsDirName)
 	if err != nil {
 		return nil, fmt.Errorf("conflict counts: %w", err)
+	}
+	frozen, err := s.CountContestedRaisedByRun(cmd.Context(), peerSyncIDs)
+	if err != nil {
+		return nil, fmt.Errorf("contested counts: %w", err)
+	}
+	counts := make(map[int64]int, len(preserved)+len(frozen))
+	for id, n := range preserved {
+		counts[id] = n
+	}
+	for id, n := range frozen {
+		if n > counts[id] {
+			counts[id] = n
+		}
 	}
 	return counts, nil
 }
