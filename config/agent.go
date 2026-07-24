@@ -84,9 +84,9 @@ type rawPeerAuth struct {
 }
 
 func resolveAgent(r *rawAgent) (*Agent, error) {
-	if r.Listen == "" {
-		return nil, errors.New("listen is required")
-	}
+	// An empty listen is the listener-less mode (F35): the agent runs the
+	// background schedulers (index/sync/audit cadences) without binding an
+	// HTTP server, for cadence-only machines that never receive peer syncs.
 	a := &Agent{Listen: r.Listen}
 	if r.DB != "" {
 		expanded, err := expandPath(r.DB)
@@ -162,6 +162,12 @@ func resolveAgentTLS(r *rawTLS, a *Agent) error {
 
 func resolveAgentAuth(r *rawAuth, a *Agent) error {
 	if r == nil || r.Token == nil {
+		if a.Listen == "" {
+			// Listener-less agent (F35): there is no HTTP surface to
+			// authenticate, so a bearer token is not required — and peer
+			// tokens would have no listener to guard either.
+			return nil
+		}
 		return errors.New("auth.token is required (no agent without authentication)")
 	}
 	// resolveSecret takes a map[string]any and pulls the named key. We pass

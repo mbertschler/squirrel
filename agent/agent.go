@@ -191,10 +191,11 @@ func (s *Server) CertFingerprint() (string, error) {
 func (s *Server) Addr() string { return s.cfg.Listen }
 
 func validateConfig(cfg Config) error {
-	if cfg.Listen == "" {
-		return errors.New("agent: Config.Listen is required")
-	}
-	if cfg.Token == "" {
+	// An empty Listen selects listener-less mode (F35): the agent runs only
+	// its background schedulers, so neither a bind address nor a bearer
+	// token is required. A token is required only when there is an HTTP
+	// surface to protect.
+	if cfg.Listen != "" && cfg.Token == "" {
 		return errors.New("agent: Config.Token is required")
 	}
 	if (cfg.TLSCert == "") != (cfg.TLSKey == "") {

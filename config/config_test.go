@@ -979,14 +979,21 @@ auth   = { }
 	}
 }
 
-func TestLoadAgentMissingListen(t *testing.T) {
-	p := writeConfig(t, `
-[agent]
-auth = { token = "x" }
-`)
-	_, err := Load(p)
-	if err == nil || !strings.Contains(err.Error(), "listen is required") {
-		t.Fatalf("expected listen-required error, got %v", err)
+// TestLoadAgentListenerLess covers F35: an [agent] block without `listen`
+// is the listener-less mode — valid, scheduler-only. A bare block needs no
+// auth, and an auth token without a listener is tolerated (unused).
+func TestLoadAgentListenerLess(t *testing.T) {
+	for _, body := range []string{
+		"\n[agent]\n",
+		"\n[agent]\nauth = { token = \"x\" }\n",
+	} {
+		cfg, err := Load(writeConfig(t, body))
+		if err != nil {
+			t.Fatalf("Load(%q): %v", body, err)
+		}
+		if cfg.Agent == nil || cfg.Agent.Listen != "" {
+			t.Fatalf("expected listener-less agent (empty Listen), got %+v", cfg.Agent)
+		}
 	}
 }
 

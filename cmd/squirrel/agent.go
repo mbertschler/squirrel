@@ -75,6 +75,24 @@ func runAgent(cmd *cobra.Command) error {
 	if err != nil {
 		return err
 	}
+	return serveAgent(cmd, cfg, srv, logger)
+}
+
+// serveAgent dispatches the built server to its run path: the listener-less
+// scheduler-only run (F35) when [agent] listen is empty, or the HTTP server
+// otherwise. Split from runAgent so the setup phase stays compact.
+func serveAgent(cmd *cobra.Command, cfg *config.Config, srv *agent.Server, logger *slog.Logger) error {
+	// Listener-less mode (F35): no `listen`, so run the schedulers without an
+	// HTTP server. Refuse an agent that would do nothing at all — a
+	// scheduler-only agent with no cadences and no scan is silent
+	// degradation, not a valid config.
+	if cfg.Agent.Listen == "" {
+		if !agentHasWork(cfg) {
+			return fmt.Errorf("listener-less agent has nothing to run: set [agent] listen to receive peer syncs, or a sync_every/index_every/scan_interval cadence, in %s", cfg.Path)
+		}
+		logSchedulerOnlyStartup(logger)
+		return srv.RunSchedulers(cmd.Context())
+	}
 	// Bind first so a port-in-use (or any other listen failure) surfaces
 	// as a CLI error and never logs a misleading "agent listening" line.
 	// We also log the listener's resolved Addr so `:0` (and other
@@ -86,6 +104,33 @@ func runAgent(cmd *cobra.Command) error {
 	}
 	logAgentStartup(logger, srv, ln.Addr().String())
 	return srv.Serve(cmd.Context(), ln)
+}
+
+// agentHasWork reports whether a listener-less agent has any background
+// work: a drift-scan interval, or at least one volume with a scheduler
+// cadence (sync, standalone index, or interval hook). It mirrors the
+// agent scheduler's own "is anything scheduled" gate so the CLI refuses a
+// do-nothing agent rather than letting it idle silently.
+func agentHasWork(cfg *config.Config) bool {
+	if cfg.Agent.ScanInterval > 0 {
+		return true
+	}
+	for _, v := range cfg.Volumes {
+		if v.SyncEvery > 0 || v.IndexEvery > 0 {
+			return true
+		}
+		if v.Hook != nil && v.Hook.Interval > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// logSchedulerOnlyStartup emits the listener-less counterpart of the
+// "agent listening" banner so a journal shows the agent came up in
+// scheduler-only mode with no bound port.
+func logSchedulerOnlyStartup(logger *slog.Logger) {
+	logger.Info("agent scheduler running", "listener", "disabled", "version", agentVersion)
 }
 
 // openAgentStore extends the standard resolveDBPath precedence with the
