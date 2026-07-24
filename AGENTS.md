@@ -56,8 +56,8 @@ real index without a repo checkout.
 
 Every **new** `CREATE TABLE` — whether in a migration or a future fresh
 baseline — MUST be declared `STRICT` (`CREATE TABLE … (…) STRICT`). STRICT
-rejects any value whose storage class doesn't match the column's declared
-type instead of silently coercing it via type affinity, so a stray string
+rejects any value that can't be losslessly converted to the column's declared
+type instead of silently coercing it via type affinity, so a non-numeric string
 bound into an integer column (a concatenated query, a reflection mishap)
 becomes a hard error rather than a wrong-storage-class row — belt-and-suspenders
 over the existing `CHECK` / `NOT NULL` / trigger discipline, in the same
