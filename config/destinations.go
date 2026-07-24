@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path"
 	"sort"
 	"strings"
 
@@ -598,6 +599,24 @@ func (d *Destination) CryptRemoteName() string {
 	return d.Name + "-crypt"
 }
 
+// RemoteRoot is the path prefix inside the destination's rclone remote
+// where this destination's tree starts. For bucket-addressed backends
+// (s3, b2, gcs) that is the bucket joined with the configured root:
+// rclone addresses the bucket as the leading path segment, while
+// squirrel's config keeps `bucket` and `root` as separate keys — a
+// composition that omits the bucket makes rclone treat the first
+// segment of root (or the volume name) as the bucket name and silently
+// write into the wrong bucket. Other backends use root verbatim (an
+// sftp root may be deliberately absolute). path.Join cleans a "/" root
+// to the bare bucket.
+func (d *Destination) RemoteRoot() string {
+	switch d.Type {
+	case "s3", "b2", "gcs":
+		return path.Join(d.Params["bucket"], d.Root)
+	}
+	return d.Root
+}
+
 // cryptSection renders the crypt overlay remote. Its remote line bakes the
 // destination root in, so transfers through the overlay address
 // volume-relative paths directly. filename_encryption is fixed off: the
@@ -607,7 +626,7 @@ func (d *Destination) cryptSection() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "[%s]\n", d.CryptRemoteName())
 	b.WriteString("type = crypt\n")
-	fmt.Fprintf(&b, "remote = %s:%s\n", d.Name, d.Root)
+	fmt.Fprintf(&b, "remote = %s:%s\n", d.Name, d.RemoteRoot())
 	b.WriteString("filename_encryption = off\n")
 	b.WriteString("directory_name_encryption = false\n")
 	fmt.Fprintf(&b, "password = %s\n", d.Crypt.Password)

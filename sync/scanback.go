@@ -55,7 +55,7 @@ func (h *contentPusher) captureScanBackRclone(ctx context.Context, rep *Report, 
 	for batch := range slices.Chunk(targets, fingerprintBatchSize) {
 		extra := checkersArgs(h.dest)
 		for _, t := range batch {
-			extra = append(extra, "--include", t.name)
+			extra = append(extra, "--include", listedRemoteName(h.dest, t.name))
 		}
 		entries, err := h.rcl.listHashes(ctx, dirURI, types, extra...)
 		if err != nil {
@@ -65,8 +65,9 @@ func (h *contentPusher) captureScanBackRclone(ctx context.Context, rep *Report, 
 		byName := make(map[string]map[string]string, len(entries))
 		present := make(map[string]bool, len(entries))
 		for _, e := range entries {
-			byName[e.Name] = e.Hashes
-			present[e.Name] = true
+			name := listedPlainName(h.dest, e.Name)
+			byName[name] = e.Hashes
+			present[name] = true
 		}
 		h.recordScanBack(ctx, rep, batch, byName, present)
 	}
@@ -87,6 +88,7 @@ func (h *contentPusher) captureScanBackS3(ctx context.Context, rep *Report, dirN
 			byName := make(map[string]map[string]string, len(etags))
 			present := make(map[string]bool, len(etags))
 			for name, etag := range etags {
+				name = listedPlainName(h.dest, name)
 				byName[name] = map[string]string{"md5": etag}
 				present[name] = true
 			}

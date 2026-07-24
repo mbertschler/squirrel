@@ -1,3 +1,6 @@
 [tools]
 rclone = "1.74.1"
 golangci-lint = "2.12.2"
+# Testbed services (design/testbed.md): S3 emulator + second-format backup.
+"github:seaweedfs/seaweedfs" = { version = "3.80", exe = "weed" }
+kopia = "0.21.1"

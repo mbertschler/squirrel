@@ -630,7 +630,7 @@ func remoteSubpathURI(dest *config.Destination, subpath string) string {
 	case dest.Crypt != nil:
 		return dest.CryptRemoteName() + ":" + subpath
 	default:
-		return dest.Name + ":" + path.Join(dest.Root, subpath)
+		return dest.Name + ":" + path.Join(dest.RemoteRoot(), subpath)
 	}
 }
 

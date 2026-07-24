@@ -369,3 +369,27 @@ func (f *caFixture) remoteObject(t *testing.T, path string) store.RemoteObject {
 	}
 	return obj
 }
+
+// TestListedNameCryptSuffix pins the crypt data-suffix mapping between
+// recorded overlay names and underlying-remote listings: names read from
+// a crypt destination's underlying remote shed ".bin", filters passed to
+// such listings gain it, and non-crypt destinations pass through
+// untouched. Without this mapping every scan-back and verify listing on
+// a crypt destination reports recorded artifacts missing and listed
+// ones unrecorded.
+func TestListedNameCryptSuffix(t *testing.T) {
+	crypt := &config.Destination{Name: "c", Type: "s3", Crypt: &config.Crypt{Password: "x"}}
+	plain := &config.Destination{Name: "p", Type: "s3"}
+	if got := listedPlainName(crypt, "abc.bin"); got != "abc" {
+		t.Errorf("crypt listed name = %q, want abc", got)
+	}
+	if got := listedRemoteName(crypt, "abc"); got != "abc.bin" {
+		t.Errorf("crypt remote name = %q, want abc.bin", got)
+	}
+	if got := listedPlainName(plain, "abc.bin"); got != "abc.bin" {
+		t.Errorf("plain listed name = %q, want abc.bin (untouched)", got)
+	}
+	if got := listedRemoteName(plain, "abc"); got != "abc" {
+		t.Errorf("plain remote name = %q, want abc (untouched)", got)
+	}
+}

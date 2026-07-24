@@ -204,7 +204,7 @@ func readObjectChecksums(ctx context.Context, rcl *Rclone, dest *config.Destinat
 		}
 		byName := make(map[string]map[string]string, len(etags))
 		for name, etag := range etags {
-			byName[name] = map[string]string{"md5": etag}
+			byName[listedPlainName(dest, name)] = map[string]string{"md5": etag}
 		}
 		return byName, nil
 	}
@@ -214,7 +214,7 @@ func readObjectChecksums(ctx context.Context, rcl *Rclone, dest *config.Destinat
 	}
 	byName := make(map[string]map[string]string, len(entries))
 	for _, e := range entries {
-		byName[e.Name] = e.Hashes
+		byName[listedPlainName(dest, e.Name)] = e.Hashes
 	}
 	return byName, nil
 }
@@ -311,7 +311,7 @@ func readPackChecksums(ctx context.Context, rcl *Rclone, dest *config.Destinatio
 		}
 		byName := make(map[string]map[string]string, len(etags))
 		for name, etag := range etags {
-			byName[name] = map[string]string{"md5": etag}
+			byName[listedPlainName(dest, name)] = map[string]string{"md5": etag}
 		}
 		return byName, nil
 	}
@@ -321,7 +321,7 @@ func readPackChecksums(ctx context.Context, rcl *Rclone, dest *config.Destinatio
 	}
 	byName := make(map[string]map[string]string, len(entries))
 	for _, e := range entries {
-		byName[e.Name] = e.Hashes
+		byName[listedPlainName(dest, e.Name)] = e.Hashes
 	}
 	return byName, nil
 }

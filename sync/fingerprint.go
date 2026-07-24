@@ -119,5 +119,35 @@ func checkersArgs(dest *config.Destination) []string {
 // scan-back fingerprint is over the stored ciphertext, and with filename
 // encryption fixed off the underlying key equals the overlay path.
 func underlyingDirURI(dest *config.Destination, dirName string) string {
-	return dest.Name + ":" + path.Join(dest.Root, dirName)
+	return dest.Name + ":" + path.Join(dest.RemoteRoot(), dirName)
+}
+
+// cryptDataSuffix is rclone crypt's data-file suffix when filename
+// encryption is off. squirrel pins filename_encryption=off and leaves
+// crypt's suffix at its default, so every file listed through the
+// *underlying* remote of a crypt destination carries this suffix while
+// squirrel records the plain overlay name.
+const cryptDataSuffix = ".bin"
+
+// listedPlainName maps a name from an underlying-remote listing back to
+// the overlay name squirrel records: crypt destinations shed the crypt
+// data suffix, everything else passes through. Every scan-back and
+// verify listing must funnel names through here or crypt destinations
+// report every recorded artifact as missing and every listed one as
+// unrecorded (they differ by the suffix).
+func listedPlainName(dest *config.Destination, name string) string {
+	if dest.Crypt != nil {
+		return strings.TrimSuffix(name, cryptDataSuffix)
+	}
+	return name
+}
+
+// listedRemoteName is the inverse mapping for filters passed to an
+// underlying-remote listing: the on-remote file name for a recorded
+// overlay name.
+func listedRemoteName(dest *config.Destination, name string) string {
+	if dest.Crypt != nil {
+		return name + cryptDataSuffix
+	}
+	return name
 }

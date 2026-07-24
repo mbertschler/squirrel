@@ -80,7 +80,10 @@ func newMinioETagReader(dest *config.Destination, dirName string) (*minioETagRea
 	return &minioETagReader{
 		client: client,
 		bucket: bucket,
-		prefix: path.Join(dest.Root, dirName) + "/",
+		// Object keys are bucket-relative and never begin with "/": the
+		// leading slash of an absolute-style root must go, or the listing
+		// prefix matches nothing that rclone actually wrote.
+		prefix: path.Join(strings.TrimPrefix(dest.Root, "/"), dirName) + "/",
 	}, nil
 }
 
