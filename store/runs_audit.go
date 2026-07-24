@@ -57,6 +57,13 @@ const (
 	// against the run that raised it. The note carries the path. This is
 	// the deliberate human act that unfreezes the path.
 	TransitionContestedClear = "contested-clear"
+	// TransitionResetDestination records a `squirrel destination reset`:
+	// the operator forgetting a destination's recorded upload and
+	// durability state (ResetDestination). It shares the destination-scoped
+	// kind='audit' run shape, so — like TransitionVerifyDestination — this
+	// note is where the audit trail names the reset destination and carries
+	// the cleared counts, the runs CHECK keeping destination NULL on the row.
+	TransitionResetDestination = "reset-destination"
 )
 
 // RunAudit is one row of the insert-only runs_audit log: a single

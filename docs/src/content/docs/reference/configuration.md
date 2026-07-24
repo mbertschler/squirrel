@@ -96,8 +96,9 @@ destination). See [Encrypted (crypt)](/squirrel/layouts/encrypted/).
 
 | Key | Meaning |
 |---|---|
-| `password` | rclone-obscured value (`rclone obscure <plaintext>`). Secret. |
-| `password2` | rclone-obscured salt; optional but recommended. Secret. |
+| `password` | Plaintext encryption password; squirrel obscures it at render time. Secret. |
+| `password2` | Plaintext salt; optional but recommended. Secret. |
+| `obscured` | `true` if `password`/`password2` are already rclone-obscured (renders them verbatim; default `false`). |
 
 Filenames are **not** encrypted (`filename_encryption = off`, fixed by design).
 
@@ -135,3 +136,9 @@ Required to run [`squirrel agent`](/squirrel/guides/agent/). Configures the
 unattended cadence (`index_every`, `sync_every`), scheduled audits, and an
 optional agent-specific `db` path (which takes precedence over the top-level `db`
 when the agent runs).
+
+`listen` is optional. When set (e.g. `0.0.0.0:8443`), the agent binds an HTTP
+server for peer syncs and the health endpoint, and a bearer token is required.
+When omitted, the agent runs its schedulers only — the *listener-less* mode for
+cadence-only machines that never receive peer syncs; `[agent.auth]` is then
+optional. See [The agent](/squirrel/guides/agent/#listener-less-cadence-only-machines).

@@ -57,6 +57,9 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newPeerSyncCmd())
 	root.AddCommand(newTUICmd())
 	root.AddCommand(newDBCmd())
+	root.AddCommand(newConfigCmd())
+	root.AddCommand(newNodeCmd())
+	root.AddCommand(newDestinationCmd())
 	root.AddCommand(newVersionCmd())
 	return root
 }
