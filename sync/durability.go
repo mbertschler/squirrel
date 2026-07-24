@@ -174,7 +174,7 @@ func pullDurability(ctx context.Context, s *store.Store, client *nodeClient, vol
 		if err != nil {
 			return rep, err
 		}
-		err = s.UpsertDestinationRunIDPulled(ctx, volumeID, c.Destination, nodeID, c.OriginRun, c.VerifyMethod, sourceNode.ID, c.VerifiedAtNs, allowRewind)
+		err = s.UpsertDestinationRunIDPulled(ctx, volumeID, c.Destination, nodeID, c.OriginRun, relayedMethod(c), sourceNode.ID, c.VerifiedAtNs, allowRewind)
 		var rewind *store.DestinationRewindError
 		if errors.As(err, &rewind) {
 			rep.Rewinds = append(rep.Rewinds, DurabilityRewind{
@@ -208,6 +208,23 @@ func pullDurability(ctx context.Context, s *store.Store, client *nodeClient, vol
 		rep.Applied++
 	}
 	return rep, nil
+}
+
+// relayedMethod is the verify method a pulled component is stored under.
+// It is the responder's method verbatim, except a fingerprint-verified
+// component is baked down to presence+size unless the responder relayed a
+// positive verify cadence for the destination: that method is content-
+// verified for the puller's offload gate (the fingerprint cannot be
+// re-read locally), so it is only honoured while the responder keeps
+// re-confirming it. Absence of the cadence (an older responder that never
+// sends it, or a destination the responder runs on no cadence) fails the
+// coupling closed — the component then needs a local fingerprint the
+// relaying node does not hold, so the gate refuses (issue #155).
+func relayedMethod(c syncproto.DurabilityComponent) string {
+	if c.VerifyMethod == store.VerifyMethodFingerprint && c.VerifyEveryNs <= 0 {
+		return store.VerifyMethodPresenceSize
+	}
+	return c.VerifyMethod
 }
 
 // validateComponent guards the wire-supplied component before it

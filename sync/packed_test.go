@@ -180,8 +180,8 @@ func TestPackedDurabilityNotCertified(t *testing.T) {
 		if rep.Status != store.RunStatusSuccess {
 			t.Fatalf("Status = %q, want success", rep.Status)
 		}
-		// presence+size is not itself a content-verified method; the gate
-		// upgrades it through the pack's verified fingerprint.
+		// The run report stays unverified (presence+size); the durability
+		// vector is upgraded separately once the pack's fingerprint lands.
 		if rep.Verification.Verified() {
 			t.Fatalf("packed push reported verified; presence+size is not content-verified")
 		}
@@ -196,8 +196,10 @@ func TestPackedDurabilityNotCertified(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ListDestinationRunIDs: %v", err)
 		}
-		if len(vector) != 1 || vector[0].VerifyMethod != store.VerifyMethodPresenceSize {
-			t.Fatalf("vector = %+v, want one presence+size component (certified after fingerprint)", vector)
+		// With the pack fingerprinted the whole pair is fingerprint-verified,
+		// so certify advances the vector to fingerprint-verified (#155).
+		if len(vector) != 1 || vector[0].VerifyMethod != store.VerifyMethodFingerprint {
+			t.Fatalf("vector = %+v, want one fingerprint-verified component (certified after fingerprint)", vector)
 		}
 	})
 
@@ -231,6 +233,75 @@ func TestPackedDurabilityNotCertified(t *testing.T) {
 			t.Fatalf("vector = %+v, want empty (pending fingerprint must not certify)", vector)
 		}
 	})
+}
+
+// TestPackedVerifyThenAdvance is the friction-log F13(b) fix for packed: a
+// pack whose fingerprint capture failed holds the whole vector (empty), and
+// a later `squirrel verify` that fills the fingerprint re-attempts the
+// advance itself — upgrading the vector to fingerprint-verified rather than
+// stalling until the next content-writing sync.
+func TestPackedVerifyThenAdvance(t *testing.T) {
+	f := setupPackedFixture(t, "1MiB")
+	ctx := context.Background()
+	t.Setenv("RCLONE_FAKE_NO_HASHES", "1")
+	f.write(t, "small.txt", "tiny")
+	f.index(t)
+	if _, err := f.sync(t); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if vec, _ := f.store.ListDestinationRunIDs(ctx, f.volumeID(t), "offsite"); len(vec) != 0 {
+		t.Fatalf("vector = %+v, want empty while the pack fingerprint is pending", vec)
+	}
+
+	t.Setenv("RCLONE_FAKE_NO_HASHES", "")
+	rep, err := VerifyRemote(ctx, f.store, f.rcl, f.pair.Destination)
+	if err != nil {
+		t.Fatalf("VerifyRemote: %v", err)
+	}
+	if rep.PacksPopulated != 1 || !rep.Clean() {
+		t.Fatalf("verify rep = %+v, want one pack fingerprint populated on a clean pass", rep)
+	}
+	vec, err := f.store.ListDestinationRunIDs(ctx, f.volumeID(t), "offsite")
+	if err != nil {
+		t.Fatalf("ListDestinationRunIDs: %v", err)
+	}
+	if len(vec) != 1 || vec[0].VerifyMethod != store.VerifyMethodFingerprint {
+		t.Fatalf("vector = %+v, want one fingerprint-verified component after verify", vec)
+	}
+}
+
+// TestPackedLaterRunHeldByPendingPack is the friction-log F13(a) fix: a
+// later run whose own pack is fingerprint-verified must NOT advance the
+// vector while an earlier run's pack is still pending. The per-state gate
+// holds the whole advance — the old per-run gate advanced vacuously past
+// the earlier pending pack.
+func TestPackedLaterRunHeldByPendingPack(t *testing.T) {
+	f := setupPackedFixture(t, "1MiB")
+	ctx := context.Background()
+
+	// Run A: the pack lands but the backend exposes no checksum -> pending.
+	t.Setenv("RCLONE_FAKE_NO_HASHES", "1")
+	f.write(t, "one.txt", "first")
+	f.index(t)
+	if _, err := f.sync(t); err != nil {
+		t.Fatalf("run A sync: %v", err)
+	}
+
+	// Run B: its own pack IS fingerprinted, but run A's pack stays pending.
+	t.Setenv("RCLONE_FAKE_NO_HASHES", "")
+	f.write(t, "two.txt", "second")
+	f.index(t)
+	if _, err := f.sync(t); err != nil {
+		t.Fatalf("run B sync: %v", err)
+	}
+
+	vec, err := f.store.ListDestinationRunIDs(ctx, f.volumeID(t), "offsite")
+	if err != nil {
+		t.Fatalf("ListDestinationRunIDs: %v", err)
+	}
+	if len(vec) != 0 {
+		t.Fatalf("vector = %+v, want empty: run B must not advance past run A's still-pending pack", vec)
+	}
 }
 
 // TestPackedAssemblyDeterministic: the same input set produces byte-for-byte

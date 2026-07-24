@@ -55,9 +55,17 @@ type gate struct {
 	// Zero disables the time-based policy — the opt-in default, so the
 	// version-vector gate behaves exactly as before.
 	maxEvidenceAge time.Duration
+	// cadenced marks the required targets that carry an effective local
+	// verify cadence (a per-destination verify_every, or the [agent]
+	// default). A locally-verified fingerprint-verified component gates
+	// only while its destination is re-confirmed on a cadence; a target
+	// this node cannot see (a relayed offsite) is absent from the map, and
+	// the relayed cadence is enforced at pull time instead. Nil is a valid
+	// empty set — no target is treated as cadenced.
+	cadenced map[string]bool
 }
 
-func loadGate(ctx context.Context, s *store.Store, volumeID int64, require []string, nowNs int64, maxEvidenceAge time.Duration) (*gate, error) {
+func loadGate(ctx context.Context, s *store.Store, volumeID int64, require []string, nowNs int64, maxEvidenceAge time.Duration, cadenced map[string]bool) (*gate, error) {
 	self, err := s.GetSelfNode(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("lookup self node: %w", err)
@@ -73,6 +81,7 @@ func loadGate(ctx context.Context, s *store.Store, volumeID int64, require []str
 		nodeNames:      map[int64]string{self.ID: self.Name},
 		nowNs:          nowNs,
 		maxEvidenceAge: maxEvidenceAge,
+		cadenced:       cadenced,
 	}
 	for _, target := range require {
 		components, err := s.ListDestinationRunIDs(ctx, volumeID, target)
@@ -249,15 +258,45 @@ func (g *gate) freshnessFailure(ctx context.Context, target string, row store.Fi
 // passes only once a verified scan-back fingerprint backs the gated content
 // — via either layout: a remote_objects row (per-hash object) or a
 // remote_packs row for the content's pack, each carrying a checksum and a
-// verified_at_ns for this destination. Any other method (including a
-// size+mtime push or an unknown/pre-v19 component) does not gate.
+// verified_at_ns for this destination.
+//
+// A fingerprint-verified component (the upgrade of a presence+size vector
+// once the whole pair carries verified fingerprints) is content-verified
+// only while a scheduled verify cadence keeps that evidence fresh:
+//
+//   - relayed (a durability pull tagged it): acceptance was decided at pull
+//     time, where a fingerprint-verified method survives only when the
+//     responder relayed a positive verify cadence for the destination
+//     (else it is baked down to presence+size, which then needs a local
+//     fingerprint this node does not hold). So a relayed fingerprint-
+//     verified component passes here directly.
+//   - local (this node advanced it): it passes while the destination has a
+//     live verify cadence; without one it falls back to the per-content
+//     scan-back check, since the node holds the fingerprints itself and
+//     re-reads them on every verify pass — the cadence coupling binds the
+//     relayed path, where the evidence cannot be re-read locally.
+//
+// Any other method (a size+mtime push or an unknown/pre-v19 component)
+// does not gate.
 func (g *gate) methodVerified(ctx context.Context, target string, comp component, row store.FileRow) (bool, error) {
 	if store.ContentVerifiedMethod(comp.method) {
 		return true, nil
 	}
+	if comp.method == store.VerifyMethodFingerprint {
+		if comp.source.Valid || g.cadenced[target] {
+			return true, nil
+		}
+		return g.contentFingerprintVerified(ctx, target, row)
+	}
 	if comp.method != store.VerifyMethodPresenceSize {
 		return false, nil
 	}
+	return g.contentFingerprintVerified(ctx, target, row)
+}
+
+// contentFingerprintVerified reports whether a verified provider
+// fingerprint backs the row's content on the target (either layout).
+func (g *gate) contentFingerprintVerified(ctx context.Context, target string, row store.FileRow) (bool, error) {
 	verified, err := g.store.ContentFingerprintVerified(ctx, row.ContentID, target)
 	if err != nil {
 		return false, fmt.Errorf("load fingerprint for content %d on %q: %w", row.ContentID, target, err)

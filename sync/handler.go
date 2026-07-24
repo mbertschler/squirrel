@@ -35,6 +35,10 @@ const (
 	// (crypt remotes expose no hashes), so results carrying it stay
 	// unverified until the provider-checksum fingerprint pass lands.
 	VerifyMethodPresenceSize = store.VerifyMethodPresenceSize
+	// VerifyMethodFingerprint upgrades a presence+size component once every
+	// object and pack backing the (volume, destination) pair is
+	// fingerprint-verified. Minted by capture and by `squirrel verify`.
+	VerifyMethodFingerprint = store.VerifyMethodFingerprint
 )
 
 // VerifyResult is the typed durability report of one handler push: how

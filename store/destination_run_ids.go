@@ -31,14 +31,36 @@ const (
 	// content check on its own — a verified scan-back fingerprint must
 	// back the object before such a component gates offload.
 	VerifyMethodPresenceSize = "presence+size"
+	// VerifyMethodFingerprint is the upgrade of a presence+size component
+	// once every object and pack backing the (volume, destination) pair
+	// carries a verified provider fingerprint (a local BLAKE3 confirmed at
+	// upload, re-confirmed against the provider's checksum of the stored
+	// bytes). Capture and `squirrel verify` both mint it (see
+	// UpgradeDestinationVectorToFingerprintVerified). It relays over the
+	// durability pull verbatim like any other method, letting a node that
+	// cannot re-read the object itself (a relayed offsite) treat the
+	// evidence as content-verified. Because that relayed evidence is only
+	// as trustworthy as the responder's re-confirmation cadence, the
+	// offload gate accepts it as content-verified only while a scheduled
+	// verify cadence keeps it fresh — hence it is deliberately absent from
+	// ContentVerifiedMethod, which the gate treats as unconditionally
+	// content-verified.
+	VerifyMethodFingerprint = "fingerprint-verified"
 )
 
 // ContentVerifiedMethod reports whether a durability component advanced
-// by method carries genuine content verification — the precondition the
-// offload gate applies before deleting a local copy. A presence-only or
-// size+mtime method is not content-verified; an empty method (a pre-v19
-// component, or one whose provenance is unknown) is treated as
-// unverified so the gate refuses rather than over-claims.
+// by method carries genuine, cadence-independent content verification —
+// the precondition the offload gate applies before deleting a local copy.
+// A presence-only or size+mtime method is not content-verified; an empty
+// method (a pre-v19 component, or one whose provenance is unknown) is
+// treated as unverified so the gate refuses rather than over-claims.
+//
+// VerifyMethodFingerprint is deliberately excluded: its evidence counts as
+// content-verified only while a scheduled verify cadence keeps it
+// re-confirmed, a condition the offload gate applies itself (local: the
+// configured cadence; relayed: the responder's cadence, baked in at pull
+// time). Callers wanting the fingerprint-verified method to count must
+// apply that cadence check themselves rather than reading it here.
 func ContentVerifiedMethod(method string) bool {
 	switch method {
 	case VerifyMethodBlake3, VerifyMethodPeer, VerifyMethodKopia:
@@ -59,7 +81,7 @@ func ContentVerifiedMethod(method string) bool {
 // callers that accept it test for "" explicitly.
 func KnownVerifyMethod(method string) bool {
 	switch method {
-	case VerifyMethodBlake3, VerifyMethodSizeMtime, VerifyMethodPeer, VerifyMethodKopia, VerifyMethodPresenceSize:
+	case VerifyMethodBlake3, VerifyMethodSizeMtime, VerifyMethodPeer, VerifyMethodKopia, VerifyMethodPresenceSize, VerifyMethodFingerprint:
 		return true
 	default:
 		return false
@@ -221,6 +243,52 @@ func (s *Store) AdvanceDestinationVectorTo(ctx context.Context, volumeID int64, 
 		}
 	}
 	return s.recordPushFreshness(ctx, volumeID, destination, components)
+}
+
+// UpgradeDestinationVectorToFingerprintVerified re-stamps the destination's
+// whole durability vector for the volume as VerifyMethodFingerprint when —
+// and only when — every present content of the volume already carries a
+// verified provider fingerprint on the destination (zero pending
+// artifacts). It is the per-state gate that fixes the two friction-log F13
+// defects: capture and `squirrel verify` both call it, so the advance
+// happens exactly when the outstanding fingerprints are complete, never
+// vacuously past a still-pending pack (the advance covers the whole present
+// set, so one pending artifact holds all of it) and never left stranded
+// after verify fills the last fingerprint.
+//
+// selfNodeID is the coordinate NULL-origin content counts under, the same
+// PresentOriginMaxima the push captured. It returns whether the vector was
+// upgraded; a pending artifact, an empty present set, or a destination this
+// volume has never successfully pushed to all return (false, nil) without
+// touching the vector — the last guard keeps content that is durable on the
+// destination only through *another* volume's push (objects are
+// destination-global) from minting a vector component for a volume whose
+// path→hash manifest never landed there.
+func (s *Store) UpgradeDestinationVectorToFingerprintVerified(ctx context.Context, volumeID int64, destination string, selfNodeID int64) (bool, error) {
+	if _, err := s.LatestSuccessfulSyncRun(ctx, volumeID, destination); err != nil {
+		if IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("lookup last successful sync of %q: %w", destination, err)
+	}
+	pending, err := s.CountVolumeContentsPendingFingerprint(ctx, volumeID, destination)
+	if err != nil {
+		return false, err
+	}
+	if pending != 0 {
+		return false, nil
+	}
+	components, err := s.PresentOriginMaxima(ctx, volumeID, selfNodeID)
+	if err != nil {
+		return false, err
+	}
+	if len(components) == 0 {
+		return false, nil
+	}
+	if err := s.AdvanceDestinationVectorTo(ctx, volumeID, destination, VerifyMethodFingerprint, components); err != nil {
+		return false, fmt.Errorf("upgrade destination vector for %q: %w", destination, err)
+	}
+	return true, nil
 }
 
 // recordPushFreshness overwrites the destination's push-freshness maxima

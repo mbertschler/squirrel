@@ -514,3 +514,142 @@ func TestOffloadDurableFileStillPasses(t *testing.T) {
 	oneResult(t, rep, "a.txt", OutcomeOffloaded)
 	oneResult(t, rep, "sub/b.txt", OutcomeOffloaded)
 }
+
+// TestOffloadFingerprintVerifiedRelayedGates is the crown-jewel relayed
+// path (issue #155): a peer-asserted fingerprint-verified component gates.
+// It exists only because the responder relayed a positive verify cadence
+// (the pull bakes it to presence+size otherwise), so the puller — which
+// holds no local fingerprint of the object — may treat the relayed
+// evidence as content-verified.
+func TestOffloadFingerprintVerifiedRelayedGates(t *testing.T) {
+	const target = "s3archive"
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), "alpha")
+	s := setupStore(t)
+	ctx := context.Background()
+	idx := indexVolume(t, s, root)
+	v := testVolume(t, s)
+	self := selfNode(t, s)
+
+	peer, err := s.GetOrCreateOriginNode(ctx, "nas")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode: %v", err)
+	}
+	if err := s.UpsertDestinationRunIDPulled(ctx, v.ID, target, self.ID, idx.RunID, store.VerifyMethodFingerprint, peer.ID, store.NowNs(), false); err != nil {
+		t.Fatalf("UpsertDestinationRunIDPulled: %v", err)
+	}
+	seedRelayedFreshness(t, s, v.ID, target, self.ID, idx.RunID)
+
+	rep, err := Offload(ctx, s, root, Options{Name: volName, Paths: []string{"."}, Require: []string{target}})
+	if err != nil {
+		t.Fatalf("Offload: %v", err)
+	}
+	oneResult(t, rep, "a.txt", OutcomeOffloaded)
+	mustBeGone(t, filepath.Join(root, "a.txt"))
+}
+
+// TestOffloadFingerprintVerifiedRelayedBakedDownRefused is the fail-closed
+// direction: when the responder relays no verify cadence the pull stores
+// the component as presence+size (see relayedMethod), and the puller has no
+// local fingerprint to back it — so the gate refuses (issue #155).
+func TestOffloadFingerprintVerifiedRelayedBakedDownRefused(t *testing.T) {
+	const target = "s3archive"
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), "alpha")
+	s := setupStore(t)
+	ctx := context.Background()
+	idx := indexVolume(t, s, root)
+	v := testVolume(t, s)
+	self := selfNode(t, s)
+
+	peer, err := s.GetOrCreateOriginNode(ctx, "nas")
+	if err != nil {
+		t.Fatalf("GetOrCreateOriginNode: %v", err)
+	}
+	if err := s.UpsertDestinationRunIDPulled(ctx, v.ID, target, self.ID, idx.RunID, store.VerifyMethodPresenceSize, peer.ID, store.NowNs(), false); err != nil {
+		t.Fatalf("UpsertDestinationRunIDPulled: %v", err)
+	}
+	seedRelayedFreshness(t, s, v.ID, target, self.ID, idx.RunID)
+
+	rep, err := Offload(ctx, s, root, Options{Name: volName, Paths: []string{"."}, Require: []string{target}})
+	if err != nil {
+		t.Fatalf("Offload: %v", err)
+	}
+	res := oneResult(t, rep, "a.txt", OutcomeNotDurable)
+	if len(res.Reasons) != 1 || !strings.Contains(res.Reasons[0], "not content-verified") {
+		t.Fatalf("reasons = %v, want a not-content-verified refusal", res.Reasons)
+	}
+	mustExist(t, filepath.Join(root, "a.txt"))
+}
+
+// TestOffloadFingerprintVerifiedLocalCadenceCoupling covers a locally-
+// advanced fingerprint-verified component: it gates when the destination
+// carries a verify cadence, falls back to a locally-held object fingerprint
+// when it does not (the node re-reads its own objects), and refuses when
+// neither holds (issue #155).
+func TestOffloadFingerprintVerifiedLocalCadenceCoupling(t *testing.T) {
+	const target = "arch"
+	seed := func(t *testing.T) (*store.Store, string, store.FileRow, int64) {
+		root := t.TempDir()
+		writeFile(t, filepath.Join(root, "a.txt"), "alpha")
+		s := setupStore(t)
+		ctx := context.Background()
+		idx := indexVolume(t, s, root)
+		v := testVolume(t, s)
+		self := selfNode(t, s)
+		if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, target, self.ID, idx.RunID, store.VerifyMethodFingerprint, false); err != nil {
+			t.Fatalf("UpsertDestinationRunIDVerified: %v", err)
+		}
+		pushRun := recordPush(t, s, v.ID, target)
+		return s, root, rowAt(t, s, v.ID, "a.txt"), pushRun
+	}
+
+	t.Run("cadence accepts", func(t *testing.T) {
+		s, root, _, _ := seed(t)
+		rep, err := Offload(context.Background(), s, root, Options{
+			Name: volName, Paths: []string{"."}, Require: []string{target},
+			VerifyCadenced: map[string]bool{target: true},
+		})
+		if err != nil {
+			t.Fatalf("Offload: %v", err)
+		}
+		oneResult(t, rep, "a.txt", OutcomeOffloaded)
+		mustBeGone(t, filepath.Join(root, "a.txt"))
+	})
+
+	t.Run("no cadence, no local fingerprint refuses", func(t *testing.T) {
+		s, root, _, _ := seed(t)
+		rep, err := Offload(context.Background(), s, root, Options{
+			Name: volName, Paths: []string{"."}, Require: []string{target},
+		})
+		if err != nil {
+			t.Fatalf("Offload: %v", err)
+		}
+		res := oneResult(t, rep, "a.txt", OutcomeNotDurable)
+		if len(res.Reasons) != 1 || !strings.Contains(res.Reasons[0], "not content-verified") {
+			t.Fatalf("reasons = %v, want a not-content-verified refusal", res.Reasons)
+		}
+		mustExist(t, filepath.Join(root, "a.txt"))
+	})
+
+	t.Run("no cadence, local fingerprint falls back", func(t *testing.T) {
+		s, root, row, pushRun := seed(t)
+		ctx := context.Background()
+		if err := s.InsertRemoteObject(ctx, store.RemoteObject{
+			ContentID: row.ContentID, Destination: target, UploadedRunID: pushRun,
+		}); err != nil {
+			t.Fatalf("InsertRemoteObject: %v", err)
+		}
+		if err := s.SetRemoteObjectFingerprint(ctx, row.ContentID, target, "sftp-sha256", "abc", store.NowNs()); err != nil {
+			t.Fatalf("SetRemoteObjectFingerprint: %v", err)
+		}
+		rep, err := Offload(ctx, s, root, Options{
+			Name: volName, Paths: []string{"."}, Require: []string{target},
+		})
+		if err != nil {
+			t.Fatalf("Offload: %v", err)
+		}
+		oneResult(t, rep, "a.txt", OutcomeOffloaded)
+		mustBeGone(t, filepath.Join(root, "a.txt"))
+	})
+}
