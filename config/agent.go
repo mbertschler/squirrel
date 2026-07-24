@@ -17,7 +17,8 @@ const (
 // callers try to start without it.
 type Agent struct {
 	// Listen is the TCP address the agent binds to, e.g. "0.0.0.0:8443".
-	// Required.
+	// Optional: an empty value selects listener-less, scheduler-only mode
+	// (F35) — the agent runs its cadences without binding an HTTP server.
 	Listen string
 	// DB optionally overrides the top-level db for the agent process. The
 	// agent binary resolves --db > Agent.DB > top-level db > default; an
@@ -28,9 +29,10 @@ type Agent struct {
 	// empty disables TLS (plain HTTP).
 	TLSCert string
 	TLSKey  string
-	// Token is the resolved bearer token literal. Required: an agent
-	// without a token is an unauthenticated open port and we refuse to
-	// start one.
+	// Token is the resolved bearer token literal. Required only when Listen
+	// is set: an agent with a listener but no token is an unauthenticated
+	// open port and we refuse to start one. A listener-less agent has no
+	// HTTP surface and needs no token.
 	Token string
 	// PeerTokens maps a per-peer bearer token to the node name that
 	// presents it, so the agent can recover an authenticated caller
