@@ -10,7 +10,10 @@ version: 2
 
 before:
   hooks:
-    - go mod tidy
+    # download, not tidy: the release must not rewrite go.mod/go.sum (a
+    # dirty tree can fail the release). CI already enforces tidiness on
+    # every push.
+    - go mod download
 
 builds:
   - id: squirrel

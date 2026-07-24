@@ -23,6 +23,8 @@ sudo mv squirrel /usr/local/bin/
 squirrel version
 ```
 
+On Windows, download the `_windows_` `.zip`, extract `squirrel.exe`, and put it on your `PATH`.
+
 `squirrel version` (and the agent's `GET /v1/health`) reports the exact release you installed, so you can pin or roll back to a known build.
 
 ### From source (Go toolchain)
