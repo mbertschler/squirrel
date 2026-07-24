@@ -430,15 +430,16 @@ func applyVerifyAlarm(ctx context.Context, s *store.Store, rep *RemoteVerifyRepo
 	if !rep.Clean() {
 		detail := fmt.Sprintf("objects mismatched=%d missing=%d, packs mismatched=%d missing=%d",
 			len(rep.Mismatched), len(rep.Missing), len(rep.PackMismatched), len(rep.PacksMissing))
-		// AlarmRaised reports only a *new* latch, so the CLI can shout on
-		// first detection without re-shouting every subsequent pass.
-		switch _, err := s.GetDestinationAlarm(ctx, rep.Destination); {
-		case store.IsNotFound(err):
-			rep.AlarmRaised = true
-		case err != nil:
-			return fmt.Errorf("check standing alarm for %q: %w", rep.Destination, err)
+		// AlarmRaised reflects only a *newly* created latch, taken from the
+		// atomic insert itself — so the CLI shouts on first detection but a
+		// concurrent second raise (which found the latch already there)
+		// stays quiet. No pre-read: that would be a TOCTOU race.
+		raised, err := s.RaiseDestinationAlarm(ctx, rep.Destination, store.AlarmKindVerifyMismatch, detail, rep.RunID)
+		if err != nil {
+			return fmt.Errorf("raise standing alarm for %q: %w", rep.Destination, err)
 		}
-		return s.RaiseDestinationAlarm(ctx, rep.Destination, store.AlarmKindVerifyMismatch, detail, rep.RunID)
+		rep.AlarmRaised = raised
+		return nil
 	}
 	cleared, err := s.ClearDestinationAlarm(ctx, rep.Destination, rep.RunID, "")
 	if err != nil {

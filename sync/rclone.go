@@ -280,7 +280,7 @@ type FailedFile struct {
 const maxFailedFiles = 100
 
 // maxStderrCapture bounds RunResult.Stderr. rclone's fatal diagnostics are
-// a line or two; 4 KiB keeps a useful head of a chattier failure without
+// a line or two; 4 KiB keeps a useful tail of a chattier failure without
 // letting a misbehaving child stream unbounded bytes into the run row.
 const maxStderrCapture = 4 << 10
 
@@ -621,15 +621,12 @@ func applyStatsEvent(result *RunResult, st *rcloneStats, onProgress func(runeven
 	}
 }
 
-// appendStderr accumulates a non-JSON stderr line into result.Stderr up to
-// maxStderrCapture bytes. Once the cap is reached further lines are
-// dropped — the head of a fatal diagnostic is what identifies the failure,
-// so keeping the first bytes is more useful than a tail. Blank lines are
-// skipped so the capture stays dense.
+// appendStderr accumulates a non-JSON stderr line into result.Stderr,
+// keeping the last maxStderrCapture bytes. rclone prints its fatal error
+// line last, so the tail is the most diagnostic slice to retain when a
+// chatty run overflows the bound; older lines are trimmed from the front.
+// Blank lines are skipped so the capture stays dense.
 func appendStderr(result *RunResult, line []byte) {
-	if len(result.Stderr) >= maxStderrCapture {
-		return
-	}
 	trimmed := strings.TrimSpace(string(line))
 	if trimmed == "" {
 		return
@@ -639,6 +636,6 @@ func appendStderr(result *RunResult, line []byte) {
 	}
 	result.Stderr += trimmed
 	if len(result.Stderr) > maxStderrCapture {
-		result.Stderr = result.Stderr[:maxStderrCapture]
+		result.Stderr = result.Stderr[len(result.Stderr)-maxStderrCapture:]
 	}
 }

@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -95,15 +96,28 @@ func TestParseJSONLogCapturesFatalLevelAndRawStderr(t *testing.T) {
 }
 
 // TestParseJSONLogStderrBounded: a pathological non-JSON stream can't
-// balloon RunResult.Stderr past the cap.
+// balloon RunResult.Stderr past the cap, and the capture keeps the tail
+// (rclone's fatal line prints last) — the final line survives while an
+// early one is trimmed from the front.
 func TestParseJSONLogStderrBounded(t *testing.T) {
+	lines := make([]string, 0, 2000)
+	for i := 0; i < 2000; i++ {
+		lines = append(lines, fmt.Sprintf("stderr line %04d", i))
+	}
 	var r RunResult
-	parseJSONLog(strings.NewReader(strings.Repeat("x", 10*maxStderrCapture)), &r, nil)
+	parseJSONLog(strings.NewReader(strings.Join(lines, "\n")), &r, nil)
+
 	if len(r.Stderr) == 0 {
-		t.Fatal("Stderr empty, want the head of the long line")
+		t.Fatal("Stderr empty, want the tail of the stream")
 	}
 	if len(r.Stderr) > maxStderrCapture {
 		t.Fatalf("Stderr len = %d, want <= %d", len(r.Stderr), maxStderrCapture)
+	}
+	if !strings.Contains(r.Stderr, "stderr line 1999") {
+		t.Fatal("Stderr lost the final line — tail not kept")
+	}
+	if strings.Contains(r.Stderr, "stderr line 0000") {
+		t.Fatal("Stderr kept the first line — want the tail only")
 	}
 }
 
