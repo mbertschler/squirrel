@@ -35,6 +35,18 @@ type destSchema struct {
 	// requiredSecret fields accept the same forms as secretFields but
 	// must resolve to a non-empty value.
 	requiredSecret []string
+	// renderKey maps a squirrel config key to the option name rclone's
+	// backend actually recognises, for the fields where squirrel's config
+	// vocabulary and rclone's option schema diverge (sftp's password →
+	// `pass`, b2's account_id/application_key → `account`/`key`). A key
+	// absent from this map renders under its own name. Translating only at
+	// the rclone boundary keeps squirrel's names in config and Params, so
+	// the user-facing config surface is unaffected.
+	renderKey map[string]string
+	// obscure lists the config keys whose value rclone's backend requires
+	// "obscured" (rclone's reversible AES obfuscation). squirrel holds the
+	// plaintext and applies the transform at render time via rcloneObscure.
+	obscure map[string]bool
 }
 
 // destSchemas registers every supported destination type. Adding a new type
@@ -57,6 +69,13 @@ var destSchemas = map[string]destSchema{
 		requiredString: []string{"host", "user"},
 		optionalString: []string{"port", "key_file", "known_hosts_file", "host_key_algorithms"},
 		secretFields:   []string{"password"},
+		// rclone's sftp backend has no `password` option — it names it `pass`
+		// and requires it rclone-obscured. Rendered verbatim, `password` is
+		// silently ignored and rclone falls back to ssh-agent (friction log
+		// F5). squirrel keeps the descriptive `password` in config and
+		// translates + obscures only at render time.
+		renderKey: map[string]string{"password": "pass"},
+		obscure:   map[string]bool{"password": true},
 	},
 	"s3": {
 		// storage_class maps to rclone's s3 storage_class config key; its
@@ -72,6 +91,11 @@ var destSchemas = map[string]destSchema{
 		rcloneType:     "b2",
 		requiredString: []string{"bucket"},
 		secretFields:   []string{"account_id", "application_key"},
+		// rclone's b2 backend names these `account` (the key ID) and `key`
+		// (the application key). squirrel keeps the more descriptive
+		// account_id/application_key in config and renames only at render
+		// time (friction log F5).
+		renderKey: map[string]string{"account_id": "account", "application_key": "key"},
 	},
 	"gcs": {
 		rcloneType:     "gcs",
@@ -445,11 +469,7 @@ func resolveCryptSecret(table map[string]any, key string, alreadyObscured bool) 
 	if val == "" || alreadyObscured {
 		return val, nil
 	}
-	obscured, err := obscureRclone(val)
-	if err != nil {
-		return "", fmt.Errorf("crypt.%s: %w", key, err)
-	}
-	return obscured, nil
+	return rcloneObscure(val), nil
 }
 
 // validateCryptRemoteNames rejects a config where one destination's crypt
@@ -607,16 +627,8 @@ func (d *Destination) RcloneSection() string {
 	fmt.Fprintf(&b, "type = %s\n", schema.rcloneType)
 	// Stable ordering: required → optional → secret, alphabetical within
 	// each band. Stable output makes the rendered file diffable.
-	for _, key := range sortedSubset(schema.requiredString) {
-		if v, ok := d.Params[key]; ok {
-			fmt.Fprintf(&b, "%s = %s\n", key, v)
-		}
-	}
-	for _, key := range sortedSubset(schema.optionalString) {
-		if v, ok := d.Params[key]; ok {
-			fmt.Fprintf(&b, "%s = %s\n", key, v)
-		}
-	}
+	d.renderParams(&b, schema, schema.requiredString)
+	d.renderParams(&b, schema, schema.optionalString)
 	if d.Type == "sftp" {
 		// rclone's sftp backend only autodetects md5sum/sha1sum, so BLAKE3
 		// must be named explicitly or squirrel's `--hash blake3` syncs abort
@@ -627,16 +639,35 @@ func (d *Destination) RcloneSection() string {
 			fmt.Fprintf(&b, "hashes = %s\n", d.HashAlgo)
 		}
 	}
-	for _, key := range sortedSubset(schema.secretFields) {
-		if v, ok := d.Params[key]; ok {
-			fmt.Fprintf(&b, "%s = %s\n", key, v)
-		}
-	}
+	d.renderParams(&b, schema, schema.secretFields)
 	if d.Crypt != nil {
 		b.WriteString("\n")
 		b.WriteString(d.cryptSection())
 	}
 	return b.String()
+}
+
+// renderParams writes the `key = value` lines for the given band of schema
+// keys present in d.Params, alphabetically for a stable render. Each key is
+// emitted under rclone's own option name (schema.renderKey) and its value
+// obscured when rclone's backend requires it (schema.obscure) — the two
+// points where squirrel's config vocabulary and rclone's option schema
+// diverge, applied here so the user-facing config surface never sees them.
+func (d *Destination) renderParams(b *strings.Builder, schema destSchema, keys []string) {
+	for _, key := range sortedSubset(keys) {
+		v, ok := d.Params[key]
+		if !ok {
+			continue
+		}
+		if schema.obscure[key] {
+			v = rcloneObscure(v)
+		}
+		name := key
+		if renamed, ok := schema.renderKey[key]; ok {
+			name = renamed
+		}
+		fmt.Fprintf(b, "%s = %s\n", name, v)
+	}
 }
 
 // CryptRemoteName is the rclone.conf section name of the crypt overlay

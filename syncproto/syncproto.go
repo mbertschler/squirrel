@@ -370,11 +370,26 @@ type DurabilityRequest struct {
 // DurabilityResponse carries every vector component the receiver has
 // recorded for the volume, across all of its destinations, plus the
 // freshness coordinates of each destination's most recent whole-volume
-// push. Empty when the receiver has never advanced a vector for the
-// volume.
+// push, plus the offload-gating capability of the destinations the
+// receiver owns for this volume. Empty when the receiver has never
+// advanced a vector for the volume (Capabilities can still be populated:
+// capability is a structural property of the config, independent of
+// whether any evidence has been recorded yet).
 type DurabilityResponse struct {
 	Components []DurabilityComponent `json:"components,omitempty"`
 	Freshness  []DurabilityFreshness `json:"freshness,omitempty"`
+	// Capabilities advertises, per destination the responder owns and
+	// syncs this volume to, whether that destination can ever contribute a
+	// durability component the offload gate accepts. A puller that gates
+	// offload on a peer-relayed required target (a target it has no local
+	// config for) consults this to fail fast up front when the owning
+	// peer's destination is structurally incapable — closing the
+	// peer-relayed subset of the offload fail-fast (#145). Absent from a
+	// responder that predates the field; a puller that finds no capability
+	// entry for a relayed target falls back to the per-file gate, so stale
+	// or missing capability info never turns a genuinely-pending state into
+	// an abort.
+	Capabilities []DestinationCapability `json:"capabilities,omitempty"`
 }
 
 // DurabilityComponent is one destination-vector component: the highest
@@ -421,6 +436,23 @@ type DurabilityFreshness struct {
 	OriginNode  string `json:"origin_node"`
 	OriginRun   int64  `json:"origin_run"`
 	UpdatedAtNs int64  `json:"updated_at_ns"`
+}
+
+// DestinationCapability advertises one destination the responding node
+// owns and whether it can ever gate offload. Destination is in the flat
+// target namespace shared by buckets and peers. CanGate is the responder's
+// own config.Destination.CanEverGateOffload verdict: false marks a
+// structurally-incapable shape (today, a crypt mirror — the overlay hides
+// the content hash and the mirror layout keeps no fingerprint to upgrade
+// it), and Reason names that gap verbatim for the puller's abort message.
+// The puller runs no predicate of its own on a relayed target — it has no
+// config for it — so it trusts the owning peer's verdict, exactly as it
+// trusts that peer's durability assertions (SAFETY-AUDIT.md D1). Reason is
+// empty when CanGate is true.
+type DestinationCapability struct {
+	Destination string `json:"destination"`
+	CanGate     bool   `json:"can_gate"`
+	Reason      string `json:"reason,omitempty"`
 }
 
 // ErrorResponse is the uniform error body. Mirrors agent's

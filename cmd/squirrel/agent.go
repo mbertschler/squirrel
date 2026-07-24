@@ -17,11 +17,6 @@ import (
 	"github.com/mbertschler/squirrel/sync"
 )
 
-// agentVersion is the value reported by GET /v1/health. A real release
-// would inject this via -ldflags at build time; the placeholder is
-// adequate for the unreleased peer-sync work.
-const agentVersion = "0.0.0-dev"
-
 // newAgentCmd returns the `squirrel agent` cobra command. It starts the
 // HTTP server declared by the `[agent]` config block and blocks until
 // the cobra context (wired to SIGINT/SIGTERM in main) is cancelled. The
@@ -64,8 +59,9 @@ func runAgent(cmd *cobra.Command) error {
 		PeerTokens:   cfg.Agent.PeerTokens,
 		TLSCert:      cfg.Agent.TLSCert,
 		TLSKey:       cfg.Agent.TLSKey,
-		Version:      agentVersion,
+		Version:      version,
 		Volumes:      cfg.Volumes,
+		Destinations: cfg.Destinations,
 		SyncRunner:   buildSchedulerSyncRunner(cfg, s, rcl),
 		ScanInterval: cfg.Agent.ScanInterval,
 		ScanStrategy: cfg.Agent.ScanStrategy,
@@ -130,7 +126,7 @@ func agentHasWork(cfg *config.Config) bool {
 // "agent listening" banner so a journal shows the agent came up in
 // scheduler-only mode with no bound port.
 func logSchedulerOnlyStartup(logger *slog.Logger) {
-	logger.Info("agent scheduler running", "listener", "disabled", "version", agentVersion)
+	logger.Info("agent scheduler running", "listener", "disabled", "version", version)
 }
 
 // openAgentStore extends the standard resolveDBPath precedence with the
@@ -277,7 +273,7 @@ func logAgentStartup(logger *slog.Logger, srv *agent.Server, addr string) {
 	attrs := []any{
 		"addr", addr,
 		"scheme", scheme,
-		"version", agentVersion,
+		"version", version,
 	}
 	// Surfacing the fingerprint at startup (F1) lets an operator read the
 	// pin peers must put in [nodes.X.tls] straight from the agent's log,

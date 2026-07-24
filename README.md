@@ -12,9 +12,28 @@ The same principle extends to sync: overwrites at the destination are preserved 
 
 ## Install
 
+### Prebuilt binary (no Go toolchain)
+
+Each `vX.Y.Z` tag publishes cross-platform binaries on the [releases page](https://github.com/mbertschler/squirrel/releases). Download the archive for your OS/arch, verify it against `checksums.txt`, extract, and put `squirrel` on your `PATH`:
+
+```
+# Linux/macOS — adjust VERSION/OS/ARCH to the asset you downloaded:
+tar -xzf squirrel_<VERSION>_<OS>_<ARCH>.tar.gz
+sudo mv squirrel /usr/local/bin/
+squirrel version
+```
+
+On Windows, download the `_windows_` `.zip`, extract `squirrel.exe`, and put it on your `PATH`.
+
+`squirrel version` (and the agent's `GET /v1/health`) reports the exact release you installed, so you can pin or roll back to a known build.
+
+### From source (Go toolchain)
+
 ```
 go install github.com/mbertschler/squirrel/cmd/squirrel@latest
 ```
+
+A source build reports its version as `0.0.0-dev` — the version is only stamped into the released binaries at build time.
 
 You will also need [rclone](https://rclone.org) ≥ 1.66 on `PATH` for `sync` and `restore` to work (BLAKE3 hash support landed in rclone 1.66):
 
@@ -147,8 +166,8 @@ Properties that differ from mirrored destinations:
 
 - **Verification is presence+size**, recorded as such: per-object transfers can't carry the end-to-end BLAKE3 check (and `crypt` remotes expose no hashes at all), so the runs row is recorded shallow and the push never claims content verification. On top of that, each upload's provider-side ciphertext fingerprint is recorded in the index and re-checked by [`squirrel verify`](#offsite-verification-squirrel-verify).
 - **Pick the layout when the destination is first used.** Switching an existing mirrored destination to `content-addressed` (or back) is not supported — point the new layout at a fresh destination or root. The push detects a mirrored history (a recorded successful sync without its manifest segment) and refuses.
-- **`squirrel restore` refuses the layout** for now; recovery tooling ships separately. The format is deliberately simple enough to recover without squirrel — see below.
-- `--dry-run` is not supported yet.
+- **`squirrel restore` restores the layout**: it resolves each present path to its content hash from the local index, fetches the per-hash object through the same rclone (`crypt`) read path the push uses, and re-hashes every fetched object before writing. When the *local index itself* is lost, the format is deliberately simple enough to recover without squirrel — see below.
+- `--dry-run` is not supported yet on the push (it previews restore).
 
 #### Offsite verification (`squirrel verify`)
 
@@ -224,7 +243,7 @@ Routing is by **size**: content at or above `pack_threshold` lands as `objects/<
 
 Durability is **transactional per run and three-artifact**: a run advances the destination's durability evidence only once *all three* of its artifacts — every pack, the run's `packs/map-<run>`, and its `index/run-<run>` segment — are confirmed on the remote **and** every pack has a verified scan-back fingerprint. A pack's fingerprint is read straight back from the provider after upload (one check per ~512 MB pack vouches for every file it holds — the packed analogue of the per-object scan-back); if that read is unavailable the pack is left **pending** with a warning and the vector is *not* advanced, so unverified packed content is never counted durable. [`squirrel verify`](#offsite-verification-squirrel-verify) fills any pending pack fingerprint and re-confirms the rest, per pack.
 
-Properties match the content-addressed layout: verification is presence+size (recorded shallow), the layout is chosen at first use and refuses to run against a differently-shaped history, `--dry-run` is not supported yet, and **`squirrel restore` refuses the layout** — recovery tooling ships separately, and the format is simple enough to recover without squirrel (below).
+Properties match the content-addressed layout: verification is presence+size (recorded shallow), the layout is chosen at first use and refuses to run against a differently-shaped history, and `--dry-run` is not supported yet on the push. **`squirrel restore` restores the layout too**: it locates each present path's content in the local index (a pack member via `pack_members`, or a per-hash object), fetches each pack **once** to serve all its requested members, decompresses the tar.zst stream, and re-hashes every extracted member before writing. When the local index is lost, the format still recovers without squirrel (below).
 
 #### Placement map format
 
@@ -358,9 +377,8 @@ squirrel sync pictures --to mirror          # every time after
 
 `--init` authorises the one-time first-use setup, by destination type:
 
-- **`local`** — writes a `.squirrel-volume` marker under the destination's volume directory. Every later sync **requires** that marker and refuses if it is missing (a missing marker after the fact almost always means the root is wrong — an unmounted disk or a typo). A marker that names a *different* volume is always refused, with or without `--init`.
+- **`local` and remote rclone** (`sftp`, `s3`, `b2`, `gcs`) — write a `.squirrel-volume` marker under the destination's volume directory (on the filesystem for local, over rclone through the same overlay the transfer uses for remotes). Every later sync **requires** that marker and refuses if it is missing (a missing marker after the fact almost always means the root is wrong — an unmounted disk, a typo, or an unreachable remote). A marker that names a *different* volume is always refused, with or without `--init`. This holds across the mirror, content-addressed, and packed layouts: the marker sits at the volume root regardless of layout, and is filtered out of every transfer, comparison, and restore.
 - **`kopia`** — permits `kopia repository create` when connecting finds no repository.
-- **Remote rclone** (`sftp`, `s3`, `b2`, `gcs`) — do **not** yet enforce a marker, so they don't currently require `--init`; marker support for them is a tracked follow-up (#64).
 
 Why a flag rather than auto-create on first use: a missing marker (or a missing kopia repository) is ambiguous — it could mean "genuinely new" or "the destination I expect is unreachable right now." Auto-creating in the second case would mint a fresh **empty** target, record it as durable, and — once `offload` trusts that durability — let it delete the only local copy. Requiring `--init` keeps that irreversible "create a new target" step a one-time, human-driven act. In particular, **the agent/scheduler never passes `--init`**, so an unattended sync can never silently create an empty target on a transient outage.
 

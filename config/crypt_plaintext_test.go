@@ -28,10 +28,10 @@ password2 = "the-salt"
 	if c.Password == "hunter2" {
 		t.Fatalf("crypt password was stored plaintext, not obscured")
 	}
-	if got := revealRclone(t, c.Password); got != "hunter2" {
+	if got := reveal(t, c.Password); got != "hunter2" {
 		t.Fatalf("obscured password reveals to %q, want %q", got, "hunter2")
 	}
-	if got := revealRclone(t, c.Password2); got != "the-salt" {
+	if got := reveal(t, c.Password2); got != "the-salt" {
 		t.Fatalf("obscured salt reveals to %q, want %q", got, "the-salt")
 	}
 }

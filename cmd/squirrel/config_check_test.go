@@ -80,6 +80,12 @@ func TestCLIConfigCheckMissingVolumeFails(t *testing.T) {
 // TestCLIConfigCheckOffloadMirrorCrypt exercises the offload_requires
 // satisfiability check (F21): a mirror-layout crypt destination can never
 // yield offload evidence, so naming it is a fatal misconfiguration.
+//
+// The rejection now lands at config load (#155's
+// rejectUnsatisfiableOffloadRequires), ahead of `config check`'s own
+// per-target classification, so what a user sees from `config check` is the
+// load error. Either way the command must name the target, explain why it can
+// never gate, and exit non-zero — that contract is what this pins.
 func TestCLIConfigCheckOffloadMirrorCrypt(t *testing.T) {
 	dir := t.TempDir()
 	docs := filepath.Join(dir, "docs")
@@ -94,11 +100,11 @@ func TestCLIConfigCheckOffloadMirrorCrypt(t *testing.T) {
 	cfgPath := writeCheckConfig(t, body)
 
 	out, err := runCLIExpectErr(t, "--config", cfgPath, "config", "check")
-	if !strings.Contains(out, "never yields offload evidence") {
-		t.Fatalf("expected offload-evidence problem:\n%s", out)
+	if !strings.Contains(out, "cloudbox") || !strings.Contains(out, "can never satisfy the durability gate") {
+		t.Fatalf("expected an unsatisfiable-offload problem naming cloudbox:\n%s", out)
 	}
-	if !strings.Contains(err.Error(), "problem") {
-		t.Fatalf("expected problem error, got %v", err)
+	if err == nil {
+		t.Fatal("expected a non-zero exit for an unsatisfiable offload_requires")
 	}
 }
 

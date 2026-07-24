@@ -52,9 +52,105 @@ func TestOffloadIncapableTargetAbortsUpFront(t *testing.T) {
 // left to the per-file gate — never a preflight nil-dereference crash.
 func TestCheckTargetsCanGateSkipsNilAndAbsent(t *testing.T) {
 	dests := map[string]*config.Destination{"backup": nil}
-	if err := checkTargetsCanGate([]string{"backup", "missing"}, dests); err != nil {
+	if err := checkTargetsCanGate([]string{"backup", "missing"}, dests, nil); err != nil {
 		t.Fatalf("checkTargetsCanGate with nil/absent entries = %v, want nil (skipped)", err)
 	}
+}
+
+// TestCheckTargetsCanGateRelayed exercises the peer-relayed half of the
+// pre-check: a relayed target the owning peer reports incapable aborts and
+// names target/reason/peer; a relayed target reported capable, or one with
+// no verdict at all (peer unreachable / predates the field), never aborts —
+// it falls through to the per-file gate.
+func TestCheckTargetsCanGateRelayed(t *testing.T) {
+	require := []string{"s3archive"}
+
+	// Incapable relayed verdict → abort naming target, reason, and peer.
+	incapable := []RelayedTargetCapability{{
+		Target: "s3archive", Peer: "nas", CanGate: false,
+		Reason: "shallow path-mirrored crypt destination",
+	}}
+	err := checkTargetsCanGate(require, nil, incapable)
+	if err == nil {
+		t.Fatal("checkTargetsCanGate with an incapable relayed target = nil, want abort")
+	}
+	for _, want := range []string{`"s3archive"`, "shallow path-mirrored crypt destination", `peer "nas"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("err = %v, want it to contain %q", err, want)
+		}
+	}
+
+	// Capable relayed verdict → no abort (pending is fine).
+	capable := []RelayedTargetCapability{{Target: "s3archive", Peer: "nas", CanGate: true}}
+	if err := checkTargetsCanGate(require, nil, capable); err != nil {
+		t.Fatalf("capable relayed target = %v, want nil (walks per file)", err)
+	}
+
+	// No verdict at all → no abort (best-effort fallback).
+	if err := checkTargetsCanGate(require, nil, nil); err != nil {
+		t.Fatalf("absent relayed capability = %v, want nil (per-file fallback)", err)
+	}
+}
+
+// TestOffloadRelayedIncapableTargetAbortsUpFront: a peer-relayed required
+// target the owning peer reports incapable aborts the whole offload before
+// any run row opens, with a message naming the target, the reason, and the
+// owning peer — the peer-relayed subset of the #121 fail-fast (#145).
+func TestOffloadRelayedIncapableTargetAbortsUpFront(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), "alpha")
+	s := setupStore(t)
+	indexVolume(t, s, root)
+	runsBefore := countRuns(t, s)
+
+	relayed := []RelayedTargetCapability{{
+		Target: "cloudbox", Peer: "nas", CanGate: false,
+		Reason: "shallow path-mirrored crypt destination",
+	}}
+	rep, err := Offload(context.Background(), s, root, Options{
+		Name: volName, Paths: []string{"."}, Require: []string{"cloudbox"}, RelayedCaps: relayed,
+	})
+	if err == nil {
+		t.Fatalf("Offload succeeded, want fail-fast; report = %+v", rep)
+	}
+	for _, want := range []string{`"cloudbox"`, "shallow path-mirrored crypt destination", `peer "nas"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("err = %v, want it to contain %q", err, want)
+		}
+	}
+	if len(rep.Results) != 0 || rep.RunID != 0 {
+		t.Fatalf("report = %+v, want empty (no candidates walked, no run opened)", rep)
+	}
+	if got := countRuns(t, s); got != runsBefore {
+		t.Fatalf("runs = %d, want unchanged %d (no offload run opened)", got, runsBefore)
+	}
+	mustExist(t, filepath.Join(root, "a.txt"))
+}
+
+// TestOffloadRelayedCapablePendingStillWalks: a peer-relayed required target
+// the owning peer reports capable but whose durability is not yet recorded
+// must NOT fail fast — a capable-but-pending relayed target walks per file
+// and reports not-durable, exactly as a locally-configured capable target.
+func TestOffloadRelayedCapablePendingStillWalks(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), "alpha")
+	s := setupStore(t)
+	indexVolume(t, s, root)
+
+	relayed := []RelayedTargetCapability{{Target: "s3archive", Peer: "nas", CanGate: true}}
+	rep, err := Offload(context.Background(), s, root, Options{
+		Name: volName, Paths: []string{"."}, Require: []string{"s3archive"}, RelayedCaps: relayed,
+	})
+	if err != nil {
+		t.Fatalf("Offload: %v (a capable-but-pending relayed target must walk, not fail fast)", err)
+	}
+	if rep.Offloaded != 0 || rep.NotDurable != 1 || rep.Errors != 0 {
+		t.Fatalf("report = %+v, want one not-durable result", rep)
+	}
+	if rep.RunID == 0 {
+		t.Fatal("RunID = 0, want a real offload run (the walk happened)")
+	}
+	mustExist(t, filepath.Join(root, "a.txt"))
 }
 
 // TestOffloadCapableTargetPendingStillWalks: a required target that is

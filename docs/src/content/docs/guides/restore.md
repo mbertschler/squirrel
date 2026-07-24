@@ -43,16 +43,48 @@ overwrite is first moved to `.squirrel-restore-history/run-<id>/`, mirroring the
 append-only [`.squirrel-history`](/squirrel/layouts/mirror/) behavior on the sync
 side. Nothing is destroyed.
 
-## Layouts that restore does not support yet
+## Content-addressed and packed destinations
 
-`squirrel restore` currently refuses:
+`squirrel restore` handles the
+[content-addressed](/squirrel/layouts/content-addressed/) and
+[packed](/squirrel/layouts/packed/) layouts too — they have no mirrored tree to
+copy, so restore works from the **local index** instead:
 
-- **[Kopia](/squirrel/layouts/kopia/) destinations** — restore goes through the
-  kopia CLI (`kopia snapshot restore`) instead.
-- **[Content-addressed](/squirrel/layouts/content-addressed/) and
-  [packed](/squirrel/layouts/packed/) destinations** — recovery tooling ships
-  separately, and the formats are simple enough to
-  [recover without squirrel](/squirrel/reference/formats/#disaster-recovery-without-squirrel).
+1. Each present path is resolved to its content BLAKE3 in the index.
+2. The bytes are located per content: a per-hash object under `objects/`, or a
+   member of a `tar.zst` pack under `packs/` (`pack_members` carries its
+   offset and length).
+3. Objects and packs are fetched through the same rclone (`crypt`) read path the
+   push uses. **Packs are fetched once** — one download serves every requested
+   member of that pack, never one fetch per file.
+4. Every fetched object and extracted pack member is **re-hashed to BLAKE3 and
+   compared** before it is written, so a misplaced or corrupted byte is refused
+   rather than restored. (Because of this, `--shallow` does not weaken an
+   archive restore — the content check is intrinsic.)
+
+:::note[Cold storage tiers need a manual thaw first]
+Restore reads whole objects and packs, so an object stored on a cold tier that
+must be *thawed before it can be read* (AWS S3 Glacier Flexible Retrieval / Deep
+Archive) has to be restored-to-standard out of band first — e.g.
+`aws s3 restore-object …` or `rclone backend restore …` — and then
+`squirrel restore` run once the objects are readable. squirrel does not yet
+orchestrate the Glacier `RestoreObject`-and-poll cycle. Warm and standard tiers
+(including `GLACIER_IR`) and local destinations need no thaw.
+:::
+
+:::note[Restoring when the local index is lost]
+The archive restore reads path→hash from the local index. If the index itself is
+gone, first recover it — swap in the [ride-along index
+snapshot](#restoring-the-index-too) — or recover the data directly from the
+[on-disk format](/squirrel/reference/formats/#disaster-recovery-without-squirrel).
+A `--from-manifest` mode that rebuilds the mapping from the destination's manifest
+segments is a possible future addition.
+:::
+
+## Kopia destinations
+
+`squirrel restore` still refuses [kopia](/squirrel/layouts/kopia/) destinations —
+restore goes through the kopia CLI (`kopia snapshot restore`) instead.
 
 ## Restoring the index too
 
