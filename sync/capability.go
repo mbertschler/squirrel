@@ -3,10 +3,23 @@ package sync
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/syncproto"
 )
+
+// peerProbeTimeout bounds a single peer's capability probe. Unlike the
+// long-running sync exchanges (which stream data and rely on caller
+// cancellation), this is a quick preflight metadata read: the shared
+// nodeClient sets no request timeout, so a peer that is reachable but
+// unresponsive — it completes the TCP/TLS handshake yet never returns a
+// response header — would otherwise hang the offload preflight forever.
+// Bounding it keeps the probe strictly best-effort: a timed-out peer
+// becomes a soft advisory and the target falls back to the per-file gate,
+// never a hard block. It is a var (not a const) only so tests can shorten
+// it. Mirrors the TUI agent client, which likewise bounds agent queries.
+var peerProbeTimeout = 15 * time.Second
 
 // RelayedCapability is one peer-relayed target's offload-gating capability
 // as advertised by the peer that owns it. It is the wire
@@ -41,7 +54,13 @@ func GatherRelayedCapabilities(ctx context.Context, volumeName string, nodes []*
 	var caps []RelayedCapability
 	var softErrs []string
 	for _, node := range nodes {
-		resp, err := newNodeClient(node).durability(ctx, syncproto.DurabilityRequest{Volume: volumeName})
+		// Each peer gets its own bounded budget so one unresponsive peer
+		// cannot starve the others or hang the whole preflight. The full
+		// response is decoded before durability returns, so cancelling
+		// immediately after is safe.
+		probeCtx, cancel := context.WithTimeout(ctx, peerProbeTimeout)
+		resp, err := newNodeClient(node).durability(probeCtx, syncproto.DurabilityRequest{Volume: volumeName})
+		cancel()
 		if err != nil {
 			softErrs = append(softErrs, fmt.Sprintf("peer %q: %v", node.Name, err))
 			continue

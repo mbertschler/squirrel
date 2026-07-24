@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/mbertschler/squirrel/agent"
 	"github.com/mbertschler/squirrel/config"
@@ -103,6 +104,52 @@ func TestGatherRelayedCapabilitiesUnreachablePeerIsSoft(t *testing.T) {
 		[]*config.Node{dead}, map[string]struct{}{"cloudbox": {}})
 	if len(caps) != 0 {
 		t.Fatalf("caps = %+v, want none from an unreachable peer", caps)
+	}
+	if len(softErrs) != 1 {
+		t.Fatalf("softErrs = %v, want exactly one advisory", softErrs)
+	}
+}
+
+// TestGatherRelayedCapabilitiesUnresponsivePeerIsBounded: a peer that is
+// reachable (accepts the connection) but never returns a response header
+// must not hang the preflight — the per-peer probe timeout fires, yielding
+// a soft advisory and no capability, so the target falls back to the
+// per-file gate. Without the bound this call would block indefinitely (the
+// shared nodeClient sets no request timeout).
+func TestGatherRelayedCapabilitiesUnresponsivePeerIsBounded(t *testing.T) {
+	block := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		<-block // hang until the test tears the server down
+	}))
+	// Cleanups run LIFO: unblock the handler first so the subsequent
+	// ts.Close (which waits for outstanding requests) does not deadlock.
+	t.Cleanup(ts.Close)
+	t.Cleanup(func() { close(block) })
+	endpoint, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatalf("parse test URL: %v", err)
+	}
+
+	orig := peerProbeTimeout
+	peerProbeTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { peerProbeTimeout = orig })
+
+	wedged := &config.Node{Name: "nas", Endpoint: endpoint, Token: "test-token"}
+	done := make(chan struct{})
+	var caps []RelayedCapability
+	var softErrs []string
+	go func() {
+		caps, softErrs = GatherRelayedCapabilities(context.Background(), "pics",
+			[]*config.Node{wedged}, map[string]struct{}{"cloudbox": {}})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("GatherRelayedCapabilities did not return; the probe is not bounded")
+	}
+	if len(caps) != 0 {
+		t.Fatalf("caps = %+v, want none from an unresponsive peer", caps)
 	}
 	if len(softErrs) != 1 {
 		t.Fatalf("softErrs = %v, want exactly one advisory", softErrs)
