@@ -198,7 +198,7 @@ type = "sftp"
 host = "nas.local"
 user = "martin"
 root = "/data"
-password = "p"
+password = "sftp-secret"
 `)
 	r := &Rclone{}
 	target := filepath.Join(t.TempDir(), "rclone.conf")
@@ -213,10 +213,15 @@ password = "p"
 		t.Fatalf("perm = %o, want 0600 (secrets are inside this file)", info.Mode().Perm())
 	}
 	body, _ := os.ReadFile(target)
-	for _, want := range []string{"[nas]", "type = sftp", "host = nas.local", "password = p"} {
+	// rclone's sftp secret option is `pass`, obscured — never the verbatim
+	// `password` key (which rclone ignores) nor the plaintext (friction F5).
+	for _, want := range []string{"[nas]", "type = sftp", "host = nas.local", "pass = "} {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("rclone.conf missing %q:\n%s", want, body)
 		}
+	}
+	if strings.Contains(string(body), "sftp-secret") {
+		t.Fatalf("plaintext sftp password leaked into rclone.conf:\n%s", body)
 	}
 }
 
@@ -351,12 +356,17 @@ password2 = "obscured-salt"
 	if err != nil {
 		t.Fatalf("read rclone.conf: %v", err)
 	}
+	// The sftp `pass` value is rcloneObscure("transport-pw"): AES-CTR under
+	// rclone's fixed published key with a zero IV, base64 raw-URL. The zero
+	// IV makes the render deterministic (so this file-level golden is
+	// stable) yet fully revealable by rclone. The crypt overlay's password
+	// is a user-supplied obscured value, passed through verbatim.
 	want := `[offsite]
 type = sftp
 host = host.example
 user = u
 blake3sum_command = b3sum
-password = transport-pw
+pass = AAAAAAAAAAAAAAAAAAAAADCpyAwmj8ezVRxkXA
 
 [offsite-crypt]
 type = crypt
