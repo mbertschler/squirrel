@@ -46,6 +46,10 @@ type dashboardData struct {
 	// that (volume, kind) pair. Used to fill the "last index" / "last sync"
 	// columns of the volumes table.
 	latestByVol map[int64]map[string]store.Run
+	// alarms are the standing per-destination alarms (#157, F30). A verify
+	// mismatch latches one until cleared; the dashboard shows them so the
+	// trust surface answers "am I safe?" with a red panel, not silence.
+	alarms []store.DestinationAlarm
 }
 
 type dashboardDataMsg struct {
@@ -104,11 +108,40 @@ func (m *dashboardModel) View() string {
 	}
 	sections := []string{
 		m.renderAgentBlock(),
+	}
+	if alarms := m.renderAlarms(); alarms != "" {
+		sections = append(sections, alarms)
+	}
+	sections = append(sections,
 		m.renderActiveRuns(),
 		m.renderVolumes(),
 		m.renderRecentRuns(),
-	}
+	)
 	return strings.Join(sections, "\n\n")
+}
+
+// renderAlarms shows the standing per-destination alarms (#157, F30) high
+// on the dashboard, right below agent health, because a latched verify
+// mismatch is exactly the "am I safe?" answer the trust surface must not
+// bury. Returns "" when nothing is in alarm so the section is absent on a
+// healthy install rather than showing an empty green box.
+func (m *dashboardModel) renderAlarms() string {
+	if len(m.data.alarms) == 0 {
+		return ""
+	}
+	header := styleErr.Render(fmt.Sprintf("Alarms (%d)", len(m.data.alarms)))
+	rows := [][]string{{"DESTINATION", "KIND", "SINCE", "RUN", "DETAIL"}}
+	for _, a := range m.data.alarms {
+		rows = append(rows, []string{
+			a.Destination,
+			a.Kind,
+			whenAgo(sql.NullInt64{Int64: a.RaisedAtNs, Valid: true}, m.data.now),
+			fmt.Sprintf("#%d", a.RaisedRunID),
+			a.Detail,
+		})
+	}
+	colours := []lipgloss.Color{colourFailure, "", "", "", ""}
+	return header + "\n" + renderTable(rows, colours)
 }
 
 func (m *dashboardModel) renderAgentBlock() string {
@@ -266,6 +299,10 @@ func loadDashboardData(ctx context.Context, s *store.Store) (dashboardData, erro
 	if err != nil {
 		return dashboardData{}, fmt.Errorf("latest by volume: %w", err)
 	}
+	alarms, err := s.ListDestinationAlarms(ctx)
+	if err != nil {
+		return dashboardData{}, fmt.Errorf("list alarms: %w", err)
+	}
 	var active, recent []store.Run
 	for _, r := range runs {
 		if r.Status == store.RunStatusRunning {
@@ -282,5 +319,6 @@ func loadDashboardData(ctx context.Context, s *store.Store) (dashboardData, erro
 		activeRuns:  active,
 		recentRuns:  recent,
 		latestByVol: latestByVol,
+		alarms:      alarms,
 	}, nil
 }

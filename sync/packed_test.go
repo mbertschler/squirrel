@@ -430,8 +430,11 @@ func TestPackedWatermarkGuardRefusesContentAddressed(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "not packed") {
 		t.Fatalf("expected packed-history refusal, got %v", err)
 	}
-	if rep.Status != store.RunStatusFailed {
-		t.Fatalf("Status = %q, want failed", rep.Status)
+	if !errors.Is(err, ErrRefused) {
+		t.Fatalf("layout guard should be a refusal (ErrRefused), got %v", err)
+	}
+	if rep.Status != store.RunStatusRefused {
+		t.Fatalf("Status = %q, want refused", rep.Status)
 	}
 }
 
@@ -454,8 +457,11 @@ func TestPackedWatermarkGuardRefusesMirror(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "not packed") {
 		t.Fatalf("expected packed-history refusal, got %v", err)
 	}
-	if rep.Status != store.RunStatusFailed {
-		t.Fatalf("Status = %q, want failed", rep.Status)
+	if !errors.Is(err, ErrRefused) {
+		t.Fatalf("layout guard should be a refusal (ErrRefused), got %v", err)
+	}
+	if rep.Status != store.RunStatusRefused {
+		t.Fatalf("Status = %q, want refused", rep.Status)
 	}
 }
 

@@ -56,6 +56,15 @@ type RemoteVerifyReport struct {
 	// PackMismatched lists packs whose provider checksum no longer matches
 	// the recorded one (Hash holds the pack key hex).
 	PackMismatched []RemoteObjectMismatch
+
+	// AlarmRaised is true when this pass latched a new standing alarm on
+	// the destination because it was not clean (#157, F30). A pass on an
+	// already-alarmed destination leaves it false (the latch was already
+	// there). AlarmCleared is true when a clean pass auto-cleared a
+	// previously standing alarm. Both drive the CLI's loud surfacing; the
+	// authoritative state lives in the destination_alarms latch.
+	AlarmRaised  bool
+	AlarmCleared bool
 }
 
 // RemoteObjectMismatch is one object whose provider checksum no longer
@@ -404,5 +413,37 @@ func recordVerifyOutcome(ctx context.Context, s *store.Store, rep *RemoteVerifyR
 	if err := s.FinishRun(ctx, rep.RunID, status, errMsg, int64(rep.Objects+rep.Packs)); err != nil {
 		return fmt.Errorf("finish verify run %d: %w", rep.RunID, err)
 	}
+	return applyVerifyAlarm(ctx, s, rep, verifyErr)
+}
+
+// applyVerifyAlarm latches or clears the destination's standing alarm from
+// this pass's outcome (#157, F30). A pass that detected a mismatch or a
+// missing object/pack raises the alarm (idempotent — a re-detection keeps
+// the original "in alarm since"); a clean pass auto-clears any standing
+// alarm, recording the clear against this verify run. A pass that aborted
+// (verifyErr != nil) proves nothing about the destination's integrity, so
+// it neither raises nor clears — its failed run row is the record.
+func applyVerifyAlarm(ctx context.Context, s *store.Store, rep *RemoteVerifyReport, verifyErr error) error {
+	if verifyErr != nil {
+		return nil
+	}
+	if !rep.Clean() {
+		detail := fmt.Sprintf("objects mismatched=%d missing=%d, packs mismatched=%d missing=%d",
+			len(rep.Mismatched), len(rep.Missing), len(rep.PackMismatched), len(rep.PacksMissing))
+		// AlarmRaised reports only a *new* latch, so the CLI can shout on
+		// first detection without re-shouting every subsequent pass.
+		switch _, err := s.GetDestinationAlarm(ctx, rep.Destination); {
+		case store.IsNotFound(err):
+			rep.AlarmRaised = true
+		case err != nil:
+			return fmt.Errorf("check standing alarm for %q: %w", rep.Destination, err)
+		}
+		return s.RaiseDestinationAlarm(ctx, rep.Destination, store.AlarmKindVerifyMismatch, detail, rep.RunID)
+	}
+	cleared, err := s.ClearDestinationAlarm(ctx, rep.Destination, rep.RunID, "")
+	if err != nil {
+		return fmt.Errorf("auto-clear standing alarm for %q: %w", rep.Destination, err)
+	}
+	rep.AlarmCleared = cleared
 	return nil
 }

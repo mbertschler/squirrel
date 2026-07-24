@@ -73,6 +73,62 @@ func TestParseJSONLogCapturesObjectlessErrors(t *testing.T) {
 	}
 }
 
+// TestParseJSONLogCapturesFatalLevelAndRawStderr: a fatal-level JSON event
+// (previously dropped by the error-only filter) and a non-JSON pre-logger
+// diagnostic are both captured, so a failing destination is diagnosable
+// (#157, F6/F15) instead of leaving a blank ERROR column.
+func TestParseJSONLogCapturesFatalLevelAndRawStderr(t *testing.T) {
+	stream := strings.Join([]string{
+		`Failed to create file system for "cloudbox:/x": didn't find backend`,
+		`{"level":"fatal","msg":"NoCredentialProviders: no valid providers in chain"}`,
+		`{"stats":{"errors":0,"fatalError":true,"totalTransfers":0,"totalChecks":0,"bytes":0}}`,
+	}, "\n")
+	var r RunResult
+	parseJSONLog(strings.NewReader(stream), &r, nil)
+
+	if len(r.FailedFiles) != 1 || !strings.Contains(r.FailedFiles[0].Message, "NoCredentialProviders") {
+		t.Fatalf("FailedFiles = %+v, want the fatal-level message captured", r.FailedFiles)
+	}
+	if !strings.Contains(r.Stderr, "didn't find backend") {
+		t.Fatalf("Stderr = %q, want the non-JSON pre-logger diagnostic", r.Stderr)
+	}
+}
+
+// TestParseJSONLogStderrBounded: a pathological non-JSON stream can't
+// balloon RunResult.Stderr past the cap.
+func TestParseJSONLogStderrBounded(t *testing.T) {
+	var r RunResult
+	parseJSONLog(strings.NewReader(strings.Repeat("x", 10*maxStderrCapture)), &r, nil)
+	if len(r.Stderr) == 0 {
+		t.Fatal("Stderr empty, want the head of the long line")
+	}
+	if len(r.Stderr) > maxStderrCapture {
+		t.Fatalf("Stderr len = %d, want <= %d", len(r.Stderr), maxStderrCapture)
+	}
+}
+
+// TestDisplayErrors pins the summary error count: rclone's per-file count
+// wins, but a fatal invocation failure with no per-file count still
+// reports at least one error so a status=failed run never claims errors=0.
+func TestDisplayErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		r    RunResult
+		want int64
+	}{
+		{"per-file errors", RunResult{Errors: 3}, 3},
+		{"fatal, no count, no captured files", RunResult{FatalError: true}, 1},
+		{"fatal, captured files", RunResult{FatalError: true, FailedFiles: []FailedFile{{Message: "a"}, {Message: "b"}}}, 2},
+		{"fatal but per-file count wins", RunResult{FatalError: true, Errors: 5}, 5},
+		{"clean", RunResult{}, 0},
+	}
+	for _, c := range cases {
+		if got := c.r.DisplayErrors(); got != c.want {
+			t.Errorf("%s: DisplayErrors() = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
 // TestParseJSONLogDetectsHashFallback: rclone's no-common-hash notice is
 // emitted at NOTICE level, which the error filter drops; parseJSONLog
 // still flags it so a flags-set, exit-0 run that silently degraded to a

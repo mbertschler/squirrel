@@ -248,8 +248,11 @@ func TestKopiaConnectFailWithoutInitRefuses(t *testing.T) {
 	if !strings.Contains(err.Error(), "--init") {
 		t.Fatalf("error should point at --init, got %v", err)
 	}
-	if rep.Status != store.RunStatusFailed {
-		t.Fatalf("Status = %q, want failed", rep.Status)
+	if !errors.Is(err, ErrRefused) {
+		t.Fatalf("connect-without-init should be a refusal (ErrRefused), got %v", err)
+	}
+	if rep.Status != store.RunStatusRefused {
+		t.Fatalf("Status = %q, want refused", rep.Status)
 	}
 	argv, _ := readCallLog(t, logPath)
 	for _, line := range argv {

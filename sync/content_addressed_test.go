@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -627,8 +628,11 @@ func TestContentAddressedWatermarkGuard(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "does not look content-addressed") {
 		t.Fatalf("expected layout-flip refusal, got %v", err)
 	}
-	if rep.Status != store.RunStatusFailed {
-		t.Fatalf("Status = %q, want failed", rep.Status)
+	if !errors.Is(err, ErrRefused) {
+		t.Fatalf("layout guard should be a refusal (ErrRefused), got %v", err)
+	}
+	if rep.Status != store.RunStatusRefused {
+		t.Fatalf("Status = %q, want refused", rep.Status)
 	}
 }
 

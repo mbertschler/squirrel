@@ -186,13 +186,13 @@ func printSyncReport(w io.Writer, rep sync.Report, runErr error) {
 		// fresh uploads.
 		fmt.Fprintf(w, "%s → %s  status=%s objects=%d skipped=%d errors=%d bytes=%d entries=%d fingerprints=%d run=%d\n",
 			rep.Volume, rep.Destination, rep.Status,
-			r.Transferred, r.Checked, r.Errors, r.Bytes,
+			r.Transferred, r.Checked, r.DisplayErrors(), r.Bytes,
 			rep.Verification.Files, rep.Fingerprints, rep.RunID,
 		)
 	default:
 		fmt.Fprintf(w, "%s → %s  status=%s transferred=%d checked=%d errors=%d bytes=%d run=%d\n",
 			rep.Volume, rep.Destination, rep.Status,
-			r.Transferred, r.Checked, r.Errors, r.Bytes, rep.RunID,
+			r.Transferred, r.Checked, r.DisplayErrors(), r.Bytes, rep.RunID,
 		)
 	}
 	if rep.NodeReceiverRunID != 0 {

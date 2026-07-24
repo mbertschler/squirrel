@@ -59,6 +59,72 @@ func TestVerifyRemoteMatchStampsVerified(t *testing.T) {
 	}
 }
 
+// TestVerifyRemoteMismatchLatchesAlarmThenClears: a mismatch latches a
+// standing per-destination alarm (#157, F30), and a subsequent clean pass
+// auto-clears it. Both transitions land in the runs_audit trail.
+func TestVerifyRemoteMismatchLatchesAlarmThenClears(t *testing.T) {
+	f := setupContentAddressedFixture(t)
+	f.write(t, "a.txt", "alpha")
+	f.index(t)
+	if _, err := f.sync(t); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	ctx := context.Background()
+
+	if err := os.Setenv("RCLONE_FAKE_HASH_PREFIX", "tampered-"); err != nil {
+		t.Fatalf("set tamper: %v", err)
+	}
+	dirty, err := VerifyRemote(ctx, f.store, f.rcl, f.pair.Destination)
+	if err != nil {
+		t.Fatalf("VerifyRemote (tampered): %v", err)
+	}
+	if !dirty.AlarmRaised {
+		t.Fatalf("tampered pass did not raise an alarm: %+v", dirty)
+	}
+	alarm, err := f.store.GetDestinationAlarm(ctx, f.pair.Destination.Name)
+	if err != nil {
+		t.Fatalf("GetDestinationAlarm: %v", err)
+	}
+	if alarm.Kind != store.AlarmKindVerifyMismatch || alarm.RaisedRunID != dirty.RunID {
+		t.Fatalf("alarm = %+v, want verify-mismatch raised by run %d", alarm, dirty.RunID)
+	}
+	if n := countAuditTransition(t, f.store, dirty.RunID, store.TransitionAlarmRaise); n != 1 {
+		t.Fatalf("alarm-raise audit count = %d, want 1", n)
+	}
+
+	if err := os.Unsetenv("RCLONE_FAKE_HASH_PREFIX"); err != nil {
+		t.Fatalf("unset tamper: %v", err)
+	}
+	clean, err := VerifyRemote(ctx, f.store, f.rcl, f.pair.Destination)
+	if err != nil {
+		t.Fatalf("VerifyRemote (clean): %v", err)
+	}
+	if !clean.Clean() || !clean.AlarmCleared {
+		t.Fatalf("clean pass did not auto-clear the alarm: %+v", clean)
+	}
+	if _, err := f.store.GetDestinationAlarm(ctx, f.pair.Destination.Name); !store.IsNotFound(err) {
+		t.Fatalf("alarm still latched after clean pass: %v", err)
+	}
+	if n := countAuditTransition(t, f.store, clean.RunID, store.TransitionAlarmClear); n != 1 {
+		t.Fatalf("alarm-clear audit count = %d, want 1", n)
+	}
+}
+
+func countAuditTransition(t *testing.T, s *store.Store, runID int64, transition string) int {
+	t.Helper()
+	audits, err := s.ListRunAudit(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ListRunAudit(%d): %v", runID, err)
+	}
+	n := 0
+	for _, a := range audits {
+		if a.Transition == transition {
+			n++
+		}
+	}
+	return n
+}
+
 // TestVerifyRemoteMismatchIsLoudAndPreservesEvidence: a changed provider
 // checksum is reported per object, marks the run partial, and leaves
 // both the recorded fingerprint and the verification stamp untouched.

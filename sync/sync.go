@@ -50,6 +50,28 @@ const RestoreHistoryDirName = ".squirrel-restore-history"
 // and from peer-sync so a snapshot is never mistaken for user content.
 const IndexDirName = ".squirrel-index"
 
+// ErrRefused marks a preflight safety refusal: a gate that declined to
+// proceed before any transfer began — a missing or mismatched
+// .squirrel-volume marker, a kopia connect that found no repository
+// without --init, or a layout guard protecting a destination whose
+// recorded history belongs to a different layout. Gates wrap it into their
+// error with %w so the run-finalising path records store.RunStatusRefused
+// rather than RunStatusFailed: a refusal is a standing "won't do this"
+// condition, not a mid-flight failure, and the audit trail keeps the two
+// distinct (#157, F26).
+var ErrRefused = errors.New("refused")
+
+// terminalStatus resolves a run's terminal status from the derived status
+// and the operation error. A preflight refusal (errors.Is(err,
+// ErrRefused)) overrides to 'refused'; every other outcome keeps the
+// derived status.
+func terminalStatus(status string, runErr error) string {
+	if runErr != nil && errors.Is(runErr, ErrRefused) {
+		return store.RunStatusRefused
+	}
+	return status
+}
+
 // Options shapes one Sync invocation.
 type Options struct {
 	// Shallow drops --checksum and --hash blake3 so rclone uses its default
@@ -252,8 +274,12 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 	// dry-run on an uninitialised destination would prevent the
 	// "preview what would happen" workflow.
 	if !opts.DryRun && dest.Type == "local" {
-		if err := ensureDestinationMarker(ctx, s, dest, vol.Name, opts.Init); err != nil {
-			return rep, err
+		if merr := ensureDestinationMarker(ctx, s, dest, vol.Name, opts.Init); merr != nil {
+			// A marker refusal fires before the sync run is allocated, so
+			// record it as its own terminal 'refused' run — otherwise a
+			// month-dead backup disk produces zero red anywhere but agent
+			// stderr (#157, F26).
+			return recordSyncRefusal(ctx, s, volID, dest.Name, &rep, merr)
 		}
 	}
 
@@ -316,6 +342,28 @@ func captureDurabilityAdvance(ctx context.Context, s *store.Store, volumeID int6
 	return components, nil
 }
 
+// recordSyncRefusal mints a terminal kind='sync' run in the 'refused'
+// state for a preflight gate that declined before the transfer began, so
+// the refusal is visible in `squirrel runs` and the TUI instead of living
+// only in the returned error (#157, F26). The run is allocated ungated
+// (BeginRun, not the concurrency gate) — a refusal transfers nothing and
+// need not contend with an in-flight sync — and finished immediately with
+// refErr as the row's error. refErr is returned unchanged so callers
+// surface the same message; a failure to even record the refusal is folded
+// into the returned error rather than masking the original refusal.
+func recordSyncRefusal(ctx context.Context, s *store.Store, volID int64, destName string, rep *Report, refErr error) (Report, error) {
+	id, err := s.BeginRun(ctx, store.RunKindSync, volID, destName, false)
+	if err != nil {
+		return *rep, fmt.Errorf("%w (also failed to record the refusal as a run: %w)", refErr, err)
+	}
+	rep.RunID = id
+	rep.Status = store.RunStatusRefused
+	if ferr := s.FinishRun(ctx, id, store.RunStatusRefused, refErr.Error(), 0); ferr != nil {
+		rep.FinishErr = ferr
+	}
+	return *rep, refErr
+}
+
 // beginSyncRunGuarded is the sync-allocator the bucket and peer paths
 // share. It honours dry-run (returns 0 with no DB write) and delegates
 // to store.BeginSyncRunIfClear for the atomic gate. A blocked attempt
@@ -368,11 +416,19 @@ func runRcloneOperation(
 		return err
 	}
 	rep.RcloneResult, err = rcl.RunWithProgress(ctx, progress, args...)
-	if err != nil && rep.RcloneResult.Errors == 0 && !rep.RcloneResult.FatalError {
-		// Invocation failed without a parseable error count: treat as fatal.
-		rep.RcloneResult.FatalError = true
-	}
 	if err != nil {
+		if rep.RcloneResult.Errors == 0 && !rep.RcloneResult.FatalError {
+			// Invocation failed without a parseable error count: treat as fatal.
+			rep.RcloneResult.FatalError = true
+		}
+		// Ensure a diagnostic reaches the run row's error column and the
+		// CLI output even when rclone logged no per-file error event — auth,
+		// host-key, and config failures print to stderr, not the JSON log
+		// (#157, F6/F15). The returned error already folds in the stderr
+		// tail, so it is the most complete single message available.
+		if len(rep.RcloneResult.FailedFiles) == 0 {
+			rep.RcloneResult.FailedFiles = []FailedFile{{Message: err.Error()}}
+		}
 		return fmt.Errorf("rclone: %w", err)
 	}
 	return nil
@@ -519,13 +575,13 @@ func ensureDestinationMarker(ctx context.Context, s *store.Store, dest *config.D
 		return nil
 	}
 	if _, ok := errors.AsType[*volmark.ErrMismatch](err); ok {
-		return fmt.Errorf("destination %q: %w (refuse to init over a different volume's tree)", dest.Name, err)
+		return fmt.Errorf("destination %q: %w (refuse to init over a different volume's tree): %w", dest.Name, err, ErrRefused)
 	}
 	if !errors.Is(err, volmark.ErrMissing) {
 		return fmt.Errorf("destination %q marker check: %w", dest.Name, err)
 	}
 	if !init {
-		return fmt.Errorf("destination %q at %s has no %s marker — re-run with --init to bootstrap (refusing in case the root is a typo)", dest.Name, root, volmark.MarkerName)
+		return fmt.Errorf("destination %q at %s has no %s marker — re-run with --init to bootstrap (refusing in case the root is a typo): %w", dest.Name, root, volmark.MarkerName, ErrRefused)
 	}
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return fmt.Errorf("destination %q: mkdir %s: %w", dest.Name, root, err)

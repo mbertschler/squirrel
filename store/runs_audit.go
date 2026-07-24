@@ -33,6 +33,20 @@ const (
 	// CHECK keeps destination NULL on audit rows, so this entry is where
 	// the audit trail names the verified destination.
 	TransitionVerifyDestination = "verify-destination"
+	// TransitionAbort records a 'running' row reaped to 'aborted' by
+	// AbortRunningRuns at agent startup (#157, F14). The note carries the
+	// reap reason so a forensic reader can tell a crash-reap apart from a
+	// real failure.
+	TransitionAbort = "abort"
+	// TransitionAlarmRaise records a destination_alarms latch being raised
+	// against the verify run that detected the mismatch (#157, F30). The
+	// note carries the destination and a bounded detail summary.
+	TransitionAlarmRaise = "alarm-raise"
+	// TransitionAlarmClear records a destination_alarms latch being
+	// cleared: against the clean verify run that auto-cleared it (operator
+	// NULL) or against the run that raised it when an operator acks
+	// (operator set). The note carries the destination.
+	TransitionAlarmClear = "alarm-clear"
 )
 
 // RunAudit is one row of the insert-only runs_audit log: a single

@@ -100,7 +100,7 @@ func (k *Kopia) ensureRepository(ctx context.Context, cfgFile, password, repoPat
 		return nil
 	}
 	if !init {
-		return fmt.Errorf("kopia repository at %s: connect failed (%w) — re-run with --init to create a new repository (refusing to auto-create in case the path is wrong or the destination is temporarily unreachable)", repoPath, connectErr)
+		return fmt.Errorf("kopia repository at %s: connect failed (%w) — re-run with --init to create a new repository (refusing to auto-create in case the path is wrong or the destination is temporarily unreachable): %w", repoPath, connectErr, ErrRefused)
 	}
 	if _, createErr := k.run(ctx, cfgFile, password, "repository", "create", "filesystem", "--path", repoPath, "--no-persist-credentials"); createErr != nil {
 		return fmt.Errorf("kopia repository at %s: connect failed (%w); create failed: %w", repoPath, connectErr, createErr)

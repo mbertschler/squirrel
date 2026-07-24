@@ -75,7 +75,33 @@ func runRuns(cmd *cobra.Command, volumeName string, limit int) error {
 	if err != nil {
 		return err
 	}
-	return printRuns(cmd.OutOrStdout(), runs, volumes, nodes, conflicts)
+	if err := printRuns(cmd.OutOrStdout(), runs, volumes, nodes, conflicts); err != nil {
+		return err
+	}
+	alarms, err := s.ListDestinationAlarms(cmd.Context())
+	if err != nil {
+		return fmt.Errorf("list destination alarms: %w", err)
+	}
+	printActiveAlarms(cmd.OutOrStdout(), alarms)
+	return nil
+}
+
+// printActiveAlarms surfaces standing per-destination alarms beneath the
+// runs listing (#157, F30). A verify mismatch latches an alarm that must
+// stay visible until an operator clears it — a single old run row scrolls
+// away, so the audit surface repeats the standing condition on every
+// `squirrel runs` until it is resolved.
+func printActiveAlarms(w io.Writer, alarms []store.DestinationAlarm) {
+	if len(alarms) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "\n%d destination(s) in alarm — clear with a clean `squirrel verify` or `squirrel verify ack <dest>`:\n",
+		len(alarms))
+	for _, a := range alarms {
+		fmt.Fprintf(w, "  ALARM %s (%s) since %s, run %d: %s\n",
+			a.Destination, a.Kind,
+			formatStarted(a.RaisedAtNs), a.RaisedRunID, a.Detail)
+	}
 }
 
 // loadNodeNames builds an id→name map for the peer_node_id values

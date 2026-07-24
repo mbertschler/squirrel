@@ -238,6 +238,33 @@ type RunResult struct {
 	// for BLAKE3 verification but hit this path was not content-verified,
 	// however rclone exited, so the caller must not record it as verified.
 	HashFallback bool
+	// Stderr is a bounded tail of rclone's non-JSON stderr — the
+	// human-readable diagnostics it prints before (or instead of) the
+	// structured JSON log: backend construction, config, auth, and host-key
+	// failures. Bounded to maxStderrCapture bytes so a pathological run
+	// can't balloon memory. It is the evidence that made a failing
+	// destination undiagnosable when it was dropped on the floor (#157,
+	// F6/F15); callers fold it into the run row's error and the scheduler
+	// log. Empty when rclone emitted only structured events.
+	Stderr string
+}
+
+// DisplayErrors is the error count for summary lines and status
+// reconciliation. It returns rclone's per-file Errors, except that a fatal
+// invocation failure that produced no per-file count reports the number of
+// captured diagnostics (at least one) — so a run that is status=failed
+// never simultaneously claims errors=0, the contradiction F6 flagged.
+func (r RunResult) DisplayErrors() int64 {
+	if r.Errors > 0 {
+		return r.Errors
+	}
+	if r.FatalError {
+		if n := int64(len(r.FailedFiles)); n > 0 {
+			return n
+		}
+		return 1
+	}
+	return 0
 }
 
 // FailedFile is one per-object error from the JSON log. Object may be
@@ -251,6 +278,11 @@ type FailedFile struct {
 // run that explodes on millions of files cannot exhaust memory. The total
 // error count in RunResult.Errors is exact regardless of this cap.
 const maxFailedFiles = 100
+
+// maxStderrCapture bounds RunResult.Stderr. rclone's fatal diagnostics are
+// a line or two; 4 KiB keeps a useful head of a chattier failure without
+// letting a misbehaving child stream unbounded bytes into the run row.
+const maxStderrCapture = 4 << 10
 
 // Run executes `rclone <args...> --config <r.Config> --use-json-log` with
 // the given extra arguments. It streams both stdout (rclone writes to
@@ -315,9 +347,20 @@ func (r *Rclone) RunWithProgress(ctx context.Context, onProgress func(runevents.
 	waitErr := cmd.Wait()
 	if waitErr != nil {
 		result.FatalError = result.Errors == 0
-		return result, fmt.Errorf("rclone exit: %w", waitErr)
+		return result, rcloneExitError(waitErr, result.Stderr)
 	}
 	return result, nil
+}
+
+// rcloneExitError wraps a non-zero rclone exit, folding in the captured
+// stderr tail when present so the scheduler log and the run row carry the
+// actual reason (auth, host key, path) rather than a bare "exit status 1"
+// (#157, F6/F15).
+func rcloneExitError(waitErr error, stderrTail string) error {
+	if tail := strings.TrimSpace(stderrTail); tail != "" {
+		return fmt.Errorf("rclone exit: %w: %s", waitErr, tail)
+	}
+	return fmt.Errorf("rclone exit: %w", waitErr)
 }
 
 // runPlain executes rclone with the wrapper's --config but without the
@@ -491,21 +534,41 @@ var hashFallbackRE = regexp.MustCompile(`no hashes in common`)
 
 func isHashFallback(msg string) bool { return hashFallbackRE.MatchString(msg) }
 
+// isErrorLevel reports whether a JSON event's level should be captured as
+// a failure diagnostic. rclone reports a fatal backend/config/auth failure
+// at "fatal" (sometimes "critical"), not "error"; capturing only "error"
+// dropped exactly those messages, leaving a failed run's ERROR column
+// blank (#157, F15). All three are folded into FailedFiles.
+func isErrorLevel(level string) bool {
+	switch level {
+	case "error", "fatal", "critical":
+		return true
+	}
+	return false
+}
+
 // parseJSONLog reads JSON-per-line events from r and updates result in
-// place. Non-JSON lines (e.g. an early startup notice on an older rclone)
-// are skipped — we cannot make decisions on them and surfacing them as
-// errors would create false positives. onProgress, if non-nil, is
-// invoked once per stats event so callers can drive a live UI.
+// place. Non-JSON lines (rclone's pre-logger diagnostics — the backend,
+// config, auth, and host-key failures it prints before the structured
+// logger is live) are appended to result.Stderr, bounded, so a failure
+// that never reaches the JSON log still carries its reason (#157,
+// F6/F15). onProgress, if non-nil, is invoked once per stats event so
+// callers can drive a live UI.
 func parseJSONLog(r io.Reader, result *RunResult, onProgress func(runevents.Progress)) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		if len(line) == 0 || line[0] != '{' {
+		if len(line) == 0 {
+			continue
+		}
+		if line[0] != '{' {
+			appendStderr(result, line)
 			continue
 		}
 		var ev rcloneEvent
 		if err := json.Unmarshal(line, &ev); err != nil {
+			appendStderr(result, line)
 			continue
 		}
 		if isHashFallback(ev.Msg) {
@@ -515,30 +578,10 @@ func parseJSONLog(r io.Reader, result *RunResult, onProgress func(runevents.Prog
 			result.HashFallback = true
 		}
 		if ev.Stats != nil {
-			result.Transferred = ev.Stats.TotalTransfers
-			result.Checked = ev.Stats.TotalChecks
-			result.Bytes = ev.Stats.Bytes
-			// Don't overwrite Errors with a smaller value from a
-			// per-attempt stats line; take the maximum so retries that
-			// fail then succeed still surface the failure count.
-			if ev.Stats.Errors > result.Errors {
-				result.Errors = ev.Stats.Errors
-			}
-			if ev.Stats.FatalError {
-				result.FatalError = true
-			}
-			if onProgress != nil {
-				onProgress(runevents.Progress{
-					Stage:      runevents.StageUploading,
-					Done:       result.Transferred,
-					Total:      ev.Stats.TotalTransfers + ev.Stats.TotalChecks,
-					BytesDone:  result.Bytes,
-					BytesTotal: ev.Stats.TotalBytes,
-				})
-			}
+			applyStatsEvent(result, ev.Stats, onProgress)
 			continue
 		}
-		if ev.Level == "error" && !isRetrySummary(ev.Msg) {
+		if isErrorLevel(ev.Level) && !isRetrySummary(ev.Msg) {
 			// Capture object-less errors too: auth failures, listing
 			// errors, "Failed to copy: …" diagnostics carry no Object
 			// but are exactly the messages we want in runs.error. Filter
@@ -550,5 +593,52 @@ func parseJSONLog(r io.Reader, result *RunResult, onProgress func(runevents.Prog
 				})
 			}
 		}
+	}
+}
+
+// applyStatsEvent folds one rclone stats event into result and drives the
+// optional progress callback. Errors is taken as the running maximum so a
+// per-attempt stats line that reports fewer errors than a prior one (a
+// retry that partially recovered) can't erase the peak failure count.
+func applyStatsEvent(result *RunResult, st *rcloneStats, onProgress func(runevents.Progress)) {
+	result.Transferred = st.TotalTransfers
+	result.Checked = st.TotalChecks
+	result.Bytes = st.Bytes
+	if st.Errors > result.Errors {
+		result.Errors = st.Errors
+	}
+	if st.FatalError {
+		result.FatalError = true
+	}
+	if onProgress != nil {
+		onProgress(runevents.Progress{
+			Stage:      runevents.StageUploading,
+			Done:       result.Transferred,
+			Total:      st.TotalTransfers + st.TotalChecks,
+			BytesDone:  result.Bytes,
+			BytesTotal: st.TotalBytes,
+		})
+	}
+}
+
+// appendStderr accumulates a non-JSON stderr line into result.Stderr up to
+// maxStderrCapture bytes. Once the cap is reached further lines are
+// dropped — the head of a fatal diagnostic is what identifies the failure,
+// so keeping the first bytes is more useful than a tail. Blank lines are
+// skipped so the capture stays dense.
+func appendStderr(result *RunResult, line []byte) {
+	if len(result.Stderr) >= maxStderrCapture {
+		return
+	}
+	trimmed := strings.TrimSpace(string(line))
+	if trimmed == "" {
+		return
+	}
+	if result.Stderr != "" {
+		result.Stderr += "\n"
+	}
+	result.Stderr += trimmed
+	if len(result.Stderr) > maxStderrCapture {
+		result.Stderr = result.Stderr[:maxStderrCapture]
 	}
 }

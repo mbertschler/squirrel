@@ -10,7 +10,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 24
+const SchemaVersion = 25
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -60,6 +60,7 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 22, up: migrateV21ToV22},
 		{version: 23, up: migrateV22ToV23},
 		{version: 24, up: migrateV23ToV24},
+		{version: 25, up: migrateV24ToV25},
 	}
 }
 
@@ -2058,4 +2059,117 @@ func migrateV23ToV24(ctx context.Context, db *sql.DB) error {
 		}
 	}
 	return tx.Commit()
+}
+
+// --- v24 → v25 ---
+
+// migrateV24ToV25 lays the audit-trail foundation for issue #157 — every
+// failure and refusal becomes a run row, every abnormal condition a
+// standing state:
+//
+//   - The runs.status CHECK widens to admit two terminal states.
+//     'refused' records a preflight safety gate declining before the
+//     transfer began (a missing/mismatched volume marker, a kopia connect
+//     that found no repository without --init, a layout guard tripping) —
+//     distinct from 'failed', which is a mid-flight failure. 'aborted'
+//     records a 'running' row reaped at agent startup because the process
+//     that owned it was killed mid-run (F14). Both are terminal; neither
+//     is a success. Reuses the FK-off rebuild recipe (v6→v7) because runs
+//     is referenced by files, hook_runs, packs, remote_objects,
+//     remote_packs, and runs_audit.
+//   - destination_alarms is the per-destination standing-alarm latch
+//     (F30): a verify mismatch raises a row that stays until a clean
+//     verify auto-clears it or an operator acks it. It is derived standing
+//     state — like peer_sync_state, the live row is maintained in place
+//     while the permanent forensic record of every raise and clear lives
+//     in runs/runs_audit — so clearing the latch loses no history. STRICT
+//     per the new-table convention.
+func migrateV24ToV25(ctx context.Context, db *sql.DB) error {
+	conn, restore, err := disableForeignKeys(ctx, db)
+	if err != nil {
+		return err
+	}
+	defer restore()
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := rebuildRunsTableV25(ctx, tx); err != nil {
+		return err
+	}
+	if err := createDestinationAlarmsV25(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (25)`); err != nil {
+		return fmt.Errorf("record schema v25: %w", err)
+	}
+	if err := verifyForeignKeysClean(ctx, tx, "v24→v25"); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func rebuildRunsTableV25(ctx context.Context, tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE runs_v25 (
+			id            INTEGER PRIMARY KEY,
+			kind          TEXT NOT NULL CHECK (kind IN ('index','sync','restore','audit','offload')),
+			volume_id     INTEGER REFERENCES volumes(id),
+			destination   TEXT,
+			started_at_ns INTEGER NOT NULL,
+			ended_at_ns   INTEGER,
+			status        TEXT NOT NULL CHECK (status IN ('running','success','failed','partial','refused','aborted')),
+			error         TEXT,
+			file_count    INTEGER NOT NULL DEFAULT 0,
+			peer_node_id      INTEGER REFERENCES nodes(id),
+			correlated_run_id INTEGER,
+			shallow INTEGER CHECK (shallow IS NULL OR shallow IN (0, 1)),
+			CHECK (
+				(kind IN ('index','audit','offload') AND destination IS NULL) OR
+				(kind IN ('sync','restore') AND destination IS NOT NULL AND destination != '')
+			)
+		)`,
+		`INSERT INTO runs_v25 (
+			id, kind, volume_id, destination, started_at_ns, ended_at_ns,
+			status, error, file_count, peer_node_id, correlated_run_id, shallow
+		)
+		SELECT id, kind, volume_id, destination, started_at_ns, ended_at_ns,
+		       status, error, file_count, peer_node_id, correlated_run_id, shallow
+		FROM runs`,
+		`DROP TABLE runs`,
+		`ALTER TABLE runs_v25 RENAME TO runs`,
+		`CREATE INDEX idx_runs_volume_started ON runs(volume_id, started_at_ns)`,
+		`CREATE INDEX idx_runs_destination ON runs(destination) WHERE destination IS NOT NULL`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("rebuild runs: %w", err)
+		}
+	}
+	return nil
+}
+
+// createDestinationAlarmsV25 creates the per-destination standing-alarm
+// latch. destination is the PRIMARY KEY: at most one active alarm per
+// destination, which the raise path keeps idempotent so "in alarm since"
+// stays stable across repeated mismatches. raised_run_id is a real FK to
+// the verify run that raised it. No secondary index: the table holds one
+// row per destination in alarm (usually zero), so every read is a PK
+// lookup or a full scan of a handful of rows — an index would never be
+// used and would violate the low-cardinality-index guidance.
+func createDestinationAlarmsV25(ctx context.Context, tx *sql.Tx) error {
+	const ddl = `CREATE TABLE destination_alarms (
+		destination   TEXT    NOT NULL PRIMARY KEY,
+		kind          TEXT    NOT NULL,
+		detail        TEXT    NOT NULL,
+		raised_run_id INTEGER NOT NULL REFERENCES runs(id),
+		raised_at_ns  INTEGER NOT NULL
+	) STRICT`
+	if _, err := tx.ExecContext(ctx, ddl); err != nil {
+		return fmt.Errorf("create destination_alarms: %w", err)
+	}
+	return nil
 }

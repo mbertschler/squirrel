@@ -171,15 +171,22 @@ func (h *peerHandler) Push(ctx context.Context, opts Options) (Report, error) {
 
 func (h *peerHandler) sealed() {}
 
-// finishHandlerRun writes a handler-driven run's terminal state from
-// rep.Status, mirroring the rclone scaffold's finishRun contract: a
-// FinishRun failure lands on rep.FinishErr so the caller surfaces it
-// next to the push outcome. The kopia and content-addressed handlers
-// share it; their file counts ride on rep.Verification.Files.
+// finishHandlerRun writes a handler-driven run's terminal state,
+// mirroring the rclone scaffold's finishRun contract: a FinishRun failure
+// lands on rep.FinishErr so the caller surfaces it next to the push
+// outcome. The kopia, content-addressed, and packed handlers share it;
+// their file counts ride on rep.Verification.Files.
+//
+// A preflight refusal (runErr wrapping ErrRefused — a kopia connect
+// without --init, a layout guard) overrides the derived status to
+// 'refused' via terminalStatus, and rep.Status is updated in place so the
+// CLI summary and TUI show the refusal as its own condition rather than a
+// generic failure (#157, F26).
 func finishHandlerRun(ctx context.Context, s *store.Store, rep *Report, runErr error) {
 	if rep.RunID == 0 {
 		return
 	}
+	rep.Status = terminalStatus(rep.Status, runErr)
 	errMsg := ""
 	if runErr != nil {
 		errMsg = runErr.Error()

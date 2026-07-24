@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -836,9 +837,25 @@ func TestSyncRefusesUninitialisedDestination(t *testing.T) {
 		t.Fatalf("remove seeded marker: %v", err)
 	}
 
-	_, err := Sync(context.Background(), f.store, f.rcl, f.vol, f.dest, Options{})
+	rep, err := Sync(context.Background(), f.store, f.rcl, f.vol, f.dest, Options{})
 	if err == nil || !strings.Contains(err.Error(), "--init") {
 		t.Fatalf("expected --init hint, got %v", err)
+	}
+	if !errors.Is(err, ErrRefused) {
+		t.Fatalf("marker refusal should wrap ErrRefused, got %v", err)
+	}
+	// The refusal must mint a visible terminal run row, not vanish into
+	// the returned error with run_id=0 (#157, F26).
+	if rep.RunID == 0 || rep.Status != store.RunStatusRefused {
+		t.Fatalf("rep = %+v, want a refused run row", rep)
+	}
+	run, gerr := f.store.GetRun(context.Background(), rep.RunID)
+	if gerr != nil {
+		t.Fatalf("GetRun(%d): %v", rep.RunID, gerr)
+	}
+	if run.Kind != store.RunKindSync || run.Status != store.RunStatusRefused ||
+		!run.Error.Valid || !strings.Contains(run.Error.String, "--init") {
+		t.Fatalf("run = %+v, want a refused sync run carrying the refusal message", run)
 	}
 }
 

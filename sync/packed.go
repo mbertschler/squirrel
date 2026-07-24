@@ -264,7 +264,7 @@ func (h *packedHandler) watermark(ctx context.Context, volID int64) (int64, erro
 	}
 	mapURI := h.mapURI(last.ID)
 	if _, err := h.rcl.statRemote(ctx, mapURI, checkersArgs(h.dest)...); err != nil {
-		return 0, fmt.Errorf("destination %q: the last successful sync (run %d) left no pack placement map at %s — its history is not packed (a mirror or content-addressed root); point the layout at a fresh destination or root instead of switching an existing one: %w", h.dest.Name, last.ID, mapURI, err)
+		return 0, fmt.Errorf("destination %q: the last successful sync (run %d) left no pack placement map at %s — its history is not packed (a mirror or content-addressed root); point the layout at a fresh destination or root instead of switching an existing one: %w: %w", h.dest.Name, last.ID, mapURI, err, ErrRefused)
 	}
 	return last.ID, nil
 }
