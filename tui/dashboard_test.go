@@ -36,8 +36,6 @@ func TestLoadDashboardDataPartitionsRuns(t *testing.T) {
 	// a successful sync run. We expect:
 	//   - activeRuns: the one running sync
 	//   - recentRuns: every terminal run, newest first, capped at 10
-	//   - latestByVol[vol.ID]: index = most recent success, sync = the
-	//     successful one (failed audit doesn't establish "last audit")
 	finishedIdx1, _ := s.BeginIndexRun(ctx, store.RunKindIndex, vol.ID, false)
 	if err := s.FinishRun(ctx, finishedIdx1, store.RunStatusSuccess, "", 100); err != nil {
 		t.Fatalf("FinishRun: %v", err)
@@ -57,7 +55,10 @@ func TestLoadDashboardDataPartitionsRuns(t *testing.T) {
 		t.Fatalf("FinishRun: %v", err)
 	}
 
-	data, err := loadDashboardData(ctx, s)
+	// cfg is nil here: this test pins the run-partitioning behaviour, which
+	// is independent of the config-driven coverage grid (that is exercised
+	// against the shared status layer in the status package's own tests).
+	data, err := loadDashboardData(ctx, s, nil)
 	if err != nil {
 		t.Fatalf("loadDashboardData: %v", err)
 	}
@@ -80,18 +81,8 @@ func TestLoadDashboardDataPartitionsRuns(t *testing.T) {
 		t.Errorf("recentRuns[0] = %d, want %d (most recent)", data.recentRuns[0].ID, successSync)
 	}
 
-	byKind := data.latestByVol[vol.ID]
-	if byKind == nil {
-		t.Fatalf("latestByVol missing entry for vol#%d", vol.ID)
-	}
-	if byKind[store.RunKindIndex].ID != finishedIdx2 {
-		t.Errorf("latest index = %d, want %d (the partial-but-newer one)",
-			byKind[store.RunKindIndex].ID, finishedIdx2)
-	}
-	if byKind[store.RunKindSync].ID != successSync {
-		t.Errorf("latest sync = %d, want %d", byKind[store.RunKindSync].ID, successSync)
-	}
-	if _, present := byKind[store.RunKindAudit]; present {
-		t.Errorf("latestByVol must not include the failed audit run")
+	// With no config, the coverage grid renders nothing.
+	if len(data.coverage.Volumes) != 0 {
+		t.Errorf("coverage.Volumes = %d, want 0 without config", len(data.coverage.Volumes))
 	}
 }

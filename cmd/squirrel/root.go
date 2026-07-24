@@ -46,6 +46,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newRunsCmd())
 	root.AddCommand(newHooksCmd())
 	root.AddCommand(newVolumesCmd())
+	root.AddCommand(newStatusCmd())
 	root.AddCommand(newSyncCmd())
 	root.AddCommand(newRestoreCmd())
 	root.AddCommand(newOffloadCmd())
