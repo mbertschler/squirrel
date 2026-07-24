@@ -172,14 +172,23 @@ func newSchedulerFixture(t *testing.T, volumeCfg *config.Volume) *schedulerFixtu
 // uses.
 func (f *schedulerFixture) scheduler() *scheduler {
 	return &scheduler{
-		store:     f.srv.store,
-		volumes:   f.srv.cfg.Volumes,
-		syncRun:   f.srv.cfg.SyncRunner,
-		logger:    f.srv.cfg.Logger,
-		locks:     f.srv.router,
-		tickEvery: time.Second,
-		now:       f.clock.Now,
-		hooks:     newHookRunner(f.srv.store, f.srv.cfg.Logger),
+		store:          f.srv.store,
+		volumes:        f.srv.cfg.Volumes,
+		syncRun:        f.srv.cfg.SyncRunner,
+		logger:         f.srv.cfg.Logger,
+		locks:          f.srv.router,
+		tickEvery:      time.Second,
+		now:            f.clock.Now,
+		hooks:          newHookRunner(f.srv.store, f.srv.cfg.Logger),
+		verifyRun:      f.srv.cfg.VerifyRunner,
+		durabilityPull: f.srv.cfg.DurabilityPuller,
+		verifyEvery:    resolveVerifyCadences(f.srv.cfg.Destinations, f.srv.cfg.VerifyEvery),
+		pullEvery:      resolvePullCadences(f.srv.cfg.Nodes),
+		// Watermark maps are always initialised (unlike the other cadence
+		// fields, they are written) so tests that set verifyEvery/pullEvery
+		// directly on the returned scheduler don't have to remember to.
+		lastVerify: map[string]time.Time{},
+		lastPull:   map[string]time.Time{},
 	}
 }
 

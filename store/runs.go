@@ -143,26 +143,44 @@ func (s *Store) BeginIndexRun(ctx context.Context, kind string, volumeID int64, 
 	return id, nil
 }
 
-// BeginRemoteVerifyRun records the start of a remote-object verification
-// pass as a kind='audit' run. The pass is destination-scoped rather than
-// volume-scoped — the content-addressed objects/ space is shared by
-// every volume — so volume_id is NULL; and the runs CHECK keeps
-// destination NULL on audit rows, so the verified destination is
-// recorded in the run's 'verify-destination' runs_audit note instead.
-// Callers must pair it with FinishRun.
-func (s *Store) BeginRemoteVerifyRun(ctx context.Context) (int64, error) {
+// beginVolumelessAuditRun inserts a 'running' kind='audit' row with NULL
+// volume_id and NULL destination — the shape shared by the out-of-band
+// checks that are scoped to a destination or a (volume, peer) pair rather
+// than to a volume's on-disk drift history (remote-object verification and
+// durability pulls). Keeping volume_id NULL deliberately holds these rows
+// out of the per-volume "last audit" reads (ListAuditRunsSince, which feeds
+// the drift-since-last-sync handshake, and LatestSuccessfulRunsByVolumeAndKind,
+// which feeds the TUI); the runs CHECK also keeps destination NULL on audit
+// rows, so the subject is recorded in the run's runs_audit note instead.
+// label names the operation for the insert's error messages. Callers must
+// pair it with FinishRun.
+func (s *Store) beginVolumelessAuditRun(ctx context.Context, label string) (int64, error) {
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO runs (kind, volume_id, destination, started_at_ns, status, file_count)
 		VALUES ('audit', NULL, NULL, ?, 'running', 0)
 	`, NowNs())
 	if err != nil {
-		return 0, fmt.Errorf("insert remote-verify run: %w", err)
+		return 0, fmt.Errorf("insert %s run: %w", label, err)
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
-		return 0, fmt.Errorf("remote-verify run last insert id: %w", err)
+		return 0, fmt.Errorf("%s run last insert id: %w", label, err)
 	}
 	return id, nil
+}
+
+// BeginRemoteVerifyRun records the start of a remote-object verification
+// pass as a kind='audit' run; the verified destination lands in the run's
+// 'verify-destination' runs_audit note. See beginVolumelessAuditRun.
+func (s *Store) BeginRemoteVerifyRun(ctx context.Context) (int64, error) {
+	return s.beginVolumelessAuditRun(ctx, "remote-verify")
+}
+
+// BeginDurabilityPullRun records the start of an agent-scheduled durability
+// pull as a kind='audit' run; the pulled volume and peer land in the run's
+// 'pull-durability' runs_audit note. See beginVolumelessAuditRun.
+func (s *Store) BeginDurabilityPullRun(ctx context.Context) (int64, error) {
+	return s.beginVolumelessAuditRun(ctx, "durability-pull")
 }
 
 // BeginPeerSyncRun is BeginRun's sibling for kind='sync' rows tied to a

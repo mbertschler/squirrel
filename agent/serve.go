@@ -109,12 +109,13 @@ func (s *Server) startScanLoop(ctx context.Context, wg *sync.WaitGroup, logger i
 }
 
 // startSchedulerLoop spins up the cadence scheduler (#39) in a sibling
-// goroutine, but only when at least one volume declares a sync_every
-// or index_every cadence. The WaitGroup parallel to startScanLoop's
+// goroutine, but only when there is scheduled work: a volume sync_every /
+// index_every cadence, a destination verify cadence (F32), or a peer
+// durability-pull cadence (F33). The WaitGroup parallel to startScanLoop's
 // usage lets Serve block on a clean exit during shutdown.
 func (s *Server) startSchedulerLoop(ctx context.Context, wg *sync.WaitGroup) {
 	sched := newScheduler(s, s.cfg.SchedulerTick, s.cfg.Now)
-	if !sched.anyScheduledVolume() {
+	if !sched.anyScheduledWork() {
 		return
 	}
 	wg.Add(1)

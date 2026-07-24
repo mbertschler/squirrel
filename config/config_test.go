@@ -1544,3 +1544,147 @@ password = "obscured"
 		t.Fatalf("crypt remote must include the bucket, got:\n%s", section)
 	}
 }
+
+// TestLoadDestinationVerifyEvery parses a per-destination verify_every on a
+// content-addressed / packed destination.
+func TestLoadDestinationVerifyEvery(t *testing.T) {
+	t.Setenv("K", "v")
+	p := writeConfig(t, `
+[destinations.arch]
+type         = "s3"
+provider     = "AWS"
+bucket       = "bkt"
+root         = "/"
+layout       = "packed"
+verify_every = "168h"
+access_key_id     = { env = "K" }
+secret_access_key = { env = "K" }
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Destinations["arch"].VerifyEvery != 168*time.Hour {
+		t.Fatalf("VerifyEvery = %s, want 168h", cfg.Destinations["arch"].VerifyEvery)
+	}
+}
+
+// TestLoadRejectsVerifyEveryOnMirror rejects verify_every on a layout that
+// keeps no per-object fingerprints — verify has nothing to re-check there.
+func TestLoadRejectsVerifyEveryOnMirror(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.usb]
+type         = "local"
+root         = "/media/usb"
+verify_every = "168h"
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "verify_every requires") {
+		t.Fatalf("expected verify_every-layout error, got %v", err)
+	}
+}
+
+// TestLoadRejectsBadVerifyEvery: an unparseable duration is caught at load,
+// like the other cadence knobs.
+func TestLoadRejectsBadVerifyEvery(t *testing.T) {
+	t.Setenv("K", "v")
+	p := writeConfig(t, `
+[destinations.arch]
+type         = "s3"
+provider     = "AWS"
+bucket       = "bkt"
+root         = "/"
+layout       = "content-addressed"
+verify_every = "nope"
+access_key_id     = { env = "K" }
+secret_access_key = { env = "K" }
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "verify_every") {
+		t.Fatalf("expected verify_every parse error, got %v", err)
+	}
+}
+
+// TestLoadAgentVerifyEvery parses the fleet-wide default verify cadence.
+func TestLoadAgentVerifyEvery(t *testing.T) {
+	p := writeConfig(t, `
+[agent]
+listen       = "127.0.0.1:9000"
+auth         = { token = "t" }
+verify_every = "336h"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Agent.VerifyEvery != 336*time.Hour {
+		t.Fatalf("Agent.VerifyEvery = %s, want 336h", cfg.Agent.VerifyEvery)
+	}
+}
+
+// TestLoadAgentVerifyEveryDefaultsZero: absent key leaves the default off.
+func TestLoadAgentVerifyEveryDefaultsZero(t *testing.T) {
+	p := writeConfig(t, `
+[agent]
+listen = "127.0.0.1:9000"
+auth   = { token = "t" }
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Agent.VerifyEvery != 0 {
+		t.Fatalf("default Agent.VerifyEvery = %s, want 0", cfg.Agent.VerifyEvery)
+	}
+}
+
+// TestLoadNodePullDurabilityEvery parses the per-node pull cadence — the
+// receive-only htpc's clock for keeping its gate evidence fresh.
+func TestLoadNodePullDurabilityEvery(t *testing.T) {
+	p := writeConfig(t, `
+[nodes.nas]
+endpoint              = "https://nas.local:8443"
+path                  = "/mnt/nas-export"
+pull_durability_every = "24h"
+auth                  = { bearer = "b" }
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Nodes["nas"].PullDurabilityEvery != 24*time.Hour {
+		t.Fatalf("PullDurabilityEvery = %s, want 24h", cfg.Nodes["nas"].PullDurabilityEvery)
+	}
+}
+
+// TestLoadNodePullDurabilityEveryDefaultsZero: absent key leaves it off.
+func TestLoadNodePullDurabilityEveryDefaultsZero(t *testing.T) {
+	p := writeConfig(t, `
+[nodes.nas]
+endpoint = "https://nas.local:8443"
+path     = "/mnt/nas-export"
+auth     = { bearer = "b" }
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Nodes["nas"].PullDurabilityEvery != 0 {
+		t.Fatalf("default PullDurabilityEvery = %s, want 0", cfg.Nodes["nas"].PullDurabilityEvery)
+	}
+}
+
+// TestLoadRejectsBadPullDurabilityEvery: an unparseable duration is caught.
+func TestLoadRejectsBadPullDurabilityEvery(t *testing.T) {
+	p := writeConfig(t, `
+[nodes.nas]
+endpoint              = "https://nas.local:8443"
+path                  = "/mnt/nas-export"
+pull_durability_every = "soon"
+auth                  = { bearer = "b" }
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "pull_durability_every") {
+		t.Fatalf("expected pull_durability_every error, got %v", err)
+	}
+}

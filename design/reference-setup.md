@@ -114,6 +114,9 @@ node_name = "nas"
 listen        = "0.0.0.0:8443"
 scan_interval = "168h"        # weekly drift scan over all volumes
 scan_strategy = "shallow"
+verify_every  = "168h"        # weekly offsite fingerprint re-check (F32),
+                              # the agent-level default for every packed/CA
+                              # destination (here: s3archive)
 [agent.tls]
 cert = "/volume1/squirrel/agent.crt"   # self-signed; peers pin the fingerprint
 key  = "/volume1/squirrel/agent.key"
@@ -252,8 +255,12 @@ offload_max_evidence_age = "720h"
 path = "/data/photos"
 
 [nodes.nas]                            # not in any sync_to: exists so the
-endpoint = "https://nas.home:8443"     # htpc can *pull durability* from nas
-path     = "/mnt/nas-export"
+endpoint              = "https://nas.home:8443"  # htpc can *pull durability*
+path                  = "/mnt/nas-export"        # from nas …
+pull_durability_every = "24h"          # … on its own clock (F33), so the
+                                       # media offload gate's relayed
+                                       # s3archive evidence stays fresh with
+                                       # zero typed commands
 [nodes.nas.auth]
 bearer = { env = "SQUIRREL_PEER_HTPC" }
 [nodes.nas.tls]
@@ -271,8 +278,8 @@ bootstrap the household should run itself. Today's coverage:
 | Drift detection (`scan_interval`) | ✅ agent, hub |
 | Index snapshots local + ride-along | ✅ on every successful sync |
 | Durability pull after node sync | ✅ initiator side only |
-| Offsite fingerprint re-check (`squirrel verify`) | ❌ manual only ([F32](friction-log.md)) |
-| Durability refresh on a *receive-only* node (htpc) | ❌ never fires ([F33](friction-log.md)) |
+| Offsite fingerprint re-check (`verify_every`) | ✅ agent, per-destination or an `[agent]` default (F32) |
+| Durability refresh on a *receive-only* node (htpc) | ✅ agent, per-node `pull_durability_every` (F33) |
 | Offload | ❌ manual by design; the *readiness signal* should still be automatic ([F17](friction-log.md)) |
 
 ## Lifecycle checkpoints

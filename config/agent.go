@@ -50,6 +50,14 @@ type Agent struct {
 	// match the stored row; ScanStrategyDeep re-hashes everything
 	// unconditionally — the bit-rot-detection schedule.
 	ScanStrategy string
+	// VerifyEvery is the default cadence the agent re-verifies every
+	// content-addressed/packed destination on when the destination itself
+	// declares no `verify_every` — the offsite fingerprint re-check that
+	// otherwise happens only when `squirrel verify` is typed. Zero (the
+	// default) means no fleet-wide verify cadence; a per-destination
+	// verify_every still applies. Verify is read-only, so the agent never
+	// escalates or bootstraps a destination on this cadence.
+	VerifyEvery time.Duration
 }
 
 // rawAgent mirrors the `[agent]` TOML block. We use typed sub-structs
@@ -62,6 +70,7 @@ type rawAgent struct {
 	Auth         *rawAuth `toml:"auth"`
 	ScanInterval string   `toml:"scan_interval"`
 	ScanStrategy string   `toml:"scan_strategy"`
+	VerifyEvery  string   `toml:"verify_every"`
 }
 
 type rawTLS struct {
@@ -103,6 +112,13 @@ func resolveAgent(r *rawAgent) (*Agent, error) {
 	}
 	if err := resolveAgentScan(r, a); err != nil {
 		return nil, err
+	}
+	if r.VerifyEvery != "" {
+		dur, err := parseVolumeCadence("verify_every", r.VerifyEvery)
+		if err != nil {
+			return nil, err
+		}
+		a.VerifyEvery = dur
 	}
 	return a, nil
 }

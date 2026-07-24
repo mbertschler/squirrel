@@ -54,6 +54,42 @@ type SyncRunReport struct {
 	Err    error
 }
 
+// VerifyRunner is the function shape the scheduler delegates one
+// destination's verify pass to (F32). It runs the same re-check as
+// `squirrel verify <destination>` and records a kind='audit' run, so the
+// agent package needs no edge to the sync package. A zero RunID with a nil
+// Err means the destination had nothing recorded to verify (a no-op, no run
+// row written); a non-zero RunID carries the audit run's outcome. Status is
+// one of store.RunStatus*.
+type VerifyRunner func(ctx context.Context, destName string) VerifyRunReport
+
+// VerifyRunReport is the VerifyRunner result surfaced to the scheduler's
+// kicked/finished/error log.
+type VerifyRunReport struct {
+	RunID  int64
+	Status string
+	Err    error
+}
+
+// DurabilityPuller is the function shape the scheduler delegates one
+// (volume, peer) durability pull to (F33). It runs the same metadata-only
+// merge as `squirrel peer-sync pull-durability` — never rewinding a
+// watermark, because the agent does not escalate — and records a
+// kind='audit' run. Counts ride along for the finished log line.
+type DurabilityPuller func(ctx context.Context, vol *config.Volume, peerName string) DurabilityPullReport
+
+// DurabilityPullReport is the DurabilityPuller result surfaced to the
+// scheduler's kicked/finished/error log.
+type DurabilityPullReport struct {
+	RunID   int64
+	Status  string
+	Err     error
+	Fetched int
+	Applied int
+	Dropped int
+	Rewinds int
+}
+
 // Config configures one agent listener. Fields are validated by New; all
 // of them are required except TLSCert/TLSKey (which must be set together
 // or not at all — empty pair means plain HTTP).
@@ -98,6 +134,30 @@ type Config struct {
 	// peer-sync receiver fixture, and a direct agent→sync edge would
 	// close the cycle.
 	SyncRunner SyncRunner
+	// Destinations maps destination name → resolved config-side
+	// destination. The scheduler consults it to find the
+	// content-addressed/packed destinations that carry a verify cadence
+	// (per-destination verify_every, or the agent-level VerifyEvery
+	// default). Nil disables the verify cadence.
+	Destinations map[string]*config.Destination
+	// Nodes maps peer node name → resolved config-side node. The
+	// scheduler consults it for the per-node pull_durability_every
+	// cadence. Nil disables the durability-pull cadence.
+	Nodes map[string]*config.Node
+	// VerifyEvery is the fleet-wide default verify cadence applied to every
+	// verifiable destination that declares no verify_every of its own
+	// (cfg.Agent.VerifyEvery). Zero means no default; a per-destination
+	// cadence still applies.
+	VerifyEvery time.Duration
+	// VerifyRunner is the scheduler's hook for running one destination's
+	// verify pass (F32). Nil disables verify-kicking. The CLI wires it to a
+	// closure over sync.VerifyRemote; an agent whose config has no
+	// verifiable destination with a cadence ignores it.
+	VerifyRunner VerifyRunner
+	// DurabilityPuller is the scheduler's hook for running one (volume,
+	// peer) durability pull (F33). Nil disables pull-kicking. The CLI wires
+	// it to a closure over sync.PullDurability.
+	DurabilityPuller DurabilityPuller
 	// SchedulerTick overrides the scheduler's evaluation period.
 	// Zero falls back to DefaultSchedulerTick. Tests pin it to a
 	// small value; production rarely needs to touch it.
