@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mbertschler/squirrel/store"
 )
@@ -256,5 +257,72 @@ func TestArchiveRestoreDryRun(t *testing.T) {
 	}
 	if n := f.copytoCount(t, ""); n != 0 {
 		t.Fatalf("dry-run issued %d copyto calls, want 0", n)
+	}
+}
+
+// TestArchiveRestoreRefusesSymlinkTarget confirms restore refuses a
+// destination path that already exists as a symlink rather than following
+// it — following would let a write clobber a path outside the restore
+// target. The symlink and its target are both left untouched.
+func TestArchiveRestoreRefusesSymlinkTarget(t *testing.T) {
+	f := setupContentAddressedFixture(t)
+	f.write(t, "a.txt", "alpha")
+	f.index(t)
+	if _, err := f.sync(t); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	target := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "precious.txt")
+	if err := os.WriteFile(outside, []byte("precious"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(target, "a.txt")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	rep, err := f.restore(t, RestoreOptions{ToPath: target})
+	if err == nil {
+		t.Fatalf("expected a symlink refusal, got nil (rep=%+v)", rep)
+	}
+	if rep.RcloneResult.Errors != 1 || rep.Status != store.RunStatusPartial {
+		t.Fatalf("rep = status=%q errors=%d, want partial/1", rep.Status, rep.RcloneResult.Errors)
+	}
+	if got, _ := os.ReadFile(outside); string(got) != "precious" {
+		t.Fatalf("outside file clobbered through the symlink: %q", got)
+	}
+	fi, err := os.Lstat(link)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("symlink was replaced or removed: mode=%v err=%v", fi.Mode(), err)
+	}
+}
+
+// TestArchiveRestorePreservesMtime confirms a restored file is stamped with
+// the mtime the index recorded, matching the mirror pull, so a follow-up
+// index sees no spurious drift.
+func TestArchiveRestorePreservesMtime(t *testing.T) {
+	f := setupContentAddressedFixture(t)
+	f.write(t, "a.txt", "alpha")
+	want := time.Unix(1_600_000_000, 0)
+	src := filepath.Join(f.pair.Volume.Path, "a.txt")
+	if err := os.Chtimes(src, want, want); err != nil {
+		t.Fatalf("set source mtime: %v", err)
+	}
+	f.index(t)
+	if _, err := f.sync(t); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	target := t.TempDir()
+	if _, err := f.restore(t, RestoreOptions{ToPath: target}); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	fi, err := os.Stat(filepath.Join(target, "a.txt"))
+	if err != nil {
+		t.Fatalf("stat restored: %v", err)
+	}
+	if fi.ModTime().UnixNano() != want.UnixNano() {
+		t.Fatalf("restored mtime = %v, want the index-recorded %v", fi.ModTime(), want)
 	}
 }

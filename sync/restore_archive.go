@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/zeebo/blake3"
@@ -76,15 +77,25 @@ func newArchiveRestore(s *store.Store, rcl *Rclone, vol *config.Volume, dest *co
 
 // restoreContent is one content to restore and the volume-relative paths it
 // must land at. A content can appear at several paths (dedup), so one fetch
-// serves them all.
+// serves them all. Each path carries its own indexed mtime so the restored
+// file is stamped back to what the index recorded — the same modtime the
+// mirror pull preserves — keeping a follow-up `squirrel index` from seeing
+// spurious drift.
 type restoreContent struct {
 	contentID int64
 	blake3    []byte
 	size      int64
-	paths     []string
+	paths     []restorePath
 }
 
-func (c restoreContent) firstPath() string { return c.paths[0] }
+// restorePath is one destination path for a content plus the mtime the
+// index recorded for it.
+type restorePath struct {
+	rel     string
+	mtimeNs int64
+}
+
+func (c restoreContent) firstPath() string { return c.paths[0].rel }
 
 // packGroup batches every requested member of one pack so the pack is
 // fetched once. members are sorted by byte offset before extraction.
@@ -148,11 +159,11 @@ func (ar *archiveRestore) resolveContents(ctx context.Context, includeFile strin
 			continue
 		}
 		if idx, ok := byContent[r.ContentID]; ok {
-			out[idx].paths = append(out[idx].paths, r.Path)
+			out[idx].paths = append(out[idx].paths, restorePath{rel: r.Path, mtimeNs: r.MtimeNs})
 			continue
 		}
 		byContent[r.ContentID] = len(out)
-		out = append(out, restoreContent{contentID: r.ContentID, blake3: r.Blake3, size: r.SizeBytes, paths: []string{r.Path}})
+		out = append(out, restoreContent{contentID: r.ContentID, blake3: r.Blake3, size: r.SizeBytes, paths: []restorePath{{rel: r.Path, mtimeNs: r.MtimeNs}}})
 	}
 	return out, nil
 }
@@ -341,9 +352,9 @@ func (ar *archiveRestore) fetch(ctx context.Context, subpath string) (string, er
 // the target directory, counting the files landed. A per-path write
 // failure is recorded and does not stop the others.
 func (ar *archiveRestore) place(rep *Report, srcTmp string, c restoreContent) {
-	for _, rel := range c.paths {
-		if err := ar.writeOne(rel, srcTmp); err != nil {
-			ar.recordFailure(rep, rel, err)
+	for _, p := range c.paths {
+		if err := ar.writeOne(p, srcTmp); err != nil {
+			ar.recordFailure(rep, p.rel, err)
 			continue
 		}
 		rep.RcloneResult.Transferred++
@@ -352,34 +363,62 @@ func (ar *archiveRestore) place(rep *Report, srcTmp string, c restoreContent) {
 }
 
 // writeOne copies the verified bytes to <target>/<rel>, creating parent
-// directories and — for an in-place restore — first preserving any file it
-// would overwrite under .squirrel-restore-history/run-<id>/.
-func (ar *archiveRestore) writeOne(rel, srcTmp string) error {
-	dst := filepath.Join(ar.target, filepath.FromSlash(rel))
+// directories, refusing to write over a non-regular file (symlink, device,
+// directory, …), preserving any overwritten regular file for an in-place
+// restore, and stamping the index-recorded mtime.
+func (ar *archiveRestore) writeOne(p restorePath, srcTmp string) error {
+	dst := filepath.Join(ar.target, filepath.FromSlash(p.rel))
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return fmt.Errorf("create target dir: %w", err)
 	}
+	if err := refuseNonRegularTarget(p.rel, dst); err != nil {
+		return err
+	}
 	if ar.preserve {
-		if err := ar.backupExisting(rel, dst); err != nil {
+		if err := ar.backupExisting(p.rel, dst); err != nil {
 			return err
 		}
 	}
-	return copyFileContents(srcTmp, dst)
+	if err := copyFileContents(srcTmp, dst); err != nil {
+		return err
+	}
+	t := time.Unix(0, p.mtimeNs)
+	if err := os.Chtimes(dst, t, t); err != nil {
+		return fmt.Errorf("set mtime on %s: %w", p.rel, err)
+	}
+	return nil
 }
 
-// backupExisting moves an existing regular file at dst under the per-run
-// restore-history subtree so an in-place overwrite never destroys prior
-// bytes — the local-side counterpart of sync's --backup-dir.
-func (ar *archiveRestore) backupExisting(rel, dst string) error {
+// refuseNonRegularTarget refuses to write when the destination already
+// exists as anything other than a regular file. Writing through a symlink
+// with os.OpenFile would follow it and could clobber a path *outside* the
+// restore target — a data-loss path squirrel must never take — so an
+// existing symlink, device, fifo, socket, or directory is a hard refusal,
+// not a silent skip. An absent path or a plain regular file is allowed.
+func refuseNonRegularTarget(rel, dst string) error {
 	info, err := os.Lstat(dst)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("stat existing %s: %w", rel, err)
+		return fmt.Errorf("stat target %s: %w", rel, err)
 	}
 	if !info.Mode().IsRegular() {
+		return fmt.Errorf("refusing to write %s: destination already exists as a non-regular file (%s) — squirrel will not follow or replace it", rel, info.Mode().Type())
+	}
+	return nil
+}
+
+// backupExisting moves an existing regular file at dst under the per-run
+// restore-history subtree so an in-place overwrite never destroys prior
+// bytes — the local-side counterpart of sync's --backup-dir. The caller
+// has already refused any non-regular destination, so dst is absent or a
+// regular file here.
+func (ar *archiveRestore) backupExisting(rel, dst string) error {
+	if _, err := os.Lstat(dst); errors.Is(err, os.ErrNotExist) {
 		return nil
+	} else if err != nil {
+		return fmt.Errorf("stat existing %s: %w", rel, err)
 	}
 	backup := filepath.Join(ar.target, RestoreHistoryDirName, "run-"+strconv.FormatInt(ar.runID, 10), filepath.FromSlash(rel))
 	if err := os.MkdirAll(filepath.Dir(backup), 0o755); err != nil {
