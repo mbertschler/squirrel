@@ -124,10 +124,15 @@ password = { env = "NAS_PASSWORD" }
 		t.Fatalf("password not resolved: %v", d.Params)
 	}
 	section := d.RcloneSection()
-	for _, want := range []string{"[nas]", "type = sftp", "host = nas.local", "user = martin", "password = hunter2"} {
+	// rclone's sftp option is `pass`, obscured — never `password`, and never
+	// the plaintext in the clear (friction log F5).
+	for _, want := range []string{"[nas]", "type = sftp", "host = nas.local", "user = martin", "pass = " + rcloneObscure("hunter2")} {
 		if !strings.Contains(section, want) {
 			t.Fatalf("section missing %q:\n%s", want, section)
 		}
+	}
+	if strings.Contains(section, "hunter2") {
+		t.Fatalf("plaintext sftp password leaked into the section:\n%s", section)
 	}
 }
 
@@ -484,7 +489,7 @@ root   = "/p"
 		wants []string
 	}{
 		{"s3", []string{"[s3]", "type = s3", "provider = AWS", "bucket = squirrel", "region = eu-central-1", "access_key_id = AK123", "secret_access_key = sssh"}},
-		{"b2", []string{"[b2]", "type = b2", "bucket = squirrel", "account_id = 0001", "application_key = appkey"}},
+		{"b2", []string{"[b2]", "type = b2", "bucket = squirrel", "account = 0001", "key = appkey"}},
 		{"gcs", []string{"[gcs]", "type = gcs", "bucket = squirrel"}},
 	}
 	for _, c := range cases {
@@ -650,21 +655,23 @@ password2 = "obscured-salt"
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	want := `[offsite]
-type = sftp
-host = host.example
-user = u
-blake3sum_command = b3sum
-password = transport-pw
-
-[offsite-crypt]
-type = crypt
-remote = offsite:/data
-filename_encryption = off
-directory_name_encryption = false
-password = obscured-pw
-password2 = obscured-salt
-`
+	// The sftp transport secret renders as rclone's `pass`, obscured; the
+	// crypt overlay's password is a user-supplied obscured value passed
+	// through verbatim.
+	want := "[offsite]\n" +
+		"type = sftp\n" +
+		"host = host.example\n" +
+		"user = u\n" +
+		"blake3sum_command = b3sum\n" +
+		"pass = " + rcloneObscure("transport-pw") + "\n" +
+		"\n" +
+		"[offsite-crypt]\n" +
+		"type = crypt\n" +
+		"remote = offsite:/data\n" +
+		"filename_encryption = off\n" +
+		"directory_name_encryption = false\n" +
+		"password = obscured-pw\n" +
+		"password2 = obscured-salt\n"
 	if got := cfg.Destinations["offsite"].RcloneSection(); got != want {
 		t.Fatalf("RcloneSection:\n%s\nwant:\n%s", got, want)
 	}

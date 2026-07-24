@@ -62,7 +62,13 @@ same verbatim-name pattern makes `b2` look broken too (squirrel writes
 unverified, no b2 endpoint in the testbed. s3/gcs names happen to
 match. Needs its own fix PR + a test that pins squirrel's rendered
 keys to rclone's real option schema. Testbed worked around via
-`key_file` auth (rclone's real name, works).
+`key_file` auth (rclone's real name, works). *Fixed in #153:* sftp
+renders `pass`, obscured at render time (rclone's obscure algorithm
+reimplemented in Go under the fixed published key, with a deterministic
+zero IV so rclone.conf stays byte-stable and rclone still reveals it);
+b2 renders `account`/`key`; and `TestRcloneSectionKeysMatchRcloneSchema`
+pins every rclone-backed type's rendered keys to rclone's real option
+names so a new backend can't repeat the class.
 
 **F6 · S1 — a failing rclone destination is undiagnosable from
 squirrel's output.** The scheduler log and the CLI both surface only
