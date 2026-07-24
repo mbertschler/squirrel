@@ -19,6 +19,7 @@ import (
 	"hash/fnv"
 	"math/rand"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -61,16 +62,16 @@ func genPhotos(out string, seed int64, years string, perYear, rawPerYear int) er
 		return err
 	}
 	for y := from; y <= to; y++ {
-		dir := filepath.Join(out, strconv.Itoa(y))
+		relDir := strconv.Itoa(y)
 		for i := 0; i < perYear; i++ {
 			name := fmt.Sprintf("IMG_%d_%04d.jpg", y, i)
-			if err := writeFile(dir, name, seed, 40<<10, 400<<10); err != nil {
+			if err := writeFile(out, relDir, name, seed, 40<<10, 400<<10); err != nil {
 				return err
 			}
 		}
 		for i := 0; i < rawPerYear; i++ {
 			name := fmt.Sprintf("RAW_%d_%02d.dng", y, i)
-			if err := writeFile(dir, name, seed, 2<<20, 3<<20); err != nil {
+			if err := writeFile(out, relDir, name, seed, 2<<20, 3<<20); err != nil {
 				return err
 			}
 		}
@@ -82,9 +83,8 @@ func genDocs(out string, seed int64, count int) error {
 	dirs := []string{"invoices", "letters", "tax/2024", "notes"}
 	exts := []string{".pdf", ".txt", ".md", ".odt"}
 	for i := 0; i < count; i++ {
-		dir := filepath.Join(out, dirs[i%len(dirs)])
 		name := fmt.Sprintf("doc_%03d%s", i, exts[i%len(exts)])
-		if err := writeFile(dir, name, seed, 1<<10, 200<<10); err != nil {
+		if err := writeFile(out, dirs[i%len(dirs)], name, seed, 1<<10, 200<<10); err != nil {
 			return err
 		}
 	}
@@ -94,29 +94,32 @@ func genDocs(out string, seed int64, count int) error {
 func genMedia(out string, seed int64) error {
 	for i := 1; i <= 3; i++ {
 		name := fmt.Sprintf("Movie_%d (20%02d).mkv", i, 10+i)
-		if err := writeFile(filepath.Join(out, "movies"), name, seed, 32<<20, 32<<20); err != nil {
+		if err := writeFile(out, "movies", name, seed, 32<<20, 32<<20); err != nil {
 			return err
 		}
 	}
 	for i := 1; i <= 4; i++ {
 		name := fmt.Sprintf("Show_S01E%02d.mkv", i)
-		if err := writeFile(filepath.Join(out, "shows"), name, seed, 12<<20, 12<<20); err != nil {
+		if err := writeFile(out, "shows", name, seed, 12<<20, 12<<20); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// writeFile writes minSize..maxSize pseudo-random bytes derived from
-// (seed, dir-relative name), creating dir as needed. Existing files
-// are overwritten with identical content (same derivation), which
-// makes re-running the generator idempotent.
-func writeFile(dir, name string, seed int64, minSize, maxSize int64) error {
+// writeFile writes minSize..maxSize pseudo-random bytes to
+// <root>/<relDir>/<name>, creating directories as needed. Content is
+// derived from (seed, relDir/name) — the full path below -out, slash
+// form, so it is stable across platforms and unaffected by where -out
+// points. Existing files are overwritten with identical content (same
+// derivation), which makes re-running the generator idempotent.
+func writeFile(root, relDir, name string, seed int64, minSize, maxSize int64) error {
+	dir := filepath.Join(root, relDir)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	h := fnv.New64a()
-	h.Write([]byte(filepath.Join(filepath.Base(dir), name)))
+	h.Write([]byte(path.Join(filepath.ToSlash(relDir), name)))
 	rng := rand.New(rand.NewSource(seed ^ int64(h.Sum64())))
 	size := minSize
 	if maxSize > minSize {
@@ -126,7 +129,6 @@ func writeFile(dir, name string, seed int64, minSize, maxSize int64) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 	buf := make([]byte, 1<<20)
 	for written := int64(0); written < size; {
 		n := int64(len(buf))
@@ -135,6 +137,7 @@ func writeFile(dir, name string, seed int64, minSize, maxSize int64) error {
 		}
 		rng.Read(buf[:n])
 		if _, err := f.Write(buf[:n]); err != nil {
+			f.Close()
 			return err
 		}
 		written += n
