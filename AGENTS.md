@@ -54,6 +54,28 @@ on drift, so CI catches a stale snapshot. `squirrel db schema` prints the DDL
 of a database directly (opening it runs migrations first), for inspecting a
 real index without a repo checkout.
 
+Every **new** `CREATE TABLE` — whether in a migration or a future fresh
+baseline — MUST be declared `STRICT` (`CREATE TABLE … (…) STRICT`). STRICT
+rejects any value whose storage class doesn't match the column's declared
+type instead of silently coercing it via type affinity, so a stray string
+bound into an integer column (a concatenated query, a reflection mishap)
+becomes a hard error rather than a wrong-storage-class row — belt-and-suspenders
+over the existing `CHECK` / `NOT NULL` / trigger discipline, in the same
+integrity-first spirit. Declare only `INTEGER`, `TEXT`, and `BLOB` columns:
+never `TIMESTAMP`, `BOOLEAN`, `DATETIME`, `VARCHAR`, or `REAL`. STRICT rejects
+the affinity-name types (`TIMESTAMP` / `BOOLEAN` / `DATETIME` / `VARCHAR`)
+outright; `REAL` it would accept, but squirrel stores every quantity as an
+exact `INTEGER` and never uses floating point, so it stays off the list too.
+This is exactly the discipline the schema already follows — ns-integer
+timestamps (`…_ns INTEGER`), `INTEGER … CHECK (x IN (0, 1))` booleans, and
+fixed-length `BLOB` hashes (`CHECK (length(h) = 32)`).
+
+The ~13 tables that predate this convention are **not** STRICT yet: STRICT
+can't be added with `ALTER`, so each needs a full rebuild (create STRICT copy
+→ `INSERT … SELECT` → drop → rename) recreating every index and trigger. That
+bulk conversion is a dedicated, well-tested migration PR of its own — don't
+ride it along with a feature, and don't convert tables ad hoc.
+
 # Code quality
 
 Don't:
