@@ -62,8 +62,8 @@ upgraded to content-verified by the scan-back fingerprint), peer nodes the
 offloading machine itself pushes to (`peer-blake3`), kopia repositories
 (`kopia-verify`), and — since #156 — a **plain (non-crypt) mirror synced
 with BLAKE3 verification**, whose full `--checksum` compare is end-to-end
-content verification and advances the vector with `rclone-blake3`
-(recorded as the `blake3` method). A **crypt** mirror is the one shape that
+content verification and advances the vector with the `blake3` method
+(rclone's `--checksum` BLAKE3 comparison). A **crypt** mirror is the one shape that
 never yields evidence: the overlay hides the content hash, so rclone falls
 back to size+mtime forever, and the mirror layout keeps no fingerprint to
 upgrade it (friction log F21). Naming a locally-configured crypt mirror in

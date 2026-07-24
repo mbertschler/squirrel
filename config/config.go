@@ -503,7 +503,7 @@ func rejectUnsatisfiableOffloadRequires(names []string, dests map[string]*Destin
 			continue
 		}
 		if capable, reason := d.CanEverGateOffload(); !capable {
-			return fmt.Errorf("offload_requires names %q, which can never satisfy the durability gate (%s); require a content-addressed or packed destination, a plain (non-crypt) mirror synced with BLAKE3 verification, or a peer node instead", n, reason)
+			return fmt.Errorf("offload_requires names %q, which can never satisfy the durability gate (%s); require a content-addressed or packed destination, a kopia repository, a plain (non-crypt) mirror synced with BLAKE3 verification, or a peer node instead", n, reason)
 		}
 	}
 	return nil
