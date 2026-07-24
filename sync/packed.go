@@ -190,16 +190,29 @@ func (h *packedHandler) push(ctx context.Context, rep *Report, volID, runID int6
 // per landed pack, reads each pack's scan-back fingerprint, and advances
 // the destination vector to fingerprint-verified only once the whole
 // (volume, destination) pair carries a verified fingerprint behind every
-// present content — packs, per-hash objects, placement map, and manifest
-// segment all landed and confirmed. Gating on the whole pending set rather
-// than this run's writes is the friction-log F13 fix: a run that packs
-// nothing no longer advances vacuously past an earlier still-pending pack,
-// and a still-pending artifact anywhere in the pair holds the whole
-// advance. `squirrel verify` fills a pending fingerprint later and
-// re-attempts this advance itself (see the store upgrade), so the vector no
-// longer stalls until the next content-writing sync. rep.Verification stays
-// unverified (presence+size is not content-verified), so RunPair does not
-// advance the vector a second time.
+// present file content. That whole-state check is
+// CountVolumeContentsPendingFingerprint, which counts present contents
+// lacking a verified remote_objects (per-hash object) or remote_packs (pack
+// member) fingerprint on this destination — so it covers packs and per-hash
+// objects, the two artifacts that carry content bytes.
+//
+// The placement map and manifest segment are deliberately NOT in that
+// pending set: they are re-derivable squirrel-written metadata that carry
+// no scan-back fingerprint. Their durability before this advance is handled
+// upstream in push, which uploads and confirms both landed at their
+// expected size before promoting the run to success — a run whose map or
+// segment failed to land returns failed and never reaches certifyPacked, so
+// the vector is untouched.
+//
+// Gating on the whole pending set rather than this run's writes is the
+// friction-log F13 fix: a run that packs nothing no longer advances
+// vacuously past an earlier still-pending pack, and a still-pending artifact
+// anywhere in the pair holds the whole advance. `squirrel verify` fills a
+// pending fingerprint later and re-attempts this advance itself (see the
+// store upgrade), so the vector no longer stalls until the next
+// content-writing sync. rep.Verification stays unverified (presence+size is
+// not content-verified), so RunPair does not advance the vector a second
+// time.
 func (h *packedHandler) certifyPacked(ctx context.Context, rep *Report, volID, runID int64, writes []store.PackWrite, advance []store.OriginComponent) error {
 	h.capturePackFingerprints(ctx, rep, runID, writes)
 	pending, err := h.store.CountVolumeContentsPendingFingerprint(ctx, volID, h.dest.Name)
