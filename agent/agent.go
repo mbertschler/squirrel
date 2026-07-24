@@ -86,6 +86,14 @@ type Config struct {
 	// disables the sync endpoints (they return 404 on every volume),
 	// which is what tests of the auth/health surface want.
 	Volumes map[string]*config.Volume
+	// Destinations maps destination name → resolved config-side
+	// destination. The durability endpoint reads it to advertise, per
+	// destination this node syncs a volume to, whether it can ever gate
+	// offload — so a peer gating on a relayed required target can fail fast
+	// when this node's destination is structurally incapable (#145). A nil
+	// map simply advertises no capabilities, degrading a peer's pre-check to
+	// the per-file gate; it never affects the sync endpoints.
+	Destinations map[string]*config.Destination
 	// SyncRunner is the cadence scheduler's (#39) hook for invoking
 	// one (volume, destination) sync. The CLI wires this to a closure
 	// that calls sync.RunPair against a configured rclone wrapper.

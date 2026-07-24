@@ -63,6 +63,7 @@ func runAgent(cmd *cobra.Command) error {
 		TLSKey:       cfg.Agent.TLSKey,
 		Version:      agentVersion,
 		Volumes:      cfg.Volumes,
+		Destinations: cfg.Destinations,
 		SyncRunner:   buildSchedulerSyncRunner(cfg, s, rcl),
 		ScanInterval: cfg.Agent.ScanInterval,
 		ScanStrategy: cfg.Agent.ScanStrategy,
