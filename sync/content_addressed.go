@@ -130,7 +130,7 @@ func (h *contentAddressedHandler) Push(ctx context.Context, opts Options) (Repor
 		return rep, err
 	}
 	if opts.DryRun {
-		return rep, fmt.Errorf("destination %q: the content-addressed push has no dry-run mode yet — run without --dry-run", h.dest.Name)
+		return rep, h.previewDryRun(ctx, &rep, volID)
 	}
 	// shallow=true on the runs row: the per-object transfers carry no
 	// BLAKE3 end-to-end check (crypt remotes expose no hashes), and the
@@ -155,6 +155,30 @@ func (h *contentAddressedHandler) Push(ctx context.Context, opts Options) (Repor
 }
 
 func (h *contentAddressedHandler) sealed() {}
+
+// previewDryRun reports what a real push would upload without transferring
+// anything or writing a runs row: rep.RunID stays 0, no objects land, and
+// no remote_objects or manifest-segment rows are written. It computes the
+// same delta and new-content selection the real push does (watermark →
+// delta → plannedUploads), so the preview matches what the next real run
+// would land. The watermark check still reads the destination, so a
+// layout-flip is refused here too — a dry-run is an honest rehearsal.
+func (h *contentAddressedHandler) previewDryRun(ctx context.Context, rep *Report, volID int64) error {
+	watermark, err := h.watermark(ctx, volID)
+	if err != nil {
+		return err
+	}
+	delta, err := h.store.ListPathDeltaSince(ctx, volID, watermark)
+	if err != nil {
+		return fmt.Errorf("compute path delta since run %d: %w", watermark, err)
+	}
+	rep.Verification.Files = int64(len(delta))
+	if err := h.previewObjectUploads(ctx, rep, plannedUploads(delta)); err != nil {
+		return err
+	}
+	rep.Status = store.RunStatusSuccess
+	return nil
+}
 
 // push runs the transactional landing: delta → objects → segment →
 // vector. rep.Status starts failed and is promoted to success only at
@@ -214,6 +238,28 @@ func (h *contentAddressedHandler) watermark(ctx context.Context, volID int64) (i
 		return 0, fmt.Errorf("destination %q: the last successful sync (run %d) left no manifest segment at %s — its history does not look content-addressed; point the layout at a fresh destination or root instead of switching an existing one: %w", h.dest.Name, last.ID, segURI, err)
 	}
 	return last.ID, nil
+}
+
+// previewObjectUploads counts, without uploading, the split uploadObjects
+// would record: planned content the destination has no record of lands on
+// rep.RcloneResult as Transferred + Bytes, content already offsite (as a
+// per-hash object or a pack member) as Checked. It writes nothing and
+// touches no object. Both layouts' dry-run preview use it — the packed
+// layout passes only its object-routed (large) content.
+func (h *contentPusher) previewObjectUploads(ctx context.Context, rep *Report, planned []store.PathDelta) error {
+	for _, d := range planned {
+		recorded, err := h.store.ContentPresentOnDestination(ctx, d.ContentID, h.dest.Name)
+		if err != nil {
+			return fmt.Errorf("lookup upload record for %s: %w", d.Path, err)
+		}
+		if recorded {
+			rep.RcloneResult.Checked++
+			continue
+		}
+		rep.RcloneResult.Transferred++
+		rep.RcloneResult.Bytes += d.SizeBytes
+	}
+	return nil
 }
 
 // uploadObjects lands every planned content object that the destination
