@@ -62,6 +62,7 @@ export default defineConfig({
             { label: "Offsite verification", link: "/guides/verification/" },
             { label: "Offloading", link: "/guides/offloading/" },
             { label: "Restoring", link: "/guides/restore/" },
+            { label: "Recovery & disaster runbooks", link: "/guides/recovery/" },
             { label: "Hooks", link: "/guides/hooks/" },
             { label: "Auditing for drift", link: "/guides/auditing/" },
             { label: "Peer sync", link: "/guides/peer-sync/" },

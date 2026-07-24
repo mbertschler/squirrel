@@ -211,7 +211,10 @@ func (h *contentAddressedHandler) watermark(ctx context.Context, volID int64) (i
 	}
 	segURI := h.segmentURI(last.ID)
 	if _, err := h.rcl.statRemote(ctx, segURI, checkersArgs(h.dest)...); err != nil {
-		return 0, fmt.Errorf("destination %q: the last successful sync (run %d) left no manifest segment at %s — its history does not look content-addressed; point the layout at a fresh destination or root instead of switching an existing one: %w", h.dest.Name, last.ID, segURI, err)
+		if freshStartOnEmptyRoot(ctx, h.rcl, h.dest) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("destination %q: the last successful sync (run %d) left no manifest segment at %s — its history does not look content-addressed; point the layout at a fresh destination or root, or (after wiping the remote root) run `squirrel destination reset %s`, instead of switching an existing one: %w", h.dest.Name, last.ID, segURI, h.dest.Name, err)
 	}
 	return last.ID, nil
 }

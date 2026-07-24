@@ -57,6 +57,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newDBCmd())
 	root.AddCommand(newConfigCmd())
 	root.AddCommand(newNodeCmd())
+	root.AddCommand(newDestinationCmd())
 	return root
 }
 

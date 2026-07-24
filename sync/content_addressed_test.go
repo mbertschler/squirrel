@@ -64,6 +64,7 @@ while [ $# -gt 0 ]; do
   --hash-type) shift; hashtypes="$hashtypes $1" ;;
   --include) shift; includes="$includes $1" ;;
   --checkers) shift ;;
+  -R) ;;
   --*) ;;
   *) if [ -z "$a1" ]; then a1="$1"; else a2="$1"; fi ;;
   esac
@@ -118,6 +119,26 @@ lsjson)
     done
     printf ']\n'
   fi
+  ;;
+lsf)
+  # Directory listing for the layout guard's emptiness probe. An injected
+  # error simulates a not-found (fresh root) or a real failure (auth etc.)
+  # so the guard's fail-closed classification can be tested.
+  if [ -n "$RCLONE_FAKE_LSF_ERROR" ]; then echo "$RCLONE_FAKE_LSF_ERROR" >&2; exit 1; fi
+  # Resolve the base directory ignoring any crypt filename suffix — we only
+  # need to know whether any file exists beneath the root — then list
+  # recursively.
+  case "$a1" in
+  *:*)
+    p="${a1#*:}"
+    case "$p" in
+    "${RCLONE_FAKE_STRIP:-//none//}"/*) p="${p#"${RCLONE_FAKE_STRIP}"/}" ;;
+    esac
+    dir="$RCLONE_FAKE_ROOT/$p" ;;
+  *) dir="$a1" ;;
+  esac
+  [ -d "$dir" ] && find "$dir" -type f
+  exit 0
   ;;
 *) echo "unexpected rclone subcommand: $cmd $*" >&2; exit 64 ;;
 esac
@@ -181,6 +202,7 @@ func setupCAFixture(t *testing.T, destBlock, strip string) *caFixture {
 	t.Setenv("RCLONE_FAKE_HASH_VALUE", "")
 	t.Setenv("RCLONE_FAKE_HASH_PREFIX", "")
 	t.Setenv("RCLONE_FAKE_CRYPT_SUFFIX", "")
+	t.Setenv("RCLONE_FAKE_LSF_ERROR", "")
 
 	root := t.TempDir()
 	volPath := filepath.Join(root, "src")
@@ -622,6 +644,10 @@ func TestContentAddressedWatermarkGuard(t *testing.T) {
 	if err := f.store.FinishRun(ctx, mirrorRun, store.RunStatusSuccess, "", 1); err != nil {
 		t.Fatalf("finish mirror-era run: %v", err)
 	}
+	// A real mirror era leaves the volume's files mirrored under the root,
+	// so the root is non-empty: a genuine layout conflict, distinct from a
+	// wiped destination (which the fresh-start recognition below handles).
+	seedRemoteFile(t, f, "pics", "a.txt")
 
 	rep, err := f.sync(t)
 	if err == nil || !strings.Contains(err.Error(), "does not look content-addressed") {
@@ -629,6 +655,79 @@ func TestContentAddressedWatermarkGuard(t *testing.T) {
 	}
 	if rep.Status != store.RunStatusFailed {
 		t.Fatalf("Status = %q, want failed", rep.Status)
+	}
+}
+
+// TestRemoteRootEmptyClassifiesErrors guards the layout guard's fail-closed
+// contract: only rclone's canonical not-found reads as an empty (fresh)
+// root; any other lsf error must surface so the guard refuses rather than
+// mistaking a broken probe (auth, network) for a wiped destination.
+func TestRemoteRootEmptyClassifiesErrors(t *testing.T) {
+	f := setupContentAddressedFixture(t)
+	ctx := context.Background()
+
+	// A canonical directory-not-found is a fresh root.
+	t.Setenv("RCLONE_FAKE_LSF_ERROR", "2020/01/01 ERROR : directory not found")
+	empty, err := f.rcl.remoteRootEmpty(ctx, "offsite:/data")
+	if err != nil || !empty {
+		t.Fatalf("not-found lsf = (%t, %v), want (true, nil)", empty, err)
+	}
+
+	// An auth/network error must surface so the guard fails closed — never
+	// reported as an empty root just because stdout was empty.
+	t.Setenv("RCLONE_FAKE_LSF_ERROR", "Failed to create file system: 401 Unauthorized")
+	empty, err = f.rcl.remoteRootEmpty(ctx, "offsite:/data")
+	if err == nil {
+		t.Fatalf("auth lsf error swallowed (empty=%t); guard would proceed instead of refusing", empty)
+	}
+	if empty {
+		t.Fatalf("auth lsf error reported empty root; must be false")
+	}
+}
+
+// seedRemoteFile writes one file under the fixture's remote root, standing
+// in for the bytes a prior (mirror) era left there so the root is non-empty.
+func seedRemoteFile(t *testing.T, f *caFixture, parts ...string) {
+	t.Helper()
+	p := f.remotePath(parts...)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatalf("mkdir remote file dir: %v", err)
+	}
+	if err := os.WriteFile(p, []byte("mirror-era-bytes"), 0o644); err != nil {
+		t.Fatalf("seed remote file: %v", err)
+	}
+}
+
+// TestContentAddressedFreshStartOnEmptyRoot is the F20 fix: when name-keyed
+// run history records a prior success but the configured root is empty on the
+// remote (a wiped or repointed destination, or one cleared by
+// `squirrel destination reset`), the guard treats it as a fresh start and
+// re-uploads instead of refusing.
+func TestContentAddressedFreshStartOnEmptyRoot(t *testing.T) {
+	f := setupContentAddressedFixture(t)
+	f.write(t, "a.txt", "alpha")
+	f.index(t)
+
+	ctx := context.Background()
+	staleRun, err := f.store.BeginRun(ctx, store.RunKindSync, f.volumeID(t), "offsite", false)
+	if err != nil {
+		t.Fatalf("seed stale run: %v", err)
+	}
+	if err := f.store.FinishRun(ctx, staleRun, store.RunStatusSuccess, "", 1); err != nil {
+		t.Fatalf("finish stale run: %v", err)
+	}
+	// Remote root left empty — no seedRemoteFile — so the guard reads it as
+	// a fresh start.
+
+	rep, err := f.sync(t)
+	if err != nil {
+		t.Fatalf("fresh-start sync failed: %v (rep=%+v)", err, rep)
+	}
+	if rep.Status != store.RunStatusSuccess {
+		t.Fatalf("Status = %q, want success", rep.Status)
+	}
+	if _, err := os.Stat(f.remoteBlob(ObjectsDirName, blake3Hex("alpha"))); err != nil {
+		t.Fatalf("fresh start did not re-upload the object: %v", err)
 	}
 }
 
