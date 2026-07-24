@@ -824,34 +824,30 @@ type RestoreOptions struct {
 	InPlace bool
 }
 
-// Restore reverses Sync: it copies from the destination's per-volume tree
-// back to the local filesystem. Like Sync it records a runs row, but with
-// kind='restore'. Restore is the opposite of additive — the rclone copy
-// will overwrite whatever exists at the target path on a hash mismatch.
-// Callers are expected to point ToPath at an empty / scratch directory
-// unless they explicitly intend to restore in place.
+// Restore reverses Sync back to the local filesystem, recording a
+// kind='restore' runs row. The mirror layout copies the destination's
+// per-volume tree down with rclone; the content-addressed and packed
+// layouts (which have no mirrored tree) resolve each present path to its
+// content hash in the local index, fetch the per-hash object or pack
+// member, and re-hash it before writing. Restore is read-only against both
+// the index and the destination — it never uploads, never mutates content
+// rows — but the rclone mirror path will overwrite whatever exists at the
+// target on a hash mismatch, so callers point ToPath at an empty / scratch
+// directory unless they explicitly intend to restore in place.
 func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, dest *config.Destination, opts RestoreOptions) (rep Report, err error) {
 	rep = Report{Volume: vol.Name, Destination: dest.Name}
 	if dest.Type == "kopia" {
 		return rep, fmt.Errorf("destination %q is a kopia repository — restore from it with the kopia CLI (`kopia snapshot restore`)", dest.Name)
 	}
-	if dest.Layout == config.LayoutContentAddressed {
-		return rep, fmt.Errorf("destination %q uses the content-addressed layout — its restore tooling ships separately; the data is recoverable by replaying the manifest segments under %s/%s/ against the destination-root %s/ (see the README's manifest format)", dest.Name, vol.Name, ManifestDirName, ObjectsDirName)
-	}
-	if dest.Layout == config.LayoutPacked {
-		return rep, fmt.Errorf("destination %q uses the packed layout — its restore tooling ships separately; the data is recoverable by replaying the manifest segments under %s/%s/ together with the placement maps under %s/ against the packs and objects at the destination root (see the README's packed layout section)", dest.Name, vol.Name, ManifestDirName, PacksDirName)
-	}
-	if w := cryptVerificationWarning(dest, opts.Shallow); w != "" {
-		rep.Warnings = append(rep.Warnings, w)
-	}
+	archive := dest.Layout == config.LayoutContentAddressed || dest.Layout == config.LayoutPacked
 
 	// "In-place" is the dangerous direction: writing into the live
 	// volume path. Unsetting ToPath is the canonical request, but a
 	// caller who explicitly passes ToPath == vol.Path is asking for
 	// the same thing and must go through the same gates — otherwise
 	// `--to <vol.Path>` would silently bypass the marker check, the
-	// non-empty refusal, AND --backup-dir, reintroducing exactly the
-	// data-loss path this PR is trying to close.
+	// non-empty refusal, AND the overwrite backup, reintroducing exactly
+	// the data-loss path this guard is trying to close.
 	targetInPlace, err := isInPlaceRestore(vol, opts.ToPath)
 	if err != nil {
 		return rep, err
@@ -860,10 +856,9 @@ func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volum
 	// Local target marker check: when restoring into the live volume
 	// path, insist on a marker that names this volume. A missing or
 	// mismatched marker is the strongest signal we have that vol.Path
-	// is a typo or unrelated tree, and overwriting it via rclone
-	// would be irreversible. A genuine scratch --to bypasses the
-	// check because the operator is explicitly redirecting to an
-	// unrelated directory.
+	// is a typo or unrelated tree, and overwriting it would be
+	// irreversible. A genuine scratch --to bypasses the check because
+	// the operator is explicitly redirecting to an unrelated directory.
 	if !opts.DryRun && targetInPlace {
 		if err := validateLocalVolumeMarker(vol); err != nil {
 			return rep, err
@@ -872,10 +867,10 @@ func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volum
 
 	// In-place overwrite gate: a non-empty live vol.Path is the
 	// most likely realistic data-loss path in squirrel today (user
-	// runs `restore` to recover what they think is missing, rclone
-	// happily replaces local edits with the destination's view). When
-	// InPlace is unset and the directory carries anything beyond the
-	// marker/history subtree, refuse with the --in-place hint.
+	// runs `restore` to recover what they think is missing, and the
+	// destination's view replaces local edits). When InPlace is unset
+	// and the directory carries anything beyond the marker/history
+	// subtree, refuse with the --in-place hint.
 	if !opts.DryRun && targetInPlace && !opts.InPlace {
 		hasContent, err := localVolumeHasContent(vol.Path)
 		if err != nil {
@@ -886,20 +881,37 @@ func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volum
 		}
 	}
 
-	// We deliberately don't require an existing index for restore: the
-	// destination is the source of truth in this direction, and a fresh
+	// We deliberately don't require an existing index for the mirror
+	// pull: the destination is the source of truth there, and a fresh
 	// laptop may have no DB rows yet. We still create a volumes row so
-	// the runs row's FK resolves.
+	// the runs row's FK resolves. (The archive pull does need the index
+	// — that is where path→hash lives — but a fresh volume simply
+	// resolves to zero present rows and restores nothing.)
 	v, err := getOrCreateVolumeForRestore(ctx, s, vol)
 	if err != nil {
 		return rep, err
 	}
 
-	runID, err := beginRestoreRun(ctx, s, opts.DryRun, v.ID, dest.Name, EffectiveShallow(dest, opts.Shallow))
+	// The archive layouts re-hash every extracted content locally, so the
+	// pull is content-verified regardless of --shallow or a crypt overlay;
+	// the mirror pull records rclone's effective comparison instead.
+	shallow := EffectiveShallow(dest, opts.Shallow)
+	if archive {
+		shallow = false
+	}
+	runID, err := beginRestoreRun(ctx, s, opts.DryRun, v.ID, dest.Name, shallow)
 	if err != nil {
 		return rep, err
 	}
 
+	if archive {
+		err = restoreArchive(ctx, s, rcl, vol, dest, v.ID, runID, targetInPlace, opts, &rep)
+		return rep, err
+	}
+
+	if w := cryptVerificationWarning(dest, opts.Shallow); w != "" {
+		rep.Warnings = append(rep.Warnings, w)
+	}
 	err = runRcloneOperation(ctx, s, rcl, opts.DryRun, runID, &rep, nil,
 		func(runID int64) ([]string, error) {
 			return buildRestoreArgs(vol, dest, runID, opts), nil
