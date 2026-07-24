@@ -168,7 +168,7 @@ func resolveAgentAuth(r *rawAuth, a *Agent) error {
 			// tokens would have no listener to guard either.
 			return nil
 		}
-		return errors.New("auth.token is required (no agent without authentication)")
+		return errors.New("auth.token is required when [agent] listen is set (the listener needs a bearer token; omit listen for a listener-less, scheduler-only agent)")
 	}
 	// resolveSecret takes a map[string]any and pulls the named key. We pass
 	// a synthetic single-entry map so the same code handles plain strings

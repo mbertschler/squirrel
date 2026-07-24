@@ -88,7 +88,7 @@ func serveAgent(cmd *cobra.Command, cfg *config.Config, srv *agent.Server, logge
 	// degradation, not a valid config.
 	if cfg.Agent.Listen == "" {
 		if !agentHasWork(cfg) {
-			return fmt.Errorf("listener-less agent has nothing to run: set [agent] listen to receive peer syncs, or a sync_every/index_every/scan_interval cadence, in %s", cfg.Path)
+			return fmt.Errorf("listener-less agent has nothing to run: set [agent] listen to receive peer syncs, or configure a cadence (a volume's sync_every, index_every, or hook.interval, or [agent] scan_interval) in %s", cfg.Path)
 		}
 		logSchedulerOnlyStartup(logger)
 		return srv.RunSchedulers(cmd.Context())
