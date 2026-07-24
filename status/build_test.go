@@ -164,7 +164,7 @@ func TestBuildAlarm(t *testing.T) {
 	s := setupStore(t)
 	ctx := context.Background()
 	root, idx := indexTree(t, s, "media")
-	if err := s.RaiseDestinationAlarm(ctx, "dest", store.AlarmKindVerifyMismatch, "checksum mismatch on object", idx.RunID); err != nil {
+	if _, err := s.RaiseDestinationAlarm(ctx, "dest", store.AlarmKindVerifyMismatch, "checksum mismatch on object", idx.RunID); err != nil {
 		t.Fatalf("RaiseDestinationAlarm: %v", err)
 	}
 	cfg := cfgFor("media", root, []string{"dest"}, nil, []string{"dest"}, nil)
