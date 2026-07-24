@@ -42,8 +42,17 @@ var rcloneObscureCipher = func() cipher.Block {
 // whatever IV the ciphertext carries, so a zero IV round-trips identically —
 // and a deterministic render keeps rclone.conf byte-stable, so
 // WriteRcloneConfig rewrites it only on a genuine credential change (its
-// churn-is-a-signal contract) instead of every time the agent renders. The
-// obscuring provides no secrecy to weaken, so the fixed IV costs nothing.
+// churn-is-a-signal contract) instead of every time the agent renders.
+//
+// The fixed IV is a deliberate trade-off, not free: in CTR mode a constant IV
+// makes identical plaintexts obscure to identical ciphertext, so the output
+// leaks equality between secrets (two destinations sharing one password render
+// to the same string) — a leak rclone's random IV avoids. It is acceptable
+// here only because (a) obscuring provides no real secrecy to begin with — the
+// AES key is published in rclone's source, so a reader with the file can
+// reveal any value regardless of IV — and (b) byte-stable output is what
+// preserves WriteRcloneConfig's churn-is-a-signal contract. Do not carry this
+// fixed-IV choice into any context that expects obscuring to hide anything.
 //
 // It lives here, unexported but reusable across the config package, because
 // the crypt-config work also needs to obscure a password without shelling
