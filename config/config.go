@@ -492,10 +492,12 @@ func validateOffloadRequires(names []string) error {
 // only at the first offload (#121's pre-check) or, for the reference laptop
 // gating on the crypt-mirror cloudbox, never (friction log F21).
 //
-// Only names with a resolved local destination are judged. A name absent from
-// dests is a peer-relayed target this node cannot see as a destination; its
-// evidence can arrive via a durability pull (see Volume.OffloadRequires), so
-// it stays permitted and remains the per-file gate's concern (#145).
+// Only names with a resolved local destination are judged here at config
+// load. A name absent from dests is a peer-relayed target this node cannot
+// see as a destination; its evidence (and, since #145, its gating capability)
+// arrives from the owning peer over sync, so it stays permitted at load and
+// is assessed at offload time by the best-effort peer pre-check — falling
+// back to the per-file gate when no peer can be reached.
 func rejectUnsatisfiableOffloadRequires(names []string, dests map[string]*Destination) error {
 	for _, n := range names {
 		d, ok := dests[n]
