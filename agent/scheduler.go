@@ -39,6 +39,20 @@ type scheduler struct {
 	// tests that construct a bare scheduler; hookRunner methods tolerate a
 	// nil receiver so the firing sites need no extra guard.
 	hooks *hookRunner
+	// verifyRun and durabilityPull are the injected hooks for the two
+	// non-volume cadences (F32/F33); nil disables the respective cadence.
+	// verifyEvery maps a verifiable destination name to its resolved verify
+	// cadence (per-destination verify_every or the [agent] default);
+	// pullEvery maps a peer name to its pull_durability_every. lastVerify
+	// and lastPull are in-memory watermarks (destination name, and
+	// volume+peer key, → last attempt) — see runVerify for why they need
+	// not persist.
+	verifyRun      VerifyRunner
+	durabilityPull DurabilityPuller
+	verifyEvery    map[string]time.Duration
+	pullEvery      map[string]time.Duration
+	lastVerify     map[string]time.Time
+	lastPull       map[string]time.Time
 }
 
 // lockHolder is the subset of the peer-sync router the scheduler uses
@@ -58,21 +72,60 @@ func newScheduler(srv *Server, tickEvery time.Duration, now func() time.Time) *s
 		now = time.Now
 	}
 	return &scheduler{
-		store:     srv.store,
-		volumes:   srv.cfg.Volumes,
-		syncRun:   srv.cfg.SyncRunner,
-		logger:    srv.cfg.Logger,
-		locks:     srv.router,
-		tickEvery: tickEvery,
-		now:       now,
-		hooks:     newHookRunner(srv.store, srv.cfg.Logger),
+		store:          srv.store,
+		volumes:        srv.cfg.Volumes,
+		syncRun:        srv.cfg.SyncRunner,
+		logger:         srv.cfg.Logger,
+		locks:          srv.router,
+		tickEvery:      tickEvery,
+		now:            now,
+		hooks:          newHookRunner(srv.store, srv.cfg.Logger),
+		verifyRun:      srv.cfg.VerifyRunner,
+		durabilityPull: srv.cfg.DurabilityPuller,
+		verifyEvery:    resolveVerifyCadences(srv.cfg.Destinations, srv.cfg.VerifyEvery),
+		pullEvery:      resolvePullCadences(srv.cfg.Nodes),
+		lastVerify:     map[string]time.Time{},
+		lastPull:       map[string]time.Time{},
 	}
 }
 
+// resolveVerifyCadences maps each verifiable (content-addressed or packed)
+// destination to its effective verify cadence: the destination's own
+// verify_every when set, otherwise the [agent] verify_every default. Only
+// destinations with a positive resulting cadence are included, so a config
+// with neither knob set yields an empty map and no verify activity.
+func resolveVerifyCadences(dests map[string]*config.Destination, def time.Duration) map[string]time.Duration {
+	out := make(map[string]time.Duration)
+	for name, d := range dests {
+		if d.Layout != config.LayoutContentAddressed && d.Layout != config.LayoutPacked {
+			continue
+		}
+		eff := d.VerifyEvery
+		if eff == 0 {
+			eff = def
+		}
+		if eff > 0 {
+			out[name] = eff
+		}
+	}
+	return out
+}
+
+// resolvePullCadences maps each peer node declaring pull_durability_every to
+// that cadence. Nodes without the knob are omitted, so a config with no pull
+// cadence yields an empty map and no durability-pull activity.
+func resolvePullCadences(nodes map[string]*config.Node) map[string]time.Duration {
+	out := make(map[string]time.Duration)
+	for name, n := range nodes {
+		if n.PullDurabilityEvery > 0 {
+			out[name] = n.PullDurabilityEvery
+		}
+	}
+	return out
+}
+
 // anyScheduledVolume reports whether any configured volume has at
-// least one cadence knob set. Serve skips starting the scheduler
-// goroutine when this returns false so the agent has no idle goroutine
-// when nothing is scheduled.
+// least one cadence knob set.
 func (s *scheduler) anyScheduledVolume() bool {
 	for _, v := range s.volumes {
 		if volumeHasCadence(v) {
@@ -80,6 +133,47 @@ func (s *scheduler) anyScheduledVolume() bool {
 		}
 	}
 	return false
+}
+
+// anyScheduledWork reports whether the scheduler has anything to do at all:
+// a volume cadence, a destination verify cadence (F32), or a peer durability
+// cadence (F33). Serve skips starting the scheduler goroutine when this
+// returns false so the agent has no idle goroutine when nothing is
+// scheduled. The verify/durability cadences are decisive on their own — a
+// receive-only node (the reference htpc) declares no volume cadence yet must
+// still run the scheduler purely to keep its offload-gate evidence fresh.
+func (s *scheduler) anyScheduledWork() bool {
+	return s.anyScheduledVolume() || len(s.verifyEvery) > 0 || len(s.pullEvery) > 0
+}
+
+// ScheduledWorkInConfig answers anyScheduledWork's question straight from a
+// config, before any Server exists: does this config give the schedulers
+// anything to do — a drift scan, a volume cadence, a destination verify
+// cadence (F32), or a peer durability-pull cadence (F33)?
+//
+// The CLI consults it to refuse a listener-less agent that would idle
+// silently (F35). It reads the same cadences through the same resolvers as
+// the scheduler's own gate, so the two cannot drift: a receive-only machine
+// whose only work is a pull_durability_every has real work and must start,
+// even though it declares no volume cadence at all.
+func ScheduledWorkInConfig(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	var scanInterval, verifyDefault time.Duration
+	if cfg.Agent != nil {
+		scanInterval, verifyDefault = cfg.Agent.ScanInterval, cfg.Agent.VerifyEvery
+	}
+	if scanInterval > 0 {
+		return true
+	}
+	for _, v := range cfg.Volumes {
+		if volumeHasCadence(v) {
+			return true
+		}
+	}
+	return len(resolveVerifyCadences(cfg.Destinations, verifyDefault)) > 0 ||
+		len(resolvePullCadences(cfg.Nodes)) > 0
 }
 
 // volumeHasCadence reports whether a volume opts into any scheduler-driven
@@ -128,6 +222,14 @@ func (s *scheduler) tick(ctx context.Context) {
 		}
 		s.evaluateVolume(ctx, v)
 	}
+	// The verify and durability-pull cadences key on destinations and peer
+	// nodes rather than volumes, so they run after the per-volume loop as
+	// their own phases. Both are read-only / metadata-only and take no
+	// volume lock: verify touches only the remote-object bookkeeping, and a
+	// durability pull only merges peer-supplied vectors — neither races the
+	// per-volume index/sync/audit work the loop above coordinates.
+	s.evaluateVerify(ctx)
+	s.evaluateDurabilityPulls(ctx)
 }
 
 func sortedVolumeNames(m map[string]*config.Volume) []string {
@@ -510,4 +612,157 @@ func (s *scheduler) runSync(ctx context.Context, vol *config.Volume, volumeID in
 			"kind", "sync", "volume", vol.Name, "destination", destName,
 			"run_id", rep.RunID, "err", rep.Err.Error())
 	}
+}
+
+// evaluateVerify walks every destination with a resolved verify cadence
+// (F32) and kicks its verify pass when due, in name order for deterministic
+// logs. A nil verifyRun (no rclone wired, or no verifiable destination)
+// disables the phase. The pass is the same one `squirrel verify` runs and
+// records its own kind='audit' run; the agent never bootstraps or writes to
+// the destination, so the marker/init boundary is respected.
+func (s *scheduler) evaluateVerify(ctx context.Context) {
+	if s.verifyRun == nil {
+		return
+	}
+	for _, destName := range sortedCadenceNames(s.verifyEvery) {
+		if ctx.Err() != nil {
+			return
+		}
+		if !s.verifyDue(destName) {
+			continue
+		}
+		s.runVerify(ctx, destName)
+	}
+}
+
+// verifyDue reports whether `now - last_verify >= cadence` for the
+// destination. A destination not yet verified this process lifetime is due.
+func (s *scheduler) verifyDue(destName string) bool {
+	last, ok := s.lastVerify[destName]
+	if !ok {
+		return true
+	}
+	return s.now().Sub(last) >= s.verifyEvery[destName]
+}
+
+// runVerify kicks one destination's verify pass and emits the
+// kicked/finished/error log triple. The in-memory watermark is advanced up
+// front so a failed or empty pass consumes the cadence window exactly like
+// the volume cadences (no special retry — the next window re-evaluates). It
+// need not persist: verify is read-only and idempotent, so re-running once
+// after an agent restart is harmless and, for evidence freshness, desirable.
+func (s *scheduler) runVerify(ctx context.Context, destName string) {
+	s.lastVerify[destName] = s.now()
+	s.logger.Info("scheduler.kicked", "kind", "verify", "destination", destName)
+	start := s.now()
+	rep := s.verifyRun(ctx, destName)
+	duration := s.now().Sub(start)
+	status := rep.Status
+	if status == "" {
+		// No recorded objects or packs: nothing to re-check and no audit
+		// run written (run_id stays 0). Reported distinctly so the log
+		// doesn't imply a verification actually ran.
+		status = "no-op"
+	}
+	s.logger.Info("scheduler.finished",
+		"kind", "verify", "destination", destName,
+		"run_id", rep.RunID, "status", status,
+		"duration_ms", duration.Milliseconds())
+	if rep.Err != nil {
+		s.logger.Error("scheduler.error",
+			"kind", "verify", "destination", destName,
+			"run_id", rep.RunID, "err", rep.Err.Error())
+	}
+}
+
+// evaluateDurabilityPulls walks every peer with a pull_durability_every
+// cadence (F33) and, for each locally-configured volume with a stake in the
+// peer's evidence, kicks a durability pull when due. A nil durabilityPull
+// disables the phase. Peers and volumes are visited in name order so the log
+// is deterministic.
+func (s *scheduler) evaluateDurabilityPulls(ctx context.Context) {
+	if s.durabilityPull == nil {
+		return
+	}
+	for _, peer := range sortedCadenceNames(s.pullEvery) {
+		for _, volName := range sortedVolumeNames(s.volumes) {
+			if ctx.Err() != nil {
+				return
+			}
+			vol := s.volumes[volName]
+			if !volumeHasDurabilityStake(vol) {
+				continue
+			}
+			if !s.pullDue(volName, peer) {
+				continue
+			}
+			s.runDurabilityPull(ctx, vol, peer)
+		}
+	}
+}
+
+// volumeHasDurabilityStake reports whether a durability pull could advance
+// anything for this volume. The merge keeps only components for destinations
+// the volume references (offload_requires ∪ sync_to — see
+// sync.acceptedDestinations), so a volume naming neither has nothing to gain
+// and is skipped. This is what lets the reference htpc pull its media
+// volume's relayed s3archive evidence while skipping the photos volume it
+// merely plays back.
+func volumeHasDurabilityStake(v *config.Volume) bool {
+	return len(v.OffloadRequires) > 0 || len(v.SyncTo) > 0
+}
+
+// pullDue reports whether `now - last_pull >= cadence` for the (volume,
+// peer) pair. A pair not yet pulled this process lifetime is due.
+func (s *scheduler) pullDue(volume, peer string) bool {
+	last, ok := s.lastPull[pullKey(volume, peer)]
+	if !ok {
+		return true
+	}
+	return s.now().Sub(last) >= s.pullEvery[peer]
+}
+
+// runDurabilityPull kicks one (volume, peer) durability pull and emits the
+// kicked/finished/error log triple. Watermark advanced up front, same policy
+// and rationale as runVerify. The injected puller never rewinds a watermark
+// — the agent does not escalate.
+func (s *scheduler) runDurabilityPull(ctx context.Context, vol *config.Volume, peer string) {
+	s.lastPull[pullKey(vol.Name, peer)] = s.now()
+	s.logger.Info("scheduler.kicked", "kind", "pull-durability", "volume", vol.Name, "peer", peer)
+	start := s.now()
+	rep := s.durabilityPull(ctx, vol, peer)
+	duration := s.now().Sub(start)
+	status := rep.Status
+	if status == "" {
+		status = store.RunStatusFailed
+	}
+	s.logger.Info("scheduler.finished",
+		"kind", "pull-durability", "volume", vol.Name, "peer", peer,
+		"run_id", rep.RunID, "status", status,
+		"fetched", rep.Fetched, "applied", rep.Applied, "dropped", rep.Dropped,
+		"rewinds", rep.Rewinds,
+		"duration_ms", duration.Milliseconds())
+	if rep.Err != nil {
+		s.logger.Error("scheduler.error",
+			"kind", "pull-durability", "volume", vol.Name, "peer", peer,
+			"run_id", rep.RunID, "err", rep.Err.Error())
+	}
+}
+
+// pullKey is the composite watermark key for a (volume, peer) durability
+// pull. The NUL separator can't appear in a validated volume or node name,
+// so distinct pairs never collide.
+func pullKey(volume, peer string) string {
+	return volume + "\x00" + peer
+}
+
+// sortedCadenceNames returns the keys of a name→cadence map in sorted order,
+// so the verify and durability phases visit their subjects deterministically.
+func sortedCadenceNames(m map[string]time.Duration) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

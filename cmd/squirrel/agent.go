@@ -54,19 +54,23 @@ func runAgent(cmd *cobra.Command) error {
 		return err
 	}
 	srv, err := agent.New(agent.Config{
-		Listen:       cfg.Agent.Listen,
-		Token:        cfg.Agent.Token,
-		PeerTokens:   cfg.Agent.PeerTokens,
-		TLSCert:      cfg.Agent.TLSCert,
-		TLSKey:       cfg.Agent.TLSKey,
-		Version:      version,
-		Volumes:      cfg.Volumes,
-		Destinations: cfg.Destinations,
-		SyncRunner:   buildSchedulerSyncRunner(cfg, s, rcl),
-		ScanInterval: cfg.Agent.ScanInterval,
-		ScanStrategy: cfg.Agent.ScanStrategy,
-		ScanLogger:   cmd.ErrOrStderr(),
-		Logger:       logger,
+		Listen:           cfg.Agent.Listen,
+		Token:            cfg.Agent.Token,
+		PeerTokens:       cfg.Agent.PeerTokens,
+		TLSCert:          cfg.Agent.TLSCert,
+		TLSKey:           cfg.Agent.TLSKey,
+		Version:          version,
+		Volumes:          cfg.Volumes,
+		Destinations:     cfg.Destinations,
+		Nodes:            cfg.Nodes,
+		VerifyEvery:      cfg.Agent.VerifyEvery,
+		SyncRunner:       buildSchedulerSyncRunner(cfg, s, rcl),
+		VerifyRunner:     buildSchedulerVerifyRunner(cfg, s, rcl),
+		DurabilityPuller: buildSchedulerDurabilityPuller(cfg, s),
+		ScanInterval:     cfg.Agent.ScanInterval,
+		ScanStrategy:     cfg.Agent.ScanStrategy,
+		ScanLogger:       cmd.ErrOrStderr(),
+		Logger:           logger,
 	}, s)
 	if err != nil {
 		return err
@@ -83,8 +87,8 @@ func serveAgent(cmd *cobra.Command, cfg *config.Config, srv *agent.Server, logge
 	// scheduler-only agent with no cadences and no scan is silent
 	// degradation, not a valid config.
 	if cfg.Agent.Listen == "" {
-		if !agentHasWork(cfg) {
-			return fmt.Errorf("listener-less agent has nothing to run: set [agent] listen to receive peer syncs, or configure a cadence (a volume's sync_every, index_every, or hook.interval, or [agent] scan_interval) in %s", cfg.Path)
+		if !agent.ScheduledWorkInConfig(cfg) {
+			return fmt.Errorf("listener-less agent has nothing to run: set [agent] listen to receive peer syncs, or configure a cadence (a volume's sync_every, index_every, or hook.interval, a destination's verify_every, a node's pull_durability_every, or [agent] scan_interval or verify_every) in %s", cfg.Path)
 		}
 		logSchedulerOnlyStartup(logger)
 		return srv.RunSchedulers(cmd.Context())
@@ -100,26 +104,6 @@ func serveAgent(cmd *cobra.Command, cfg *config.Config, srv *agent.Server, logge
 	}
 	logAgentStartup(logger, srv, ln.Addr().String())
 	return srv.Serve(cmd.Context(), ln)
-}
-
-// agentHasWork reports whether a listener-less agent has any background
-// work: a drift-scan interval, or at least one volume with a scheduler
-// cadence (sync, standalone index, or interval hook). It mirrors the
-// agent scheduler's own "is anything scheduled" gate so the CLI refuses a
-// do-nothing agent rather than letting it idle silently.
-func agentHasWork(cfg *config.Config) bool {
-	if cfg.Agent.ScanInterval > 0 {
-		return true
-	}
-	for _, v := range cfg.Volumes {
-		if v.SyncEvery > 0 || v.IndexEvery > 0 {
-			return true
-		}
-		if v.Hook != nil && v.Hook.Interval > 0 {
-			return true
-		}
-	}
-	return false
 }
 
 // logSchedulerOnlyStartup emits the listener-less counterpart of the
@@ -171,11 +155,13 @@ func resolveAgentDBPath(cmd *cobra.Command, cfg *config.Config) (string, error) 
 }
 
 // resolveSchedulerRclone locates the rclone binary and writes the
-// squirrel-managed rclone.conf when at least one volume declares a
-// sync_every cadence with at least one destination on sync_to. Pure
-// index-only schedules (or no scheduled volumes at all) skip the
-// lookup so a host without rclone installed can still run the agent
-// for its peer-sync surface or its index cadences.
+// squirrel-managed rclone.conf when the schedule needs rclone: at least one
+// volume declares a sync_every cadence with a destination on sync_to, or at
+// least one verifiable destination carries a verify cadence (F32, which
+// reads provider checksums through rclone). Pure index-only schedules (or a
+// receive-only node whose only cadence is a durability pull) skip the lookup
+// so a host without rclone installed can still run the agent for its
+// peer-sync surface, its index cadences, or its durability pulls.
 //
 // The version preflight mirrors what scheduled syncs will invoke: they
 // run with the default sync.Options{} (Shallow=false), so `--hash blake3`
@@ -184,19 +170,25 @@ func resolveAgentDBPath(cmd *cobra.Command, cfg *config.Config) (string, error) 
 // operator gets a clear startup error rather than a midnight pager when
 // the first scheduled sync fires and rclone rejects the flag.
 func resolveSchedulerRclone(cmd *cobra.Command, cfg *config.Config) (*sync.Rclone, error) {
-	if !anyVolumeNeedsScheduledSync(cfg) {
+	needsSync := anyVolumeNeedsScheduledSync(cfg)
+	needsVerify := anyDestinationNeedsScheduledVerify(cfg)
+	if !needsSync && !needsVerify {
 		return nil, nil
 	}
 	rcl, err := sync.Find()
 	if err != nil {
-		return nil, fmt.Errorf("scheduler needs rclone for scheduled syncs: %w", err)
+		return nil, fmt.Errorf("scheduler needs rclone for scheduled syncs/verifies: %w", err)
 	}
-	pairs, err := sync.PairsFor(cfg, "", "")
-	if err != nil {
-		return nil, fmt.Errorf("scheduler rclone preflight: %w", err)
-	}
-	if err := sync.EnsureMinVersion(cmd.Context(), rcl, cmd.ErrOrStderr(), sync.ShallowForPairs(pairs, false)); err != nil {
-		return nil, fmt.Errorf("scheduler rclone preflight: %w", err)
+	// The version preflight (`--hash blake3`) is a sync concern; a
+	// verify-only schedule reads provider checksums and doesn't need it.
+	if needsSync {
+		pairs, err := sync.PairsFor(cfg, "", "")
+		if err != nil {
+			return nil, fmt.Errorf("scheduler rclone preflight: %w", err)
+		}
+		if err := sync.EnsureMinVersion(cmd.Context(), rcl, cmd.ErrOrStderr(), sync.ShallowForPairs(pairs, false)); err != nil {
+			return nil, fmt.Errorf("scheduler rclone preflight: %w", err)
+		}
 	}
 	if _, err := rcl.WriteRcloneConfig(rcloneConfigPathFor(cfg), cfg.Destinations); err != nil {
 		return nil, fmt.Errorf("write rclone config: %w", err)
@@ -207,6 +199,33 @@ func resolveSchedulerRclone(cmd *cobra.Command, cfg *config.Config) (*sync.Rclon
 func anyVolumeNeedsScheduledSync(cfg *config.Config) bool {
 	for _, v := range cfg.Volumes {
 		if v.SyncEvery > 0 && len(v.SyncTo) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// anyDestinationNeedsScheduledVerify reports whether any verifiable
+// destination has an effective verify cadence — its own verify_every, or the
+// [agent] verify_every default. Mirrors the scheduler's own resolution so
+// the rclone/runner wiring lines up with what the scheduler will actually
+// fire.
+func anyDestinationNeedsScheduledVerify(cfg *config.Config) bool {
+	agentDefault := cfg.Agent != nil && cfg.Agent.VerifyEvery > 0
+	for _, d := range cfg.Destinations {
+		if d.Layout != config.LayoutContentAddressed && d.Layout != config.LayoutPacked {
+			continue
+		}
+		if d.VerifyEvery > 0 || agentDefault {
+			return true
+		}
+	}
+	return false
+}
+
+func anyNodeNeedsScheduledPull(cfg *config.Config) bool {
+	for _, n := range cfg.Nodes {
+		if n.PullDurabilityEvery > 0 {
 			return true
 		}
 	}
@@ -256,6 +275,103 @@ func schedulerPairFor(cfg *config.Config, vol *config.Volume, destName string) (
 		return sync.Pair{Volume: vol, Node: n}, nil
 	}
 	return sync.Pair{}, fmt.Errorf("destination %q is not declared in config", destName)
+}
+
+// buildSchedulerVerifyRunner returns the closure the scheduler invokes to
+// verify one destination (F32). It runs sync.VerifyRemote — the same pass as
+// `squirrel verify <destination>`, recording its own kind='audit' run — so
+// the two surfaces share one code path. A nil rcl (no destination needs a
+// verify cadence) returns a nil runner, which the scheduler treats as
+// "verify-kicking disabled".
+func buildSchedulerVerifyRunner(cfg *config.Config, s *store.Store, rcl *sync.Rclone) agent.VerifyRunner {
+	if rcl == nil || !anyDestinationNeedsScheduledVerify(cfg) {
+		return nil
+	}
+	return func(ctx context.Context, destName string) agent.VerifyRunReport {
+		dest, ok := cfg.Destinations[destName]
+		if !ok {
+			return agent.VerifyRunReport{Status: store.RunStatusFailed, Err: fmt.Errorf("destination %q is not declared in config", destName)}
+		}
+		rep, err := sync.VerifyRemote(ctx, s, rcl, dest)
+		return agent.VerifyRunReport{RunID: rep.RunID, Status: verifyRunStatus(rep, err), Err: err}
+	}
+}
+
+// verifyRunStatus maps a VerifyRemote outcome to the status the scheduler
+// logs, matching sync.recordVerifyOutcome. An empty string means "nothing
+// recorded to verify" (no audit run written); the scheduler renders it as a
+// no-op rather than a run.
+func verifyRunStatus(rep sync.RemoteVerifyReport, err error) string {
+	switch {
+	case err != nil:
+		return store.RunStatusFailed
+	case rep.RunID == 0:
+		return ""
+	case !rep.Clean():
+		return store.RunStatusPartial
+	default:
+		return store.RunStatusSuccess
+	}
+}
+
+// buildSchedulerDurabilityPuller returns the closure the scheduler invokes to
+// pull one peer's durability vectors for a volume (F33). It runs
+// sync.PullDurability — the same metadata-only merge the CLI and the
+// post-sync pull share — with allowRewind always false (the agent never
+// escalates), and wraps it in a kind='audit' run so the refresh appears in
+// `squirrel runs`. A config with no pull cadence returns a nil puller.
+func buildSchedulerDurabilityPuller(cfg *config.Config, s *store.Store) agent.DurabilityPuller {
+	if !anyNodeNeedsScheduledPull(cfg) {
+		return nil
+	}
+	return func(ctx context.Context, vol *config.Volume, peerName string) agent.DurabilityPullReport {
+		node, ok := cfg.Nodes[peerName]
+		if !ok {
+			return agent.DurabilityPullReport{Status: store.RunStatusFailed, Err: fmt.Errorf("node %q is not declared in config", peerName)}
+		}
+		runID, err := s.BeginDurabilityPullRun(ctx)
+		if err != nil {
+			return agent.DurabilityPullReport{Status: store.RunStatusFailed, Err: err}
+		}
+		rep, pullErr := sync.PullDurability(ctx, s, vol, node, false)
+		return finishDurabilityPullRun(ctx, s, runID, vol.Name, peerName, rep, pullErr)
+	}
+}
+
+// finishDurabilityPullRun records the pull's 'pull-durability' audit note and
+// finishes its run, then returns the scheduler-facing report. A refused
+// rewind lands as 'partial' (surfaced, but never applied — the agent does not
+// escalate); a transport/merge failure as 'failed'. The pull error and any
+// bookkeeping errors (audit-note append, run finish) are joined so a failure
+// to record or finish the run — which would otherwise strand a 'running' row
+// — always reaches the scheduler's error log rather than hiding behind an
+// already-set pull error.
+func finishDurabilityPullRun(ctx context.Context, s *store.Store, runID int64, volume, peer string, rep sync.DurabilityPullReport, pullErr error) agent.DurabilityPullReport {
+	status, errMsg := durabilityPullStatus(rep, pullErr)
+	note := fmt.Sprintf("volume=%s peer=%s fetched=%d applied=%d dropped=%d rewinds=%d",
+		volume, peer, rep.Fetched, rep.Applied, rep.Dropped, len(rep.Rewinds))
+	auditErr := s.AppendRunAudit(ctx, store.RunAuditEntry{RunID: runID, Transition: store.TransitionPullDurability, Note: note})
+	finErr := s.FinishRun(ctx, runID, status, errMsg, int64(rep.Applied))
+	return agent.DurabilityPullReport{
+		RunID:   runID,
+		Status:  status,
+		Err:     errors.Join(pullErr, auditErr, finErr),
+		Fetched: rep.Fetched, Applied: rep.Applied, Dropped: rep.Dropped, Rewinds: len(rep.Rewinds),
+	}
+}
+
+// durabilityPullStatus maps a pull outcome to (run status, run error
+// message). Refused rewinds are the designed safe behaviour, not a failure,
+// but are surfaced as 'partial' so they don't hide behind a green 'success'.
+func durabilityPullStatus(rep sync.DurabilityPullReport, pullErr error) (string, string) {
+	switch {
+	case pullErr != nil:
+		return store.RunStatusFailed, pullErr.Error()
+	case len(rep.Rewinds) > 0:
+		return store.RunStatusPartial, fmt.Sprintf("%d component(s) refused as rewinds (not applied — the agent does not escalate)", len(rep.Rewinds))
+	default:
+		return store.RunStatusSuccess, ""
+	}
 }
 
 // logAgentStartup emits a single structured startup line via slog so a

@@ -69,6 +69,15 @@ type Options struct {
 	// staleness policy — the opt-in default, so the version-vector gate
 	// behaves exactly as before.
 	MaxEvidenceAge time.Duration
+	// VerifyCadenced marks the required targets that carry an effective
+	// local verify cadence (a per-destination verify_every, or the [agent]
+	// default). The gate accepts a locally-advanced fingerprint-verified
+	// component as content-verified only while its destination is on such a
+	// cadence, so the provider-fingerprint evidence keeps being re-confirmed
+	// for as long as deletions are permitted (issue #155). A relayed
+	// target this node cannot see is absent — the responder's cadence is
+	// enforced at pull time. Nil is a valid empty set.
+	VerifyCadenced map[string]bool
 	// DryRun evaluates and reports the per-file gate decisions from the
 	// index alone: no runs row, no file reads, no deletions, no status
 	// flips. Disk-drift checks only happen on a real run, immediately
@@ -161,7 +170,7 @@ func Offload(ctx context.Context, s *store.Store, root string, opts Options) (re
 		return Report{}, err
 	}
 	now := time.Now()
-	g, err := loadGate(ctx, s, vol.ID, opts.Require, now.UnixNano(), opts.MaxEvidenceAge)
+	g, err := loadGate(ctx, s, vol.ID, opts.Require, now.UnixNano(), opts.MaxEvidenceAge, opts.VerifyCadenced)
 	if err != nil {
 		return Report{}, err
 	}

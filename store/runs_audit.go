@@ -33,6 +33,12 @@ const (
 	// CHECK keeps destination NULL on audit rows, so this entry is where
 	// the audit trail names the verified destination.
 	TransitionVerifyDestination = "verify-destination"
+	// TransitionPullDurability records an agent-scheduled durability pull
+	// against its kind='audit' run (see BeginDurabilityPullRun). The note
+	// carries the pulled volume, the peer, and the fetched/applied/dropped/
+	// rewind counters — the runs CHECK keeps volume_id and destination NULL
+	// on audit rows, so this entry is where the audit trail names them.
+	TransitionPullDurability = "pull-durability"
 	// TransitionResetDestination records a `squirrel destination reset`:
 	// the operator forgetting a destination's recorded upload and
 	// durability state (ResetDestination). It shares the destination-scoped

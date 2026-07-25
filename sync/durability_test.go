@@ -5,10 +5,38 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mbertschler/squirrel/store"
 	"github.com/mbertschler/squirrel/syncproto"
 )
+
+// TestRelayedMethodCadenceCoupling: a relayed fingerprint-verified
+// component is stored verbatim only when the responder relayed a positive
+// verify cadence; without it the method is baked down to presence+size so
+// the puller (which holds no local fingerprint) fails the offload gate
+// closed. Other methods pass through regardless (issue #155).
+func TestRelayedMethodCadenceCoupling(t *testing.T) {
+	base := syncproto.DurabilityComponent{Destination: "s3", OriginNode: "laptop", OriginRun: 5}
+
+	c := base
+	c.VerifyMethod = store.VerifyMethodFingerprint
+	c.VerifyEveryNs = int64(168 * time.Hour)
+	if got := relayedMethod(c); got != store.VerifyMethodFingerprint {
+		t.Fatalf("relayedMethod(cadenced) = %q, want fingerprint-verified", got)
+	}
+
+	c.VerifyEveryNs = 0
+	if got := relayedMethod(c); got != store.VerifyMethodPresenceSize {
+		t.Fatalf("relayedMethod(no cadence) = %q, want presence+size (fail closed)", got)
+	}
+
+	c = base
+	c.VerifyMethod = store.VerifyMethodBlake3
+	if got := relayedMethod(c); got != store.VerifyMethodBlake3 {
+		t.Fatalf("relayedMethod(blake3) = %q, want blake3 unchanged", got)
+	}
+}
 
 // seedReceiverDurability records vector components on the receiver so
 // the pull tests have something to fetch. Returns the receiver's self
@@ -437,6 +465,7 @@ func TestValidateComponentVerifyMethod(t *testing.T) {
 		store.VerifyMethodPeer,
 		store.VerifyMethodKopia,
 		store.VerifyMethodPresenceSize,
+		store.VerifyMethodFingerprint,
 	} {
 		c := base
 		c.VerifyMethod = method

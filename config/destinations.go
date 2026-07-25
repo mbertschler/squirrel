@@ -8,6 +8,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/dustin/go-humanize"
 )
@@ -173,6 +174,10 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 	if err != nil {
 		return nil, err
 	}
+	verifyEvery, err := resolveVerifyEvery(raw, layout)
+	if err != nil {
+		return nil, err
+	}
 	params, err := validateAndResolveParams(schema, raw)
 	if err != nil {
 		return nil, err
@@ -181,7 +186,30 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 		Name: name, Type: typ, Root: root, Layout: layout, Params: params,
 		Crypt: crypt, HashAlgo: hashAlgo, Checkers: checkers, PathStyle: pathStyle,
 		PackThreshold: pack.threshold, PackSize: pack.size, ZstdLevel: pack.zstdLevel,
+		VerifyEvery: verifyEvery,
 	}, nil
+}
+
+// resolveVerifyEvery validates the optional per-destination `verify_every`
+// cadence that drives the agent's scheduled re-check of this destination's
+// recorded objects and packs (the same pass as `squirrel verify`). It is
+// meaningful only on the content-addressed and packed layouts that keep
+// per-artifact fingerprints, so a present key on any other layout is
+// rejected rather than silently ignored — a mirror destination has nothing
+// for verify to re-check. Empty stays zero: no per-destination cadence, an
+// [agent] verify_every default may still apply.
+func resolveVerifyEvery(raw map[string]any, layout string) (time.Duration, error) {
+	v, err := optionalString(raw, "verify_every")
+	if err != nil {
+		return 0, err
+	}
+	if v == "" {
+		return 0, nil
+	}
+	if layout != LayoutContentAddressed && layout != LayoutPacked {
+		return 0, fmt.Errorf("verify_every requires the %q or %q layout; layout %q keeps no per-object fingerprints to re-check", LayoutContentAddressed, LayoutPacked, layout)
+	}
+	return parseVolumeCadence("verify_every", v)
 }
 
 // sftpHashAlgos are the checksum types rclone's sftp backend can read
@@ -505,6 +533,7 @@ func validateAndResolveParams(schema destSchema, raw map[string]any) (map[string
 		"type": true, "root": true, "crypt": true, "layout": true,
 		"hash_algo": true, "checkers": true, "force_path_style": true,
 		"pack_threshold": true, "pack_size": true, "zstd_level": true,
+		"verify_every": true,
 	}
 	for _, key := range schema.requiredString {
 		v, err := requireString(raw, key)
