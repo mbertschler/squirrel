@@ -775,3 +775,42 @@ func (d *Destination) CanEverGateOffload() (bool, string) {
 	}
 	return true, ""
 }
+
+// VerifyCadencedTargets marks the required targets that carry an effective
+// local verify cadence — a per-destination verify_every, or the [agent]
+// verify_every default applied to a content-addressed/packed destination.
+// The offload gate accepts a locally-advanced fingerprint-verified
+// component as content-verified only for a target in this set, so the
+// provider-fingerprint evidence keeps being re-confirmed for as long as
+// deletions are permitted (issue #155). A required target with no local
+// destination — a peer-relayed offsite this node cannot see — is omitted;
+// the responder's cadence governs it, relayed and enforced at pull time.
+//
+// It lives here, beside CanEverGateOffload, because both the offload
+// command and the readiness query behind `squirrel status` must feed the
+// gate the same set: readiness promises its totals match what an offload
+// would actually move, and a divergence here would quietly break that.
+func (c *Config) VerifyCadencedTargets(require []string) map[string]bool {
+	var agentDefault time.Duration
+	if c.Agent != nil {
+		agentDefault = c.Agent.VerifyEvery
+	}
+	out := make(map[string]bool, len(require))
+	for _, name := range require {
+		d, ok := c.Destinations[name]
+		if !ok {
+			continue
+		}
+		if d.Layout != LayoutContentAddressed && d.Layout != LayoutPacked {
+			continue
+		}
+		eff := d.VerifyEvery
+		if eff == 0 {
+			eff = agentDefault
+		}
+		if eff > 0 {
+			out[name] = true
+		}
+	}
+	return out
+}

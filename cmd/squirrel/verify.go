@@ -22,7 +22,7 @@ import (
 // recorded fingerprint left exactly as found so the operator inspects the
 // evidence.
 func newVerifyCmd() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "verify [<destination>]",
 		Short: "Re-check recorded offsite objects and packs against their upload fingerprints",
 		Args:  cobra.MaximumNArgs(1),
@@ -34,6 +34,8 @@ func newVerifyCmd() *cobra.Command {
 			return runVerify(cmd, destName)
 		},
 	}
+	cmd.AddCommand(newVerifyAckCmd())
+	return cmd
 }
 
 func runVerify(cmd *cobra.Command, destName string) error {
@@ -108,7 +110,8 @@ func verifiableLayout(layout string) bool {
 }
 
 // printVerifyReport renders one destination's pass: a loud stderr line
-// per missing or mismatched object or pack, then the summary counters.
+// per missing or mismatched object or pack, then the summary counters,
+// then the standing-alarm transition this pass caused (#157, F30).
 func printVerifyReport(out, errOut io.Writer, rep sync.RemoteVerifyReport, runErr error) {
 	printVerifyFailures(errOut, "object", rep.Destination, rep.Missing, rep.Mismatched)
 	printVerifyFailures(errOut, "pack", rep.Destination, rep.PacksMissing, rep.PackMismatched)
@@ -125,6 +128,20 @@ func printVerifyReport(out, errOut io.Writer, rep sync.RemoteVerifyReport, runEr
 		len(rep.Mismatched), len(rep.Missing), rep.Unrecorded,
 		rep.Packs, rep.PacksVerified, rep.PacksPopulated, rep.PacksPending,
 		len(rep.PackMismatched), len(rep.PacksMissing))
+	printVerifyAlarmTransition(out, errOut, rep)
+}
+
+// printVerifyAlarmTransition surfaces the standing-alarm change this pass
+// made: a raised alarm shouts on stderr with how to clear it, an
+// auto-cleared alarm is a quiet confidence line on stdout.
+func printVerifyAlarmTransition(out, errOut io.Writer, rep sync.RemoteVerifyReport) {
+	if rep.AlarmRaised {
+		fmt.Fprintf(errOut, "ALARM %s: verification failed — this destination stays in alarm until a clean `squirrel verify %s` clears it or you run `squirrel verify ack %s`\n",
+			rep.Destination, rep.Destination, rep.Destination)
+	}
+	if rep.AlarmCleared {
+		fmt.Fprintf(out, "verify %s: standing alarm cleared by this clean pass\n", rep.Destination)
+	}
 }
 
 // printVerifyFailures writes one stderr line per missing or mismatched

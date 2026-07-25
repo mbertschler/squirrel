@@ -9,6 +9,30 @@ import (
 	"time"
 )
 
+// minimalRunsDDL is the runs table at its v15-through-v24 shape. The
+// destination_run_ids migration fixtures below carry it because the
+// v24→v25 migration rebuilds runs (widening its status CHECK), which reads
+// from the existing table — a real database at any of these versions
+// always has runs, so the minimal fixtures must too.
+const minimalRunsDDL = `CREATE TABLE runs (
+	id                INTEGER PRIMARY KEY,
+	kind              TEXT NOT NULL CHECK (kind IN ('index','sync','restore','audit','offload')),
+	volume_id         INTEGER REFERENCES volumes(id),
+	destination       TEXT,
+	started_at_ns     INTEGER NOT NULL,
+	ended_at_ns       INTEGER,
+	status            TEXT NOT NULL CHECK (status IN ('running','success','failed','partial')),
+	error             TEXT,
+	file_count        INTEGER NOT NULL DEFAULT 0,
+	peer_node_id      INTEGER REFERENCES nodes(id),
+	correlated_run_id INTEGER,
+	shallow           INTEGER CHECK (shallow IS NULL OR shallow IN (0, 1)),
+	CHECK (
+		(kind IN ('index','audit','offload') AND destination IS NULL) OR
+		(kind IN ('sync','restore') AND destination IS NOT NULL AND destination != '')
+	)
+)`
+
 // TestMigrateV18ToV19AddsVerifyMethod builds a minimal v18 database with
 // a pre-existing durability component and confirms the migration adds
 // verify_method (NULL on the carried-over row) without disturbing the
@@ -23,6 +47,7 @@ func TestMigrateV18ToV19AddsVerifyMethod(t *testing.T) {
 		`CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)`,
 		`CREATE TABLE volumes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL)`,
 		`CREATE TABLE nodes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, endpoint TEXT, public_key_fingerprint TEXT)`,
+		minimalRunsDDL,
 		// contents exists from v14 on; a real v18 DB carries it, and the
 		// v20→v21 triggers attach to it, so the minimal fixture must too.
 		`CREATE TABLE contents (
@@ -97,6 +122,7 @@ func TestMigrateV22ToV23AddsVerifiedAt(t *testing.T) {
 		`CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)`,
 		`CREATE TABLE volumes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL)`,
 		`CREATE TABLE nodes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, endpoint TEXT, public_key_fingerprint TEXT)`,
+		minimalRunsDDL,
 		`CREATE TABLE contents (
 			id             INTEGER PRIMARY KEY,
 			blake3         BLOB NOT NULL UNIQUE CHECK (length(blake3) = 32),
@@ -824,6 +850,7 @@ func TestMigrateV21ToV22AddsSourceNodeID(t *testing.T) {
 		`CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)`,
 		`CREATE TABLE volumes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL)`,
 		`CREATE TABLE nodes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, endpoint TEXT, public_key_fingerprint TEXT)`,
+		minimalRunsDDL,
 		`CREATE TABLE contents (
 			id             INTEGER PRIMARY KEY,
 			blake3         BLOB NOT NULL UNIQUE CHECK (length(blake3) = 32),

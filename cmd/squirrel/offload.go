@@ -76,7 +76,7 @@ func runOffload(cmd *cobra.Command, volumeName string, paths []string, olderThan
 		RequireDests:   requiredDestinations(cfg, vol.OffloadRequires),
 		RelayedCaps:    relayedCaps,
 		MaxEvidenceAge: vol.OffloadMaxEvidenceAge,
-		VerifyCadenced: verifyCadencedTargets(cfg, vol.OffloadRequires),
+		VerifyCadenced: cfg.VerifyCadencedTargets(vol.OffloadRequires),
 		DryRun:         dryRun,
 	})
 	printOffloadReport(cmd.OutOrStdout(), cmd.ErrOrStderr(), rep, dryRun)
@@ -100,40 +100,6 @@ func requiredDestinations(cfg *config.Config, require []string) map[string]*conf
 	for _, name := range require {
 		if d, ok := cfg.Destinations[name]; ok {
 			out[name] = d
-		}
-	}
-	return out
-}
-
-// verifyCadencedTargets marks the required targets that carry an effective
-// local verify cadence — a per-destination verify_every, or the [agent]
-// verify_every default applied to a content-addressed/packed destination.
-// The offload gate accepts a locally-advanced fingerprint-verified
-// component as content-verified only for a target in this set, so the
-// provider-fingerprint evidence keeps being re-confirmed for as long as
-// deletions are permitted (issue #155). A required target with no local
-// destination — a peer-relayed offsite this node cannot see — is omitted;
-// the responder's cadence governs it, relayed and enforced at pull time.
-func verifyCadencedTargets(cfg *config.Config, require []string) map[string]bool {
-	var agentDefault time.Duration
-	if cfg.Agent != nil {
-		agentDefault = cfg.Agent.VerifyEvery
-	}
-	out := make(map[string]bool, len(require))
-	for _, name := range require {
-		d, ok := cfg.Destinations[name]
-		if !ok {
-			continue
-		}
-		if d.Layout != config.LayoutContentAddressed && d.Layout != config.LayoutPacked {
-			continue
-		}
-		eff := d.VerifyEvery
-		if eff == 0 {
-			eff = agentDefault
-		}
-		if eff > 0 {
-			out[name] = true
 		}
 	}
 	return out

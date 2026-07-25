@@ -44,6 +44,14 @@ func statusColour(status string) lipgloss.Color {
 		return colourWarning
 	case "running":
 		return colourRunning
+	case "refused":
+		// A refusal is a fail-closed safety gate; it must read as red so a
+		// month-dead backup disk produces visible red, not a muted dot.
+		return colourFailure
+	case "aborted":
+		// A reaped run never completed but did not fail; amber keeps it out
+		// of the green "you may close the laptop" set without crying failure.
+		return colourWarning
 	default:
 		return colourMuted
 	}

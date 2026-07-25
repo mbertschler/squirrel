@@ -74,11 +74,17 @@ func runSync(cmd *cobra.Command, volumeName, destinationName string, progress bo
 	if opts.Shallow {
 		fmt.Fprintln(out, shallowSyncWarning)
 	}
-	if err := sync.EnsureMinVersion(cmd.Context(), rcl, out, sync.ShallowForPairs(pairs, opts.Shallow)); err != nil {
-		return err
-	}
-	if err := writeRcloneConfigLogged(out, rcl, cfg); err != nil {
-		return err
+	// Skip the rclone preamble entirely when every pair targets kopia:
+	// kopia never invokes rclone, so a version check is pointless and
+	// "rclone.conf updated" is misleading noise on a kopia-only sync
+	// (friction F11b).
+	if pairsNeedRclone(pairs) {
+		if err := sync.EnsureMinVersion(cmd.Context(), rcl, out, sync.ShallowForPairs(pairs, opts.Shallow)); err != nil {
+			return err
+		}
+		if err := writeRcloneConfigLogged(out, rcl, cfg); err != nil {
+			return err
+		}
 	}
 	// One snapshotter shared across every pair: the VACUUM INTO snapshot
 	// is taken once per invocation and fanned out (decision #1). Disabled
@@ -104,7 +110,7 @@ func runSync(cmd *cobra.Command, volumeName, destinationName string, progress bo
 		if pp != nil {
 			pp.clear()
 		}
-		printSyncReport(out, rep, err)
+		printSyncReport(out, rep, err, false)
 		if err != nil || rep.Status != "success" {
 			anyFailed = true
 		}
@@ -146,6 +152,20 @@ func rcloneConfigPathFor(cfg *config.Config) string {
 	return filepath.Join(filepath.Dir(cfg.Path), "rclone.conf")
 }
 
+// pairsNeedRclone reports whether any pair in the batch drives rclone.
+// Peer nodes (Destination nil) transfer bytes with rclone, as do every
+// non-kopia bucket destination; only a batch composed entirely of kopia
+// destinations skips rclone. Used to suppress the rclone preamble on a
+// kopia-only sync (F11b).
+func pairsNeedRclone(pairs []sync.Pair) bool {
+	for _, p := range pairs {
+		if p.Destination == nil || p.Destination.Type != "kopia" {
+			return true
+		}
+	}
+	return false
+}
+
 // writeRcloneConfigLogged renders the rclone.conf and logs a single line
 // when the file actually changed. An unexpected rewrite is worth
 // surfacing: the config is derived deterministically from squirrel's
@@ -162,7 +182,10 @@ func writeRcloneConfigLogged(out io.Writer, rcl *sync.Rclone, cfg *config.Config
 	return nil
 }
 
-func printSyncReport(w io.Writer, rep sync.Report, runErr error) {
+// printSyncReport renders one pair's outcome. reverse flips the arrow to
+// destination → volume for restores, whose bytes flow the other way from
+// a sync (the restore-arrow friction item).
+func printSyncReport(w io.Writer, rep sync.Report, runErr error, reverse bool) {
 	r := rep.RcloneResult
 	for _, msg := range rep.Warnings {
 		fmt.Fprintf(w, "warning: %s\n", msg)
@@ -170,37 +193,19 @@ func printSyncReport(w io.Writer, rep sync.Report, runErr error) {
 	for _, msg := range rep.NodePendingWarnings {
 		fmt.Fprintf(w, "warning: peer reports %s\n", msg)
 	}
-	switch rep.Verification.Method {
-	case sync.VerifyMethodKopia:
-		// Kopia pushes have no rclone counters; render the snapshot's
-		// own numbers instead.
-		fmt.Fprintf(w, "%s → %s  status=%s files=%d bytes=%d snapshot=%s verified=%t run=%d\n",
-			rep.Volume, rep.Destination, rep.Status,
-			rep.Verification.Files, rep.Verification.Bytes,
-			rep.Verification.SnapshotID, rep.Verification.Verified(), rep.RunID,
-		)
-	case sync.VerifyMethodPresenceSize:
-		// Content-addressed pushes count objects, with skipped = hashes
-		// the destination already recorded, entries = manifest segment
-		// lines, and fingerprints = provider checksums captured for the
-		// fresh uploads.
-		fmt.Fprintf(w, "%s → %s  status=%s objects=%d skipped=%d errors=%d bytes=%d entries=%d fingerprints=%d run=%d\n",
-			rep.Volume, rep.Destination, rep.Status,
-			r.Transferred, r.Checked, r.Errors, r.Bytes,
-			rep.Verification.Files, rep.Fingerprints, rep.RunID,
-		)
-		// A packed dry-run reports its pack-side routing here; the
-		// object side rode the objects=/bytes= counters above. Only a
-		// packed dry-run sets SizeBand, so this line is preview-only.
-		if p := rep.PackPreview; p.SizeBand > 0 {
-			fmt.Fprintf(w, "  would pack %d content(s) (%d uncompressed byte(s)) into ~%d pack(s), each targeting %d compressed byte(s)\n",
-				p.Contents, p.Bytes, p.Packs, p.SizeBand)
-		}
-	default:
-		fmt.Fprintf(w, "%s → %s  status=%s transferred=%d checked=%d errors=%d bytes=%d run=%d\n",
-			rep.Volume, rep.Destination, rep.Status,
-			r.Transferred, r.Checked, r.Errors, r.Bytes, rep.RunID,
-		)
+	src, dst := rep.Volume, rep.Destination
+	if reverse {
+		src, dst = rep.Destination, rep.Volume
+	}
+	// A run that never reached a terminal state — a preflight error before
+	// its runs row was allocated (unindexed volume, "already running") —
+	// carries an empty status and run=0; the counter line would read
+	// "status= … run=0", pure noise. Skip it and let the error below carry
+	// the message. Gates that mint a 'refused' row (#157) do have a status
+	// and run id, so they still print as their own condition (friction
+	// F11d).
+	if rep.Status != "" {
+		printSyncSummaryLine(w, rep, src, dst)
 	}
 	if rep.NodeReceiverRunID != 0 {
 		fmt.Fprintf(w, "  receiver_run=%d matched=%d mismatched=%d missing=%d conflicts=%d\n",
@@ -230,6 +235,17 @@ func printSyncReport(w io.Writer, rep sync.Report, runErr error) {
 			fmt.Fprintf(w, "    preserved at %s:%s\n", rep.Destination, c.PreservedAtPath)
 		}
 	}
+	for _, c := range rep.NodeContested {
+		fmt.Fprintf(w, "  contested %s: frozen by a prior conflict — bytes refused, not delivered\n", c.Path)
+		if c.PreservedAtPath != "" {
+			fmt.Fprintf(w, "    versions live %s, preserved %s at %s:%s\n",
+				c.LiveBlake3Hex, c.PreservedBlake3Hex, rep.Destination, c.PreservedAtPath)
+		}
+		// Quote the args: a contested path may contain whitespace
+		// (validateRelPath allows it), which would otherwise split into
+		// several shell words when the operator copy-pastes the hint.
+		fmt.Fprintf(w, "    resolve with: squirrel conflicts resolve %q %q\n", rep.Volume, c.Path)
+	}
 	for _, ff := range r.FailedFiles {
 		// Some rclone errors (auth, listing, fatal copy) have no Object.
 		// Render those as a bare "error: ..." rather than "error : ...".
@@ -252,5 +268,46 @@ func printSyncReport(w io.Writer, rep sync.Report, runErr error) {
 	}
 	if runErr != nil {
 		fmt.Fprintf(w, "  %v\n", runErr)
+	}
+}
+
+// printSyncSummaryLine renders the one-line counter summary for a pair,
+// keyed off the handler's verification method. src/dst carry the already
+// direction-resolved endpoints. The default (rclone bucket / peer / restore)
+// line reports already_correct so an in-sync no-op is distinguishable from
+// an empty one — transferred=0 alone is ambiguous (friction F7).
+func printSyncSummaryLine(w io.Writer, rep sync.Report, src, dst string) {
+	r := rep.RcloneResult
+	switch rep.Verification.Method {
+	case sync.VerifyMethodKopia:
+		// Kopia pushes have no rclone counters; render the snapshot's
+		// own numbers instead.
+		fmt.Fprintf(w, "%s → %s  status=%s files=%d bytes=%d snapshot=%s verified=%t run=%d\n",
+			src, dst, rep.Status,
+			rep.Verification.Files, rep.Verification.Bytes,
+			rep.Verification.SnapshotID, rep.Verification.Verified(), rep.RunID,
+		)
+	case sync.VerifyMethodPresenceSize:
+		// Content-addressed pushes count objects, with skipped = hashes
+		// the destination already recorded, entries = manifest segment
+		// lines, and fingerprints = provider checksums captured for the
+		// fresh uploads.
+		fmt.Fprintf(w, "%s → %s  status=%s objects=%d skipped=%d errors=%d bytes=%d entries=%d fingerprints=%d run=%d\n",
+			src, dst, rep.Status,
+			r.Transferred, r.Checked, r.DisplayErrors(), r.Bytes,
+			rep.Verification.Files, rep.Fingerprints, rep.RunID,
+		)
+		// A packed dry-run reports its pack-side routing here; the
+		// object side rode the objects=/bytes= counters above. Only a
+		// packed dry-run sets SizeBand, so this line is preview-only.
+		if p := rep.PackPreview; p.SizeBand > 0 {
+			fmt.Fprintf(w, "  would pack %d content(s) (%d uncompressed byte(s)) into ~%d pack(s), each targeting %d compressed byte(s)\n",
+				p.Contents, p.Bytes, p.Packs, p.SizeBand)
+		}
+	default:
+		fmt.Fprintf(w, "%s → %s  status=%s transferred=%d already_correct=%d errors=%d bytes=%d run=%d\n",
+			src, dst, rep.Status,
+			r.Transferred, rep.AlreadyCorrect, r.DisplayErrors(), r.Bytes, rep.RunID,
+		)
 	}
 }

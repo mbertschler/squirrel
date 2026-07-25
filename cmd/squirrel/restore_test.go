@@ -43,6 +43,11 @@ func TestCLIRestoreRoundTrip(t *testing.T) {
 	if !strings.Contains(out, "status=success") {
 		t.Fatalf("restore did not succeed:\n%s", out)
 	}
+	// The restore arrow flips to destination → volume: bytes flow that
+	// way, unlike a sync's volume → destination (restore-arrow friction).
+	if !strings.Contains(out, "scratch → pics") {
+		t.Fatalf("restore arrow should read destination → volume:\n%s", out)
+	}
 	for _, name := range []string{"a.txt", "b.txt"} {
 		path := filepath.Join(f.volumeDir, name)
 		body, err := os.ReadFile(path)

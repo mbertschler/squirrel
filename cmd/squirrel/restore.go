@@ -100,7 +100,9 @@ func runRestore(cmd *cobra.Command, volumeName, fromName string, opts sync.Resto
 	}
 
 	rep, runErr := sync.Restore(cmd.Context(), s, rcl, vol, dest, opts)
-	printSyncReport(out, rep, runErr)
+	// Restore pulls destination → local, so flip the arrow: the sync-shaped
+	// "volume → destination" would misreport the byte-flow direction.
+	printSyncReport(out, rep, runErr, true)
 	if runErr != nil || rep.Status != "success" {
 		return fmt.Errorf("restore did not complete cleanly")
 	}

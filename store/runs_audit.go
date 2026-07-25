@@ -33,6 +33,30 @@ const (
 	// CHECK keeps destination NULL on audit rows, so this entry is where
 	// the audit trail names the verified destination.
 	TransitionVerifyDestination = "verify-destination"
+	// TransitionAbort records a 'running' row reaped to 'aborted' by
+	// AbortRunningRuns at agent startup (#157, F14). The note carries the
+	// reap reason so a forensic reader can tell a crash-reap apart from a
+	// real failure.
+	TransitionAbort = "abort"
+	// TransitionAlarmRaise records a destination_alarms latch being raised
+	// against the verify run that detected the mismatch (#157, F30). The
+	// note carries the destination and a bounded detail summary.
+	TransitionAlarmRaise = "alarm-raise"
+	// TransitionAlarmClear records a destination_alarms latch being
+	// cleared: against the clean verify run that auto-cleared it (operator
+	// NULL) or against the run that raised it when an operator acks
+	// (operator set). The note carries the destination.
+	TransitionAlarmClear = "alarm-clear"
+	// TransitionContestedRaise records a contested_paths latch being
+	// raised against the sync run that hit the conflict (#158, F27): the
+	// freeze that stops the divergent-edit ping-pong. The note carries the
+	// volume-relative path. Written once per distinct freeze episode.
+	TransitionContestedRaise = "contested-raise"
+	// TransitionContestedClear records a contested_paths latch being
+	// cleared by an explicit `squirrel conflicts resolve` (operator set),
+	// against the run that raised it. The note carries the path. This is
+	// the deliberate human act that unfreezes the path.
+	TransitionContestedClear = "contested-clear"
 	// TransitionPullDurability records an agent-scheduled durability pull
 	// against its kind='audit' run (see BeginDurabilityPullRun). The note
 	// carries the pulled volume, the peer, and the fetched/applied/dropped/

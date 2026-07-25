@@ -248,8 +248,11 @@ func TestKopiaConnectFailWithoutInitRefuses(t *testing.T) {
 	if !strings.Contains(err.Error(), "--init") {
 		t.Fatalf("error should point at --init, got %v", err)
 	}
-	if rep.Status != store.RunStatusFailed {
-		t.Fatalf("Status = %q, want failed", rep.Status)
+	if !errors.Is(err, ErrRefused) {
+		t.Fatalf("connect-without-init should be a refusal (ErrRefused), got %v", err)
+	}
+	if rep.Status != store.RunStatusRefused {
+		t.Fatalf("Status = %q, want refused", rep.Status)
 	}
 	argv, _ := readCallLog(t, logPath)
 	for _, line := range argv {
@@ -606,5 +609,22 @@ func TestKopiaAdvanceScopedToCapturedPresentSet(t *testing.T) {
 	}
 	if vector[0].VerifyMethod != store.VerifyMethodKopia {
 		t.Fatalf("verify method = %q, want %q", vector[0].VerifyMethod, store.VerifyMethodKopia)
+	}
+}
+
+// TestStripANSI covers F11c: kopia paints its output for a terminal, and
+// those escape sequences must not leak into the error folded into
+// squirrel's structured log / runs.error column.
+func TestStripANSI(t *testing.T) {
+	cases := map[string]string{
+		"\x1b[31merror:\x1b[0m disk full":      "error: disk full",
+		"plain message":                        "plain message",
+		"\x1b[1;33mwarn\x1b[0m \x1b[2Kcleared": "warn cleared",
+		"":                                     "",
+	}
+	for in, want := range cases {
+		if got := stripANSI(in); got != want {
+			t.Errorf("stripANSI(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

@@ -47,11 +47,18 @@ type SyncRunner func(ctx context.Context, vol *config.Volume, destName string) S
 
 // SyncRunReport is the SyncRunner result surfaced to the scheduler.
 // Kept minimal — anything richer belongs in the runs table the CLI
-// inspects via `squirrel runs`, not on the agent's hot path.
+// inspects via `squirrel runs`, not on the agent's hot path. Conflicts
+// and Contested carry the peer-sync divergence counts so the scheduler
+// logs a conflict signal on the initiating machine, not only the hub
+// (#158, F27): Conflicts is how many paths this run resolved by
+// preserving the loser and landing this node's bytes live, Contested how
+// many the receiver refused because a prior freeze still stands.
 type SyncRunReport struct {
-	RunID  int64
-	Status string
-	Err    error
+	RunID     int64
+	Status    string
+	Err       error
+	Conflicts int
+	Contested int
 }
 
 // VerifyRunner is the function shape the scheduler delegates one

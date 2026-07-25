@@ -29,29 +29,38 @@ const (
 
 // Run statuses. A run begins in 'running' and is moved to a terminal state by
 // FinishRun. 'partial' means the walk completed but some files errored.
+// 'refused' means a preflight safety gate declined before the operation
+// began — a missing/mismatched volume marker, a kopia connect that found no
+// repository without --init, a layout guard — so the refusal reaches the
+// audit trail instead of living only in a caller's error (#157, F26). It is
+// distinct from 'failed', which is a mid-flight failure. 'aborted' means a
+// 'running' row was reaped because the process that owned it died mid-run
+// (the agent reaps its own orphans at startup — #157, F14); it is terminal
+// but records that the run never completed, not that it failed.
 const (
 	RunStatusRunning = "running"
 	RunStatusSuccess = "success"
 	RunStatusFailed  = "failed"
 	RunStatusPartial = "partial"
+	RunStatusRefused = "refused"
+	RunStatusAborted = "aborted"
 )
 
 // ErrAlreadyFinished is returned by FinishRun when the target run is
-// already in a terminal status (success/partial/failed). The first
-// terminal write wins: its status, error, and ended_at_ns are the audit
-// record, and a second FinishRun would silently rewrite them. Callers
-// that may legitimately race a double-finish (e.g. agent/sync.go's
+// already in a terminal status (success/partial/failed/refused/aborted).
+// The first terminal write wins: its status, error, and ended_at_ns are
+// the audit record, and a second FinishRun would silently rewrite them.
+// Callers that may legitimately race a double-finish (e.g. agent/sync.go's
 // handleClose firing after closeSession already finalised) detect this
 // with errors.Is and fall back to a log-only path rather than treating
 // it as a hard error.
 var ErrAlreadyFinished = errors.New("run is already in a terminal status")
 
-// isTerminalStatus reports whether status is one of the three terminal
-// run states. A row in any of these must not be re-finalised by
-// FinishRun.
+// isTerminalStatus reports whether status is one of the terminal run
+// states. A row in any of these must not be re-finalised by FinishRun.
 func isTerminalStatus(status string) bool {
 	switch status {
-	case RunStatusSuccess, RunStatusPartial, RunStatusFailed:
+	case RunStatusSuccess, RunStatusPartial, RunStatusFailed, RunStatusRefused, RunStatusAborted:
 		return true
 	}
 	return false
@@ -412,11 +421,31 @@ func (s *Store) GetRun(ctx context.Context, id int64) (Run, error) {
 // from the sync-package directory naming convention.
 func (s *Store) CountFilesFirstSeenByRunWithPathPrefix(ctx context.Context, runIDs []int64, pathPrefix string) (map[int64]int, error) {
 	out := make(map[int64]int, len(runIDs))
+	// Batch the id set: each query binds len(chunk)+2 parameters, so an
+	// unbatched call over a large peer-sync history would overflow SQLite's
+	// bound-parameter cap (SQLITE_MAX_VARIABLE_NUMBER) and fail with "too
+	// many SQL variables". 400 keeps every query well under any cap.
+	const idsPerQuery = 400
+	for start := 0; start < len(runIDs); start += idsPerQuery {
+		end := start + idsPerQuery
+		if end > len(runIDs) {
+			end = len(runIDs)
+		}
+		if err := s.countFilesFirstSeenChunk(ctx, runIDs[start:end], pathPrefix, out); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// countFilesFirstSeenChunk runs the grouped count for one id batch and folds
+// the results into out. Non-zero counts only; absent keys mean zero.
+func (s *Store) countFilesFirstSeenChunk(ctx context.Context, runIDs []int64, pathPrefix string, out map[int64]int) error {
 	if len(runIDs) == 0 {
-		return out, nil
+		return nil
 	}
 	placeholders := strings.Repeat("?,", len(runIDs)-1) + "?"
-	args := make([]any, 0, len(runIDs)+1)
+	args := make([]any, 0, len(runIDs)+2)
 	for _, id := range runIDs {
 		args = append(args, id)
 	}
@@ -428,18 +457,18 @@ func (s *Store) CountFilesFirstSeenByRunWithPathPrefix(ctx context.Context, runI
 		   AND (fo.path = ? OR fo.path LIKE ? ESCAPE '\')
 		 GROUP BY f.first_seen_run_id`, args...)
 	if err != nil {
-		return nil, fmt.Errorf("count files by run: %w", err)
+		return fmt.Errorf("count files by run: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var id int64
 		var n int
 		if err := rows.Scan(&id, &n); err != nil {
-			return nil, fmt.Errorf("scan count row: %w", err)
+			return fmt.Errorf("scan count row: %w", err)
 		}
 		out[id] = n
 	}
-	return out, rows.Err()
+	return rows.Err()
 }
 
 // escapeLikePrefix escapes %, _ and \ in s so it can be embedded into a
@@ -736,18 +765,22 @@ func (s *Store) LatestSuccessfulIndexRun(ctx context.Context, volumeID int64) (R
 	return scanRun(row.Scan)
 }
 
-// LatestFinishedRun returns the most recent terminal-status (success,
-// partial, or failed) run of the given kind for (volumeID, destination).
-// destination must be "" for index/audit kinds (the schema CHECK ensures
-// those carry no destination) and the rclone destination or peer node
-// name for sync/restore kinds. Returns sql.ErrNoRows when no matching
-// run exists.
+// LatestFinishedRun returns the most recent terminal-status run of the
+// given kind for (volumeID, destination). destination must be "" for
+// index/audit kinds (the schema CHECK ensures those carry no destination)
+// and the rclone destination or peer node name for sync/restore kinds.
+// Returns sql.ErrNoRows when no matching run exists.
 //
 // The scheduler (#39) computes `now - last_finished` from this row to
-// decide whether a cadence-driven run is due. Failed terminal states
-// count: per the issue's failure-policy (no special retry, the next
-// tick re-evaluates), a failed run consumes the cadence window like
-// any other.
+// decide whether a cadence-driven run is due. success, partial, failed,
+// and refused all count: per the issue's failure-policy (no special
+// retry, the next tick re-evaluates), each consumes the cadence window
+// like any other — a 'refused' run in particular backs the scheduler off
+// a dead destination (a missing marker, an un-bootstrapped repository)
+// instead of re-minting an identical refusal every tick. 'aborted' is
+// deliberately excluded: a run reaped mid-flight never completed, so the
+// cadence should re-attempt rather than treat the crash as a finished
+// window.
 func (s *Store) LatestFinishedRun(ctx context.Context, kind string, volumeID int64, destination string) (Run, error) {
 	var row *sql.Row
 	if destination == "" {
@@ -755,7 +788,7 @@ func (s *Store) LatestFinishedRun(ctx context.Context, kind string, volumeID int
 			`SELECT `+runColumns+`
 			 FROM runs
 			 WHERE kind = ? AND volume_id = ? AND destination IS NULL
-			   AND status IN ('success','partial','failed')
+			   AND status IN ('success','partial','failed','refused')
 			 ORDER BY id DESC LIMIT 1`,
 			kind, volumeID)
 	} else {
@@ -763,7 +796,7 @@ func (s *Store) LatestFinishedRun(ctx context.Context, kind string, volumeID int
 			`SELECT `+runColumns+`
 			 FROM runs
 			 WHERE kind = ? AND volume_id = ? AND destination = ?
-			   AND status IN ('success','partial','failed')
+			   AND status IN ('success','partial','failed','refused')
 			 ORDER BY id DESC LIMIT 1`,
 			kind, volumeID, destination)
 	}
@@ -901,4 +934,70 @@ func (s *Store) HasRunningRun(ctx context.Context, kind string, volumeID int64, 
 		return false, fmt.Errorf("check running run: %w", err)
 	}
 	return found, nil
+}
+
+// AbortRunningRuns transitions every run currently in 'running' to
+// 'aborted', stamping ended_at_ns, recording reason as the row's error,
+// and appending an 'abort' runs_audit transition per reaped row so the
+// append-only trail records who moved the row and why. It returns the ids
+// reaped, oldest first, so the caller can log them.
+//
+// Called once at agent startup to clear phantom 'running' rows left by a
+// prior agent that was killed mid-run (#157, F14): those rows otherwise
+// block BeginSyncRunIfClear/BeginIndexRunIfClear forever and render as a
+// live, elapsed-ticking banner in the TUI hours later. A freshly started
+// agent has kicked nothing yet, so at startup every 'running' row
+// necessarily predates it — the reap assumes the agent is the single
+// writer of runs on this node (the reference-setup model), and a
+// concurrent CLI run started against the same DB is out of scope.
+func (s *Store) AbortRunningRuns(ctx context.Context, reason string) ([]int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin abort running runs: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	ids, err := runningRunIDsTx(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	atNs := NowNs()
+	for _, id := range ids {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE runs SET ended_at_ns = ?, status = ?, error = ?
+			WHERE id = ? AND status = 'running'
+		`, atNs, RunStatusAborted, reason, id); err != nil {
+			return nil, fmt.Errorf("abort run %d: %w", id, err)
+		}
+		if err := appendRunAuditTx(ctx, tx,
+			RunAuditEntry{RunID: id, Transition: TransitionAbort, Note: reason}, atNs); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit abort running runs: %w", err)
+	}
+	return ids, nil
+}
+
+// runningRunIDsTx returns the ids of every 'running' run inside tx,
+// ascending, so the reap order and the returned slice are deterministic.
+func runningRunIDsTx(ctx context.Context, tx *sql.Tx) ([]int64, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM runs WHERE status = 'running' ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("list running runs: %w", err)
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan running run id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }

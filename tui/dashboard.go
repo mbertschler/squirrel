@@ -10,20 +10,25 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/mbertschler/squirrel/config"
+	"github.com/mbertschler/squirrel/status"
 	"github.com/mbertschler/squirrel/store"
 )
 
 // dashboardModel surfaces squirrel's live state in one screen:
 //
 //   - the local agent's health (one-line probe of /v1/health)
+//   - standing per-destination alarms
 //   - runs currently in-flight (kind, volume, destination, elapsed)
-//   - per-volume health (name, path, last-index, last-sync)
+//   - the per-(volume × target) coverage + durability grid (the "am I
+//     safe?" panel, from the shared status query layer)
 //   - the most recent terminal runs
 //
 // Data is pulled on each tickMsg via a single SQL pass plus one HTTP probe;
 // both run as Bubble Tea commands so the UI never blocks on I/O.
 type dashboardModel struct {
 	store  *store.Store
+	cfg    *config.Config
 	client *agentClient
 
 	width, height int
@@ -32,7 +37,21 @@ type dashboardModel struct {
 	loaded      bool
 	loadErr     error
 	agentStatus agentStatus
+
+	// readinessByVol caches the last computed offload-readiness tally per
+	// volume name. The coverage/durability grid rebuilds every one-second
+	// tick with readiness skipped (its dominant cost — a whole-index gate
+	// pass); the tally is refreshed on the slower readinessRefreshTicks
+	// cadence and overlaid onto the grid at render time, so "N offloadable
+	// now" stays visible without paying for it every tick.
+	readinessByVol      map[string]status.OffloadReadiness
+	ticksSinceReadiness int
 }
+
+// readinessRefreshTicks is how many one-second ticks pass between
+// offload-readiness recomputations. Coverage and durability still refresh
+// every tick; only the expensive gate-pass tally is throttled.
+const readinessRefreshTicks = 15
 
 // dashboardData is the snapshot rendered by the dashboard. Built fresh on
 // each tick — there is no incremental update path, since the queries are
@@ -42,15 +61,29 @@ type dashboardData struct {
 	volumes    []store.Volume
 	activeRuns []store.Run
 	recentRuns []store.Run
-	// latestByVol[volID][kind] is the most recent terminal-status run for
-	// that (volume, kind) pair. Used to fill the "last index" / "last sync"
-	// columns of the volumes table.
-	latestByVol map[int64]map[string]store.Run
+	// coverage is the per-(volume × target) sync-coverage and durability
+	// grid from the shared status query layer — the same facts and
+	// severities `squirrel status` prints. Empty when no config is loaded
+	// (the grid needs sync_to / offload_requires / cadences to render).
+	coverage status.Report
+	// alarms are the standing per-destination alarms (#157, F30). A verify
+	// mismatch latches one until cleared; the dashboard shows them so the
+	// trust surface answers "am I safe?" with a red panel, not silence.
+	alarms []store.DestinationAlarm
+	// contested are the standing contested-path freezes (#158, F27). A
+	// peer-sync conflict latches one until an operator resolves it; the
+	// dashboard shows them as a badge on *this* machine — the losing edge,
+	// not only the hub — so a silently diverging file surfaces.
+	contested []store.ContestedPath
 }
 
 type dashboardDataMsg struct {
 	data dashboardData
 	err  error
+	// readinessFresh is true when this fetch recomputed the offload tally
+	// (a slow-cadence tick), so the receiver should refresh its cache from
+	// data.coverage; a fast tick leaves it false and the cache stands.
+	readinessFresh bool
 }
 
 type agentStatus struct {
@@ -61,8 +94,8 @@ type agentStatus struct {
 
 type agentStatusMsg agentStatus
 
-func newDashboardModel(s *store.Store) *dashboardModel {
-	return &dashboardModel{store: s}
+func newDashboardModel(s *store.Store, cfg *config.Config) *dashboardModel {
+	return &dashboardModel{store: s, cfg: cfg}
 }
 
 // attachClient is called by the root model after construction so the
@@ -71,7 +104,10 @@ func newDashboardModel(s *store.Store) *dashboardModel {
 func (m *dashboardModel) attachClient(c *agentClient) { m.client = c }
 
 func (m *dashboardModel) Init() tea.Cmd {
-	return tea.Batch(m.fetchData(), m.probeAgent())
+	// Recompute readiness on (re)activation so the tally is current the
+	// moment the user opens the dashboard, then throttle on the tick path.
+	m.ticksSinceReadiness = 0
+	return tea.Batch(m.fetchData(true), m.probeAgent())
 }
 
 func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -80,12 +116,20 @@ func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		return m, nil
 	case tickMsg:
-		return m, tea.Batch(m.fetchData(), m.probeAgent())
+		m.ticksSinceReadiness++
+		refresh := m.ticksSinceReadiness >= readinessRefreshTicks
+		if refresh {
+			m.ticksSinceReadiness = 0
+		}
+		return m, tea.Batch(m.fetchData(refresh), m.probeAgent())
 	case dashboardDataMsg:
 		m.loaded = true
 		m.loadErr = msg.err
 		if msg.err == nil {
 			m.data = msg.data
+			if msg.readinessFresh {
+				m.cacheReadiness(msg.data.coverage)
+			}
 		}
 		return m, nil
 	case agentStatusMsg:
@@ -104,11 +148,78 @@ func (m *dashboardModel) View() string {
 	}
 	sections := []string{
 		m.renderAgentBlock(),
-		m.renderActiveRuns(),
-		m.renderVolumes(),
-		m.renderRecentRuns(),
 	}
+	if alarms := m.renderAlarms(); alarms != "" {
+		sections = append(sections, alarms)
+	}
+	if contested := m.renderContested(); contested != "" {
+		sections = append(sections, contested)
+	}
+	sections = append(sections,
+		m.renderActiveRuns(),
+		m.renderCoverage(),
+		m.renderRecentRuns(),
+	)
 	return strings.Join(sections, "\n\n")
+}
+
+// renderAlarms shows the standing per-destination alarms (#157, F30) high
+// on the dashboard, right below agent health, because a latched verify
+// mismatch is exactly the "am I safe?" answer the trust surface must not
+// bury. Returns "" when nothing is in alarm so the section is absent on a
+// healthy install rather than showing an empty green box.
+func (m *dashboardModel) renderAlarms() string {
+	if len(m.data.alarms) == 0 {
+		return ""
+	}
+	header := styleErr.Render(fmt.Sprintf("Alarms (%d)", len(m.data.alarms)))
+	rows := [][]string{{"DESTINATION", "KIND", "SINCE", "RUN", "DETAIL"}}
+	for _, a := range m.data.alarms {
+		rows = append(rows, []string{
+			a.Destination,
+			a.Kind,
+			whenAgo(sql.NullInt64{Int64: a.RaisedAtNs, Valid: true}, m.data.now),
+			fmt.Sprintf("#%d", a.RaisedRunID),
+			a.Detail,
+		})
+	}
+	colours := []lipgloss.Color{colourFailure, "", "", "", ""}
+	return header + "\n" + renderTable(rows, colours)
+}
+
+// renderContested shows standing contested-path freezes (#158, F27) as a
+// badge just below the alarms, because a divergent edit frozen on this
+// machine is part of the "am I safe?" answer the trust surface must not
+// bury. Returns "" when nothing is frozen so the section is absent on a
+// healthy install. The count in the header is the badge the losing edge
+// needs — the hub is no longer the only place the conflict is visible.
+func (m *dashboardModel) renderContested() string {
+	if len(m.data.contested) == 0 {
+		return ""
+	}
+	header := styleErr.Render(fmt.Sprintf("Contested paths (%d)", len(m.data.contested)))
+	rows := [][]string{{"VOLUME", "PATH", "PRESERVED AT", "SINCE"}}
+	for _, c := range m.data.contested {
+		rows = append(rows, []string{
+			m.volumeName(sql.NullInt64{Int64: c.VolumeID, Valid: true}),
+			c.Path,
+			contestedPreservedCell(c.PreservedAtPath),
+			whenAgo(sql.NullInt64{Int64: c.RaisedAtNs, Valid: true}, m.data.now),
+		})
+	}
+	colours := []lipgloss.Color{colourFailure, "", "", ""}
+	hint := styleMuted.Render("resolve with `squirrel conflicts resolve <volume> <path>`")
+	return header + "\n" + renderTable(rows, colours) + "\n" + hint
+}
+
+// contestedPreservedCell renders the preserved-loser location, or a dash
+// when the freeze record carries none (an initiator that learned of the
+// freeze without a preserved path).
+func contestedPreservedCell(p string) string {
+	if p == "" {
+		return "—"
+	}
+	return p
 }
 
 func (m *dashboardModel) renderAgentBlock() string {
@@ -150,21 +261,92 @@ func (m *dashboardModel) renderActiveRuns() string {
 	return header + "\n" + renderTable(rows, []lipgloss.Color{"", "", "", "", colourRunning})
 }
 
-func (m *dashboardModel) renderVolumes() string {
-	header := styleHeader.Render(fmt.Sprintf("Volumes (%d)", len(m.data.volumes)))
-	if len(m.data.volumes) == 0 {
-		return header + "\n" + styleMuted.Render("no volumes configured")
+// renderCoverage is the "am I safe?" panel: per volume, the per-target
+// sync-coverage and durability grid from the shared status layer, replacing
+// the old single LAST SYNC cell that hid a week-behind target behind a
+// fresh ✓ (friction-log F16/F17/F23). Each volume gets a header line
+// (name, path, index freshness, offloadable total) coloured by its worst
+// level, then a target sub-table with the STATE and DURABLE cells coloured
+// per target.
+func (m *dashboardModel) renderCoverage() string {
+	vols := m.data.coverage.Volumes
+	header := styleHeader.Render(fmt.Sprintf("Coverage (%d)", len(vols)))
+	if len(vols) == 0 {
+		hint := "no volumes configured"
+		if m.cfg == nil {
+			hint = "no config loaded — coverage needs sync_to / offload_requires to render"
+		}
+		return header + "\n" + styleMuted.Render(hint)
 	}
-	rows := [][]string{{"NAME", "PATH", "LAST INDEX", "LAST SYNC"}}
-	for _, v := range m.data.volumes {
+	blocks := []string{header}
+	for _, v := range vols {
+		blocks = append(blocks, m.renderVolumeCoverage(v))
+	}
+	return strings.Join(blocks, "\n\n")
+}
+
+// renderVolumeCoverage renders one volume's coverage block. The
+// offload-readiness figure comes from the throttled cache (the grid itself
+// rebuilds every tick with readiness skipped), falling back to the volume's
+// own tally when the cache has no entry yet.
+func (m *dashboardModel) renderVolumeCoverage(v status.VolumeStatus) string {
+	dot := lipgloss.NewStyle().Foreground(levelColour(v.Level())).Render("●")
+	title := fmt.Sprintf("%s %s  %s", dot, v.Name, styleMuted.Render(v.Path))
+	offload := v.Offload
+	if cached, ok := m.readinessByVol[v.Name]; ok {
+		offload = cached
+	}
+	meta := styleMuted.Render(fmt.Sprintf("index %s · %s",
+		status.IndexLabel(v), status.OffloadLabel(offload)))
+	if len(v.Targets) == 0 {
+		return title + "\n" + meta + "\n" + styleMuted.Render("  no targets configured")
+	}
+	rows := [][]string{{"TARGET", "ROLE", "LAST SYNC", "STATE", "DURABLE", "METHOD", "EVIDENCE"}}
+	for _, t := range v.Targets {
 		rows = append(rows, []string{
-			v.Name,
-			v.Path,
-			m.formatLast(v.ID, store.RunKindIndex),
-			m.formatLast(v.ID, store.RunKindSync),
+			t.Name, status.RoleLabel(t), status.LastSyncLabel(t), status.StateLabel(t),
+			status.DurableLabel(t), status.MethodLabel(t), status.EvidenceLabel(t),
 		})
 	}
-	return header + "\n" + renderTable(rows, nil)
+	tbl := renderTableColoured(rows, nil, coverageCellColour(v.Targets))
+	return title + "\n" + meta + "\n" + tbl
+}
+
+// coverageCellColour paints the STATE column by each target's coverage
+// level and the DURABLE column by its durability level, so the two "am I
+// safe?" dimensions read at a glance without decoding the words.
+func coverageCellColour(targets []status.TargetStatus) func(rowIdx, colIdx int) lipgloss.Color {
+	const stateCol, durableCol = 3, 4
+	return func(rowIdx, colIdx int) lipgloss.Color {
+		if rowIdx == 0 || rowIdx > len(targets) {
+			return ""
+		}
+		t := targets[rowIdx-1]
+		switch colIdx {
+		case stateCol:
+			return levelColour(t.SyncLevel)
+		case durableCol:
+			if t.Durability != nil {
+				return levelColour(t.Durability.Level)
+			}
+		}
+		return ""
+	}
+}
+
+// levelColour maps a status level onto the dashboard palette. Neutral gets
+// no colour (the default foreground) so informational cells don't shout.
+func levelColour(l status.Level) lipgloss.Color {
+	switch l {
+	case status.LevelOK:
+		return colourSuccess
+	case status.LevelWarn:
+		return colourWarning
+	case status.LevelCritical:
+		return colourFailure
+	default:
+		return ""
+	}
 }
 
 func (m *dashboardModel) renderRecentRuns() string {
@@ -206,28 +388,29 @@ func (m *dashboardModel) volumeName(id sql.NullInt64) string {
 	return fmt.Sprintf("vol#%d", id.Int64)
 }
 
-func (m *dashboardModel) formatLast(volID int64, kind string) string {
-	byKind := m.data.latestByVol[volID]
-	if byKind == nil {
-		return styleMuted.Render("—")
-	}
-	r, ok := byKind[kind]
-	if !ok {
-		return styleMuted.Render("—")
-	}
-	ago := whenAgo(r.EndedAtNs, m.data.now)
-	statusGlyph := lipgloss.NewStyle().Foreground(statusColour(r.Status)).Render(glyphForStatus(r.Status))
-	return fmt.Sprintf("%s %s", ago, statusGlyph)
-}
-
-func (m *dashboardModel) fetchData() tea.Cmd {
+// fetchData loads the dashboard snapshot. withReadiness selects whether the
+// coverage build pays for the offload-readiness tally: false on the
+// one-second tick (the grid still refreshes; the cached tally is overlaid
+// at render), true on the slow cadence and on activation.
+func (m *dashboardModel) fetchData(withReadiness bool) tea.Cmd {
 	return func() tea.Msg {
 		// Use a tight per-fetch deadline so a stuck DB doesn't freeze the UI.
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		data, err := loadDashboardData(ctx, m.store)
-		return dashboardDataMsg{data: data, err: err}
+		data, err := loadDashboardData(ctx, m.store, m.cfg, !withReadiness)
+		return dashboardDataMsg{data: data, err: err, readinessFresh: withReadiness && err == nil}
 	}
+}
+
+// cacheReadiness refreshes the per-volume offload tally from a report that
+// was built with readiness computed. Fast-tick reports carry only the
+// policy flag (zero counts) and must not overwrite this cache.
+func (m *dashboardModel) cacheReadiness(rep status.Report) {
+	cache := make(map[string]status.OffloadReadiness, len(rep.Volumes))
+	for _, v := range rep.Volumes {
+		cache[v.Name] = v.Offload
+	}
+	m.readinessByVol = cache
 }
 
 func (m *dashboardModel) probeAgent() tea.Cmd {
@@ -246,13 +429,16 @@ func (m *dashboardModel) probeAgent() tea.Cmd {
 	}
 }
 
-// loadDashboardData runs the SQL queries that back the dashboard. The
+// loadDashboardData runs the queries that back the dashboard. The
 // recent-runs bucket comes from a bounded ListRuns scan (200 is plenty
-// for "what happened today"); the per-(volume,kind) "last successful"
-// table comes from its own helper that scans every run, so volumes
-// whose last index sits beyond the recent window still surface
-// correctly.
-func loadDashboardData(ctx context.Context, s *store.Store) (dashboardData, error) {
+// for "what happened today"); the coverage grid comes from the shared
+// status query layer, which scans per (volume × target) so a target beyond
+// the recent-runs window still surfaces correctly. The coverage build is
+// skipped when no config is loaded — it needs sync_to / offload_requires /
+// cadences — leaving the grid to render its own "no config" hint.
+// skipReadiness omits the expensive offload-readiness tally (see fetchData
+// and readinessRefreshTicks).
+func loadDashboardData(ctx context.Context, s *store.Store, cfg *config.Config, skipReadiness bool) (dashboardData, error) {
 	now := time.Now()
 	vols, err := s.ListVolumes(ctx)
 	if err != nil {
@@ -262,9 +448,19 @@ func loadDashboardData(ctx context.Context, s *store.Store) (dashboardData, erro
 	if err != nil {
 		return dashboardData{}, fmt.Errorf("list runs: %w", err)
 	}
-	latestByVol, err := s.LatestSuccessfulRunsByVolumeAndKind(ctx)
+	alarms, err := s.ListDestinationAlarms(ctx)
 	if err != nil {
-		return dashboardData{}, fmt.Errorf("latest by volume: %w", err)
+		return dashboardData{}, fmt.Errorf("list alarms: %w", err)
+	}
+	contested, err := s.ListContestedPaths(ctx)
+	if err != nil {
+		return dashboardData{}, fmt.Errorf("list contested paths: %w", err)
+	}
+	var coverage status.Report
+	if cfg != nil {
+		if coverage, err = status.BuildWithOptions(ctx, s, cfg, status.Options{SkipOffloadReadiness: skipReadiness}); err != nil {
+			return dashboardData{}, fmt.Errorf("build coverage: %w", err)
+		}
 	}
 	var active, recent []store.Run
 	for _, r := range runs {
@@ -277,10 +473,12 @@ func loadDashboardData(ctx context.Context, s *store.Store) (dashboardData, erro
 		}
 	}
 	return dashboardData{
-		now:         now,
-		volumes:     vols,
-		activeRuns:  active,
-		recentRuns:  recent,
-		latestByVol: latestByVol,
+		now:        now,
+		volumes:    vols,
+		activeRuns: active,
+		recentRuns: recent,
+		coverage:   coverage,
+		alarms:     alarms,
+		contested:  contested,
 	}, nil
 }

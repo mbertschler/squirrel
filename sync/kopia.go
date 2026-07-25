@@ -8,12 +8,23 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/store"
 )
+
+// ansiEscapeRE matches ANSI CSI escape sequences (colour among them).
+// kopia paints its progress and error output for a terminal; folding that
+// raw into an error would leak escape sequences into squirrel's structured
+// agent log and the runs.error column, so the stderr tail is stripped
+// first (friction F11c).
+var ansiEscapeRE = regexp.MustCompile("\x1b\\[[0-9;?]*[ -/]*[@-~]")
+
+// stripANSI removes ANSI escape sequences from s.
+func stripANSI(s string) string { return ansiEscapeRE.ReplaceAllString(s, "") }
 
 // Kopia is a configured kopia wrapper. Like rclone, kopia is treated as
 // an opaque child process: squirrel owns the argv, points every
@@ -71,7 +82,7 @@ func (k *Kopia) run(ctx context.Context, cfgFile, password string, args ...strin
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		verb := strings.Join(args[:min(2, len(args))], " ")
-		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+		if msg := stripANSI(strings.TrimSpace(stderr.String())); msg != "" {
 			return stdout.Bytes(), fmt.Errorf("kopia %s: %w: %s", verb, err, msg)
 		}
 		return stdout.Bytes(), fmt.Errorf("kopia %s: %w", verb, err)
@@ -100,7 +111,7 @@ func (k *Kopia) ensureRepository(ctx context.Context, cfgFile, password, repoPat
 		return nil
 	}
 	if !init {
-		return fmt.Errorf("kopia repository at %s: connect failed (%w) — re-run with --init to create a new repository (refusing to auto-create in case the path is wrong or the destination is temporarily unreachable)", repoPath, connectErr)
+		return fmt.Errorf("kopia repository at %s: connect failed (%w) — re-run with --init to create a new repository (refusing to auto-create in case the path is wrong or the destination is temporarily unreachable): %w", repoPath, connectErr, ErrRefused)
 	}
 	if _, createErr := k.run(ctx, cfgFile, password, "repository", "create", "filesystem", "--path", repoPath, "--no-persist-credentials"); createErr != nil {
 		return fmt.Errorf("kopia repository at %s: connect failed (%w); create failed: %w", repoPath, connectErr, createErr)

@@ -99,6 +99,10 @@ func glyphForStatus(status string) string {
 		return "~"
 	case "running":
 		return "●"
+	case "refused":
+		return "⊘"
+	case "aborted":
+		return "⊗"
 	default:
 		return "·"
 	}

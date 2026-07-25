@@ -42,6 +42,22 @@ func TestCLISyncHappyPath(t *testing.T) {
 	}
 }
 
+// TestCLISyncAlreadyCorrect covers F7: a second sync of an unchanged
+// volume reports already_correct so an in-sync no-op is distinguishable
+// from an empty one (transferred=0 alone is ambiguous).
+func TestCLISyncAlreadyCorrect(t *testing.T) {
+	requireRcloneCLI(t)
+	f := writeSyncFixture(t)
+	writeTestFile(t, filepath.Join(f.volumeDir, "a.txt"), "alpha")
+	writeTestFile(t, filepath.Join(f.volumeDir, "b.txt"), "beta")
+	runCLI(t, "--config", f.configPath, "index", f.volumeName)
+	runCLI(t, "--config", f.configPath, "sync", "pics") // first sync transfers
+	out := runCLI(t, "--config", f.configPath, "sync", "pics")
+	if !strings.Contains(out, "transferred=0") || !strings.Contains(out, "already_correct=2") {
+		t.Fatalf("second sync should report transferred=0 already_correct=2: %q", out)
+	}
+}
+
 func TestCLISyncUnknownDestinationFlag(t *testing.T) {
 	f := writeSyncFixture(t)
 	_, err := runCLIExpectErr(t, "--config", f.configPath, "sync", "pics", "--to", "ghost")
@@ -104,6 +120,11 @@ sync_to = ["mirror"]
 	}
 	if !strings.Contains(out, "snapshot=snap123") || !strings.Contains(out, "verified=true") {
 		t.Fatalf("output missing the kopia snapshot summary:\n%s", out)
+	}
+	// F11b: a kopia-only sync never touches rclone, so it must not print
+	// the "rclone.conf updated" line.
+	if strings.Contains(out, "rclone.conf updated") {
+		t.Fatalf("kopia-only sync should not log an rclone.conf update:\n%s", out)
 	}
 }
 

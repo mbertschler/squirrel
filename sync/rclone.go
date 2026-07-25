@@ -22,6 +22,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/runevents"
@@ -33,6 +35,26 @@ import (
 // --hash blake3 flag used by sync would be rejected by rclone.
 var MinRcloneVersion = Version{Major: 1, Minor: 66}
 
+// DefaultStallTimeout is the no-progress bound the agent scheduler applies
+// to every automatic rclone transfer (see Rclone.StallTimeout). Ten
+// minutes is comfortably longer than the longest legitimate gap between
+// progress reports — hashing one very large file for a --checksum
+// comparison surfaces no transfer/check advance until it completes — while
+// bounding a wedged endpoint far below the "indefinite" hang F25 recorded.
+// A dark endpoint usually fails sooner via rclone's own --contimeout /
+// --timeout; the guard covers the live-but-stuck case those don't.
+const DefaultStallTimeout = 10 * time.Minute
+
+// rcloneConnectTimeout and rcloneIOTimeout are passed as --contimeout and
+// --timeout on every streaming transfer so a dead or unresponsive endpoint
+// self-terminates instead of hanging. They match rclone's own defaults but
+// are set explicitly so the bound is guaranteed applied and lives in one
+// tunable place (#160, F25).
+const (
+	rcloneConnectTimeout = "1m"
+	rcloneIOTimeout      = "5m"
+)
+
 // Rclone is a configured rclone wrapper. Binary is the resolved executable
 // path; Config is the path to the squirrel-managed rclone.conf written by
 // WriteRcloneConfig. All Run invocations pass --config Config so the user's
@@ -40,6 +62,17 @@ var MinRcloneVersion = Version{Major: 1, Minor: 66}
 type Rclone struct {
 	Binary string
 	Config string
+	// StallTimeout, when > 0, bounds a streaming transfer (RunWithProgress)
+	// by progress rather than by total wall-clock: if rclone reports no
+	// advance in transferred+checked+bytes for this long, the child is
+	// killed and the run fails with a diagnosable "stalled" error. It is the
+	// squirrel-side backstop for a connection that stays alive but stops
+	// making progress — the storage-full S3 hang of F25 that tripped neither
+	// --contimeout nor --timeout. Zero (the default, used by the foreground
+	// CLI where a human can interrupt) disables the guard; the agent
+	// scheduler sets it to DefaultStallTimeout so an unattended cadence can
+	// never wedge forever.
+	StallTimeout time.Duration
 }
 
 // Find locates the rclone binary on PATH. The returned Rclone has Config
@@ -240,6 +273,33 @@ type RunResult struct {
 	// for BLAKE3 verification but hit this path was not content-verified,
 	// however rclone exited, so the caller must not record it as verified.
 	HashFallback bool
+	// Stderr is a bounded tail of rclone's non-JSON stderr — the
+	// human-readable diagnostics it prints before (or instead of) the
+	// structured JSON log: backend construction, config, auth, and host-key
+	// failures. Bounded to maxStderrCapture bytes so a pathological run
+	// can't balloon memory. It is the evidence that made a failing
+	// destination undiagnosable when it was dropped on the floor (#157,
+	// F6/F15); callers fold it into the run row's error and the scheduler
+	// log. Empty when rclone emitted only structured events.
+	Stderr string
+}
+
+// DisplayErrors is the error count for summary lines and status
+// reconciliation. It returns rclone's per-file Errors, except that a fatal
+// invocation failure that produced no per-file count reports the number of
+// captured diagnostics (at least one) — so a run that is status=failed
+// never simultaneously claims errors=0, the contradiction F6 flagged.
+func (r RunResult) DisplayErrors() int64 {
+	if r.Errors > 0 {
+		return r.Errors
+	}
+	if r.FatalError {
+		if n := int64(len(r.FailedFiles)); n > 0 {
+			return n
+		}
+		return 1
+	}
+	return 0
 }
 
 // FailedFile is one per-object error from the JSON log. Object may be
@@ -253,6 +313,11 @@ type FailedFile struct {
 // run that explodes on millions of files cannot exhaust memory. The total
 // error count in RunResult.Errors is exact regardless of this cap.
 const maxFailedFiles = 100
+
+// maxStderrCapture bounds RunResult.Stderr. rclone's fatal diagnostics are
+// a line or two; 4 KiB keeps a useful tail of a chattier failure without
+// letting a misbehaving child stream unbounded bytes into the run row.
+const maxStderrCapture = 4 << 10
 
 // Run executes `rclone <args...> --config <r.Config> --use-json-log` with
 // the given extra arguments. It streams both stdout (rclone writes to
@@ -278,23 +343,18 @@ func (r *Rclone) RunWithProgress(ctx context.Context, onProgress func(runevents.
 	if r.Config == "" {
 		return RunResult{}, errors.New("rclone wrapper: Config not set (call WriteRcloneConfig first)")
 	}
-	full := append([]string{
-		"--config", r.Config,
-		"--use-json-log",
-		"--log-level", "INFO",
-		"--stats", "1s",
-	}, args...)
-	cmd := exec.CommandContext(ctx, r.Binary, full...)
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return RunResult{}, fmt.Errorf("rclone stderr pipe: %w", err)
+	// A per-run cancel backs the no-progress guard: rclone's own timeouts
+	// bound a dead connection, the guard bounds a live-but-wedged one (F25).
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var guard *stallGuard
+	if r.StallTimeout > 0 {
+		guard = newStallGuard(runCtx, r.StallTimeout, cancel)
 	}
-	stdout, err := cmd.StdoutPipe()
+
+	cmd, stderr, stdout, err := r.startRclone(runCtx, args)
 	if err != nil {
-		return RunResult{}, fmt.Errorf("rclone stdout pipe: %w", err)
-	}
-	if err := cmd.Start(); err != nil {
-		return RunResult{}, fmt.Errorf("rclone start: %w", err)
+		return RunResult{}, err
 	}
 
 	var (
@@ -304,7 +364,7 @@ func (r *Rclone) RunWithProgress(ctx context.Context, onProgress func(runevents.
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		parseJSONLog(stderr, &result, onProgress)
+		parseJSONLog(stderr, &result, onProgress, guard.advance)
 	}()
 	go func() {
 		defer wg.Done()
@@ -315,11 +375,145 @@ func (r *Rclone) RunWithProgress(ctx context.Context, onProgress func(runevents.
 	wg.Wait()
 
 	waitErr := cmd.Wait()
+	cancel()
+	guard.wait()
 	if waitErr != nil {
 		result.FatalError = result.Errors == 0
-		return result, fmt.Errorf("rclone exit: %w", waitErr)
+		return result, rcloneRunError(waitErr, result.Stderr, guard, r.StallTimeout)
 	}
 	return result, nil
+}
+
+// startRclone assembles the full argument list — config, JSON logging,
+// per-second stats, and the connect/IO timeouts every transfer carries
+// (#160, F25) — and starts the child on runCtx, returning its stderr and
+// stdout pipes. runCtx backs both the caller's cancellation and the stall
+// guard's kill.
+func (r *Rclone) startRclone(runCtx context.Context, args []string) (*exec.Cmd, io.Reader, io.Reader, error) {
+	full := append([]string{
+		"--config", r.Config,
+		"--use-json-log",
+		"--log-level", "INFO",
+		"--stats", "1s",
+		"--contimeout", rcloneConnectTimeout,
+		"--timeout", rcloneIOTimeout,
+	}, args...)
+	cmd := exec.CommandContext(runCtx, r.Binary, full...)
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("rclone stderr pipe: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("rclone stdout pipe: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, nil, nil, fmt.Errorf("rclone start: %w", err)
+	}
+	return cmd, stderr, stdout, nil
+}
+
+// stallGuard kills a running rclone child when a streaming transfer stops
+// making progress for longer than timeout. rclone's --contimeout/--timeout
+// bound a dead connection; the guard is the squirrel-side backstop for a
+// connection that stays alive yet stops advancing — the storage-full hang
+// of F25 that tripped neither. It is driven off rclone's periodic --stats
+// events (via notifyAdvance): any growth in transferred+checked+bytes
+// resets the timer, so a slow-but-moving transfer of a large volume is
+// never killed while a wedged one is.
+type stallGuard struct {
+	timeout time.Duration
+	cancel  context.CancelFunc
+	poke    chan struct{}
+	done    chan struct{}
+	fired   atomic.Bool
+}
+
+func newStallGuard(ctx context.Context, timeout time.Duration, cancel context.CancelFunc) *stallGuard {
+	g := &stallGuard{
+		timeout: timeout,
+		cancel:  cancel,
+		poke:    make(chan struct{}, 1),
+		done:    make(chan struct{}),
+	}
+	go g.watch(ctx)
+	return g
+}
+
+// advance signals progress from the stats-reader goroutine. Non-blocking:
+// a pending poke already carries the reset, so a dropped signal is
+// harmless. Safe on a nil guard so the disabled path needs no branch.
+func (g *stallGuard) advance() {
+	if g == nil {
+		return
+	}
+	select {
+	case g.poke <- struct{}{}:
+	default:
+	}
+}
+
+// watch resets its timer on every progress poke and, when the timer
+// expires with no intervening progress, records the stall and cancels the
+// run context — which makes exec.CommandContext kill the rclone child. It
+// returns when ctx is done (the run finished or was cancelled elsewhere).
+func (g *stallGuard) watch(ctx context.Context) {
+	defer close(g.done)
+	timer := time.NewTimer(g.timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-g.poke:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(g.timeout)
+		case <-timer.C:
+			g.fired.Store(true)
+			g.cancel()
+			return
+		}
+	}
+}
+
+// wait blocks until the watch goroutine has returned so the caller can read
+// fired without a race. Safe on a nil guard.
+func (g *stallGuard) wait() {
+	if g == nil {
+		return
+	}
+	<-g.done
+}
+
+// rcloneRunError builds the error for a non-zero rclone exit. When the
+// stall guard fired, the exit is a kill squirrel caused, so we say so
+// plainly (folding in the captured stderr tail, #157) rather than
+// surfacing a bare "signal: killed"; otherwise it defers to
+// rcloneExitError.
+func rcloneRunError(waitErr error, stderrTail string, guard *stallGuard, timeout time.Duration) error {
+	if guard != nil && guard.fired.Load() {
+		if tail := strings.TrimSpace(stderrTail); tail != "" {
+			return fmt.Errorf("rclone stalled: no progress for %s, killed: %w: %s", timeout, waitErr, tail)
+		}
+		return fmt.Errorf("rclone stalled: no progress for %s, killed: %w", timeout, waitErr)
+	}
+	return rcloneExitError(waitErr, stderrTail)
+}
+
+// rcloneExitError wraps a non-zero rclone exit, folding in the captured
+// stderr tail when present so the scheduler log and the run row carry the
+// actual reason (auth, host key, path) rather than a bare "exit status 1"
+// (#157, F6/F15).
+func rcloneExitError(waitErr error, stderrTail string) error {
+	if tail := strings.TrimSpace(stderrTail); tail != "" {
+		return fmt.Errorf("rclone exit: %w: %s", waitErr, tail)
+	}
+	return fmt.Errorf("rclone exit: %w", waitErr)
 }
 
 // runPlain executes rclone with the wrapper's --config but without the
@@ -605,21 +799,42 @@ var hashFallbackRE = regexp.MustCompile(`no hashes in common`)
 
 func isHashFallback(msg string) bool { return hashFallbackRE.MatchString(msg) }
 
+// isErrorLevel reports whether a JSON event's level should be captured as
+// a failure diagnostic. rclone reports a fatal backend/config/auth failure
+// at "fatal" (sometimes "critical"), not "error"; capturing only "error"
+// dropped exactly those messages, leaving a failed run's ERROR column
+// blank (#157, F15). All three are folded into FailedFiles.
+func isErrorLevel(level string) bool {
+	switch level {
+	case "error", "fatal", "critical":
+		return true
+	}
+	return false
+}
+
 // parseJSONLog reads JSON-per-line events from r and updates result in
-// place. Non-JSON lines (e.g. an early startup notice on an older rclone)
-// are skipped — we cannot make decisions on them and surfacing them as
-// errors would create false positives. onProgress, if non-nil, is
-// invoked once per stats event so callers can drive a live UI.
-func parseJSONLog(r io.Reader, result *RunResult, onProgress func(runevents.Progress)) {
+// place. Non-JSON lines (rclone's pre-logger diagnostics — the backend,
+// config, auth, and host-key failures it prints before the structured
+// logger is live) are appended to result.Stderr, bounded, so a failure
+// that never reaches the JSON log still carries its reason (#157,
+// F6/F15). onProgress, if non-nil, is invoked once per stats event so
+// callers can drive a live UI.
+func parseJSONLog(r io.Reader, result *RunResult, onProgress func(runevents.Progress), onAdvance func()) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var lastProgressTotal int64
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		if len(line) == 0 || line[0] != '{' {
+		if len(line) == 0 {
+			continue
+		}
+		if line[0] != '{' {
+			appendStderr(result, line)
 			continue
 		}
 		var ev rcloneEvent
 		if err := json.Unmarshal(line, &ev); err != nil {
+			appendStderr(result, line)
 			continue
 		}
 		if isHashFallback(ev.Msg) {
@@ -629,30 +844,11 @@ func parseJSONLog(r io.Reader, result *RunResult, onProgress func(runevents.Prog
 			result.HashFallback = true
 		}
 		if ev.Stats != nil {
-			result.Transferred = ev.Stats.TotalTransfers
-			result.Checked = ev.Stats.TotalChecks
-			result.Bytes = ev.Stats.Bytes
-			// Don't overwrite Errors with a smaller value from a
-			// per-attempt stats line; take the maximum so retries that
-			// fail then succeed still surface the failure count.
-			if ev.Stats.Errors > result.Errors {
-				result.Errors = ev.Stats.Errors
-			}
-			if ev.Stats.FatalError {
-				result.FatalError = true
-			}
-			if onProgress != nil {
-				onProgress(runevents.Progress{
-					Stage:      runevents.StageUploading,
-					Done:       result.Transferred,
-					Total:      ev.Stats.TotalTransfers + ev.Stats.TotalChecks,
-					BytesDone:  result.Bytes,
-					BytesTotal: ev.Stats.TotalBytes,
-				})
-			}
+			applyStatsEvent(result, ev.Stats, onProgress)
+			notifyAdvance(result, &lastProgressTotal, onAdvance)
 			continue
 		}
-		if ev.Level == "error" && !isRetrySummary(ev.Msg) {
+		if isErrorLevel(ev.Level) && !isRetrySummary(ev.Msg) {
 			// Capture object-less errors too: auth failures, listing
 			// errors, "Failed to copy: …" diagnostics carry no Object
 			// but are exactly the messages we want in runs.error. Filter
@@ -664,5 +860,67 @@ func parseJSONLog(r io.Reader, result *RunResult, onProgress func(runevents.Prog
 				})
 			}
 		}
+	}
+}
+
+// notifyAdvance pokes the stall guard whenever the running total of
+// transferred+checked+bytes has grown since the last stats event, so a
+// transfer that is slow but genuinely moving keeps resetting the guard's
+// timer while a wedged one — rclone still emitting per-second stats, but
+// with flat counters — lets it fire. Checks count as progress so a long
+// verification pass over an already-populated destination is not mistaken
+// for a stall.
+func notifyAdvance(result *RunResult, last *int64, onAdvance func()) {
+	if onAdvance == nil {
+		return
+	}
+	total := result.Transferred + result.Checked + result.Bytes
+	if total > *last {
+		*last = total
+		onAdvance()
+	}
+}
+
+// applyStatsEvent folds one rclone stats event into result and drives the
+// optional progress callback. Errors is taken as the running maximum so a
+// per-attempt stats line that reports fewer errors than a prior one (a
+// retry that partially recovered) can't erase the peak failure count.
+func applyStatsEvent(result *RunResult, st *rcloneStats, onProgress func(runevents.Progress)) {
+	result.Transferred = st.TotalTransfers
+	result.Checked = st.TotalChecks
+	result.Bytes = st.Bytes
+	if st.Errors > result.Errors {
+		result.Errors = st.Errors
+	}
+	if st.FatalError {
+		result.FatalError = true
+	}
+	if onProgress != nil {
+		onProgress(runevents.Progress{
+			Stage:      runevents.StageUploading,
+			Done:       result.Transferred,
+			Total:      st.TotalTransfers + st.TotalChecks,
+			BytesDone:  result.Bytes,
+			BytesTotal: st.TotalBytes,
+		})
+	}
+}
+
+// appendStderr accumulates a non-JSON stderr line into result.Stderr,
+// keeping the last maxStderrCapture bytes. rclone prints its fatal error
+// line last, so the tail is the most diagnostic slice to retain when a
+// chatty run overflows the bound; older lines are trimmed from the front.
+// Blank lines are skipped so the capture stays dense.
+func appendStderr(result *RunResult, line []byte) {
+	trimmed := strings.TrimSpace(string(line))
+	if trimmed == "" {
+		return
+	}
+	if result.Stderr != "" {
+		result.Stderr += "\n"
+	}
+	result.Stderr += trimmed
+	if len(result.Stderr) > maxStderrCapture {
+		result.Stderr = result.Stderr[len(result.Stderr)-maxStderrCapture:]
 	}
 }

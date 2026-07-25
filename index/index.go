@@ -66,6 +66,14 @@ type Report struct {
 	RunID int64
 }
 
+// SawFiles reports whether the walk observed any live file (added,
+// modified, or unchanged). Zero across all three means the tree held no
+// regular files this run — an empty or wrong-mounted volume path, which
+// callers surface as a warning on first index since it is otherwise
+// indistinguishable from a healthy no-op (friction F8). This package never
+// writes to stderr, so the decision is returned rather than printed.
+func (r Report) SawFiles() bool { return r.Added+r.Modified+r.Unchanged > 0 }
+
 // ErrAlreadyRunning is returned from Index when store.BeginIndexRunIfClear
 // refuses to start because another index- or audit-kind run is already in
 // flight against the same volume. Callers can errors.As against this type

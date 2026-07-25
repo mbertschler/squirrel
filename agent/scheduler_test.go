@@ -124,10 +124,14 @@ func (f *fakeSyncRunner) Calls() []syncCall {
 // + fake sync runner. The scheduler's tick method drives behaviour
 // directly; the goroutine-driven run() loop is only used in the
 // integration test below.
-func newSchedulerFixture(t *testing.T, volumeCfg *config.Volume) *schedulerFixture {
+func newSchedulerFixture(t *testing.T, vols ...*config.Volume) *schedulerFixture {
 	t.Helper()
-	if volumeCfg.Path == "" {
-		volumeCfg.Path = t.TempDir()
+	volumes := make(map[string]*config.Volume, len(vols))
+	for _, v := range vols {
+		if v.Path == "" {
+			v.Path = t.TempDir()
+		}
+		volumes[v.Name] = v
 	}
 	dbPath := filepath.Join(t.TempDir(), "index.db")
 	s, err := store.Open(dbPath)
@@ -144,7 +148,7 @@ func newSchedulerFixture(t *testing.T, volumeCfg *config.Volume) *schedulerFixtu
 		Listen:     "127.0.0.1:0",
 		Token:      "tok",
 		Version:    "test",
-		Volumes:    map[string]*config.Volume{volumeCfg.Name: volumeCfg},
+		Volumes:    volumes,
 		Logger:     logger,
 		SyncRunner: syncRunner.Runner(),
 	}, s)
@@ -174,7 +178,7 @@ func (f *schedulerFixture) scheduler() *scheduler {
 	return &scheduler{
 		store:          f.srv.store,
 		volumes:        f.srv.cfg.Volumes,
-		syncRun:        f.srv.cfg.SyncRunner,
+		dispatch:       newSyncDispatcher(f.srv.cfg.SyncRunner, f.srv.cfg.Logger, f.clock.Now, defaultMaxParallelSyncs),
 		logger:         f.srv.cfg.Logger,
 		locks:          f.srv.router,
 		tickEvery:      time.Second,
@@ -203,7 +207,6 @@ func (f *schedulerFixture) seedFile() {
 		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
 			f.t.Fatalf("write %s: %v", p, err)
 		}
-		return
 	}
 }
 
@@ -319,6 +322,7 @@ func TestSchedulerSyncRunsPreSyncIndexFirst(t *testing.T) {
 	ctx := context.Background()
 
 	sch.tick(ctx)
+	sch.dispatch.wait() // syncs run on per-destination workers; drain them
 
 	runs, err := f.store.ListRuns(ctx, store.ListRunsOpts{})
 	if err != nil {
@@ -421,9 +425,12 @@ func TestSchedulerSkipsWhenInFlightIndexRun(t *testing.T) {
 	}
 }
 
-// TestSchedulerSkipsWhenInFlightSyncRun plants a stale running sync
-// row and asserts the scheduler skips the sync (but, per the
-// invariant, the pre-sync index still ran in this tick). We use a
+// TestSchedulerSkipsWhenInFlightSyncRun plants a stale running sync row and
+// asserts the scheduler skips the sync — and, since that pair is the volume's
+// only due destination, skips the pre-sync index too (#160). Re-indexing the
+// source on every tick for the whole duration of an in-flight push would burn
+// I/O and flood the never-pruned runs audit trail with a kind='index' row per
+// tick; the in-flight push was already preceded by its own index. We use a
 // fake sync runner so we can verify it never gets invoked.
 func TestSchedulerSkipsWhenInFlightSyncRun(t *testing.T) {
 	f := newSchedulerFixture(t, &config.Volume{
@@ -446,6 +453,7 @@ func TestSchedulerSkipsWhenInFlightSyncRun(t *testing.T) {
 
 	sch := f.scheduler()
 	sch.tick(context.Background())
+	sch.dispatch.wait()
 
 	if got := len(f.syncLog.Calls()); got != 0 {
 		t.Fatalf("sync invoked %d times despite running sync row; want 0", got)
@@ -453,25 +461,47 @@ func TestSchedulerSkipsWhenInFlightSyncRun(t *testing.T) {
 	if !f.containsLogLine("scheduler.skipped", "kind=sync", "in-flight") {
 		t.Fatalf("missing in-flight sync skip log:\n%s", f.logBuf.String())
 	}
-	// Pre-sync index still ran — the invariant says sync always
-	// indexes first, and the only thing skipped here is the sync
-	// itself.
+	// No new pre-sync index: with the sole due destination already in
+	// flight, there is no new push for an index to precede. Only the planted
+	// 'running' sync row should exist.
 	runs, _ := f.store.ListRuns(context.Background(), store.ListRunsOpts{})
-	var sawIndex, sawSync bool
-	for _, r := range runs {
-		switch r.Kind {
-		case store.RunKindIndex:
-			sawIndex = true
-		case store.RunKindSync:
-			sawSync = true
+	if len(runs) != 1 || runs[0].Kind != store.RunKindSync || runs[0].Status != store.RunStatusRunning {
+		t.Fatalf("runs=%+v; want only the planted running sync row (no redundant pre-sync index)", runs)
+	}
+}
+
+// TestSchedulerTwoVolumesSameDestinationBothRun guards the starvation trap
+// (#160): the tick iterates volumes by name, so if two volumes are due to
+// the same destination on one tick the earlier one wins the destination.
+// The dispatcher must queue the later one behind it and run it — not skip
+// it every tick forever. "aaa" sorts before "zzz"; both must produce a sync
+// run to "backup".
+func TestSchedulerTwoVolumesSameDestinationBothRun(t *testing.T) {
+	f := newSchedulerFixture(t,
+		&config.Volume{Name: "aaa", SyncTo: []string{"backup"}, SyncEvery: time.Hour},
+		&config.Volume{Name: "zzz", SyncTo: []string{"backup"}, SyncEvery: time.Hour},
+	)
+	f.seedFile()
+	sch := f.scheduler()
+
+	sch.tick(context.Background())
+	sch.dispatch.wait()
+
+	var aaaRan, zzzRan bool
+	for _, c := range f.syncLog.Calls() {
+		if c.Destination != "backup" {
+			continue
+		}
+		switch c.Volume {
+		case "aaa":
+			aaaRan = true
+		case "zzz":
+			zzzRan = true
 		}
 	}
-	if !sawIndex {
-		t.Fatalf("expected a pre-sync index row even when sync is gated: %+v", runs)
-	}
-	if !sawSync {
-		// The planted 'running' sync row counts as a sync; just sanity.
-		t.Fatalf("expected the planted running sync row to remain: %+v", runs)
+	if !aaaRan || !zzzRan {
+		t.Fatalf("both volumes must sync to the shared destination; aaa=%v zzz=%v (calls=%+v)",
+			aaaRan, zzzRan, f.syncLog.Calls())
 	}
 }
 
@@ -526,6 +556,7 @@ func TestSchedulerCadenceUsesLastFinished(t *testing.T) {
 
 	// Tick 1: nothing prior → fires.
 	sch.tick(ctx)
+	sch.dispatch.wait()
 	if got := len(f.syncLog.Calls()); got != 1 {
 		t.Fatalf("after tick 1: sync calls = %d; want 1", got)
 	}
@@ -533,6 +564,7 @@ func TestSchedulerCadenceUsesLastFinished(t *testing.T) {
 	// Advance 30min, still under cadence → does not fire.
 	f.clock.Add(30 * time.Minute)
 	sch.tick(ctx)
+	sch.dispatch.wait()
 	if got := len(f.syncLog.Calls()); got != 1 {
 		t.Fatalf("after tick 2 (under cadence): sync calls = %d; want 1", got)
 	}
@@ -540,9 +572,155 @@ func TestSchedulerCadenceUsesLastFinished(t *testing.T) {
 	// Advance another hour, past cadence → fires again.
 	f.clock.Add(time.Hour)
 	sch.tick(ctx)
+	sch.dispatch.wait()
 	if got := len(f.syncLog.Calls()); got != 2 {
 		t.Fatalf("after tick 3 (over cadence): sync calls = %d; want 2", got)
 	}
+}
+
+// waitUntil polls cond until it returns true or a short deadline passes,
+// failing the test on timeout. It synchronises with the dispatcher's async
+// workers without a fixed sleep, so a test can wait for one destination's
+// queue to drain while another destination's sync is still (deliberately)
+// blocked.
+func waitUntil(t *testing.T, cond func() bool, what string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// TestSchedulerInFlightSyncNotReindexedEachTick is the #160 regression guard:
+// once a sync is dispatched and stays in flight across ticks, the scheduler
+// must NOT re-run that volume's pre-sync index every tick — otherwise a slow
+// multi-hour push would flood the never-pruned runs audit trail with a
+// kind='index' row per 30s tick. The pre-sync index runs exactly once (on the
+// tick that dispatches the sync), while a different, not-in-flight
+// (volume, destination) keeps indexing and dispatching normally on the very
+// ticks the wedged one is skipped — proving the guard is per-pair, not global.
+func TestSchedulerInFlightSyncNotReindexedEachTick(t *testing.T) {
+	f := newSchedulerFixture(t,
+		&config.Volume{Name: "photos", SyncTo: []string{"cloudbox"}, SyncEvery: time.Hour},
+		&config.Volume{Name: "docs", SyncTo: []string{"backup"}, SyncEvery: time.Hour},
+	)
+	f.seedFile()
+
+	release := make(chan struct{})
+	photosInFlight := make(chan struct{}, 1)
+	docsFinished := make(chan struct{}, 8)
+	f.syncLog.runFn = func(ctx context.Context, vol *config.Volume, destName string) SyncRunReport {
+		v, err := f.store.GetVolumeByName(ctx, vol.Name)
+		if err != nil {
+			return SyncRunReport{Err: err}
+		}
+		id, blocker, err := f.store.BeginSyncRunIfClear(ctx, store.SyncRunSpec{
+			VolumeID: v.ID, Destination: destName,
+		})
+		if err != nil {
+			return SyncRunReport{Err: err}
+		}
+		if blocker != nil {
+			return SyncRunReport{RunID: blocker.ID, Err: fmt.Errorf("already running")}
+		}
+		if vol.Name == "photos" {
+			// Announce the running row exists, then block — keeping the
+			// photos->cloudbox sync in flight across the following ticks
+			// without ever finishing it (the F25 wedge, minus the kill).
+			photosInFlight <- struct{}{}
+			<-release
+		}
+		if err := f.store.FinishRun(ctx, id, store.RunStatusSuccess, "", 0); err != nil {
+			return SyncRunReport{RunID: id, Err: err}
+		}
+		if vol.Name == "docs" {
+			docsFinished <- struct{}{}
+		}
+		return SyncRunReport{RunID: id, Status: store.RunStatusSuccess}
+	}
+
+	sch := f.scheduler()
+	ctx := context.Background()
+
+	countIndex := func(volName string) int {
+		t.Helper()
+		v, err := f.store.GetVolumeByName(ctx, volName)
+		if err != nil {
+			t.Fatalf("GetVolumeByName(%s): %v", volName, err)
+		}
+		runs, err := f.store.ListRuns(ctx, store.ListRunsOpts{})
+		if err != nil {
+			t.Fatalf("ListRuns: %v", err)
+		}
+		n := 0
+		for _, r := range runs {
+			if r.Kind == store.RunKindIndex && r.VolumeID.Valid && r.VolumeID.Int64 == v.ID {
+				n++
+			}
+		}
+		return n
+	}
+	// drainDocs waits for docs' just-dispatched sync to finish and its queue
+	// slot to clear, so the next tick sees docs as not-in-flight while photos
+	// stays wedged.
+	drainDocs := func(tick int) {
+		<-docsFinished
+		waitUntil(t, func() bool { return !sch.dispatch.inFlight("backup", "docs") },
+			fmt.Sprintf("docs queue to drain after tick %d", tick))
+	}
+
+	// Tick 1: both due, neither in flight -> each indexes once and dispatches.
+	// photos' sync blocks (stays running); docs' sync finishes.
+	sch.tick(ctx)
+	<-photosInFlight
+	drainDocs(1)
+	if got := countIndex("photos"); got != 1 {
+		t.Fatalf("after tick 1: photos index runs = %d; want 1", got)
+	}
+	if got := countIndex("docs"); got != 1 {
+		t.Fatalf("after tick 1: docs index runs = %d; want 1", got)
+	}
+
+	// Ticks 2 and 3: photos is still in flight -> skipped with NO new
+	// pre-sync index. docs comes due again each hour and must keep indexing +
+	// dispatching normally on the very ticks photos is skipped.
+	for tick := 2; tick <= 3; tick++ {
+		f.clock.Add(time.Hour + time.Minute)
+		sch.tick(ctx)
+		drainDocs(tick)
+		if got := countIndex("photos"); got != 1 {
+			t.Fatalf("after tick %d: photos index runs = %d; want 1 (in-flight sync must not be re-indexed)", tick, got)
+		}
+		if got := countIndex("docs"); got != tick {
+			t.Fatalf("after tick %d: docs index runs = %d; want %d (not-in-flight volume indexes each due tick)", tick, got, tick)
+		}
+	}
+
+	var photosCalls, docsCalls int
+	for _, c := range f.syncLog.Calls() {
+		switch c.Volume {
+		case "photos":
+			photosCalls++
+		case "docs":
+			docsCalls++
+		}
+	}
+	if photosCalls != 1 {
+		t.Fatalf("photos sync calls = %d; want 1 (dispatched once, then skipped while in flight)", photosCalls)
+	}
+	if docsCalls != 3 {
+		t.Fatalf("docs sync calls = %d; want 3 (once per due tick)", docsCalls)
+	}
+	if !f.containsLogLine("scheduler.skipped", "kind=sync", "volume=photos", "in-flight") {
+		t.Fatalf("missing in-flight skip log for photos:\n%s", f.logBuf.String())
+	}
+
+	close(release)
+	sch.dispatch.wait()
 }
 
 // TestSchedulerFailedSyncStillConsumesCadence guards the failure
@@ -571,6 +749,7 @@ func TestSchedulerFailedSyncStillConsumesCadence(t *testing.T) {
 	ctx := context.Background()
 
 	sch.tick(ctx)
+	sch.dispatch.wait()
 	if calls.Load() != 1 {
 		t.Fatalf("tick 1 sync calls = %d; want 1", calls.Load())
 	}
@@ -578,6 +757,7 @@ func TestSchedulerFailedSyncStillConsumesCadence(t *testing.T) {
 	// Within cadence → no re-fire even though the prior run failed.
 	f.clock.Add(10 * time.Minute)
 	sch.tick(ctx)
+	sch.dispatch.wait()
 	if calls.Load() != 1 {
 		t.Fatalf("under-cadence tick after failure called sync %d times; want 1 (no special retry)",
 			calls.Load())
@@ -586,6 +766,7 @@ func TestSchedulerFailedSyncStillConsumesCadence(t *testing.T) {
 	// Past cadence → re-fires (regardless of prior failure).
 	f.clock.Add(time.Hour)
 	sch.tick(ctx)
+	sch.dispatch.wait()
 	if calls.Load() != 2 {
 		t.Fatalf("past-cadence tick after failure called sync %d times; want 2", calls.Load())
 	}
@@ -607,6 +788,7 @@ func TestSchedulerBothCadencesShareIndexRun(t *testing.T) {
 	ctx := context.Background()
 
 	sch.tick(ctx)
+	sch.dispatch.wait()
 
 	runs, _ := f.store.ListRuns(ctx, store.ListRunsOpts{})
 	var indexCount int
@@ -636,11 +818,13 @@ func TestSchedulerStandaloneIndexAfterSyncCadenceWaits(t *testing.T) {
 	ctx := context.Background()
 
 	sch.tick(ctx) // fires sync + pre-sync index.
+	sch.dispatch.wait()
 
 	// 10min later → under index_every from the pre-sync index, no
 	// standalone fires.
 	f.clock.Add(10 * time.Minute)
 	sch.tick(ctx)
+	sch.dispatch.wait()
 	runs, _ := f.store.ListRuns(ctx, store.ListRunsOpts{})
 	var indexCount int
 	for _, r := range runs {
@@ -656,6 +840,7 @@ func TestSchedulerStandaloneIndexAfterSyncCadenceWaits(t *testing.T) {
 	// due yet because sync_every is 1h).
 	f.clock.Add(10 * time.Minute) // total 20min since pre-sync.
 	sch.tick(ctx)
+	sch.dispatch.wait()
 	runs, _ = f.store.ListRuns(ctx, store.ListRunsOpts{})
 	indexCount = 0
 	for _, r := range runs {
@@ -801,9 +986,12 @@ func TestSchedulerDropsSyncWhenRunnerNil(t *testing.T) {
 	})
 	f.seedFile()
 	sch := f.scheduler()
-	sch.syncRun = nil
+	// A dispatcher with no runner is the index-only-host case (no rclone
+	// wired): sync-triggering paths log a skip and create no sync rows.
+	sch.dispatch = newSyncDispatcher(nil, f.srv.cfg.Logger, f.clock.Now, defaultMaxParallelSyncs)
 
 	sch.tick(context.Background())
+	sch.dispatch.wait()
 
 	if !f.containsLogLine("scheduler.skipped", "kind=sync", "sync runner not configured") {
 		t.Fatalf("missing nil-runner skip log:\n%s", f.logBuf.String())

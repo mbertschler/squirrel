@@ -369,7 +369,7 @@ func (h *packedHandler) watermark(ctx context.Context, volID int64) (int64, erro
 		if freshStartOnEmptyRoot(ctx, h.rcl, h.dest) {
 			return 0, nil
 		}
-		return 0, fmt.Errorf("destination %q: the last successful sync (run %d) left no pack placement map at %s — its history is not packed (a mirror or content-addressed root); point the layout at a fresh destination or root, or (after wiping the remote root) run `squirrel destination reset %s`, instead of switching an existing one: %w", h.dest.Name, last.ID, mapURI, h.dest.Name, err)
+		return 0, fmt.Errorf("destination %q: the last successful sync (run %d) left no pack placement map at %s — its history is not packed (a mirror or content-addressed root); point the layout at a fresh destination or root, or (after wiping the remote root) run `squirrel destination reset %s`, instead of switching an existing one: %w: %w", h.dest.Name, last.ID, mapURI, h.dest.Name, err, ErrRefused)
 	}
 	return last.ID, nil
 }

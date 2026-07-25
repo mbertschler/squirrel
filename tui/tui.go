@@ -90,7 +90,7 @@ type rootModel struct {
 
 func newRootModel(s *store.Store, cfg *config.Config) *rootModel {
 	client := newAgentClient(cfg)
-	dash := newDashboardModel(s)
+	dash := newDashboardModel(s, cfg)
 	dash.attachClient(client)
 	return &rootModel{
 		active:    screenDashboard,

@@ -50,6 +50,28 @@ const RestoreHistoryDirName = ".squirrel-restore-history"
 // and from peer-sync so a snapshot is never mistaken for user content.
 const IndexDirName = ".squirrel-index"
 
+// ErrRefused marks a preflight safety refusal: a gate that declined to
+// proceed before any transfer began — a missing or mismatched
+// .squirrel-volume marker, a kopia connect that found no repository
+// without --init, or a layout guard protecting a destination whose
+// recorded history belongs to a different layout. Gates wrap it into their
+// error with %w so the run-finalising path records store.RunStatusRefused
+// rather than RunStatusFailed: a refusal is a standing "won't do this"
+// condition, not a mid-flight failure, and the audit trail keeps the two
+// distinct (#157, F26).
+var ErrRefused = errors.New("refused")
+
+// terminalStatus resolves a run's terminal status from the derived status
+// and the operation error. A preflight refusal (errors.Is(err,
+// ErrRefused)) overrides to 'refused'; every other outcome keeps the
+// derived status.
+func terminalStatus(status string, runErr error) string {
+	if runErr != nil && errors.Is(runErr, ErrRefused) {
+		return store.RunStatusRefused
+	}
+	return status
+}
+
 // Options shapes one Sync invocation.
 type Options struct {
 	// Shallow drops --checksum and --hash blake3 so rclone uses its default
@@ -98,6 +120,15 @@ type Report struct {
 	RunID        int64
 	RcloneResult RunResult
 	Status       string // success / partial / failed
+	// AlreadyCorrect counts the paths the destination already held
+	// correctly, so a no-op-because-in-sync is distinguishable from a
+	// no-op-because-empty in the summary (transferred=0 alone is
+	// ambiguous — friction F7). For rclone bucket pushes and restores it
+	// is rclone's already-matching count; for peer syncs the handler
+	// derives it as present-total minus the paths the sync acted on
+	// (the Merkle walk never sends identical folders to /plan, so it
+	// cannot be counted from the disposition list alone).
+	AlreadyCorrect int64
 	// Verification is the handler's typed durability report for this
 	// push: which comparison backed it, what the tool counted, and —
 	// via Verified() — whether the destination's copy was
@@ -141,6 +172,16 @@ type Report struct {
 	// and the new BLAKE3 plus the receiver-relative preserved path so
 	// the CLI can render a meaningful "review at <path>" pointer.
 	NodeConflicts []syncproto.ConflictDetail
+	// NodeContested is non-empty when the receiver refused one or more
+	// paths with the `contested` disposition: paths frozen by a prior
+	// conflict whose divergent re-assertion is declined until an operator
+	// resolves it (#158, F27). The initiator's bytes for these paths did
+	// NOT land — both existing versions stay preserved on the receiver.
+	// Each record carries the frozen winner + preserved-loser digests and
+	// the receiver-relative preserved location so the initiator mirrors
+	// the freeze into its own contested marker and points the operator at
+	// both versions.
+	NodeContested []syncproto.ContestedDetail
 	// SnapshotErr captures a failure to take the post-sync index
 	// snapshot or to ride it along to the destination (#75). It is
 	// strictly defense-in-depth: a snapshot failure must not flip a
@@ -257,8 +298,12 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 	// an uninitialised destination would prevent the "preview what would
 	// happen" workflow.
 	if !opts.DryRun {
-		if err := ensureDestinationMarker(ctx, s, rcl, dest, vol.Name, opts.Init); err != nil {
-			return rep, err
+		if merr := ensureDestinationMarker(ctx, s, rcl, dest, vol.Name, opts.Init); merr != nil {
+			// A marker refusal fires before the sync run is allocated, so
+			// record it as its own terminal 'refused' run — otherwise a
+			// month-dead backup disk produces zero red anywhere but agent
+			// stderr (#157, F26).
+			return recordSyncRefusal(ctx, s, volID, dest.Name, &rep, merr)
 		}
 	}
 
@@ -321,6 +366,28 @@ func captureDurabilityAdvance(ctx context.Context, s *store.Store, volumeID int6
 	return components, nil
 }
 
+// recordSyncRefusal mints a terminal kind='sync' run in the 'refused'
+// state for a preflight gate that declined before the transfer began, so
+// the refusal is visible in `squirrel runs` and the TUI instead of living
+// only in the returned error (#157, F26). The run is allocated ungated
+// (BeginRun, not the concurrency gate) — a refusal transfers nothing and
+// need not contend with an in-flight sync — and finished immediately with
+// refErr as the row's error. refErr is returned unchanged so callers
+// surface the same message; a failure to even record the refusal is folded
+// into the returned error rather than masking the original refusal.
+func recordSyncRefusal(ctx context.Context, s *store.Store, volID int64, destName string, rep *Report, refErr error) (Report, error) {
+	id, err := s.BeginRun(ctx, store.RunKindSync, volID, destName, false)
+	if err != nil {
+		return *rep, fmt.Errorf("%w (also failed to record the refusal as a run: %w)", refErr, err)
+	}
+	rep.RunID = id
+	rep.Status = store.RunStatusRefused
+	if ferr := s.FinishRun(ctx, id, store.RunStatusRefused, refErr.Error(), 0); ferr != nil {
+		rep.FinishErr = ferr
+	}
+	return *rep, refErr
+}
+
 // beginSyncRunGuarded is the sync-allocator the bucket and peer paths
 // share. It honours dry-run (returns 0 with no DB write) and delegates
 // to store.BeginSyncRunIfClear for the atomic gate. A blocked attempt
@@ -373,11 +440,19 @@ func runRcloneOperation(
 		return err
 	}
 	rep.RcloneResult, err = rcl.RunWithProgress(ctx, progress, args...)
-	if err != nil && rep.RcloneResult.Errors == 0 && !rep.RcloneResult.FatalError {
-		// Invocation failed without a parseable error count: treat as fatal.
-		rep.RcloneResult.FatalError = true
-	}
 	if err != nil {
+		if rep.RcloneResult.Errors == 0 && !rep.RcloneResult.FatalError {
+			// Invocation failed without a parseable error count: treat as fatal.
+			rep.RcloneResult.FatalError = true
+		}
+		// Ensure a diagnostic reaches the run row's error column and the
+		// CLI output even when rclone logged no per-file error event — auth,
+		// host-key, and config failures print to stderr, not the JSON log
+		// (#157, F6/F15). The returned error already folds in the stderr
+		// tail, so it is the most complete single message available.
+		if len(rep.RcloneResult.FailedFiles) == 0 {
+			rep.RcloneResult.FailedFiles = []FailedFile{{Message: err.Error()}}
+		}
 		return fmt.Errorf("rclone: %w", err)
 	}
 	return nil
@@ -439,6 +514,10 @@ func beginRestoreRun(ctx context.Context, s *store.Store, dryRun bool, volID int
 // to the rclone outcome on this very run.
 func finishRun(ctx context.Context, s *store.Store, dryRun bool, runID int64, rep *Report) {
 	rep.Status = deriveStatus(rep.RcloneResult)
+	// rclone's "checks" are the files it found already matching at the
+	// destination and did not transfer — exactly the already-correct
+	// count the summary reports (F7). Peer syncs set this themselves.
+	rep.AlreadyCorrect = rep.RcloneResult.Checked
 	if dryRun || runID == 0 {
 		return
 	}
@@ -533,13 +612,13 @@ func ensureLocalDestinationMarker(ctx context.Context, s *store.Store, dest *con
 		return nil
 	}
 	if _, ok := errors.AsType[*volmark.ErrMismatch](err); ok {
-		return fmt.Errorf("destination %q: %w (refuse to init over a different volume's tree)", dest.Name, err)
+		return fmt.Errorf("destination %q: %w (refuse to init over a different volume's tree): %w", dest.Name, err, ErrRefused)
 	}
 	if !errors.Is(err, volmark.ErrMissing) {
 		return fmt.Errorf("destination %q marker check: %w", dest.Name, err)
 	}
 	if !init {
-		return fmt.Errorf("destination %q at %s has no %s marker — re-run with --init to bootstrap (refusing in case the root is a typo)", dest.Name, root, volmark.MarkerName)
+		return fmt.Errorf("destination %q at %s has no %s marker — re-run with --init to bootstrap (refusing in case the root is a typo): %w", dest.Name, root, volmark.MarkerName, ErrRefused)
 	}
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return fmt.Errorf("destination %q: mkdir %s: %w", dest.Name, root, err)

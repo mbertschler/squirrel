@@ -49,6 +49,9 @@ func runAgent(cmd *cobra.Command) error {
 	defer s.Close()
 
 	logger := slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), &slog.HandlerOptions{Level: slog.LevelInfo}))
+	if err := reapOrphanedRunsAtStartup(cmd.Context(), s, logger); err != nil {
+		return err
+	}
 	rcl, err := resolveSchedulerRclone(cmd, cfg)
 	if err != nil {
 		return err
@@ -104,6 +107,25 @@ func serveAgent(cmd *cobra.Command, cfg *config.Config, srv *agent.Server, logge
 	}
 	logAgentStartup(logger, srv, ln.Addr().String())
 	return srv.Serve(cmd.Context(), ln)
+}
+
+// reapOrphanedRunsAtStartup transitions any 'running' run left behind by a
+// previously-killed agent to 'aborted' before the schedulers start (#157,
+// F14). A freshly started agent has kicked nothing yet, so every 'running'
+// row necessarily predates it; leaving them would block the run gates
+// forever and render as a live, elapsed-ticking banner in the TUI hours
+// later. The reap is loud — one info line naming the reaped ids — because
+// automatic recovery must never be invisible (ux-principle 5).
+func reapOrphanedRunsAtStartup(ctx context.Context, s *store.Store, logger *slog.Logger) error {
+	ids, err := s.AbortRunningRuns(ctx, "reaped at agent startup: the agent that owned this run was killed mid-run")
+	if err != nil {
+		return fmt.Errorf("reap orphaned runs: %w", err)
+	}
+	if len(ids) > 0 {
+		logger.Warn("reaped orphaned runs",
+			"count", len(ids), "run_ids", ids, "status", store.RunStatusAborted)
+	}
+	return nil
 }
 
 // logSchedulerOnlyStartup emits the listener-less counterpart of the
@@ -179,6 +201,10 @@ func resolveSchedulerRclone(cmd *cobra.Command, cfg *config.Config) (*sync.Rclon
 	if err != nil {
 		return nil, fmt.Errorf("scheduler needs rclone for scheduled syncs/verifies: %w", err)
 	}
+	// Bound every automatic transfer by the no-progress guard so a wedged
+	// endpoint fails its own run instead of hanging forever (#160, F25).
+	// Foreground `squirrel sync` leaves this unset — a human can interrupt.
+	rcl.StallTimeout = sync.DefaultStallTimeout
 	// The version preflight (`--hash blake3`) is a sync concern; a
 	// verify-only schedule reads provider checksums and doesn't need it.
 	if needsSync {
@@ -263,7 +289,13 @@ func buildSchedulerSyncRunner(cfg *config.Config, s *store.Store, rcl *sync.Rclo
 			opts.Snapshot = sync.NewSnapshotter(s, rcl, snapshotConfig(cfg, s.Path()))
 		}
 		rep, runErr := sync.RunPair(ctx, s, tools, pair, opts)
-		return agent.SyncRunReport{RunID: rep.RunID, Status: rep.Status, Err: runErr}
+		return agent.SyncRunReport{
+			RunID:     rep.RunID,
+			Status:    rep.Status,
+			Err:       runErr,
+			Conflicts: len(rep.NodeConflicts),
+			Contested: len(rep.NodeContested),
+		}
 	}
 }
 
