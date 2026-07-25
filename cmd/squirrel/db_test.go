@@ -243,15 +243,19 @@ func TestCLIDBRestoreRejectsSchemaMismatch(t *testing.T) {
 
 // TestCLIDBSchemaPrintsDDL confirms `squirrel db schema` dumps the
 // opened database's DDL, including the invariants the schema enforces:
-// the foundational volumes table, the content entity table, and the
-// one-live-row-per-path partial unique index.
+// the foundational volumes table, the content entity table, the
+// one-live-row-per-path partial unique index, and STRICT typing. The
+// table names come back quoted because the v27 STRICT conversion
+// rebuilt them under a scratch name and renamed them into place —
+// SQLite quotes the substituted name in the stored DDL.
 func TestCLIDBSchemaPrintsDDL(t *testing.T) {
 	f := writeSyncFixture(t)
 	out := runCLI(t, "--config", f.configPath, "db", "schema")
 	for _, want := range []string{
-		"CREATE TABLE volumes",
-		"CREATE TABLE contents",
+		`CREATE TABLE "volumes"`,
+		`CREATE TABLE "contents"`,
 		"uniq_files_live_per_path",
+		") STRICT",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("db schema output missing %q:\n%s", want, out)

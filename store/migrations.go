@@ -10,7 +10,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 26
+const SchemaVersion = 27
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -38,8 +38,9 @@ type migration struct {
 // Convention for new migrations: every new CREATE TABLE MUST be declared
 // STRICT and use only INTEGER/TEXT/BLOB column types (no TIMESTAMP /
 // BOOLEAN / DATETIME / VARCHAR / REAL). See AGENTS.md "Schema & migrations".
-// The existing tables predate this and are not STRICT yet — their bulk
-// conversion is a separate migration PR, not something to do ad hoc here.
+// Every table is STRICT as of v27 (migrate_v27.go converted the ones that
+// predated the convention), so a rebuild that drops the keyword would be a
+// regression, not a neutral rewrite.
 func buildMigrations(mctx migrationCtx) []migration {
 	return []migration{
 		{version: 3, up: migrateV2ToV3},
@@ -68,6 +69,7 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 24, up: migrateV23ToV24},
 		{version: 25, up: migrateV24ToV25},
 		{version: 26, up: migrateV25ToV26},
+		{version: 27, up: migrateV26ToV27},
 	}
 }
 
@@ -89,8 +91,12 @@ type migrationCtx struct {
 // would only roll back failed migrations, not buggy-but-successful
 // ones. Fresh databases (current == 0) skip the snapshot because
 // there's nothing to lose.
+//
+// The bootstrap CREATE is STRICT per the schema convention. On a database
+// that predates v27 it is a no-op (IF NOT EXISTS doesn't compare
+// definitions) and the v26→v27 rebuild converts the existing table instead.
 func (s *Store) migrate(ctx context.Context, nodeName string, opts OpenOptions) error {
-	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL PRIMARY KEY)`); err != nil {
+	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL PRIMARY KEY) STRICT`); err != nil {
 		return fmt.Errorf("create schema_version: %w", err)
 	}
 
