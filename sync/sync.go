@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -129,6 +130,15 @@ type Report struct {
 	// (the Merkle walk never sends identical folders to /plan, so it
 	// cannot be counted from the disposition list alone).
 	AlreadyCorrect int64
+	// Changed is how many files this run actually wrote at its target —
+	// the destination for a push, the local restore tree for a restore —
+	// as opposed to the "files covered" counts above, which also include
+	// everything already correct. It lands in runs.changed_count so
+	// `squirrel runs --changes` and the TUI fold can collapse an in-sync
+	// bucket push (#182). Invalid (Valid=false) means the handler has no
+	// honest count to report — a kopia snapshot knows only its total file
+	// count — and the run keeps the conservative file_count rendering.
+	Changed sql.NullInt64
 	// Verification is the handler's typed durability report for this
 	// push: which comparison backed it, what the tool counted, and —
 	// via Verified() — whether the destination's copy was
@@ -518,6 +528,11 @@ func finishRun(ctx context.Context, s *store.Store, dryRun bool, runID int64, re
 	// destination and did not transfer — exactly the already-correct
 	// count the summary reports (F7). Peer syncs set this themselves.
 	rep.AlreadyCorrect = rep.RcloneResult.Checked
+	// The transfers are the other half of that split, and they are what
+	// this run actually changed at the destination — the number the
+	// no-op fold keys on (#182). Recording it here makes `already_correct`
+	// and the fold two views of one rclone summary.
+	rep.Changed = knownChanged(rep.RcloneResult.Transferred)
 	if dryRun || runID == 0 {
 		return
 	}
@@ -526,9 +541,27 @@ func finishRun(ctx context.Context, s *store.Store, dryRun bool, runID int64, re
 		errMsg = rep.RcloneResult.FailedFiles[0].Message
 	}
 	fileCount := rep.RcloneResult.Transferred + rep.RcloneResult.Checked
-	if err := s.FinishRun(ctx, runID, rep.Status, errMsg, fileCount); err != nil {
+	if err := finishRunRow(ctx, s, runID, rep.Status, errMsg, fileCount, rep.Changed); err != nil {
 		rep.FinishErr = err
 	}
+}
+
+// knownChanged wraps a driver's changed-file count for Report.Changed.
+// Handlers that cannot report one leave the field zero-valued, which
+// records runs.changed_count as NULL ("unknown") rather than a false zero.
+func knownChanged(n int64) sql.NullInt64 {
+	return sql.NullInt64{Int64: n, Valid: true}
+}
+
+// finishRunRow writes a run's terminal state through the changed-count-aware
+// store call when the driver reported one, and through the plain FinishRun
+// (leaving runs.changed_count NULL) when it did not. Shared by the rclone
+// scaffold and the curated handlers so both make the same choice.
+func finishRunRow(ctx context.Context, s *store.Store, runID int64, status, errMsg string, fileCount int64, changed sql.NullInt64) error {
+	if changed.Valid {
+		return s.FinishRunChanged(ctx, runID, status, errMsg, fileCount, changed.Int64)
+	}
+	return s.FinishRun(ctx, runID, status, errMsg, fileCount)
 }
 
 // historyDirInSourceWarning returns a one-line advisory when the source

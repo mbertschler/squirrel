@@ -43,6 +43,16 @@ func TestRunIsInteresting(t *testing.T) {
 		{"failed", store.Run{ID: 3, Status: store.RunStatusFailed}, true},
 		{"refused", store.Run{ID: 4, Status: store.RunStatusRefused}, true},
 		{"success with conflict", store.Run{ID: 7, Status: store.RunStatusSuccess, FileCount: 0}, true},
+		// #182: a bucket push counts already-correct files in file_count,
+		// so only changed_count can tell the in-sync no-op from the push
+		// that actually moved content.
+		{"in-sync bucket push", store.Run{ID: 8, Status: store.RunStatusSuccess, FileCount: 42,
+			ChangedCount: sql.NullInt64{Int64: 0, Valid: true}}, false},
+		{"bucket push that transferred", store.Run{ID: 9, Status: store.RunStatusSuccess, FileCount: 42,
+			ChangedCount: sql.NullInt64{Int64: 3, Valid: true}}, true},
+		// Pre-v28 history has no changed count and keeps the conservative
+		// file_count rendering.
+		{"pre-v28 bucket push", store.Run{ID: 10, Status: store.RunStatusSuccess, FileCount: 42}, true},
 	}
 	for _, tc := range tests {
 		if got := runIsInteresting(tc.r, conflicts); got != tc.want {
@@ -54,20 +64,25 @@ func TestRunIsInteresting(t *testing.T) {
 // TestFilterRuns exercises both filters end to end, including that the
 // descending order is preserved.
 func TestFilterRuns(t *testing.T) {
+	changed := func(n int64) sql.NullInt64 { return sql.NullInt64{Int64: n, Valid: true} }
 	runs := []store.Run{
-		{ID: 5, Status: store.RunStatusSuccess, FileCount: 0}, // no-op
-		{ID: 4, Status: store.RunStatusSuccess, FileCount: 3}, // change
-		{ID: 3, Status: store.RunStatusFailed},                // failed
-		{ID: 2, Status: store.RunStatusRefused},               // refused
-		{ID: 1, Status: store.RunStatusSuccess, FileCount: 0}, // no-op
+		// A steady-state bucket push and an all-unchanged re-index: both
+		// consider the whole volume, both changed nothing (#182).
+		{ID: 7, Status: store.RunStatusSuccess, FileCount: 42, ChangedCount: changed(0)},
+		{ID: 6, Status: store.RunStatusSuccess, FileCount: 42, ChangedCount: changed(2)}, // moved content
+		{ID: 5, Status: store.RunStatusSuccess, FileCount: 0},                            // no-op
+		{ID: 4, Status: store.RunStatusSuccess, FileCount: 3},                            // change
+		{ID: 3, Status: store.RunStatusFailed},                                           // failed
+		{ID: 2, Status: store.RunStatusRefused},                                          // refused
+		{ID: 1, Status: store.RunStatusSuccess, FileCount: 0},                            // no-op
 	}
 	conflicts := map[int64]int{}
 
 	if ids := runIDs(filterRuns(runs, conflicts, true, false)); !sameIDs(ids, []int64{3, 2}) {
 		t.Fatalf("--failed ids = %v, want [3 2]", ids)
 	}
-	if ids := runIDs(filterRuns(runs, conflicts, false, true)); !sameIDs(ids, []int64{4, 3, 2}) {
-		t.Fatalf("--changes ids = %v, want [4 3 2]", ids)
+	if ids := runIDs(filterRuns(runs, conflicts, false, true)); !sameIDs(ids, []int64{6, 4, 3, 2}) {
+		t.Fatalf("--changes ids = %v, want [6 4 3 2]", ids)
 	}
 }
 

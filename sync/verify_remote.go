@@ -445,7 +445,14 @@ func recordVerifyOutcome(ctx context.Context, s *store.Store, rep *RemoteVerifyR
 	}); err != nil {
 		return err
 	}
-	if err := s.FinishRun(ctx, rep.RunID, status, errMsg, int64(rep.Objects+rep.Packs)); err != nil {
+	// A verification pass moves no content, so what it changes is the
+	// fingerprints it recorded for the first time: the initial capture pass
+	// over a destination stays visible, and the cadence passes that only
+	// re-confirmed what was already recorded fold away as steady-state
+	// noise (#182). A pass that found a mismatch or a missing object is
+	// 'partial' or 'failed' and stays visible on status alone.
+	changed := int64(rep.Populated + rep.PacksPopulated)
+	if err := s.FinishRunChanged(ctx, rep.RunID, status, errMsg, int64(rep.Objects+rep.Packs), changed); err != nil {
 		return fmt.Errorf("finish verify run %d: %w", rep.RunID, err)
 	}
 	return applyVerifyAlarm(ctx, s, rep, verifyErr)

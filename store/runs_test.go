@@ -101,6 +101,89 @@ func TestFinishRunWritesAuditRow(t *testing.T) {
 	}
 }
 
+// TestFinishRunChangedRecordsCount covers the v28 column (#182): a driver
+// that knows what it changed records it, and a driver that does not leaves
+// runs.changed_count NULL rather than a false zero.
+func TestFinishRunChangedRecordsCount(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+
+	known := makeRun(t, s, vID)
+	if err := s.FinishRunChanged(ctx, known, RunStatusSuccess, "", 42, 3); err != nil {
+		t.Fatalf("FinishRunChanged: %v", err)
+	}
+	got, err := s.GetRun(ctx, known)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if got.FileCount != 42 {
+		t.Errorf("file_count = %d, want 42", got.FileCount)
+	}
+	if !got.ChangedCount.Valid || got.ChangedCount.Int64 != 3 {
+		t.Errorf("changed_count = %+v, want 3", got.ChangedCount)
+	}
+
+	unknown := makeRun(t, s, vID)
+	if err := s.FinishRun(ctx, unknown, RunStatusSuccess, "", 42); err != nil {
+		t.Fatalf("FinishRun: %v", err)
+	}
+	got, err = s.GetRun(ctx, unknown)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if got.ChangedCount.Valid {
+		t.Errorf("changed_count = %+v, want NULL when the caller can't say", got.ChangedCount)
+	}
+}
+
+// TestFinishRunRejectsNegativeChangedCount pins the column's CHECK: a
+// changed count is a cardinality, and a negative one is a bug in the
+// caller's arithmetic, not a value to store.
+func TestFinishRunRejectsNegativeChangedCount(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	vID := makeVolume(t, s, "/v")
+	runID := makeRun(t, s, vID)
+
+	if err := s.FinishRunChanged(ctx, runID, RunStatusSuccess, "", 42, -1); err == nil {
+		t.Fatal("FinishRunChanged with a negative changed count should be rejected")
+	}
+	got, err := s.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if got.Status != RunStatusRunning {
+		t.Errorf("status = %q, want the row left untouched at %q", got.Status, RunStatusRunning)
+	}
+}
+
+// TestRunNoOp pins the shared fold rule behind `runs --changes` and the
+// TUI's `f` key: the recorded changed count decides where there is one, and
+// the pre-v28 file_count heuristic decides — conservatively — where there
+// is not.
+func TestRunNoOp(t *testing.T) {
+	changed := func(n int64) sql.NullInt64 { return sql.NullInt64{Int64: n, Valid: true} }
+	tests := []struct {
+		name string
+		run  Run
+		want bool
+	}{
+		{"in-sync bucket push", Run{Status: RunStatusSuccess, FileCount: 42, ChangedCount: changed(0)}, true},
+		{"bucket push that transferred", Run{Status: RunStatusSuccess, FileCount: 42, ChangedCount: changed(1)}, false},
+		{"all-unchanged re-index", Run{Status: RunStatusSuccess, FileCount: 900, ChangedCount: changed(0)}, true},
+		{"failed run that changed nothing", Run{Status: RunStatusFailed, ChangedCount: changed(0)}, false},
+		{"still running", Run{Status: RunStatusRunning, ChangedCount: changed(0)}, false},
+		{"pre-v28 peer-sync no-op", Run{Status: RunStatusSuccess, FileCount: 0}, true},
+		{"pre-v28 bucket push", Run{Status: RunStatusSuccess, FileCount: 42}, false},
+	}
+	for _, tc := range tests {
+		if got := tc.run.NoOp(); got != tc.want {
+			t.Errorf("%s: NoOp() = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 // TestAppendRunAuditRoundTrip exercises the standalone (non-FinishRun)
 // audit writer the `runs fail` CLI and #77's correlation write use, and
 // confirms ListRunAudit returns rows oldest-first with operator/note

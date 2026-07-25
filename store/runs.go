@@ -77,15 +77,22 @@ func isTerminalStatus(status string) bool {
 // latter carries the *other side's* local run id so the two halves of one
 // logical sync can be joined offline.
 type Run struct {
-	ID              int64
-	Kind            string
-	VolumeID        sql.NullInt64
-	Destination     sql.NullString
-	StartedAtNs     int64
-	EndedAtNs       sql.NullInt64
-	Status          string
-	Error           sql.NullString
-	FileCount       int64
+	ID          int64
+	Kind        string
+	VolumeID    sql.NullInt64
+	Destination sql.NullString
+	StartedAtNs int64
+	EndedAtNs   sql.NullInt64
+	Status      string
+	Error       sql.NullString
+	FileCount   int64
+	// ChangedCount is how many files the run actually changed —
+	// transferred, added, superseded, offloaded — as opposed to
+	// FileCount's "files the run considered", which for bucket pushes and
+	// index runs also counts everything already correct or unchanged.
+	// NULL (Valid=false) means unknown: rows written before v28, and runs
+	// whose driver has no honest changed count to report. See Run.NoOp.
+	ChangedCount    sql.NullInt64
 	PeerNodeID      sql.NullInt64
 	CorrelatedRunID sql.NullInt64
 	// Shallow is true when the run skipped BLAKE3 verification in
@@ -95,6 +102,28 @@ type Run struct {
 	// the receiver side of a node sync (which makes no such choice) and
 	// for the pre-v10 history that never recorded it.
 	Shallow sql.NullBool
+}
+
+// NoOp reports whether the run is routine steady-state noise: a clean
+// success that changed nothing. It is the one rule behind both
+// `squirrel runs --changes` and the TUI's `f` fold, so the CLI and the TUI
+// hide exactly the same rows.
+//
+// A run that recorded a ChangedCount answers directly, whatever its kind.
+// For the rest — history written before v28, and drivers with no honest
+// count (a kopia snapshot reports only its total file count; a destination
+// reset changes recorded state, not files) — it falls back to the
+// FileCount == 0 heuristic. That fallback errs toward showing: FileCount
+// over-counts for bucket and index runs, so such a run stays visible
+// rather than risking a hidden run that moved content.
+func (r Run) NoOp() bool {
+	if r.Status != RunStatusSuccess {
+		return false
+	}
+	if r.ChangedCount.Valid {
+		return r.ChangedCount.Int64 == 0
+	}
+	return r.FileCount == 0
 }
 
 // BeginRun records the start of a sync or restore run and returns its
@@ -275,10 +304,37 @@ func nullInt64Label(v sql.NullInt64) string {
 	return fmt.Sprintf("%d", v.Int64)
 }
 
-// FinishRun records the terminal state of a run. errMsg is stored as NULL
+// FinishRun records the terminal state of a run whose caller has no
+// changed-file count to state: a run reaped by `runs fail`, a preflight
+// refusal or a failure that never got as far as moving anything, a driver
+// whose tool reports no such number. runs.changed_count is left NULL
+// ("unknown"), which keeps the row in Run.NoOp's conservative file_count
+// fallback rather than folding it away on a fabricated zero. Callers that
+// do know must use FinishRunChanged, or a genuine no-op stays on screen.
+//
+// See FinishRunChanged for the shared contract (guarded transition,
+// runs_audit row, error semantics).
+func (s *Store) FinishRun(ctx context.Context, runID int64, status string, errMsg string, fileCount int64) error {
+	return s.finishRun(ctx, runID, status, errMsg, fileCount, sql.NullInt64{})
+}
+
+// FinishRunChanged is FinishRun for the drivers that know how many files
+// their run actually changed: rclone's transferred count for a bucket
+// push, the manifest delta for a content-layout push, the receiver-verified
+// paths for a peer sync, added+modified for an index walk, the offloaded
+// count for an offload. changedCount is recorded alongside fileCount so a
+// clean run that changed nothing reads as the no-op it is regardless of
+// kind (#182).
+func (s *Store) FinishRunChanged(ctx context.Context, runID int64, status string, errMsg string, fileCount, changedCount int64) error {
+	return s.finishRun(ctx, runID, status, errMsg, fileCount,
+		sql.NullInt64{Int64: changedCount, Valid: true})
+}
+
+// finishRun records the terminal state of a run. errMsg is stored as NULL
 // when empty. fileCount should be the total number of files the run touched
 // (added + modified + unchanged) so the runs table doubles as a coarse audit
-// log without needing to scan files.
+// log without needing to scan files; changedCount narrows that to the files
+// the run actually changed, or is invalid when the caller cannot say.
 //
 // The transition is guarded: a row already in a terminal status
 // (success/partial/failed) is never re-finalised — the first terminal
@@ -292,7 +348,7 @@ func nullInt64Label(v sql.NullInt64) string {
 // The status update and a 'finish' runs_audit row are written in one
 // transaction so the append-only transition log can't diverge from the
 // run row. The audit note carries the resulting status.
-func (s *Store) FinishRun(ctx context.Context, runID int64, status string, errMsg string, fileCount int64) error {
+func (s *Store) finishRun(ctx context.Context, runID int64, status string, errMsg string, fileCount int64, changedCount sql.NullInt64) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin finish run %d: %w", runID, err)
@@ -316,9 +372,9 @@ func (s *Store) FinishRun(ctx context.Context, runID int64, status string, errMs
 		errVal = sql.NullString{String: errMsg, Valid: true}
 	}
 	if _, err := tx.ExecContext(ctx, `
-		UPDATE runs SET ended_at_ns = ?, status = ?, error = ?, file_count = ?
+		UPDATE runs SET ended_at_ns = ?, status = ?, error = ?, file_count = ?, changed_count = ?
 		WHERE id = ?
-	`, atNs, status, errVal, fileCount, runID); err != nil {
+	`, atNs, status, errVal, fileCount, changedCount, runID); err != nil {
 		return fmt.Errorf("finish run %d: %w", runID, err)
 	}
 	if err := appendRunAuditTx(ctx, tx,
@@ -349,12 +405,12 @@ type ListRunsOpts struct {
 // runColumns is the fixed projection for every read of a runs row. Keeps
 // the scan order in lockstep with the query order; adding a column means
 // editing one place.
-const runColumns = `id, kind, volume_id, destination, started_at_ns, ended_at_ns, status, error, file_count, peer_node_id, correlated_run_id, shallow`
+const runColumns = `id, kind, volume_id, destination, started_at_ns, ended_at_ns, status, error, file_count, changed_count, peer_node_id, correlated_run_id, shallow`
 
 func scanRun(scan func(...any) error) (Run, error) {
 	var r Run
 	err := scan(&r.ID, &r.Kind, &r.VolumeID, &r.Destination, &r.StartedAtNs, &r.EndedAtNs,
-		&r.Status, &r.Error, &r.FileCount, &r.PeerNodeID, &r.CorrelatedRunID, &r.Shallow)
+		&r.Status, &r.Error, &r.FileCount, &r.ChangedCount, &r.PeerNodeID, &r.CorrelatedRunID, &r.Shallow)
 	return r, err
 }
 

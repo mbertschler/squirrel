@@ -186,6 +186,11 @@ func (h *peerHandler) sealed() {}
 // 'refused' via terminalStatus, and rep.Status is updated in place so the
 // CLI summary and TUI show the refusal as its own condition rather than a
 // generic failure (#157, F26).
+//
+// rep.Changed rides along as runs.changed_count where the handler set it
+// (the content-layout pushes count their manifest delta); kopia leaves it
+// unset, since a snapshot summary reports the whole tree and no honest
+// changed count — that run keeps the conservative file_count rendering.
 func finishHandlerRun(ctx context.Context, s *store.Store, rep *Report, runErr error) {
 	if rep.RunID == 0 {
 		return
@@ -195,7 +200,7 @@ func finishHandlerRun(ctx context.Context, s *store.Store, rep *Report, runErr e
 	if runErr != nil {
 		errMsg = runErr.Error()
 	}
-	if err := s.FinishRun(ctx, rep.RunID, rep.Status, errMsg, rep.Verification.Files); err != nil {
+	if err := finishRunRow(ctx, s, rep.RunID, rep.Status, errMsg, rep.Verification.Files, rep.Changed); err != nil {
 		rep.FinishErr = err
 	}
 }

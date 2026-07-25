@@ -1556,7 +1556,8 @@ func (r *peerSyncRouter) handleClose(w http.ResponseWriter, req *http.Request) {
 // already failing, and the run row's stuck-'running' state is the worse
 // outcome the caller surfaces, so there's nothing to return through.
 func (r *peerSyncRouter) finalizeFailedClose(ctx context.Context, runID int64, committed int, cause error) {
-	err := r.srv.store.FinishRun(ctx, runID, store.RunStatusFailed, cause.Error(), int64(committed))
+	err := r.srv.store.FinishRunChanged(ctx, runID, store.RunStatusFailed, cause.Error(),
+		int64(committed), int64(committed))
 	if err == nil {
 		return
 	}
@@ -1623,7 +1624,10 @@ func (r *peerSyncRouter) closeSession(ctx context.Context, sess *peerSession, st
 	if finishStatus != store.RunStatusSuccess && finishStatus != store.RunStatusPartial && finishStatus != store.RunStatusFailed {
 		finishStatus = store.RunStatusPartial
 	}
-	if err := r.srv.store.FinishRun(ctx, sess.receiverRunID, finishStatus, "", int64(committed)); err != nil {
+	// committed is both counts on the receiver side: every row written
+	// here is a path whose content this session changed locally, so a
+	// session that committed nothing reads as the no-op it is (#182).
+	if err := r.srv.store.FinishRunChanged(ctx, sess.receiverRunID, finishStatus, "", int64(committed), int64(committed)); err != nil {
 		return committed, fmt.Errorf("finish run: %w", err)
 	}
 	return committed, nil

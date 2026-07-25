@@ -32,16 +32,67 @@ func TestDestinationCell(t *testing.T) {
 	}
 }
 
-// TestRunIsNoOp covers the F19 fold rule: a clean success that touched no
-// files is a no-op; anything else is not.
-func TestRunIsNoOp(t *testing.T) {
-	if !runIsNoOp(store.Run{Status: store.RunStatusSuccess, FileCount: 0}) {
-		t.Error("clean 0-file success should be a no-op")
+// TestApplyFilterFoldsBucketNoOps covers the F19 fold now that it keys on
+// runs.changed_count (#182): consecutive bucket pushes that transferred
+// nothing collapse behind one marker even though their file_count counts
+// the whole volume, while the push that moved content stays on screen.
+func TestApplyFilterFoldsBucketNoOps(t *testing.T) {
+	bucketRun := func(id, changed int64) store.Run {
+		return store.Run{
+			ID:           id,
+			Kind:         store.RunKindSync,
+			Destination:  sql.NullString{String: "s3archive", Valid: true},
+			Status:       store.RunStatusSuccess,
+			FileCount:    42,
+			ChangedCount: sql.NullInt64{Int64: changed, Valid: true},
+		}
 	}
-	if runIsNoOp(store.Run{Status: store.RunStatusSuccess, FileCount: 3}) {
-		t.Error("success that touched files is not a no-op")
+	m := newRunsModel(nil)
+	m.resizeColumns()
+	m.rows = []store.Run{bucketRun(4, 0), bucketRun(3, 0), bucketRun(2, 3), bucketRun(1, 0)}
+	m.applyFilter()
+
+	if m.foldedCount != 2 {
+		t.Errorf("foldedCount = %d, want 2 (the pair of in-sync pushes)", m.foldedCount)
 	}
-	if runIsNoOp(store.Run{Status: store.RunStatusFailed}) {
-		t.Error("failed run is not a no-op")
+	// Marker, the run that moved content, the lone trailing no-op.
+	if len(m.displayRuns) != 3 {
+		t.Fatalf("displayed %d rows, want 3: %+v", len(m.displayRuns), m.displayRuns)
+	}
+	if m.displayRuns[0] != nil {
+		t.Errorf("row 0 should be the fold marker, got run %+v", m.displayRuns[0])
+	}
+	if m.displayRuns[1] == nil || m.displayRuns[1].ID != 2 {
+		t.Errorf("row 1 should be run 2 (transferred 3 files), got %+v", m.displayRuns[1])
+	}
+	if m.displayRuns[2] == nil || m.displayRuns[2].ID != 1 {
+		t.Errorf("row 2 should be the lone no-op run 1, got %+v", m.displayRuns[2])
+	}
+}
+
+// TestApplyFilterKeepsPreV28NoOps covers the fallback: history written
+// before changed_count existed keeps its conservative rendering, so a pair
+// of bucket pushes with a non-zero file_count and no changed count stays
+// visible rather than folding on a guess.
+func TestApplyFilterKeepsPreV28NoOps(t *testing.T) {
+	legacy := func(id int64) store.Run {
+		return store.Run{
+			ID:          id,
+			Kind:        store.RunKindSync,
+			Destination: sql.NullString{String: "s3archive", Valid: true},
+			Status:      store.RunStatusSuccess,
+			FileCount:   42,
+		}
+	}
+	m := newRunsModel(nil)
+	m.resizeColumns()
+	m.rows = []store.Run{legacy(2), legacy(1)}
+	m.applyFilter()
+
+	if m.foldedCount != 0 {
+		t.Errorf("foldedCount = %d, want 0 — unknown changed counts must not fold", m.foldedCount)
+	}
+	if len(m.displayRuns) != 2 {
+		t.Errorf("displayed %d rows, want both runs", len(m.displayRuns))
 	}
 }

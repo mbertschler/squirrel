@@ -383,7 +383,9 @@ func finishDurabilityPullRun(ctx context.Context, s *store.Store, runID int64, v
 	note := fmt.Sprintf("volume=%s peer=%s fetched=%d applied=%d dropped=%d rewinds=%d",
 		volume, peer, rep.Fetched, rep.Applied, rep.Dropped, len(rep.Rewinds))
 	auditErr := s.AppendRunAudit(ctx, store.RunAuditEntry{RunID: runID, Transition: store.TransitionPullDurability, Note: note})
-	finErr := s.FinishRun(ctx, runID, status, errMsg, int64(rep.Applied))
+	// Applied is both counts: a pull that merged no durability rows changed
+	// nothing locally, so it folds out of the steady-state noise (#182).
+	finErr := s.FinishRunChanged(ctx, runID, status, errMsg, int64(rep.Applied), int64(rep.Applied))
 	return agent.DurabilityPullReport{
 		RunID:   runID,
 		Status:  status,

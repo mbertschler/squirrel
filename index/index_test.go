@@ -564,6 +564,62 @@ func TestIndexRecordsRuns(t *testing.T) {
 	}
 }
 
+// TestIndexRecordsChangedCount pins the v28 column for index runs (#182):
+// the first walk added a file and the second changed nothing, so the two
+// rows carry the same file_count but different changed counts — and only
+// the second folds out of `runs --changes` and the TUI's fold. A third walk
+// after an edit and a delete counts both as changes.
+func TestIndexRecordsChangedCount(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), "hello")
+	writeFile(t, filepath.Join(root, "b.txt"), "world")
+
+	s := setupStore(t)
+	ctx := context.Background()
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("first Index: %v", err)
+	}
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("second Index: %v", err)
+	}
+	writeFile(t, filepath.Join(root, "a.txt"), "hello again")
+	if err := os.Remove(filepath.Join(root, "b.txt")); err != nil {
+		t.Fatalf("remove b.txt: %v", err)
+	}
+	if _, err := Index(ctx, s, root, Options{}); err != nil {
+		t.Fatalf("third Index: %v", err)
+	}
+
+	absRoot, _ := filepath.Abs(root)
+	vol := volumeFor(t, s, absRoot)
+	runs, err := s.ListRuns(ctx, store.ListRunsOpts{VolumeID: &vol.ID})
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	if len(runs) != 3 {
+		t.Fatalf("got %d run rows, want 3: %+v", len(runs), runs)
+	}
+	// added a.txt + b.txt, nothing, then a.txt modified + b.txt missing.
+	wantChanged := []int64{2, 0, 2}
+	for i, r := range runs {
+		if !r.ChangedCount.Valid {
+			t.Fatalf("run %d changed_count is NULL, want %d", i, wantChanged[i])
+		}
+		if r.ChangedCount.Int64 != wantChanged[i] {
+			t.Errorf("run %d changed_count = %d, want %d", i, r.ChangedCount.Int64, wantChanged[i])
+		}
+	}
+	if runs[0].NoOp() || !runs[1].NoOp() || runs[2].NoOp() {
+		t.Errorf("NoOp() = %v, want [false true false]",
+			[]bool{runs[0].NoOp(), runs[1].NoOp(), runs[2].NoOp()})
+	}
+	// The all-unchanged walk still considered every file — the point of
+	// the new column is that file_count alone couldn't say it was a no-op.
+	if runs[1].FileCount != 2 {
+		t.Errorf("no-op run file_count = %d, want 2 (files considered)", runs[1].FileCount)
+	}
+}
+
 // TestIndexRecordsShallowFlag pins that the runs row carries the
 // Options.Shallow value the call was made with: shallow=true for the
 // fast (size, mtime) path and shallow=false for the rehash-everything

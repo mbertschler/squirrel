@@ -293,6 +293,12 @@ func (i *indexer) beginRun() error {
 // and the per-file error count: a fatal failure yields 'failed', per-file
 // errors with a clean walk yield 'partial', and an entirely clean run yields
 // 'success'.
+//
+// file_count is everything the walk considered; changed_count narrows that
+// to the observations this run actually recorded — a new path, a path whose
+// content was superseded, or a path that went missing. An all-unchanged
+// re-index therefore reads as the no-op it is, instead of reporting the
+// whole volume (#182).
 func (i *indexer) finishRun(report *Report, fatalErr error) {
 	report.RunID = i.runID
 	if i.opts.DryRun || i.runID == 0 {
@@ -300,7 +306,8 @@ func (i *indexer) finishRun(report *Report, fatalErr error) {
 	}
 	status, errMsg := runStatus(report, fatalErr)
 	fileCount := int64(report.Added + report.Modified + report.Unchanged)
-	if err := i.store.FinishRun(i.ctx, i.runID, status, errMsg, fileCount); err != nil {
+	changed := int64(report.Added + report.Modified + report.Missing)
+	if err := i.store.FinishRunChanged(i.ctx, i.runID, status, errMsg, fileCount, changed); err != nil {
 		// Surface as a per-run error rather than swallowing silently. The
 		// outer caller has already accepted a report and a fatal error (if
 		// any); we can only append.

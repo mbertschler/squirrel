@@ -237,6 +237,9 @@ func (h *packedHandler) push(ctx context.Context, rep *Report, volID, runID int6
 		return fmt.Errorf("compute path delta since run %d: %w", watermark, err)
 	}
 	rep.Verification.Files = int64(len(delta))
+	// Same reading as the content-addressed push: the delta is what this
+	// run changes at the destination, so an empty one folds as a no-op.
+	rep.Changed = knownChanged(int64(len(delta)))
 	large, small, err := h.routeBySize(ctx, rep, plannedUploads(delta))
 	if err != nil {
 		return err

@@ -10,7 +10,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 27
+const SchemaVersion = 28
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -70,6 +70,7 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 25, up: migrateV24ToV25},
 		{version: 26, up: migrateV25ToV26},
 		{version: 27, up: migrateV26ToV27},
+		{version: 28, up: migrateV27ToV28},
 	}
 }
 
@@ -2249,4 +2250,48 @@ func createContestedPathsV26(ctx context.Context, tx *sql.Tx) error {
 		return fmt.Errorf("create contested_paths: %w", err)
 	}
 	return nil
+}
+
+// --- v27 → v28 ---
+
+// migrateV27ToV28 adds runs.changed_count: how many files a run actually
+// changed, as opposed to file_count's "files the run considered" (#182,
+// completing #161's F19).
+//
+// file_count means different things per kind. A peer sync records the
+// receiver-verified — i.e. transferred — count, so its no-ops already read
+// as zero; a bucket push records transferred *plus* already-correct and an
+// index run records added plus modified plus unchanged, so their no-ops
+// read as the whole volume. No column answered "did this run change
+// anything?" across kinds, which left `squirrel runs --changes` and the
+// TUI's fold able to collapse only peer-sync no-ops — and in the reference
+// household's steady state most rows are per-destination bucket pushes.
+//
+// The column is nullable with no default, so every pre-migration row reads
+// back as NULL, meaning "unknown" rather than a fabricated zero. Run.NoOp
+// falls back to the old file_count heuristic for those, keeping history's
+// conservative rendering exactly as it is today. Purely additive: no
+// existing column changes meaning and no run row is rewritten, so the audit
+// trail stays intact.
+//
+// No index: the column is queried alongside a full listing read, never as a
+// selective predicate, and its cardinality is low — an index would go
+// unused.
+func migrateV27ToV28(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// One line, because SQLite stores the added column's text verbatim in
+	// sqlite_master and store/schema.sql is generated from it.
+	if _, err := tx.ExecContext(ctx,
+		`ALTER TABLE runs ADD COLUMN changed_count INTEGER CHECK (changed_count IS NULL OR changed_count >= 0)`); err != nil {
+		return fmt.Errorf("add runs.changed_count: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (28)`); err != nil {
+		return fmt.Errorf("record schema v28: %w", err)
+	}
+	return tx.Commit()
 }

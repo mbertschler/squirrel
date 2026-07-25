@@ -216,6 +216,10 @@ func (h *contentAddressedHandler) push(ctx context.Context, rep *Report, volID, 
 		return fmt.Errorf("compute path delta since run %d: %w", watermark, err)
 	}
 	rep.Verification.Files = int64(len(delta))
+	// The delta is exactly what this push changes at the destination: the
+	// paths whose content the manifest segment newly maps. An empty delta
+	// is a genuine no-op, which is what the runs fold keys on (#182).
+	rep.Changed = knownChanged(int64(len(delta)))
 	if err := h.uploadObjects(ctx, rep, runID, plannedUploads(delta)); err != nil {
 		return err
 	}
