@@ -194,16 +194,16 @@ func gatherRuns(cmd *cobra.Command, s *store.Store, volumeID *int64, limit int, 
 
 // conflictCountsForFilter loads only the conflict counts the active filter
 // needs. --failed consults none — an attention-worthy run is unconditionally
-// kept — so it returns an empty map. --changes needs them only for the
-// ambiguous rows (a clean success that touched no files), so it counts just
-// those rather than the whole unbounded fetch.
+// kept — so it returns an empty map. --changes needs them only for the rows
+// that would otherwise be hidden as no-ops, so it counts just those rather
+// than the whole unbounded fetch.
 func conflictCountsForFilter(cmd *cobra.Command, s *store.Store, runs []store.Run, onlyFailed bool) (map[int64]int, error) {
 	if onlyFailed {
 		return map[int64]int{}, nil
 	}
 	var candidates []store.Run
 	for _, r := range runs {
-		if r.Status == store.RunStatusSuccess && r.FileCount == 0 {
+		if r.NoOp() {
 			candidates = append(candidates, r)
 		}
 	}
@@ -238,22 +238,16 @@ func runNeedsAttention(status string) bool {
 }
 
 // runIsInteresting reports whether a run is worth showing under --changes:
-// anything needing attention, still running, that touched files, or that
-// resolved conflicts. A clean success that touched nothing is the routine
+// anything needing attention, still running, that changed files, or that
+// resolved conflicts. A clean success that changed nothing is the routine
 // no-op the filter hides.
 //
-// runs.file_count conflates transferred with already-correct for bucket and
-// index runs (it is the total files considered, not the delta), so an
-// in-sync bucket sync or an all-unchanged re-index still shows here — the
-// filter deliberately errs toward showing rather than risk hiding a run
-// that moved content. It reliably folds peer-sync no-ops, whose file_count
-// is the receiver-verified (i.e. transferred) count and so is zero when
-// nothing moved.
+// store.Run.NoOp owns the "changed nothing" rule so this filter and the
+// TUI's `f` fold hide exactly the same rows: the run's recorded
+// changed_count where it has one, and the conservative file_count
+// heuristic for the pre-v28 history and the drivers that report no count.
 func runIsInteresting(r store.Run, conflicts map[int64]int) bool {
-	if r.Status != store.RunStatusSuccess {
-		return true
-	}
-	if r.FileCount > 0 {
+	if !r.NoOp() {
 		return true
 	}
 	return conflicts[r.ID] > 0

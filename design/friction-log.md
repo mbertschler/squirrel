@@ -201,7 +201,7 @@ On the nas, `sync photos laptop` (received from laptop) and
 the TUI — the destination column holds a peer name in both directions.
 The audit trail answers "what happened" but not "who initiated".
 
-**F19 · S3 — steady-state run noise buries signal.** With compressed
+**F19 · S3 — ~~steady-state run noise buries signal.~~ (filters + fold, #179; `runs.changed_count`, #182)** With compressed
 cadences the runs list is dominated by 0-file no-op rows (one per
 volume × destination per tick). Nothing distinguishes "checked,
 nothing to do" from "transferred nothing unexpectedly"; a day of real
@@ -210,6 +210,14 @@ hundreds of no-ops. Filters (`runs --failed`, `runs --changes`) and
 TUI-side folding of consecutive no-ops would restore the audit trail's
 readability. (The `runs` help text also still says "List index runs";
 it lists every kind.)
+
+#179 landed the filters and the fold, but both keyed on
+`file_count == 0`, which only ever collapsed peer-sync no-ops — a bucket
+push or an index run counts what it *considered*, so the bulk of the
+noise stayed on screen. #182 added `runs.changed_count`, populated by
+each driver from what it actually moved, and both surfaces now key on
+that (falling back to the old heuristic for pre-v28 history, which stays
+truthfully "unknown" rather than silently folding).
 
 **F20 · S2 — ~~recovering a wrecked destination has no supported path.~~ (`squirrel destination reset` + empty-root guard, #176)**
 After the F12 bug era the packed-layout guard refused every further

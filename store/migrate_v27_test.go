@@ -125,8 +125,10 @@ func TestMigrateV26ToV27PreservesEveryRow(t *testing.T) {
 		}
 		want := before
 		if table == "schema_version" {
-			// The migration records v27 in the table it just rebuilt.
-			want++
+			// The v27 migration records its own version in the table it
+			// just rebuilt, and Open carries on to SchemaVersion — one
+			// row per step from the v26 fixture.
+			want += int64(SchemaVersion - 26)
 		}
 		if after := countsAfter[table]; after != want {
 			t.Errorf("%s rows = %d after migration, want %d", table, after, want)

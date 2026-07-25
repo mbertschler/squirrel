@@ -75,8 +75,14 @@ func runNodeSession(ctx context.Context, s *store.Store, rcl *Rclone, vol *confi
 			if err != nil {
 				errMsg = err.Error()
 			}
+			// The receiver-verified paths are both the file count and
+			// the changed count for a peer sync: the Merkle walk never
+			// sends an identical folder to /plan, so nothing that
+			// matched already reaches the transfer. Recording it as
+			// changed_count too states that explicitly rather than
+			// leaving the fold to infer it (#182).
 			fileCount := int64(len(rep.NodeVerify.Matched))
-			if finishErr := s.FinishRun(ctx, rep.RunID, finishStatus, errMsg, fileCount); finishErr != nil {
+			if finishErr := s.FinishRunChanged(ctx, rep.RunID, finishStatus, errMsg, fileCount, fileCount); finishErr != nil {
 				rep.FinishErr = finishErr
 			}
 		}

@@ -372,8 +372,10 @@ func beginRun(ctx context.Context, s *store.Store, volumeID int64, volumeName st
 // the fatal error, 'partial' when any per-file operation errored, and
 // 'success' otherwise (skipped files are decisions, so a run that only
 // skipped is still a success). file_count records how many files were
-// actually offloaded. A failed terminal write is surfaced on the report
-// — the per-file flips already committed individually and stand.
+// actually offloaded, and so does changed_count — an offloaded row is a
+// files-row flip, and a run that only skipped changed nothing (#182). A
+// failed terminal write is surfaced on the report — the per-file flips
+// already committed individually and stand.
 func finishRun(ctx context.Context, s *store.Store, runID int64, report *Report, fatalErr error) {
 	status, errMsg := store.RunStatusSuccess, ""
 	switch {
@@ -382,7 +384,8 @@ func finishRun(ctx context.Context, s *store.Store, runID int64, report *Report,
 	case report.Errors > 0:
 		status = store.RunStatusPartial
 	}
-	if err := s.FinishRun(ctx, runID, status, errMsg, int64(report.Offloaded)); err != nil {
+	offloaded := int64(report.Offloaded)
+	if err := s.FinishRunChanged(ctx, runID, status, errMsg, offloaded, offloaded); err != nil {
 		report.FinishErr = fmt.Errorf("finish offload run %d: %w", runID, err)
 	}
 }

@@ -259,10 +259,11 @@ func (m *runsModel) applyFilter() {
 	for i := 0; i < len(filtered); {
 		// Collapse a maximal run of consecutive no-op rows into one marker,
 		// but only when there is more than one — a lone no-op isn't worth
-		// a fold line (F19).
-		if m.fold && runIsNoOp(filtered[i]) {
+		// a fold line (F19). store.Run.NoOp is the same rule the CLI's
+		// `runs --changes` filter applies, so both hide the same rows.
+		if m.fold && filtered[i].NoOp() {
 			j := i
-			for j < len(filtered) && runIsNoOp(filtered[j]) {
+			for j < len(filtered) && filtered[j].NoOp() {
 				j++
 			}
 			if n := j - i; n > 1 {
@@ -303,14 +304,6 @@ func (m *runsModel) runTableRow(r store.Run, now time.Time) table.Row {
 // layout stays aligned.
 func foldMarkerRow(n int) table.Row {
 	return table.Row{"⋯", "", fmt.Sprintf("%d no-op runs folded", n), "", "", "", "", "", ""}
-}
-
-// runIsNoOp reports whether a run is routine no-op noise — a clean success
-// that touched no files. Mirrors the CLI's `runs --changes` fold rule; a
-// peer-sync no-op has file_count 0, so those collapse, while bucket/index
-// no-ops (file_count counts files considered, not moved) stay visible.
-func runIsNoOp(r store.Run) bool {
-	return r.Status == store.RunStatusSuccess && r.FileCount == 0
 }
 
 // destinationCell renders the DESTINATION column, prefixing a peer-sync row
