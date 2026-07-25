@@ -267,21 +267,45 @@ func (h *packedHandler) push(ctx context.Context, rep *Report, volID, runID int6
 
 // certifyPacked closes the durability seam: it records a remote_packs row
 // per landed pack, reads each pack's scan-back fingerprint, and advances
-// the destination vector only once every pack this run assembled is
-// fingerprint-verified — the third leg of the three-artifact gate (packs +
-// placement map + manifest segment all landed and confirmed). A pending
-// capture holds the vector so the offload gate never counts unverified
-// packed content as durable; `squirrel verify` fills the fingerprint later
-// and a subsequent sync advances the vector. rep.Verification stays
-// unverified (presence+size is not a content-verified method), so RunPair
-// does not advance the vector a second time.
+// the destination vector to fingerprint-verified only once the whole
+// (volume, destination) pair carries a verified fingerprint behind every
+// present file content. That whole-state check is
+// CountVolumeContentsPendingFingerprint, which counts present contents
+// lacking a verified remote_objects (per-hash object) or remote_packs (pack
+// member) fingerprint on this destination — so it covers packs and per-hash
+// objects, the two artifacts that carry content bytes.
+//
+// The placement map and manifest segment are deliberately NOT in that
+// pending set: they are re-derivable squirrel-written metadata that carry
+// no scan-back fingerprint. Their durability before this advance is handled
+// upstream in push, which uploads and confirms both landed at their
+// expected size before promoting the run to success — a run whose map or
+// segment failed to land returns failed and never reaches certifyPacked, so
+// the vector is untouched.
+//
+// Gating on the whole pending set rather than this run's writes is the
+// friction-log F13 fix: a run that packs nothing no longer advances
+// vacuously past an earlier still-pending pack, and a still-pending artifact
+// anywhere in the pair holds the whole advance. `squirrel verify` fills a
+// pending fingerprint later and re-attempts this advance itself (see the
+// store upgrade), so the vector no longer stalls until the next
+// content-writing sync. rep.Verification stays unverified (presence+size is
+// not content-verified), so RunPair does not advance the vector a second
+// time.
 func (h *packedHandler) certifyPacked(ctx context.Context, rep *Report, volID, runID int64, writes []store.PackWrite, advance []store.OriginComponent) error {
-	verified := h.capturePackFingerprints(ctx, rep, runID, writes)
-	if verified < len(writes) {
-		rep.Warnings = append(rep.Warnings, fmt.Sprintf("destination %q: %d of %d pack(s) this run are not yet fingerprint-verified; the durability vector was not advanced — run `squirrel verify` to certify them", h.dest.Name, len(writes)-verified, len(writes)))
+	h.capturePackFingerprints(ctx, rep, runID, writes)
+	pending, err := h.store.CountVolumeContentsPendingFingerprint(ctx, volID, h.dest.Name)
+	if err != nil {
+		return fmt.Errorf("count pending fingerprints for %s: %w", h.dest.Name, err)
+	}
+	if pending > 0 {
+		rep.Warnings = append(rep.Warnings, fmt.Sprintf("destination %q: %d content(s) are not yet fingerprint-verified; the durability vector was not advanced — run `squirrel verify` to certify them", h.dest.Name, pending))
 		return nil
 	}
-	if err := h.store.AdvanceDestinationVectorTo(ctx, volID, h.dest.Name, store.VerifyMethodPresenceSize, advance); err != nil {
+	if len(advance) == 0 {
+		return nil
+	}
+	if err := h.store.AdvanceDestinationVectorTo(ctx, volID, h.dest.Name, store.VerifyMethodFingerprint, advance); err != nil {
 		return fmt.Errorf("advance destination vector for %s: %w", h.dest.Name, err)
 	}
 	return nil
@@ -294,9 +318,9 @@ func (h *packedHandler) certifyPacked(ctx context.Context, rep *Report, volID, r
 // (never rclone's md5 slot, which is blank for a multipart object); other
 // backends read `rclone lsjson --hash`. A pack whose fingerprint could not
 // be read stays pending (checksum NULL) with a warning — never a fabricated
-// value. It returns how many packs were fingerprint-verified this run.
-func (h *packedHandler) capturePackFingerprints(ctx context.Context, rep *Report, runID int64, writes []store.PackWrite) int {
-	before := rep.Fingerprints
+// value. The whole-pair pending tally (CountVolumeContentsPendingFingerprint)
+// is what certifyPacked gates the vector advance on, so this returns nothing.
+func (h *packedHandler) capturePackFingerprints(ctx context.Context, rep *Report, runID int64, writes []store.PackWrite) {
 	targets := make([]captureTarget, 0, len(writes))
 	for _, w := range writes {
 		pack, err := h.store.GetPackByKey(ctx, w.Pack.PackKey)
@@ -320,7 +344,6 @@ func (h *packedHandler) capturePackFingerprints(ctx context.Context, rep *Report
 		})
 	}
 	h.captureScanBackFingerprints(ctx, rep, PacksDirName, targets)
-	return int(rep.Fingerprints - before)
 }
 
 // watermark resolves the run id the delta starts after: the last

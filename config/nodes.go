@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/mbertschler/squirrel/syncproto"
 )
@@ -38,6 +39,15 @@ type Node struct {
 	// volume) or "off" (always Transfer). The literal travels in the
 	// /v1/sync/begin payload; the receiver validates and applies it.
 	DedupStrategy string
+	// PullDurabilityEvery is the agent-scheduler cadence for pulling this
+	// peer's destination durability vectors — the same metadata-only merge
+	// that `squirrel peer-sync pull-durability` runs and that rides along
+	// after a successful node sync. Giving evidence freshness its own clock
+	// lets a receive-only node (one this machine never initiates a sync to)
+	// keep its offload-gate evidence fresh with zero typed commands. Zero
+	// means "no scheduled pull". The pull never rewinds a watermark — the
+	// agent does not escalate.
+	PullDurabilityEvery time.Duration
 }
 
 // rawNode mirrors the `[nodes.X]` TOML block. Token is `any` so the
@@ -45,11 +55,12 @@ type Node struct {
 // it transparently — accepting either a literal string or
 // `{ env = "VAR" }`.
 type rawNode struct {
-	Endpoint      string       `toml:"endpoint"`
-	Path          string       `toml:"path"`
-	DedupStrategy string       `toml:"dedup_strategy"`
-	Auth          *rawNodeAuth `toml:"auth"`
-	TLS           *rawNodeTLS  `toml:"tls"`
+	Endpoint            string       `toml:"endpoint"`
+	Path                string       `toml:"path"`
+	DedupStrategy       string       `toml:"dedup_strategy"`
+	PullDurabilityEvery string       `toml:"pull_durability_every"`
+	Auth                *rawNodeAuth `toml:"auth"`
+	TLS                 *rawNodeTLS  `toml:"tls"`
 }
 
 type rawNodeAuth struct {
@@ -116,12 +127,20 @@ func resolveNode(name string, r *rawNode) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	var pullEvery time.Duration
+	if r.PullDurabilityEvery != "" {
+		pullEvery, err = parseVolumeCadence("pull_durability_every", r.PullDurabilityEvery)
+		if err != nil {
+			return nil, err
+		}
+	}
 	node := &Node{
-		Name:          name,
-		Endpoint:      u,
-		Token:         tok,
-		Path:          r.Path,
-		DedupStrategy: strategy,
+		Name:                name,
+		Endpoint:            u,
+		Token:               tok,
+		Path:                r.Path,
+		DedupStrategy:       strategy,
+		PullDurabilityEvery: pullEvery,
 	}
 	if r.TLS != nil && r.TLS.CertFingerprint != "" {
 		fp := strings.ToLower(r.TLS.CertFingerprint)

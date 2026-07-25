@@ -57,6 +57,12 @@ const (
 	// against the run that raised it. The note carries the path. This is
 	// the deliberate human act that unfreezes the path.
 	TransitionContestedClear = "contested-clear"
+	// TransitionPullDurability records an agent-scheduled durability pull
+	// against its kind='audit' run (see BeginDurabilityPullRun). The note
+	// carries the pulled volume, the peer, and the fetched/applied/dropped/
+	// rewind counters — the runs CHECK keeps volume_id and destination NULL
+	// on audit rows, so this entry is where the audit trail names them.
+	TransitionPullDurability = "pull-durability"
 	// TransitionResetDestination records a `squirrel destination reset`:
 	// the operator forgetting a destination's recorded upload and
 	// durability state (ResetDestination). It shares the destination-scoped

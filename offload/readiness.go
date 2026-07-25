@@ -22,6 +22,14 @@ type ReadinessOptions struct {
 	// same time-based staleness gate an offload would apply. Zero disables
 	// the staleness policy.
 	MaxEvidenceAge time.Duration
+	// VerifyCadenced is Options.VerifyCadenced: the required targets under
+	// an effective local verify cadence, from
+	// config.Config.VerifyCadencedTargets. It must be the same set the real
+	// offload passes — it widens the gate for locally-advanced
+	// fingerprint-verified components, so a readiness call that omitted it
+	// would report fewer bytes than an offload would actually move. Nil is
+	// a valid empty set.
+	VerifyCadenced map[string]bool
 }
 
 // ReadinessReport totals what an offload of the whole volume would move
@@ -57,7 +65,7 @@ func Readiness(ctx context.Context, s *store.Store, opts ReadinessOptions) (Read
 		return ReadinessReport{Applicable: false}, nil
 	}
 	now := time.Now()
-	g, err := loadGate(ctx, s, opts.VolumeID, opts.Require, now.UnixNano(), opts.MaxEvidenceAge)
+	g, err := loadGate(ctx, s, opts.VolumeID, opts.Require, now.UnixNano(), opts.MaxEvidenceAge, opts.VerifyCadenced)
 	if err != nil {
 		return ReadinessReport{}, err
 	}

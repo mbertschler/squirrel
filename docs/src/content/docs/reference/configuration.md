@@ -116,6 +116,7 @@ For `layout = "content-addressed"` or `layout = "packed"` destinations. See
 | `pack_threshold` | packed | — | Files smaller than this are packed; at/above land as objects (e.g. `1MiB`). |
 | `pack_size` | packed | — | Target size of one pack before it is closed (e.g. `512MiB`). |
 | `zstd_level` | packed | — | zstd compression level, `1` fastest … `4` best. |
+| `verify_every` | content-addressed / packed | off | Cadence for the agent to re-check this destination's recorded objects and packs against their upload fingerprints — the same pass as [`squirrel verify`](/squirrel/guides/verification/), recorded as an `audit` run. Falls back to `[agent] verify_every`. Read-only; the agent never writes to the destination. |
 
 ## `[backups]`
 
@@ -142,3 +143,25 @@ server for peer syncs and the health endpoint, and a bearer token is required.
 When omitted, the agent runs its schedulers only — the *listener-less* mode for
 cadence-only machines that never receive peer syncs; `[agent.auth]` is then
 optional. See [The agent](/squirrel/guides/agent/#listener-less-cadence-only-machines).
+
+| Key | Required | Meaning |
+|---|---|---|
+| `listen` | no | Bind address, e.g. `0.0.0.0:8443`. Omit for listener-less, scheduler-only mode (above). |
+| `db` | no | Agent-specific index path; wins over the top-level `db`. |
+| `auth.token` | with `listen` | Shared bearer token. Required only when the agent binds an HTTP surface. |
+| `scan_interval` | no | Drift-scan cadence over every hosted volume. Off when absent. |
+| `scan_strategy` | no | `shallow` (default) or `deep` (re-hash everything — bit-rot detection). |
+| `verify_every` | no | Fleet-wide default verify cadence applied to every content-addressed/packed destination that declares no `verify_every` of its own. Off when absent. |
+
+## `[nodes.<name>]`
+
+A peer that runs its own agent. See [Peer sync](/squirrel/guides/peer-sync/).
+
+| Key | Required | Meaning |
+|---|---|---|
+| `endpoint` | yes | Peer's sync-API URL, e.g. `https://nas.home:8443`. |
+| `path` | yes | rclone target prefix bytes are copied into. |
+| `auth.bearer` | yes | Bearer token this node presents to the peer. |
+| `tls.cert_fingerprint` | no | `sha256:<hex>` pin for the peer's self-signed cert. |
+| `dedup_strategy` | no | `copy` (default) or `off`. |
+| `pull_durability_every` | no | Cadence for the agent to pull this peer's durability vectors (the same merge as [`squirrel peer-sync pull-durability`](/squirrel/guides/peer-sync/)), giving evidence freshness its own clock. Lets a **receive-only** node (one this machine never syncs *to*) keep its offload-gate evidence fresh unattended. The agent never rewinds a watermark. Off when absent. |

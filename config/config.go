@@ -200,6 +200,15 @@ type Destination struct {
 	// LayoutPacked destinations, where it defaults to 3; zero on every
 	// other layout.
 	ZstdLevel int
+	// VerifyEvery is the agent-scheduler cadence for re-checking this
+	// destination's recorded objects and packs against their upload
+	// fingerprints — the same pass as `squirrel verify`, recorded as an
+	// `audit` run. Meaningful only on the content-addressed and packed
+	// layouts that keep per-artifact fingerprints; rejected at load on any
+	// other layout. Zero means "no per-destination verify cadence"; an
+	// [agent] verify_every default may still apply. Verify is read-only —
+	// the agent never writes to or bootstraps the destination.
+	VerifyEvery time.Duration
 }
 
 // Destination layout values. The layout shapes what sync writes under

@@ -827,7 +827,9 @@ func TestContentVerifiedMethod(t *testing.T) {
 			t.Fatalf("method %q should be content-verified", m)
 		}
 	}
-	for _, m := range []string{VerifyMethodPresenceSize, VerifyMethodSizeMtime, "", "bogus"} {
+	// fingerprint-verified is intentionally NOT unconditionally content-
+	// verified: its acceptance is cadence-coupled and applied by the gate.
+	for _, m := range []string{VerifyMethodPresenceSize, VerifyMethodSizeMtime, VerifyMethodFingerprint, "", "bogus"} {
 		if ContentVerifiedMethod(m) {
 			t.Fatalf("method %q must not be content-verified", m)
 		}

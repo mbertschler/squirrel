@@ -132,7 +132,42 @@ func VerifyRemote(ctx context.Context, s *store.Store, rcl *Rclone, dest *config
 	if err := recordVerifyOutcome(ctx, s, &rep, verifyErr); err != nil {
 		return rep, err
 	}
+	// A clean pass may have filled the last pending fingerprint of a
+	// (volume, destination) pair: re-attempt the durability-vector upgrade
+	// now so the vector no longer stalls until the next content-writing
+	// sync (friction-log F13). A dirty pass (mismatch or missing artifact)
+	// leaves the recorded fingerprints as found, so it must not advance
+	// evidence. Like RunPair's advance, an upgrade failure surfaces as the
+	// command's error even though the audit run already closed.
+	if verifyErr == nil && rep.Clean() {
+		if err := upgradeFingerprintVectors(ctx, s, dest.Name); err != nil {
+			return rep, err
+		}
+	}
 	return rep, verifyErr
+}
+
+// upgradeFingerprintVectors re-stamps the durability vector of every
+// volume as fingerprint-verified where the destination now carries a
+// verified fingerprint behind all its present content
+// (UpgradeDestinationVectorToFingerprintVerified is a no-op for a volume
+// that was never pushed to the destination or still has a pending
+// artifact, so iterating every volume is safe and self-limiting).
+func upgradeFingerprintVectors(ctx context.Context, s *store.Store, destination string) error {
+	self, err := s.GetSelfNode(ctx)
+	if err != nil {
+		return fmt.Errorf("verify %q: self node: %w", destination, err)
+	}
+	volumes, err := s.ListVolumes(ctx)
+	if err != nil {
+		return fmt.Errorf("verify %q: list volumes: %w", destination, err)
+	}
+	for _, v := range volumes {
+		if _, err := s.UpgradeDestinationVectorToFingerprintVerified(ctx, v.ID, destination, self.ID); err != nil {
+			return fmt.Errorf("verify %q: upgrade vector for volume %q: %w", destination, v.Name, err)
+		}
+	}
+	return nil
 }
 
 // verifyRecorded sweeps a destination's recorded content objects (the

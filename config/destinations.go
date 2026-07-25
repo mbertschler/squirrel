@@ -8,6 +8,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/dustin/go-humanize"
 )
@@ -173,6 +174,10 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 	if err != nil {
 		return nil, err
 	}
+	verifyEvery, err := resolveVerifyEvery(raw, layout)
+	if err != nil {
+		return nil, err
+	}
 	params, err := validateAndResolveParams(schema, raw)
 	if err != nil {
 		return nil, err
@@ -181,7 +186,30 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 		Name: name, Type: typ, Root: root, Layout: layout, Params: params,
 		Crypt: crypt, HashAlgo: hashAlgo, Checkers: checkers, PathStyle: pathStyle,
 		PackThreshold: pack.threshold, PackSize: pack.size, ZstdLevel: pack.zstdLevel,
+		VerifyEvery: verifyEvery,
 	}, nil
+}
+
+// resolveVerifyEvery validates the optional per-destination `verify_every`
+// cadence that drives the agent's scheduled re-check of this destination's
+// recorded objects and packs (the same pass as `squirrel verify`). It is
+// meaningful only on the content-addressed and packed layouts that keep
+// per-artifact fingerprints, so a present key on any other layout is
+// rejected rather than silently ignored — a mirror destination has nothing
+// for verify to re-check. Empty stays zero: no per-destination cadence, an
+// [agent] verify_every default may still apply.
+func resolveVerifyEvery(raw map[string]any, layout string) (time.Duration, error) {
+	v, err := optionalString(raw, "verify_every")
+	if err != nil {
+		return 0, err
+	}
+	if v == "" {
+		return 0, nil
+	}
+	if layout != LayoutContentAddressed && layout != LayoutPacked {
+		return 0, fmt.Errorf("verify_every requires the %q or %q layout; layout %q keeps no per-object fingerprints to re-check", LayoutContentAddressed, LayoutPacked, layout)
+	}
+	return parseVolumeCadence("verify_every", v)
 }
 
 // sftpHashAlgos are the checksum types rclone's sftp backend can read
@@ -505,6 +533,7 @@ func validateAndResolveParams(schema destSchema, raw map[string]any) (map[string
 		"type": true, "root": true, "crypt": true, "layout": true,
 		"hash_algo": true, "checkers": true, "force_path_style": true,
 		"pack_threshold": true, "pack_size": true, "zstd_level": true,
+		"verify_every": true,
 	}
 	for _, key := range schema.requiredString {
 		v, err := requireString(raw, key)
@@ -745,4 +774,43 @@ func (d *Destination) CanEverGateOffload() (bool, string) {
 		return false, "shallow path-mirrored crypt destination: BLAKE3 verification cannot pass through the crypt overlay and the mirror layout records no scan-back fingerprint to upgrade it"
 	}
 	return true, ""
+}
+
+// VerifyCadencedTargets marks the required targets that carry an effective
+// local verify cadence — a per-destination verify_every, or the [agent]
+// verify_every default applied to a content-addressed/packed destination.
+// The offload gate accepts a locally-advanced fingerprint-verified
+// component as content-verified only for a target in this set, so the
+// provider-fingerprint evidence keeps being re-confirmed for as long as
+// deletions are permitted (issue #155). A required target with no local
+// destination — a peer-relayed offsite this node cannot see — is omitted;
+// the responder's cadence governs it, relayed and enforced at pull time.
+//
+// It lives here, beside CanEverGateOffload, because both the offload
+// command and the readiness query behind `squirrel status` must feed the
+// gate the same set: readiness promises its totals match what an offload
+// would actually move, and a divergence here would quietly break that.
+func (c *Config) VerifyCadencedTargets(require []string) map[string]bool {
+	var agentDefault time.Duration
+	if c.Agent != nil {
+		agentDefault = c.Agent.VerifyEvery
+	}
+	out := make(map[string]bool, len(require))
+	for _, name := range require {
+		d, ok := c.Destinations[name]
+		if !ok {
+			continue
+		}
+		if d.Layout != LayoutContentAddressed && d.Layout != LayoutPacked {
+			continue
+		}
+		eff := d.VerifyEvery
+		if eff == 0 {
+			eff = agentDefault
+		}
+		if eff > 0 {
+			out[name] = true
+		}
+	}
+	return out
 }

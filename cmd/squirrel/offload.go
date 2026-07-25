@@ -76,6 +76,7 @@ func runOffload(cmd *cobra.Command, volumeName string, paths []string, olderThan
 		RequireDests:   requiredDestinations(cfg, vol.OffloadRequires),
 		RelayedCaps:    relayedCaps,
 		MaxEvidenceAge: vol.OffloadMaxEvidenceAge,
+		VerifyCadenced: cfg.VerifyCadencedTargets(vol.OffloadRequires),
 		DryRun:         dryRun,
 	})
 	printOffloadReport(cmd.OutOrStdout(), cmd.ErrOrStderr(), rep, dryRun)

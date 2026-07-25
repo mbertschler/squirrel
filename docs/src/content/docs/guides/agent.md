@@ -20,6 +20,15 @@ The agent requires an `[agent]` block in config.
   (`index_every` / `sync_every`).
 - **Scheduled audits** — runs [`audit`](/squirrel/guides/auditing/) passes on a
   schedule.
+- **Scheduled verify** — re-checks each content-addressed/packed destination's
+  recorded objects and packs against their upload fingerprints on its
+  `verify_every` cadence (per-destination, or an `[agent]` default) — the same
+  pass as [`squirrel verify`](/squirrel/guides/verification/), recorded as an
+  `audit` run. Offsite bitrot detection stops depending on anyone typing it.
+- **Scheduled durability pull** — refreshes a peer's relayed durability
+  evidence on its `pull_durability_every` cadence, independent of any sync. A
+  receive-only node keeps its [offload](/squirrel/guides/offloading/) gate
+  evidence fresh unattended.
 - **Hook firing** — fires per-volume [hooks](/squirrel/guides/hooks/) on change
   (after each successful index run) and on their `interval`.
 - **HTTP server** — exposes a health endpoint, serves peer syncs, and drives

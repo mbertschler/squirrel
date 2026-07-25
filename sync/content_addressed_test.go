@@ -466,14 +466,16 @@ func TestContentAddressedPushHappyPath(t *testing.T) {
 	if vector[0].OriginNodeID != self.ID || vector[0].OriginRunID == 0 {
 		t.Fatalf("vector component = %+v, want self node at the introduction run", vector[0])
 	}
-	// The content-addressed advance records presence+size, not a
-	// content-verified method: the offload gate holds this target out
-	// until a verified fingerprint backs the object (#109).
-	if vector[0].VerifyMethod != VerifyMethodPresenceSize {
-		t.Fatalf("verify method = %q, want %q", vector[0].VerifyMethod, VerifyMethodPresenceSize)
+	// Both objects were fingerprinted this run, so the whole (volume,
+	// destination) pair is fingerprint-verified and the advance is stamped
+	// fingerprint-verified — the #155 upgrade at capture. It is not
+	// unconditionally content-verified (ContentVerifiedMethod excludes it):
+	// the offload gate additionally requires a verify cadence (#155).
+	if vector[0].VerifyMethod != VerifyMethodFingerprint {
+		t.Fatalf("verify method = %q, want %q", vector[0].VerifyMethod, VerifyMethodFingerprint)
 	}
 	if store.ContentVerifiedMethod(vector[0].VerifyMethod) {
-		t.Fatalf("presence+size must not count as content-verified")
+		t.Fatalf("fingerprint-verified must not count as unconditionally content-verified")
 	}
 
 	// Transfers and confirmations address the crypt overlay remote.
@@ -483,6 +485,37 @@ func TestContentAddressedPushHappyPath(t *testing.T) {
 	}
 	if !strings.Contains(string(log), "copyto") || !strings.Contains(string(log), "offsite-crypt:"+ObjectsDirName+"/") {
 		t.Fatalf("shim log lacks crypt-addressed copyto lines:\n%s", log)
+	}
+}
+
+// TestContentAddressedVerifyUpgradesVector is the friction-log F13(b) side
+// for the content-addressed layout: a push whose object fingerprint capture
+// failed advances presence+size, and a later verify that fills the
+// fingerprint upgrades the component to fingerprint-verified (issue #155).
+func TestContentAddressedVerifyUpgradesVector(t *testing.T) {
+	f := setupContentAddressedFixture(t)
+	ctx := context.Background()
+	t.Setenv("RCLONE_FAKE_NO_HASHES", "1")
+	f.write(t, "a.txt", "alpha")
+	f.index(t)
+	if _, err := f.sync(t); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	vec, _ := f.store.ListDestinationRunIDs(ctx, f.volumeID(t), "offsite")
+	if len(vec) != 1 || vec[0].VerifyMethod != VerifyMethodPresenceSize {
+		t.Fatalf("vector = %+v, want one presence+size component while the fingerprint is pending", vec)
+	}
+
+	t.Setenv("RCLONE_FAKE_NO_HASHES", "")
+	if _, err := VerifyRemote(ctx, f.store, f.rcl, f.pair.Destination); err != nil {
+		t.Fatalf("VerifyRemote: %v", err)
+	}
+	vec, err := f.store.ListDestinationRunIDs(ctx, f.volumeID(t), "offsite")
+	if err != nil {
+		t.Fatalf("ListDestinationRunIDs: %v", err)
+	}
+	if len(vec) != 1 || vec[0].VerifyMethod != VerifyMethodFingerprint {
+		t.Fatalf("vector = %+v, want fingerprint-verified after verify", vec)
 	}
 }
 

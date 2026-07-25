@@ -207,6 +207,45 @@ func TestBeginRemoteVerifyRun(t *testing.T) {
 	}
 }
 
+// TestBeginDurabilityPullRun: an agent-scheduled durability pull rides on a
+// kind='audit' run with no volume and no destination, so it stays out of the
+// per-volume drift-audit reads even though it concerns a specific volume —
+// the pulled volume/peer live in the run's runs_audit note instead.
+func TestBeginDurabilityPullRun(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	v, err := s.CreateVolume(ctx, "media", "/data/media")
+	if err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	id, err := s.BeginDurabilityPullRun(ctx)
+	if err != nil {
+		t.Fatalf("BeginDurabilityPullRun: %v", err)
+	}
+	run, err := s.GetRun(ctx, id)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if run.Kind != RunKindAudit || run.VolumeID.Valid || run.Destination.Valid || run.Status != RunStatusRunning {
+		t.Fatalf("run = %+v, want a running audit run with NULL volume and destination", run)
+	}
+	if err := s.AppendRunAudit(ctx, RunAuditEntry{RunID: id, Transition: TransitionPullDurability, Note: "volume=media peer=nas fetched=3 applied=2 dropped=0 rewinds=0"}); err != nil {
+		t.Fatalf("AppendRunAudit: %v", err)
+	}
+	if err := s.FinishRun(ctx, id, RunStatusSuccess, "", 2); err != nil {
+		t.Fatalf("FinishRun: %v", err)
+	}
+	// The NULL volume_id keeps it out of the drift-since-last-sync handshake
+	// read, which is scoped to a volume.
+	audits, err := s.ListAuditRunsSince(ctx, v.ID, 0)
+	if err != nil {
+		t.Fatalf("ListAuditRunsSince: %v", err)
+	}
+	if len(audits) != 0 {
+		t.Fatalf("durability-pull run leaked into volume drift audits: %+v", audits)
+	}
+}
+
 // TestRemoteObjectInsertRefusesDuplicate: the fingerprint recorded at
 // upload time is what later verifications compare against, so a second
 // insert for the same (content, destination) must fail loudly instead

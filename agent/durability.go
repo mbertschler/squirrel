@@ -63,6 +63,10 @@ func (r *peerSyncRouter) durabilityResponse(ctx context.Context, volumeName stri
 	if err != nil {
 		return syncproto.DurabilityResponse{}, fmt.Errorf("list push freshness: %w", err)
 	}
+	// The effective verify cadence per destination, relayed so a puller can
+	// apply the fingerprint-verified cadence coupling against this
+	// responder's own re-confirmation schedule (see DurabilityComponent).
+	cadences := resolveVerifyCadences(r.srv.cfg.Destinations, r.srv.cfg.VerifyEvery)
 	names := make(map[int64]string, 4)
 	resolve := func(nodeID int64) (string, error) {
 		if name, ok := names[nodeID]; ok {
@@ -86,12 +90,13 @@ func (r *peerSyncRouter) durabilityResponse(ctx context.Context, volumeName stri
 			return syncproto.DurabilityResponse{}, err
 		}
 		resp.Components = append(resp.Components, syncproto.DurabilityComponent{
-			Destination:  row.Destination,
-			OriginNode:   name,
-			OriginRun:    row.OriginRunID,
-			UpdatedAtNs:  row.UpdatedAtNs,
-			VerifyMethod: row.VerifyMethod,
-			VerifiedAtNs: row.VerifiedAtNs.Int64, // zero when NULL (unknown)
+			Destination:   row.Destination,
+			OriginNode:    name,
+			OriginRun:     row.OriginRunID,
+			UpdatedAtNs:   row.UpdatedAtNs,
+			VerifyMethod:  row.VerifyMethod,
+			VerifiedAtNs:  row.VerifiedAtNs.Int64, // zero when NULL (unknown)
+			VerifyEveryNs: int64(cadences[row.Destination]),
 		})
 	}
 	for _, row := range fresh {

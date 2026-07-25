@@ -122,7 +122,10 @@ func buildVolume(ctx context.Context, s *store.Store, cfg *config.Config, self s
 		return vs, nil
 	}
 	readiness, err := offload.Readiness(ctx, s, offload.ReadinessOptions{
-		VolumeID: dbVol.ID, Require: vol.OffloadRequires, MaxEvidenceAge: vol.OffloadMaxEvidenceAge,
+		VolumeID:       dbVol.ID,
+		Require:        vol.OffloadRequires,
+		MaxEvidenceAge: vol.OffloadMaxEvidenceAge,
+		VerifyCadenced: cfg.VerifyCadencedTargets(vol.OffloadRequires),
 	})
 	if err != nil {
 		return VolumeStatus{}, fmt.Errorf("offload readiness for %q: %w", vol.Name, err)
