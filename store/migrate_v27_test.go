@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -143,18 +144,30 @@ func TestMigrateV26ToV27PreservesEveryRow(t *testing.T) {
 
 	// Every FK still resolves: the rebuild ran with enforcement off, so
 	// this is the check that the id-preserving copies kept the graph whole.
-	fkRows, err := s.db.QueryContext(ctx, `PRAGMA foreign_key_check`)
+	if violations := countFKViolations(t, s.db); violations != 0 {
+		t.Errorf("foreign_key_check reported %d violations after migration", violations)
+	}
+}
+
+// countFKViolations returns how many rows PRAGMA foreign_key_check reports.
+// Zero rows is a clean graph; the row contents don't matter here, only that
+// iteration itself succeeded — a swallowed iteration error would read as
+// "clean".
+func countFKViolations(t *testing.T, db *sql.DB) int {
+	t.Helper()
+	rows, err := db.QueryContext(context.Background(), `PRAGMA foreign_key_check`)
 	if err != nil {
 		t.Fatalf("foreign_key_check: %v", err)
 	}
+	defer rows.Close()
 	violations := 0
-	for fkRows.Next() {
+	for rows.Next() {
 		violations++
 	}
-	fkRows.Close()
-	if violations != 0 {
-		t.Errorf("foreign_key_check reported %d violations after migration", violations)
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate foreign_key_check rows: %v", err)
 	}
+	return violations
 }
 
 // assertContentRowIntact checks the content entity survived the rebuild
@@ -183,8 +196,12 @@ func assertContentRowIntact(t *testing.T, s *Store) {
 }
 
 // assertFilesRowsIntact checks the path↔content observations came across
-// with their statuses: the live row and the superseded predecessor at the
-// same path, plus the missing row in the child folder.
+// whole: the live row and the superseded predecessor at the same path in
+// the root folder, plus the missing row in the child folder. The full
+// (folder_id, name, content_id, status) tuple is compared — the binding of
+// a path to a *particular* content is the observation, so a swapped
+// content_id would be exactly the kind of loss this migration must not
+// cause.
 func assertFilesRowsIntact(t *testing.T, s *Store) {
 	t.Helper()
 	rows, err := s.db.QueryContext(context.Background(),
@@ -201,11 +218,18 @@ func assertFilesRowsIntact(t *testing.T, s *Store) {
 		if err := rows.Scan(&folderID, &name, &contentID, &status); err != nil {
 			t.Fatalf("scan files row: %v", err)
 		}
-		got = append(got, strings.Join([]string{name, status}, "="))
+		got = append(got, fmt.Sprintf("folder=%d name=%s content=%d status=%s", folderID, name, contentID, status))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate files rows: %v", err)
 	}
 	// Ordered by (folder_id, name, content_id): a.txt's superseded
 	// predecessor (content 1) precedes its live row (content 2).
-	want := []string{"a.txt=superseded", "a.txt=present", "gone.txt=missing"}
+	want := []string{
+		"folder=1 name=a.txt content=1 status=superseded",
+		"folder=1 name=a.txt content=2 status=present",
+		"folder=2 name=gone.txt content=1 status=missing",
+	}
 	if !equalStrings(got, want) {
 		t.Errorf("files rows = %v, want %v", got, want)
 	}
