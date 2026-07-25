@@ -54,7 +54,7 @@ on drift, so CI catches a stale snapshot. `squirrel db schema` prints the DDL
 of a database directly (opening it runs migrations first), for inspecting a
 real index without a repo checkout.
 
-Every **new** `CREATE TABLE` — whether in a migration or a future fresh
+Every `CREATE TABLE` — whether in a migration or a future fresh
 baseline — MUST be declared `STRICT` (`CREATE TABLE … (…) STRICT`). STRICT
 rejects any value that can't be losslessly converted to the column's declared
 type instead of silently coercing it via type affinity, so a non-numeric string
@@ -70,11 +70,15 @@ This is exactly the discipline the schema already follows — ns-integer
 timestamps (`…_ns INTEGER`), `INTEGER … CHECK (x IN (0, 1))` booleans, and
 fixed-length `BLOB` hashes (`CHECK (length(h) = 32)`).
 
-The ~13 tables that predate this convention are **not** STRICT yet: STRICT
-can't be added with `ALTER`, so each needs a full rebuild (create STRICT copy
-→ `INSERT … SELECT` → drop → rename) recreating every index and trigger. That
-bulk conversion is a dedicated, well-tested migration PR of its own — don't
-ride it along with a feature, and don't convert tables ad hoc.
+Every table is STRICT as of **v27**: the eighteen that predated the
+convention were converted in bulk by `store/migrate_v27.go` (STRICT can't be
+added with `ALTER`, so each was rebuilt — create STRICT copy → `INSERT …
+SELECT` → drop → rename → recreate every index and trigger, all in one
+transaction with foreign keys off and a `foreign_key_check` before commit).
+`TestSchemaIsAllStrict` fails if any table at `SchemaVersion` is not STRICT,
+so the convention is enforced, not just documented. Rebuilding a table for
+some other reason must carry the keyword forward — dropping it is a
+regression, not a neutral rewrite.
 
 # Code quality
 
