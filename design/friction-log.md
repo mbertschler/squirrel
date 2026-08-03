@@ -70,8 +70,8 @@ b2 renders `account`/`key`; and `TestRcloneSectionKeysMatchRcloneSchema`
 pins every rclone-backed type's rendered keys to rclone's real option
 names so a new backend can't repeat the class.
 
-**F6 · S1 — a failing rclone destination is undiagnosable from
-squirrel's output.** The scheduler log and the CLI both surface only
+**F6 · S1 — ~~a failing rclone destination is undiagnosable from
+squirrel's output.~~ (stderr tail on the run row, #174)** The scheduler log and the CLI both surface only
 `rclone: rclone exit: exit status 1` — no stderr, no hint (auth? host
 key? path?), and the summary line simultaneously claims `errors=0` on
 a `status=failed` run. Diagnosing F5 required hand-driving rclone
@@ -79,14 +79,14 @@ against squirrel's generated conf — exactly the "you never touch
 rclone" boundary the README promises. Failure paths are supposed to
 be first-class; this is the single worst violation found so far.
 
-**F7 · S3 — `transferred=0` is ambiguous.** homepc's docs → nas sync
+**F7 · S3 — ~~`transferred=0` is ambiguous.~~ (#179)** homepc's docs → nas sync
 (receiver already had identical content) prints the same
 `transferred=0 ... matched=0` shape an empty volume would produce.
 No "N already correct" count anywhere, so a no-op-because-in-sync is
 indistinguishable from a no-op-because-nothing-there. Same class as
 F4: healthy states must be *affirmatively* reported.
 
-**F8 · S3 — indexing an empty/mistyped volume path is silent.** `index`
+**F8 · S3 — ~~indexing an empty/mistyped volume path is silent.~~ (#179)** `index`
 on a path with nothing in it: `added=0 ... errors=0`, exit 0. A typo'd
 volume path produces the identical result. The `local` destination
 gets a marker precisely against this error class; the volume side has
@@ -100,7 +100,11 @@ restart, re-check — with no warning anywhere had the restart been
 forgotten (the agent would happily keep syncing with dead credentials
 and the F6-grade error reporting).
 
-**F10 · S2 — the scheduler pounds un-bootstrapped destinations.**
+*Still open* — and now the only surviving violation of "set up once,
+then trust" (`ux-principles.md` §1), since a config edit is the one
+routine flow that still ends in a hand-typed chore.
+
+**F10 · S2 — ~~the scheduler pounds un-bootstrapped destinations.~~ (refused runs consume the cadence window, #174; `needs-init` standing state, #177)**
 Before `--init`, every cadence tick retried kopia-mirror (and failing
 cloudbox) at full frequency — a failed sync run every 45 s per pair,
 forever. The refusal message itself is excellent ("re-run with --init
@@ -109,7 +113,7 @@ forever. The refusal message itself is excellent ("re-run with --init
 with the scheduler backing off instead of stacking identical failed
 runs into the audit trail.
 
-**F11 · S4 — output nits.** Per-run summary lines don't name the
+**F11 · S4 — ~~output nits.~~ (all four, #179 + #174)** Per-run summary lines don't name the
 volume in `index` output (running three volumes back-to-back gives
 three anonymous lines); `rclone.conf updated` prints even for
 kopia-only syncs (kopia never touches rclone); kopia's ANSI color
@@ -142,8 +146,8 @@ slash-trimmed; pinned by tests. *Process lesson for the log: every
 "success" the scheduler reported for s3archive during this era was a
 write to the wrong bucket.*
 
-**F13 · S1 — packed durability advances past a pending pack
-fingerprint (real bug #3, confirmed, unfixed).** Mechanism, from the
+**F13 · S1 — ~~packed durability advances past a pending pack
+fingerprint~~ (real bug #3, fixed in #178).** Mechanism, from the
 DB evidence plus `packedHandler.certifyPacked`: the "no advance while
 packs are unverified" gate only counts packs written *by this run*
 (`verified < len(writes)`). Run A writes a pack, fingerprint capture
@@ -167,27 +171,36 @@ The fix is to gate the advance on *no pending artifacts for the
 advance) when verify newly certifies the outstanding set. Needs its
 own PR + regression tests for both sides.
 
-**F14 · S2 — a killed agent leaves phantom "running" runs forever.**
+*Fixed in #178, as prescribed on both sides.* The advance now gates on
+`CountVolumeContentsPendingFingerprint` — the whole (volume, destination)
+pending set rather than this run's writes — so a run that packs nothing can
+no longer pass the guard vacuously, and a still-pending artifact holds the
+vector with a warning naming `squirrel verify` as the way out. Side (b):
+`squirrel verify` re-attempts the advance itself once it certifies the
+outstanding set, so the vector no longer waits for the next content-writing
+sync to notice.
+
+**F14 · S2 — ~~a killed agent leaves phantom "running" runs forever.~~ (startup reaping to `aborted`, #174)**
 Run #17 (interrupted when the agent process was killed mid-sync) still
 shows `status=running` in `squirrel runs` and renders as a live,
 elapsed-ticking banner at the top of the TUI dashboard — hours later.
 Agent startup should reap its own orphaned runs (`status=aborted`),
 else the trust surface displays activity that is not happening.
 
-**F15 · S1 — failed rclone runs record an empty error in the audit
-trail.** `runs` shows bug-era cloudbox failures as `failed` with a
+**F15 · S1 — ~~failed rclone runs record an empty error in the audit
+trail.~~ (#174)** `runs` shows bug-era cloudbox failures as `failed` with a
 blank ERROR column, while kopia failures carry their full message. The
 run row is the permanent record; for rclone it preserves no evidence
 at all (compounding F6, which is about the live surfaces).
 
-**F16 · S2 — per-destination sync coverage is invisible at a glance.**
+**F16 · S2 — ~~per-destination sync coverage is invisible at a glance.~~ (coverage grid, #177)**
 The TUI dashboard and volumes tab show a single "LAST SYNC" cell per
 volume, but photos syncs to four targets. A destination can fail for a
 week behind a fresh ✓ earned by any other target. The one question the
 dashboard must answer — "is every configured target caught up?" —
 needs a per-(volume × destination) grid with per-cell staleness.
 
-**F17 · S2 — durability has no question command.** Nothing answers
+**F17 · S2 — ~~durability has no question command.~~ (`squirrel status` + TUI durability panel, #177)** Nothing answers
 "what is durable where": the vectors, freshness, verify methods, and
 evidence ages live only in the DB, surfaced indirectly through offload
 refusals (`squirrel offload --dry-run` side effects). For the safety
@@ -195,7 +208,7 @@ model squirrel is built on, this is the flagship missing
 introspection — a `squirrel status`/TUI durability panel showing, per
 volume × target: vector coverage, verify method, evidence age.
 
-**F18 · S3 — inbound and outbound peer runs are indistinguishable.**
+**F18 · S3 — ~~inbound and outbound peer runs are indistinguishable.~~ (direction arrows, #179)**
 On the nas, `sync photos laptop` (received from laptop) and
 `sync photos htpc` (pushed to htpc) render identically in `runs` and
 the TUI — the destination column holds a peer name in both directions.
@@ -234,8 +247,8 @@ explicit operator verb for "forget/reset this destination's recorded
 state" (audit-preserving) should exist rather than leaving sqlite
 surgery or renames as the only outs.
 
-**F21 · S1 — mirror destinations produce no durability evidence, so
-`offload_requires` naming one can never be satisfied.** The mirror
+**F21 · S1 — ~~mirror destinations produce no durability evidence, so
+`offload_requires` naming one can never be satisfied.~~ (#164)** The mirror
 sync path contains no vector-advance call at all (only the
 content-addressed/packed and node paths do). The reference setup as
 originally designed — laptop requiring `cloudbox` (crypt mirror) —
@@ -247,6 +260,14 @@ yields evidence; longer-term, verified plain-mirror runs
 (`rclone-blake3`) arguably deserve vector advances. The walk switched
 the laptop's policy to `s3archive2`; `reference-setup.md` needs the
 same amendment with the reasoning.
+
+*Fixed in #164, both directions.* Verified plain mirrors now earn
+`rclone-blake3` vector advances, and an `offload_requires` entry naming a
+destination whose layout structurally cannot gate is rejected at config
+load rather than waiting forever. `reference-setup.md` carries the
+amendment and the reasoning (#171). #173 extended the same fail-fast to
+peer-relayed targets, where the unsatisfiable destination is only visible
+through another node's capability report.
 
 ## Checkpoints 4–5 — trip return + offload day
 
@@ -263,7 +284,14 @@ evidence" — F21). The user cannot tell waiting from wedged, and the
 vocabulary (component/origin/need N) is the internal vector model
 verbatim.
 
-**F23 · S2 — the edge machine is blind to its own safety.** The
+*Partially addressed.* The waiting-vs-wedged half is gone structurally:
+a destination that can never gate is now rejected at config load (#164),
+including when only a peer can see it (#173), so a surviving refusal
+always means "not yet". **Still open:** the refusal is printed once per
+file with no aggregation, no mention of which requirements already
+passed, and in the vector model's own vocabulary.
+
+**F23 · S2 — ~~the edge machine is blind to its own safety.~~ (#177)** The
 laptop's TUI shows index/sync freshness only. For the machine whose
 seat is "roaming, small disk, wants to offload", none of its real
 questions are answerable: has my content reached the offsites (via
@@ -271,7 +299,7 @@ the hub)? how fresh is my relayed evidence? what could I offload
 today? The durability answer exists in its own DB (pulled vectors) —
 nothing renders it. Same F17 gap, but sharpest at the edge seat.
 
-**F25 · S1 — one hung transfer starves the whole household schedule.**
+**F25 · S1 — ~~one hung transfer starves the whole household schedule.~~ (per-destination workers + transfer timeouts, #181)**
 When the S3 endpoint stopped accepting writes (storage full), the
 in-flight `rclone copyto` hung and the nas scheduler — a single
 serial worker — kicked nothing else for minutes: no cloudbox pushes,
@@ -288,7 +316,7 @@ hand. Needs: per-destination workers (or at least a stall timeout +
 skip), rclone invocations bounded by --contimeout/--timeout, and the
 TUI showing "in flight since HH:MM" per pair.
 
-**F24 · S3 — trip-return catch-up worked perfectly but invisibly.**
+**F24 · S3 — ~~trip-return catch-up worked perfectly but invisibly.~~ (catch-up note, #179)**
 404 new photos: indexed and pushed to the hub in a single 30 s
 cadence tick (run #124, 1.1 s transfer) — genuinely impressive.
 The only trace is one runs row among dozens of no-ops; nothing
@@ -298,8 +326,8 @@ is rendered indistinguishable from routine noise.
 
 ## Checkpoints 6–7 — conflict + scary moments
 
-**F26 · S1 — refused syncs leave no run row, so the audit trail (and
-TUI) never show them.** With the USB disk "unplugged", the scheduled
+**F26 · S1 — ~~refused syncs leave no run row, so the audit trail (and
+TUI) never show them.~~ (preflight refusals mint `refused` rows, #174)** With the USB disk "unplugged", the scheduled
 docs→usb sync is refused (marker missing) with a perfect *message* —
 but `run_id=0`: the refusal happens before a runs row exists, so the
 permanent record and every squirrel surface show only that the last
@@ -343,9 +371,9 @@ human act that unfreezes; squirrel never resolves on its own). Adopting the
 non-live version stays a deliberate `restore`, not something resolve does
 silently.
 
-**F29 · S1 — relayed offload against a cold archive is structurally
+**F29 · S1 — ~~relayed offload against a cold archive is structurally
 unreachable, so no machine in the reference household can offload
-anything.** The endgame of the whole design — htpc/laptop dropping
+anything.~~ (verify-method upgrades, #178)** The endgame of the whole design — htpc/laptop dropping
 local bytes because the hub proved them durable offsite — dead-ends
 at the last gate: packed/CA components are written (and relayed) as
 `verify_method=presence+size` and are *never upgraded* when
@@ -365,6 +393,16 @@ objects+packs fingerprint-verified, upgrade the vector component to a
 content-verified method and relay that — the schema already carries
 `verify_method` end-to-end.
 
+*Fixed in #178, along the fix direction above.*
+`UpgradeDestinationVectorToFingerprintVerified` re-stamps a (volume,
+destination) component once every underlying object and pack is
+fingerprint-verified, `squirrel verify` calls it at the end of a clean
+pass, and the upgraded method relays to peers like any other component —
+so the hub's certified archive can finally open the edges' gates. With
+F21 (mirrors earn evidence) and F13 (the pending gate) closed alongside
+it, the offload endgame is reachable end-to-end for the first time.
+Still unwalked on real backends (#129).
+
 ## Checkpoint 8 — restore day
 
 **F28 · S2 — ~~a dead edge machine has no supported restore path.~~ (reverse-peer-push runbook + restore signpost, #176)** The
@@ -377,8 +415,8 @@ tokens, cert pins, node entries on both sides) is the full bootstrap
 gauntlet again. "Laptop died" is the single most likely disaster in
 the household; today its answer is "copy files back by hand".
 
-**F30 · S2 — tamper detection rings once, then everything carries
-on.** The corruption drill was caught perfectly (loud per-object line,
+**F30 · S2 — ~~tamper detection rings once, then everything carries
+on.~~ (latching destination alarms + `verify ack`, #174)** The corruption drill was caught perfectly (loud per-object line,
 recorded-vs-current fingerprint, non-zero exit, audit run recorded as
 `partial` with the error — even visible in the recovered catalog).
 But nothing changes state: the next scheduled sync pushes to the
@@ -399,6 +437,12 @@ the connective tissue: a "your NAS died" runbook (or `squirrel
 recover` guided flow) that sequences fetch-snapshot → restore volumes
 → re-pair peers. Tonight that sequence took tool-author knowledge to
 assemble.
+
+*Partially addressed in #176:* `docs/guides/recovery.md` is the runbook —
+destination reset, rebuilding a machine from its hub, and the manual
+mirror / index-snapshot / packed paths, sequenced. **Still open:** the
+guided `squirrel recover` flow; today the operator follows the page by
+hand.
 
 **Not walked:** `offload_max_evidence_age` staleness refusals (the
 gate currently refuses CA evidence earlier, on verify-method — F29 —
@@ -426,14 +470,14 @@ both sides of every conflict round.
 Identified while writing the design docs, confirmed by the walk;
 recorded here so the friction catalogue has exactly one home.
 
-**F32 · S2 — `squirrel verify` has no agent cadence.** Offsite
+**F32 · S2 — ~~`squirrel verify` has no agent cadence.~~ (`verify_every`, #172)** Offsite
 fingerprint re-checking only happens when typed. Bitrot detection
 that depends on someone remembering it violates set-up-once-then-
 trust; the agent needs a `verify_every`-style cadence with results in
 the runs table like every other loop.
 
-**F33 · S2 — pulled durability evidence only refreshes as a side
-effect of initiating a sync.** The automatic pull rides on successful
+**F33 · S2 — ~~pulled durability evidence only refreshes as a side
+effect of initiating a sync.~~ (its own cadence, #172)** The automatic pull rides on successful
 node syncs, so a receive-only node (htpc) never refreshes at all, and
 any node stops refreshing when nothing changes — exactly when
 `offload_max_evidence_age` starts counting against it. Evidence
@@ -456,6 +500,9 @@ is config noise and attack surface.
 
 ## Summary and priority
 
+*The verdict below is the walk's own, kept as written that night; the
+status annotations were added afterwards as fixes landed.*
+
 The engine is trustworthy; the *seams* between its subsystems and the
 human are where trust leaks. Tonight's walk found four real product
 bugs (F5 sftp `pass`, F12 bucket addressing — fixed on this branch;
@@ -466,25 +513,59 @@ can't be asked why.**
 
 Suggested attack order:
 
-1. **Make offload reachable** (F29 + F13 + F21): upgrade vector
+1. ✅ **Make offload reachable** (F29 + F13 + F21): upgrade vector
    methods on full fingerprint verification, fix the pending-pack
    gate, decide mirror evidence policy, and validate
    `offload_requires` against target capabilities at config load.
    Until then the flagship feature doesn't exist for users.
-2. **Make failure visible** (F6/F15, F26, F14, F30, F10): rclone
+   — *#178, #164, #173.*
+2. ✅ **Make failure visible** (F6/F15, F26, F14, F30, F10): rclone
    stderr into run rows and scheduler errors; refusals mint run rows;
    reap orphaned runs; latch verify alarms; back off un-bootstrapped
    destinations. One theme: every failure becomes a run row and every
-   abnormal state a standing surface.
-3. **Make the conflict loop converge and notify** (F27).
-4. **Answer the two standing questions** (F16, F17, F23): per-
+   abnormal state a standing surface. — *#174, with the `needs-init`
+   standing state in #177.*
+3. ✅ **Make the conflict loop converge and notify** (F27). — *#180.*
+4. ✅ **Answer the two standing questions** (F16, F17, F23): per-
    (volume × destination) coverage grid and a durability/offloadable
-   panel — CLI (`squirrel status`) and TUI dashboard both.
-5. **De-friction bootstrap** (F1-F4, F20, F28, F34, F35): cert/token/
+   panel — CLI (`squirrel status`) and TUI dashboard both. — *#177.*
+5. ✅ **De-friction bootstrap** (F1-F4, F20, F28, F34, F35): cert/token/
    pairing helpers, config check, destination reset,
-   machine-replacement runbook.
-6. **Unstall the scheduler** (F25): per-destination isolation +
-   transfer timeouts.
-7. **Close the automation loop** (F32, F33): verify on an agent
+   machine-replacement runbook. — *#171, #175, #176; F34's load-time
+   validation is still partial.*
+6. ✅ **Unstall the scheduler** (F25): per-destination isolation +
+   transfer timeouts. — *#181.*
+7. ✅ **Close the automation loop** (F32, F33): verify on an agent
    cadence and evidence refresh on its own clock — both prerequisites
-   for trusting offload (theme 1) over time.
+   for trusting offload (theme 1) over time. — *#172.*
+
+## Where the log stands
+
+All seven themes above have landed; four of the five S1 findings that
+were open at the end of the walk (F13, F21, F26, F29, F30) are closed,
+as are all four product bugs. What the walk called the flagship gap —
+offload being structurally unreachable — is reachable in code.
+
+Still open, in rough priority:
+
+- **F22 · S2 (remainder)** — offload gate refusals still print once
+  per file, unaggregated, in the vector model's vocabulary. The
+  waiting-vs-wedged half is closed.
+- **F9 · S3** — the agent neither reloads config nor warns on drift
+  against the file on disk. Logged S3 on the night, but it is the last
+  standing violation of set-up-once-then-trust
+  (`ux-principles.md` §1), which arguably prices it higher now that
+  the louder findings are gone.
+- **F31 · S3 (remainder)** — the recovery runbook is written; the
+  guided `squirrel recover` flow is not.
+- **F34 · S3 (remainder)** — `config check` flags a missing node
+  byte-path, but load-time validation is still absent.
+- **Fleet view** — not a walk finding but the standing open problem in
+  `ux-principles.md` §3: every surface answers for one node, and the
+  household has five databases.
+
+The one thing code cannot close: **#129**, the end-to-end offload
+shakedown on real backends. The walk exercised the chain against the
+testbed (SeaweedFS S3, sftp, kopia); offload has still never run
+against a real cold archive, and F29's fix in particular changes
+exactly the gate that shakedown is meant to test.
