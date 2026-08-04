@@ -71,6 +71,39 @@ metadata-only), then per recorded object:
 Each pass is recorded as an `audit` run, with the destination and counters in the
 run's audit trail.
 
+## A clean pass unlocks offload
+
+Verification is not only a bitrot check — it is what makes a cold-archive
+destination usable by [`offload`](/squirrel/guides/offloading/). Content-addressed
+and packed uploads are recorded as `presence+size` at write time, and the offload
+gate refuses that method. When a pass leaves every object and pack of a
+(volume, destination) pair fingerprint-verified, squirrel **upgrades the
+durability vector to a content-verified method** and re-attempts any advance that
+was held back, relaying the upgraded method to peers.
+
+So on a cold archive the sequence is sync → verify → offloadable, not sync →
+offloadable. Giving verify [its own agent cadence](/squirrel/guides/agent/)
+(`verify_every`) keeps that unattended.
+
+## A mismatch latches an alarm
+
+A mismatch does not just print and exit non-zero — it raises a **standing alarm**
+on the destination that outlives the run. The alarm shows on the TUI dashboard
+and in [`squirrel status`](/squirrel/reference/cli/#squirrel-status) until it is
+dealt with, so a corruption finding cannot scroll away in the runs list while
+later syncs push on as if nothing happened.
+
+Clear it either way:
+
+```sh
+squirrel verify archive              # a clean pass clears the alarm itself
+squirrel verify ack archive          # or acknowledge it explicitly
+```
+
+The raise and the clear are both recorded, with the operator's name on an
+explicit ack — "someone decided this was fine" stays as auditable as the failure
+that raised it.
+
 :::note[Why the ciphertext fingerprint is stable]
 Because crypt encrypts with a random per-file nonce, the fingerprint is a
 property of the *uploaded ciphertext*, not of the content — which is exactly
