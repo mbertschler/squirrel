@@ -54,6 +54,11 @@ any time and mutates nothing; **change** (`sync --init`, `offload`, `restore`,
 `destination reset`, `conflicts resolve`, `verify ack`, `db restore`,
 `agent cert`, `node pair`) is deliberate and typed by hand on purpose.
 
+[`verify`](#squirrel-verify) straddles the two on purpose, and is listed in
+neither: it is read-only *against the remote*, but writes what it learns
+locally — recording fingerprints, upgrading a durability vector, and latching
+an alarm on a mismatch. It is a question whose answer squirrel keeps.
+
 ---
 
 ## squirrel
@@ -229,8 +234,9 @@ a path.) Requires one of: `<hash>`, `<path>`, `--duplicates`, `--missing`, or
 squirrel runs
 ```
 
-Takes no arguments. Lists every kind of run — index, sync, audit, offload,
-verify — not just index runs. See
+Takes no arguments. Lists every kind of run — `index`, `sync`, `restore`,
+`audit`, `offload` — not just index runs. (`squirrel verify` is recorded under
+`audit`, not as a kind of its own.) See
 [Runs & the audit trail](/squirrel/concepts/runs/).
 
 | Flag | Default | Meaning |
