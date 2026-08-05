@@ -66,18 +66,24 @@ every configured target caught up, when was durability evidence last
 Green means "you may close the laptop." Anything not green says what to
 do about it.
 
-For a single machine this now holds: the coverage grid answers per
-(volume × destination) rather than per volume, so a target that has
-been failing for a week can no longer hide behind a fresh ✓ earned by
-another one, and the durability panel carries vector coverage, verify
-method, and evidence age — the same answers `squirrel status` gives on
-a headless box.
+This now holds. The coverage grid answers per (volume × destination)
+rather than per volume, so a target that has been failing for a week
+can no longer hide behind a fresh ✓ earned by another one, and the
+durability panel carries vector coverage, verify method, and evidence
+age — the same answers `squirrel status` gives on a headless box.
 
-Open problem: the TUI reads one node's local index, so the NAS's TUI
-knows nothing about the laptop's state. The household has five squirrel
-databases; the human has one question. Some form of fleet view —
-plausibly on the hub node, fed by the peer metadata that already flows
-— is needed for the principle to hold at household scale.
+It holds at household scale too: the fleet block answers, for a volume,
+where else it lives — the other machines as well as the destinations —
+how far behind or ahead each copy is, how many files are missing there,
+and when each was last verified. The household has one squirrel
+database per machine; the human has one question, and can ask it from
+whichever machine they happen to be sitting at.
+
+The standing requirement that comes with it: a fleet answer is only as
+current as the last exchange with that node, so every row carries an
+"as of" and a dark peer reads as *unknown*, never as fine. A trust
+surface that quietly presents stale hearsay as fact would violate this
+principle more thoroughly than having no fleet view at all.
 
 ## 4. Scary moments are first-class UX
 

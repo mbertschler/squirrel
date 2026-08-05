@@ -145,6 +145,23 @@ amber until the agent is restarted:
 config on disk has changed since this agent started; restart to apply (/home/you/.squirrel/config.toml, noticed 12m ago)
 ```
 
+Below the target grid, a **fleet** block answers where else the volume lives —
+the other machines as well as the destinations — and how current each copy is
+relative to this one:
+
+```
+  FLEET       BEHIND  MISSING  LAST CHANGE  LAST VERIFIED  AS OF
+  nas         0       0        4m ago       2h ago         4m ago
+  htpc        12      12       6d ago       6d ago         5m ago
+  s3archive   0       0        1h ago       9h ago         1h ago
+```
+
+`BEHIND` and `MISSING` are relative to this machine's content. `AS OF` is when
+this machine last heard from that place — a peer that has gone dark keeps its
+last known figures but ages its `AS OF`, so it reads as **unknown** rather than
+healthy. A row can also be *ahead*, which is how a hub sees content on a laptop
+it has never received.
+
 The **exit code** carries the worst level, so the same command scripts a health
 check without parsing the grid:
 
