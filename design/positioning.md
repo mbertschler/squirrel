@@ -50,10 +50,10 @@ question you asked — never a chore it should have done for you.
 
 **2 · One glance, one answer.**
 `squirrel status` and the TUI answer "am I safe?" per volume and per
-destination: caught up, durable, when the evidence was last actually
-*verified*. Green means you can close the laptop. Anything else says
-what to do about it — and says it until you deal with it, because
-alarms latch instead of scrolling away.
+destination: whether it is caught up, whether it is durable, and when
+its evidence was last actually *verified*. Green means you can close
+the laptop. Anything else says what to do about it — and says it until
+you deal with it, because alarms latch instead of scrolling away.
 
 **3 · Proof, not hope.**
 Squirrel's one destructive act — dropping local bytes once they're
