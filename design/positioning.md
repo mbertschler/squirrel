@@ -7,14 +7,14 @@ landing page and README rewrite.*
 ## The problem
 
 The front page sells the **storage engine**. The product is now an
-**unattended household system**.
+**unattended system that spans every device you own**.
 
 Today's four cards are "Content, not paths", "Verified uploads",
 "Append-only by design", "Many backends, one config". All true, all
 still worth saying — and all describing the layer *underneath* the
 thing someone actually adopts. The word *agent* does not appear on the
-landing page. Neither do cadences, the household, the "am I safe?"
-answer, or offload. A reader comes away thinking squirrel is a sync
+landing page. Neither do cadences, the multi-device story, the "am I
+safe?" answer, or offload. A reader comes away thinking squirrel is a sync
 tool they will have to remember to run, which is exactly what
 [`ux-principles.md`](ux-principles.md) §2 says it must never be.
 
@@ -25,7 +25,7 @@ The UX phase built a second product on top of it and nobody re-pitched.
 
 > ### Set up once, then trust.
 > Squirrel keeps your files safe — on one computer, or across every
-> machine in the house — and proves it, so you never have to wonder.
+> device you own — and proves it, so you never have to wonder.
 
 Configure each machine once. From then on squirrel's agent owns the
 loop: indexing, syncing, verification, snapshots, and durability
@@ -95,16 +95,21 @@ The page never says what size of setup squirrel is for, which leaves a
 reader with one computer guessing whether they need a NAS. Say the range
 outright, smallest first:
 
-> **From one computer to the whole house.**
+> **From one computer to every device you own.**
 > Squirrel works the same at any size: one machine backing up to one
 > destination, or many machines sharing several — local drives, network
 > storage, cloud buckets, cold archive. Same config file, same commands.
 > Add machines and destinations as you get them.
 
-Lead with the smallest case; the full house is the top of the range, not
-the entry price. Name categories of destination rather than a particular
-topology — the point is that the shape is yours to choose, and a concrete
-example here would read as the required one.
+Lead with the smallest case; the many-device setup is the top of the
+range, not the entry price. Name categories of destination rather than a
+particular topology — the point is that the shape is yours to choose, and
+a concrete example here would read as the required one.
+
+Avoid "house" and "household" in shipped copy. Plenty of readers don't
+live in a house, and "household" is insider vocabulary borrowed from
+`reference-setup.md` that tells a newcomer nothing. Say *devices* — it
+covers the apartment, the desk, and the rack equally.
 
 ## Why this framing
 
@@ -125,8 +130,8 @@ is exactly why it belongs on a card instead of in the FAQ.
 
 The claim has to hold at both ends of the range. It does: one machine
 with one destination gets the same agent, the same "am I safe?" answer,
-and the same proof-gated offload as a full house. The copy should never
-make the small setup feel like the degenerate case.
+and the same proof-gated offload as a dozen machines do. The copy should
+never make the small setup feel like the degenerate case.
 
 ## Decisions
 
@@ -135,12 +140,13 @@ make the small setup feel like the degenerate case.
    deletion from source to destination, and squirrel does not. That is
    the feature, and it is what makes offload safe rather than
    frightening. The proof-gating is the second sentence, not the first.
-2. ~~**How loudly do we say "household"?**~~ **Say the range instead.**
-   Smallest first — one machine and one destination, scaling up to a
-   house full of computers and drives. "Household" on its own is
-   insider vocabulary that tells a first-time reader nothing; the hero
-   and the scaling section say the range in categories rather than a
-   worked example.
+2. ~~**How loudly do we say "household"?**~~ **Not at all — say the
+   range, in devices.** Smallest first: one machine and one destination,
+   scaling up to every computer and drive you own. "Household" is
+   insider vocabulary that tells a first-time reader nothing, and
+   "house" assumes a kind of home not everyone has. The hero and the
+   scaling section say the range in categories rather than a worked
+   example.
 3. ~~**Is "trust" overclaiming before #129?**~~ **No — write the copy
    as if the shakedown has passed.** If it turns something up, that is
    fixed inside #129 rather than by a second pass over the docs.
