@@ -36,7 +36,7 @@ without anyone typing a command — and loses nothing.
 itself, and can prove it worked." / "The backup system you stop
 thinking about."
 
-## The four pillars
+## The five pillars
 
 Replacing the current cards. Order matters — the product first, the
 guarantee it rests on last.
@@ -54,14 +54,22 @@ its evidence was last actually *verified*. Green means you can close
 the laptop. Anything else says what to do about it — and says it until
 you deal with it, because alarms latch instead of scrolling away.
 
-**3 · Proof, not hope.**
-Squirrel's one destructive act — dropping local bytes once they're
-safe elsewhere — happens only against proof: the content must be
-verified present on every target *you* required, by fingerprint, not
-by "the upload didn't error". A machine with a small disk can lean on
-the rest of your setup without you auditing it by hand.
+**3 · Verified, not assumed.**
+Every upload is checked against what actually landed, and offsite
+copies are re-checked on their own schedule long after the transfer
+succeeded. "The upload didn't error" is not evidence; a fingerprint
+that still matches months later is. When a check fails, squirrel says
+so and keeps saying so.
 
-**4 · Nothing is ever lost.**
+**4 · Deleting locally never deletes your backup.**
+Most backup tools mirror your deletions — remove a file at the source
+and the copy is gone too, sometimes before you notice. Squirrel never
+propagates a delete. That is what makes freeing up space safe:
+`squirrel offload` removes local bytes *on purpose*, and only once the
+content is verified on every destination you required. Old photos
+leave your laptop; they don't leave your archive.
+
+**5 · Nothing is ever lost.**
 Content is addressed by BLAKE3, so a hash ever observed stays
 retrievable. Destinations are append-only — an overwrite preserves the
 prior bytes. Both sides of a sync conflict survive. The audit trail is
@@ -72,7 +80,7 @@ never auto-pruned. This is the floor everything else stands on.
 | Where | Now | Proposed |
 |---|---|---|
 | Hero tagline | "Backup tool for your own NAS + cloud offsite storage. Indexes by BLAKE3 content hash…" | "Set up once, then trust." + the hero line above |
-| Four cards | Content / Verified / Append-only / Backends | The four pillars above |
+| Four cards | Content / Verified / Append-only / Backends | The five pillars above — offload gets one of its own |
 | Missing entirely | — | A **scaling** section (copy below) |
 | README opening | Same engine framing | Mirror the new hero, keep the engine detail below the fold |
 
@@ -105,27 +113,40 @@ leading with, and it is the one a prosumer choosing between them will
 care about. Content-addressing is how squirrel earns the claim — it is
 the evidence, not the pitch.
 
+The second axis is deletion. A tool that mirrors deletions makes
+"clear some space locally" a dangerous sentence: the copy you were
+relying on goes with it, often silently. Squirrel splits the two —
+local bytes and the durable copy are separate decisions — so freeing
+space is a normal thing to do rather than something to be careful
+about. Readers who have been burned by this will recognise it
+immediately; readers who haven't will not know to look for it, which
+is exactly why it belongs on a card instead of in the FAQ.
+
 The claim has to hold at both ends of the range. It does: one machine
 with one destination gets the same agent, the same "am I safe?" answer,
 and the same proof-gated offload as a full house. The copy should never
 make the small setup feel like the degenerate case.
 
-## Open questions
+## Decisions
 
-1. **Does offload get a card?** It's the most distinctive thing squirrel
-   does and the hardest to explain in forty words. Pillar 3 is my
-   attempt; it may deserve its own page linked from the card instead.
-2. ~~**How loudly do we say "household"?**~~ **Decided:** lead with the
-   range, smallest first — one machine and one destination, scaling up
-   to a house full of computers and drives. "Household" on its own is
+1. ~~**Does offload get a card?**~~ **Yes — pillar 4.** And it leads
+   with the comparison, not the mechanism: most backup tools mirror a
+   deletion from source to destination, and squirrel does not. That is
+   the feature, and it is what makes offload safe rather than
+   frightening. The proof-gating is the second sentence, not the first.
+2. ~~**How loudly do we say "household"?**~~ **Say the range instead.**
+   Smallest first — one machine and one destination, scaling up to a
+   house full of computers and drives. "Household" on its own is
    insider vocabulary that tells a first-time reader nothing; the hero
-   and the new scaling section above say the range instead, in
-   categories rather than a worked example.
-3. **Is "trust" overclaiming before #129?** Offload has never run
-   against a real cold archive. Pillar 3 describes shipped, tested
-   behaviour, but the shakedown is still open — worth deciding whether
-   the pitch waits on it.
-4. **Fleet view is still missing.** Pillar 2 is true per machine; the
-   household has five databases and the human has one question. Say
-   "per machine" plainly, or wait for a fleet view before making the
-   glance claim household-wide?
+   and the scaling section say the range in categories rather than a
+   worked example.
+3. ~~**Is "trust" overclaiming before #129?**~~ **No — write the copy
+   as if the shakedown has passed.** If it turns something up, that is
+   fixed inside #129 rather than by a second pass over the docs.
+
+## Open question
+
+**Fleet view is still missing.** Pillar 2 is true per machine; a
+multi-machine setup has one index per machine and the human has one
+question. Say "per machine" plainly, or hold the glance claim until
+there is a combined view?
