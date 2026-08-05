@@ -35,6 +35,30 @@ The agent requires an `[agent]` block in config.
   the state the [TUI](/squirrel/guides/tui/) and desktop app read. Only when
   `[agent] listen` is set (see below).
 
+## One slow destination cannot stall the rest
+
+Syncs are dispatched **per destination**, so a cloud target that has gone dark
+does not hold up local NAS→HTPC replication behind it. Two bounds keep a sick
+destination from occupying its own worker forever:
+
+- every automatic rclone transfer runs with connect and I/O timeouts, so a dead
+  endpoint fails rather than hanging;
+- a **stall timeout** (10 minutes without progress by default) covers the case
+  those miss — an endpoint that is live but stuck, accepting the connection and
+  then never moving bytes.
+
+A pair that is already syncing when its cadence comes round again is skipped and
+logged, not queued up behind itself.
+
+## Orphaned runs are reaped at startup
+
+A run interrupted by a killed agent would otherwise sit at `running` forever and
+render as a live, elapsed-ticking banner on the dashboard. The agent reaps its
+own orphans on startup, marking them
+[`aborted`](/squirrel/concepts/runs/#run-statuses) — a terminal status that,
+unlike the others, does *not* consume the cadence window, so the work is
+re-attempted rather than treated as a finished pass.
+
 ## Listener-less (cadence-only) machines
 
 A machine that only *originates* content — a roaming laptop that pushes to a

@@ -32,18 +32,57 @@ recorded durability must cover a file's content before its bytes may go. **A
 volume without the key refuses to offload entirely.** The names share the flat
 destination/node namespace that `sync_to` uses; they may also name targets only a
 *peer* pushes to (evidence arrives through the
-[peer durability pull](/squirrel/guides/peer-sync/)), and a name with no recorded
-evidence simply keeps the gate closed.
+[peer durability pull](/squirrel/guides/peer-sync/)), and a name whose evidence
+has not arrived yet simply keeps the gate closed.
+
+:::caution[An unsatisfiable requirement is a config error, not a closed gate]
+A target whose layout can *never* produce durability evidence — a plain crypt
+mirror, say — is rejected when the config loads, rather than leaving a gate that
+silently never opens. The check covers targets only a peer pushes to as well,
+using the capabilities that peer reports. This distinction is the whole point:
+a refusal you see always means **not yet**, never **never**.
+:::
 
 ## The durability gate
 
 The gate is evaluated **per file, entirely offline**, against the durability
-version vectors in the local index: content with origin `(node, run)` passes for
-a target iff the target's recorded vector component for that node is ≥ `run`, for
-**every** required target.
+version vectors in the local index. A file passes for a target only when all
+three of these hold, for **every** required target:
+
+1. **Coverage** — content with origin `(node, run)` needs the target's recorded
+   vector component for that node to be ≥ `run`.
+2. **Verification method** — the component must be *content-verified*. A
+   component recorded as `presence+size` (the object is there and the right
+   size) is refused: presence is not proof of bytes.
+3. **Freshness** — if [`offload_max_evidence_age`](#evidence-staleness-opt-in)
+   is set, the evidence must have been re-verified within it.
 
 Files failing the gate are skipped and reported per target
-(`missing component for origin X` / `stale: have 40 need 45`).
+(`missing component for origin X` / `stale: have 40 need 45` /
+`not content-verified (method "presence+size", asserted by peer nas)`).
+
+### How a component becomes content-verified
+
+Content-addressed and packed uploads are recorded as `presence+size` at write
+time — a crypt remote exposes no hash to compare, and a pack's members are not
+individually addressable at the destination. They are **upgraded** when a
+[`squirrel verify`](/squirrel/guides/verification/) pass finds every underlying
+object and pack fingerprint-verified: the component is re-stamped as
+content-verified and relays to peers that way, so a hub's certified archive can
+open an edge machine's gate.
+
+The practical consequence: on a cold-archive target, offload becomes possible
+after verification has run, not merely after the sync succeeded. Give
+`verify` [its own agent cadence](/squirrel/guides/agent/) and this happens
+unattended; run it by hand and offload waits on you.
+
+:::note[Verify also re-attempts the advance]
+A destination with any still-pending fingerprint holds its whole durability
+vector back, not just the pending object — an advance that skipped a pending
+pack would vouch for content only reachable through it. Verify certifies the
+outstanding set and re-attempts the advance itself, so the vector does not wait
+for the next content-writing sync to notice.
+:::
 
 ## Evidence staleness (opt-in)
 

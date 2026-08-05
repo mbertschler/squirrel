@@ -7,6 +7,24 @@ This walkthrough assumes you have a config file declaring at least one volume an
 destination — see [Config file & volumes](/squirrel/configuration/config-file/)
 for the minimal setup.
 
+## Check the config first
+
+```sh
+squirrel config check
+```
+
+The first thing to run after writing a config. It reads the *config file* rather
+than the database, so a volume you have declared but never indexed still shows
+up, and it tells you affirmatively what it found:
+
+```
+1 volumes, 1 destinations, 0 nodes — all resolvable
+```
+
+That matters because `squirrel volumes` reads the database — before your first
+index it prints an empty list and exits `0`, which looks identical to "nothing
+configured".
+
 ## Index a volume
 
 ```sh
@@ -43,6 +61,18 @@ to create anything — this keeps "create a new empty target" a human-driven act
 See [Syncing & first use](/squirrel/guides/syncing/).
 :::
 
+## Ask whether you are safe
+
+```sh
+squirrel status                 # every volume
+squirrel status pictures        # just one
+```
+
+Per volume, one row per configured target: last sync, state, durability, verify
+method, and evidence age — plus whether anything is offload-ready. The exit code
+is the worst level found (`0` green, `1` amber, `2` red), so the same command
+works as a scripted health check.
+
 ## Look up content
 
 By BLAKE3 hex hash:
@@ -70,11 +100,17 @@ squirrel query --history ~/Pictures/foo.jpg
 ```sh
 squirrel runs
 squirrel runs --volume pictures --limit 5
+squirrel runs --failed              # only failed, refused, aborted, or partial
+squirrel runs --changes             # hide clean no-ops
 ```
+
+Once the agent is running its cadences, most rows are no-ops. `--changes` and
+`--failed` are how you keep the audit trail readable.
 
 ## Open the terminal UI
 
-Watch live runs, browse the index ncdu-style, and drill into run records:
+The trust surface: standing alarms, contested paths, live runs, and the
+per-target coverage grid — plus an ncdu-style index browser.
 
 ```sh
 squirrel tui

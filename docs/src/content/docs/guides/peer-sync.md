@@ -52,3 +52,38 @@ verification instant, relayed over the wire and capped at now — it cannot make
 evidence look fresher than the peer actually holds it. See
 [offload evidence staleness](/squirrel/guides/offloading/#evidence-staleness-opt-in).
 :::
+
+Give the pull [its own cadence](/squirrel/guides/agent/) with
+`pull_durability_every` rather than relying on it riding along with a sync. A
+receive-only node never initiates a sync, and any node stops refreshing when
+nothing changes — which is exactly when `offload_max_evidence_age` starts
+counting against it.
+
+## Conflicts and the contested freeze
+
+When the same path is edited on two machines between cadences, both pushes are
+legitimate and squirrel refuses to lose either. The receiver keeps one version
+live and preserves the other under `<volume>/.squirrel-conflicts/run-<id>/`.
+
+That alone would let the two machines re-assert their versions at each other
+forever, one conflict copy per tick. So the first conflict also raises a
+**contested freeze** on the path: while it stands, a divergent re-assertion from
+any peer is refused rather than applied, and the flip-flopping stops at the first
+conflict, preserved once.
+
+```sh
+squirrel conflicts                              # what is frozen
+squirrel conflicts resolve <volume> <path>      # unfreeze it
+```
+
+The freeze is not just the hub's business — each node mirrors it into its own
+index, so the losing edge machine sees a contested badge on its own dashboard
+instead of green 0-file syncs while its local file quietly differs from the
+household's copy. Conflict and contested counts also land on the initiators' run
+rows.
+
+Resolving **clears the latch; it does not pick a winner.** The version that is
+live stays live. Adopting the preserved copy instead is a deliberate
+[`restore`](/squirrel/guides/restore/) — never something `resolve` does silently.
+Squirrel never resolves a conflict on its own; the latch exists precisely because
+that call is yours.

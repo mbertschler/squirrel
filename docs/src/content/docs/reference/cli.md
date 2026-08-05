@@ -18,16 +18,23 @@ Resolution precedence for the database path is `--db` > config `db` field >
 ```
 squirrel index   <volume>            [--shallow] [--dry-run] [--workers N] [--progress]
 squirrel sync    [<volume>]          [--to DEST] [--shallow] [--dry-run] [--init] [--progress]
+squirrel status  [<volume>]
 squirrel verify  [<destination>]
+squirrel verify ack <destination>
 squirrel offload <volume> [path...]  [--older-than DUR] [--dry-run]
 squirrel query   [<hash-or-path>]    [--history] [--duplicates] [--missing] [--from NODE]
-squirrel runs                        [--volume NAME] [--limit N]
+squirrel runs                        [--volume NAME] [--limit N] [--failed] [--changes]
 squirrel runs fail <id>
 squirrel hooks                       [--volume NAME] [--limit N]
 squirrel volumes
+squirrel conflicts
+squirrel conflicts resolve <volume> <path>
 squirrel restore <volume>            [--from NAME] [--to PATH] [--shallow] [--dry-run] [--in-place]
 squirrel destination reset <dest>    [--yes] [--dry-run]
 squirrel audit   [<volume>]          [--deep | --folders]
+squirrel config check
+squirrel node pair <peer>            [--local-endpoint URL] [--peer-endpoint URL]
+                                     [--peer-fingerprint sha256:HEX] [--peer-path PATH]
 squirrel peer-sync history <volume> <peer>
 squirrel peer-sync pull-durability <volume> <peer> [--allow-rewind]
 squirrel db backup                   [--to PATH] [--keep N]
@@ -36,7 +43,21 @@ squirrel db restore <snapshot>       [--force]
 squirrel db schema
 squirrel tui
 squirrel agent
+squirrel agent cert                  [--force]
+squirrel version
 ```
+
+Commands split into two families ([UX principle 2](https://github.com/mbertschler/squirrel/blob/main/design/ux-principles.md)):
+**introspection** (`status`, `runs`, `query`, `volumes`, `hooks`, `conflicts`,
+`config check`, `peer-sync history`, `db schema`, `db check`, `tui`) is safe at
+any time and mutates nothing; **change** (`sync --init`, `offload`, `restore`,
+`destination reset`, `conflicts resolve`, `verify ack`, `db restore`,
+`agent cert`, `node pair`) is deliberate and typed by hand on purpose.
+
+[`verify`](#squirrel-verify) straddles the two on purpose, and is listed in
+neither: it is read-only *against the remote*, but writes what it learns
+locally — recording fingerprints, upgrading a durability vector, and latching
+an alarm on a mismatch. It is a question whose answer squirrel keeps.
 
 ---
 
@@ -91,6 +112,44 @@ Optional single positional. No arg = every `(volume, destination)` pair; one arg
 
 ---
 
+## squirrel status
+
+**Show per-target sync coverage and durability, and the offload-ready total.**
+
+```
+squirrel status [<volume>]
+```
+
+Optional single positional; omitted = every declared volume. No flags. The
+read-only "am I safe?" answer: per volume, when it was last indexed, then one
+row per configured target with its role, last sync, state, durability coverage,
+verify method, and evidence age — plus the volume's offload readiness.
+
+```
+docs  /home/you/Documents  [amber]
+  index: 8s ago
+  TARGET  ROLE  LAST SYNC  STATE         DURABLE  METHOD  EVIDENCE
+  nas     sync  never      never-synced  —        —       —
+  offload: no policy
+overall: amber
+```
+
+The **exit code** carries the worst level, so the same command scripts a health
+check without parsing the grid:
+
+| Exit | Level | Meaning |
+|---|---|---|
+| `0` | green / neutral | Caught up within cadence and durable where policy requires; nothing to report. |
+| `1` | amber | Not caught up yet, needs a one-time bootstrap, or evidence aged past policy. Recoverable and expected. |
+| `2` | red | A latched alarm, a failed or regressed sync, or a pair far past its cadence. |
+
+Passing a volume name scopes both the grid and the exit code to that volume, so
+a per-volume check is not reddened by an unrelated one. The TUI dashboard
+renders the same facts from the same query layer — see
+[Terminal UI](/squirrel/guides/tui/).
+
+---
+
 ## squirrel verify
 
 **Re-check recorded offsite objects and packs against their upload fingerprints.**
@@ -103,6 +162,25 @@ Optional single positional. If omitted, verifies every content-addressed or
 packed destination in config (sorted). An explicit destination must have layout
 `content-addressed` or `packed`, else it errors. No flags. See
 [Offsite verification](/squirrel/guides/verification/).
+
+A clean pass does two things beyond reporting: it fills any pending fingerprints
+and then **upgrades the destination's durability vector to a content-verified
+method**, which is what lets [`offload`](#squirrel-offload) accept it. A mismatch
+**latches a standing alarm** on the destination that survives the run and shows
+on every surface until acknowledged.
+
+### squirrel verify ack
+
+**Acknowledge and clear a standing verify alarm on a destination.**
+
+```
+squirrel verify ack <destination>
+```
+
+Exactly one positional — the destination name. No flags. Clears the latch raised
+by a verify mismatch so the destination stops showing red; the raise and the
+clear both survive in the audit trail with the operator recorded. A subsequent
+clean verify pass also clears the alarm on its own.
 
 ---
 
@@ -150,18 +228,29 @@ a path.) Requires one of: `<hash>`, `<path>`, `--duplicates`, `--missing`, or
 
 ## squirrel runs
 
-**List index runs (most recent first).**
+**List runs of every kind (most recent first).**
 
 ```
 squirrel runs
 ```
 
-Takes no arguments. See [Runs & the audit trail](/squirrel/concepts/runs/).
+Takes no arguments. Lists every kind of run — `index`, `sync`, `restore`,
+`audit`, `offload` — not just index runs. (`squirrel verify` is recorded under
+`audit`, not as a kind of its own.) See
+[Runs & the audit trail](/squirrel/concepts/runs/).
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--volume` | all | Filter to runs against this volume name. |
 | `--limit` | `20` | Maximum number of runs to show (`0` for no limit). |
+| `--failed` | `false` | Show only runs that need attention: `failed`, `refused`, `aborted`, or `partial`. |
+| `--changes` | `false` | Hide clean no-op runs; show only runs that moved content or need attention. |
+
+Under household cadences most rows are no-ops (a pair checked, nothing to do).
+`--changes` keys on the count of files a run actually changed, so it folds away
+bucket pushes and index runs too, not just peer-sync no-ops. Runs recorded
+before that count existed are shown rather than silently folded — their change
+count is genuinely unknown.
 
 ### squirrel runs fail
 
@@ -203,6 +292,46 @@ squirrel volumes
 ```
 
 Takes no arguments and has no flags. Output is `id<TAB>name<TAB>path` per line.
+
+---
+
+## squirrel conflicts
+
+**List unresolved contested paths (frozen peer-sync conflicts).**
+
+```
+squirrel conflicts
+```
+
+Takes no arguments and has no flags. When the same path is edited on two
+machines between cadences, the receiver preserves the loser under
+`.squirrel-conflicts/` and raises a **contested freeze** on the path. While the
+freeze stands, a divergent re-assertion from any peer is refused instead of
+minting another conflict copy — the ping-pong stops at the first conflict. Both
+versions stay reachable: the winner is live, the loser is on disk.
+
+```
+no contested paths — nothing frozen
+```
+
+Every node mirrors the freeze into its own index, so the losing edge machine
+sees it too, not just the hub. See [Peer sync](/squirrel/guides/peer-sync/).
+
+### squirrel conflicts resolve
+
+**Clear a contested freeze so syncs flow again (explicit human act).**
+
+```
+squirrel conflicts resolve <volume> <path>
+```
+
+Two positionals: volume then the volume-relative path. No flags. Clearing the
+latch lets syncs resume for that path; the raise and the clear are both recorded
+with the operator's name. Squirrel never resolves a conflict on its own.
+
+Resolve does **not** choose a version. It unfreezes the path with the current
+winner live. Adopting the preserved version instead is a deliberate
+[`restore`](#squirrel-restore), never a side effect of resolving.
 
 ---
 
@@ -277,6 +406,76 @@ Optional single positional; omitted = every declared volume (sorted). See
 | `--folders` | `false` | Re-derive folder Merkle hashes from the index and report divergence (no disk walk). |
 
 `--deep` and `--folders` are mutually exclusive.
+
+---
+
+## squirrel config
+
+**Inspect the squirrel configuration.**
+
+On its own it prints help.
+
+### squirrel config check
+
+**Parse and resolve the config, stat its paths, and report what it declares.**
+
+```
+squirrel config check
+```
+
+Takes no arguments and has no flags. The first command to run after writing or
+editing a config: it reads the *config file*, not the database, so a declared
+but never-indexed volume still shows up. Each volume, destination, and node is
+stated with its resolved path and an `ok` or a flagged problem, and the summary
+line affirms what was found.
+
+```
+config: ~/.squirrel/config.toml
+
+volumes (1)
+  ok    docs  /home/you/Documents
+destinations (1)
+  ok    nas  local mirror
+nodes (0)
+
+1 volumes, 1 destinations, 0 nodes — all resolvable
+```
+
+It also stats each node's byte-path and flags one that is missing, catching the
+out-of-band mount assumption before bytes silently fail to land.
+
+---
+
+## squirrel node
+
+**Manage peer node relationships.**
+
+On its own it prints help. See [Peer sync](/squirrel/guides/peer-sync/).
+
+### squirrel node pair
+
+**Emit matching config halves (tokens, endpoints, fingerprints) for a peer relationship.**
+
+```
+squirrel node pair <peer>
+```
+
+Exactly one positional — the peer's node name. A single peer relationship needs
+four token bindings across two machines' config files, each side's
+`[agent.auth.peers.X]` matching the other side's `[nodes.Y].auth.bearer`.
+Writing those by hand is the most error-prone part of bootstrap, and nothing
+catches a mismatch until a sync fails with `401`. This generates both halves so
+they match by construction.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--local-endpoint` | — | This node's agent endpoint as the peer dials it (e.g. `https://nas.home:8443`). |
+| `--peer-endpoint` | — | The peer's agent endpoint. |
+| `--peer-fingerprint` | — | The peer's TLS cert fingerprint (`sha256:…`), as printed by [`agent cert`](#squirrel-agent-cert). |
+| `--peer-path` | — | The byte-path where this node mounts the peer's data. |
+
+It **emits** config; it never edits a file. Paste each half into the machine it
+names.
 
 ---
 
@@ -396,3 +595,49 @@ squirrel agent
 
 No arguments, no flags. Requires an `[agent]` block in config. See
 [The agent](/squirrel/guides/agent/).
+
+A machine that only runs cadences and never receives from a peer does not need a
+listener: omit `listen` and the agent runs listener-less, with no HTTP surface
+and no auth token to configure.
+
+### squirrel agent cert
+
+**Generate the agent's self-signed TLS cert+key and print its `sha256:` pin.**
+
+```
+squirrel agent cert
+```
+
+No positionals. Writes the cert and key to the paths in `[agent.tls]` and prints
+the fingerprint peers must pin — the same `sha256:<hex>` string
+[`node pair`](#squirrel-node-pair) takes as `--peer-fingerprint`. Certificate
+pinning is the documented trust anchor between agents; this removes the openssl
+incantations that used to be the only way to produce its ingredients.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--force` | `false` | Overwrite an existing cert/key. This changes the fingerprint — **every peer must re-pin**. |
+
+---
+
+## squirrel version
+
+**Print the squirrel version and build information.**
+
+```
+squirrel version
+```
+
+No arguments, no flags. Prints the release, commit, build time, Go version, and
+platform, so a household can confirm which build a machine is running:
+
+```
+squirrel v1.2.3
+  commit:   a1b2c3d
+  built:    2026-07-24T10:00:00Z
+  go:       go1.26.1
+  platform: linux/amd64
+```
+
+A source build reports `0.0.0-dev` — the version is stamped only into released
+binaries. The agent reports the same string on `GET /v1/health`.
