@@ -24,7 +24,7 @@ The UX phase built a second product on top of it and nobody re-pitched.
 ## The pitch
 
 > ### Set up once, then trust.
-> Squirrel keeps your files safe — on one laptop, or across every
+> Squirrel keeps your files safe — on one computer, or across every
 > machine in the house — and proves it, so you never have to wonder.
 
 Configure each machine once. From then on squirrel's agent owns the
@@ -59,7 +59,7 @@ Squirrel's one destructive act — dropping local bytes once they're
 safe elsewhere — happens only against proof: the content must be
 verified present on every target *you* required, by fingerprint, not
 by "the upload didn't error". A machine with a small disk can lean on
-the household without you auditing it by hand.
+the rest of your setup without you auditing it by hand.
 
 **4 · Nothing is ever lost.**
 Content is addressed by BLAKE3, so a hash ever observed stays
@@ -71,7 +71,7 @@ never auto-pruned. This is the floor everything else stands on.
 
 | Where | Now | Proposed |
 |---|---|---|
-| Hero tagline | "Backup tool for your own NAS + cloud offsite storage. Indexes by BLAKE3 content hash…" | "Set up once, then trust." + the household line |
+| Hero tagline | "Backup tool for your own NAS + cloud offsite storage. Indexes by BLAKE3 content hash…" | "Set up once, then trust." + the hero line above |
 | Four cards | Content / Verified / Append-only / Backends | The four pillars above |
 | Missing entirely | — | A **scaling** section (copy below) |
 | README opening | Same engine framing | Mirror the new hero, keep the engine detail below the fold |
@@ -83,18 +83,19 @@ opening move.
 ### The scaling section
 
 The page never says what size of setup squirrel is for, which leaves a
-reader with one laptop guessing whether they need a NAS. Say the range
+reader with one computer guessing whether they need a NAS. Say the range
 outright, smallest first:
 
-> **From one laptop to the whole house.**
-> Squirrel works the same whether you have a single laptop backing up to
-> one cloud bucket, or a house full of computers and drives: a NAS as the
-> hub, a laptop that comes and goes, a media box that only receives, cold
-> archive offsites behind them. Same config file, same commands — you add
-> machines and destinations as you get them.
+> **From one computer to the whole house.**
+> Squirrel works the same at any size: one machine backing up to one
+> destination, or many machines sharing several — local drives, network
+> storage, cloud buckets, cold archive. Same config file, same commands.
+> Add machines and destinations as you get them.
 
-Lead with the one-laptop case. "Household" is the top of the range, not
-the entry price.
+Lead with the smallest case; the full house is the top of the range, not
+the entry price. Name categories of destination rather than a particular
+topology — the point is that the shape is yours to choose, and a concrete
+example here would read as the required one.
 
 ## Why this framing
 
@@ -104,10 +105,10 @@ leading with, and it is the one a prosumer choosing between them will
 care about. Content-addressing is how squirrel earns the claim — it is
 the evidence, not the pitch.
 
-The claim has to hold at both ends of the range. It does: a single
-laptop with one bucket gets the same agent, the same "am I safe?"
-answer, and the same proof-gated offload as a five-machine house. The
-copy should never make the small setup feel like the degenerate case.
+The claim has to hold at both ends of the range. It does: one machine
+with one destination gets the same agent, the same "am I safe?" answer,
+and the same proof-gated offload as a full house. The copy should never
+make the small setup feel like the degenerate case.
 
 ## Open questions
 
@@ -115,10 +116,11 @@ copy should never make the small setup feel like the degenerate case.
    does and the hardest to explain in forty words. Pillar 3 is my
    attempt; it may deserve its own page linked from the card instead.
 2. ~~**How loudly do we say "household"?**~~ **Decided:** lead with the
-   range, smallest first — one laptop and one bucket, scaling up to a
-   house full of computers and drives. "Household" on its own is
-   insider vocabulary that tells a first-time reader nothing; the
-   hero and the new scaling section above say the range instead.
+   range, smallest first — one machine and one destination, scaling up
+   to a house full of computers and drives. "Household" on its own is
+   insider vocabulary that tells a first-time reader nothing; the hero
+   and the new scaling section above say the range instead, in
+   categories rather than a worked example.
 3. **Is "trust" overclaiming before #129?** Offload has never run
    against a real cold archive. Pillar 3 describes shipped, tested
    behaviour, but the shakedown is still open — worth deciding whether
