@@ -48,11 +48,12 @@ Every command squirrel has is either a deliberate change or a
 question you asked — never a chore it should have done for you.
 
 **2 · One glance, one answer.**
-`squirrel status` and the TUI answer "am I safe?" per volume and per
-destination: whether it is caught up, whether it is durable, and when
-its evidence was last actually *verified*. Green means you can close
-the laptop. Anything else says what to do about it — and says it until
-you deal with it, because alarms latch instead of scrolling away.
+`squirrel status` and the TUI answer "am I safe?" for a volume
+everywhere it lives — every destination and every other machine:
+whether each is caught up, how far behind it is, whether it is durable,
+and when its evidence was last actually *verified*. Green means you can
+close the laptop. Anything else says what to do about it — and says it
+until you deal with it, because alarms latch instead of scrolling away.
 
 **3 · Verified, not assumed.**
 Every upload is checked against what actually landed, and offsite
@@ -143,10 +144,12 @@ make the small setup feel like the degenerate case.
 3. ~~**Is "trust" overclaiming before #129?**~~ **No — write the copy
    as if the shakedown has passed.** If it turns something up, that is
    fixed inside #129 rather than by a second pass over the docs.
+4. ~~**Fleet view is still missing.**~~ **Tracked as #187; the copy
+   assumes it.** Pillar 2 makes the glance claim across every place a
+   volume lives rather than qualifying it per machine — the qualified
+   version was the weaker half of the pitch, and a reader with more
+   than one computer would have asked the question anyway. Same rule as
+   #129: fix anything the implementation turns up inside that ticket.
 
-## Open question
-
-**Fleet view is still missing.** Pillar 2 is true per machine; a
-multi-machine setup has one index per machine and the human has one
-question. Say "per machine" plainly, or hold the glance claim until
-there is a combined view?
+Nothing is open. This brief is ready to be turned into landing-page and
+README copy on the maintainer's word.
