@@ -211,12 +211,20 @@ func snapshotAge(s sync.IndexSnapshot, now time.Time) string {
 
 // executeRecovery runs the phases, each behind its own confirmation, and
 // stops at the first refusal or failure rather than half-recovering.
+// A declined phase ends the run: each phase reports whether it went ahead,
+// and a false stops the sequence where it stands. Continuing past a "no"
+// would restore volumes against an index that was never installed, and
+// would claim "recovery complete" over work the operator declined — the
+// half-recovery this verb exists to prevent. Declining is not an error, so
+// the command still exits 0.
 func executeRecovery(cmd *cobra.Command, cfg *config.Config, plan recoverPlan, opts recoverOptions) error {
 	out := cmd.OutOrStdout()
-	if err := recoverIndexPhase(cmd, plan, opts); err != nil {
+	proceeded, err := recoverIndexPhase(cmd, plan, opts)
+	if err != nil || !proceeded {
 		return err
 	}
-	if err := recoverVolumesPhase(cmd, plan, opts); err != nil {
+	proceeded, err = recoverVolumesPhase(cmd, plan, opts)
+	if err != nil || !proceeded {
 		return err
 	}
 	printRepairGuidance(out, cfg, plan)
@@ -227,37 +235,37 @@ func executeRecovery(cmd *cobra.Command, cfg *config.Config, plan recoverPlan, o
 // recoverIndexPhase fetches the chosen snapshot and installs it as the live
 // index, then records the recovery in the database that has just become the
 // live one.
-func recoverIndexPhase(cmd *cobra.Command, plan recoverPlan, opts recoverOptions) error {
+func recoverIndexPhase(cmd *cobra.Command, plan recoverPlan, opts recoverOptions) (bool, error) {
 	out := cmd.OutOrStdout()
 	if !confirmPhase(cmd, opts, fmt.Sprintf(
 		"phase 1: fetch %s and make it this machine's index?", plan.chosen.Name)) {
-		return nil
+		return false, nil
 	}
 
 	rcl, err := sync.Find()
 	if err != nil {
-		return err
+		return false, err
 	}
 	dir, err := os.MkdirTemp("", "squirrel-recover-")
 	if err != nil {
-		return fmt.Errorf("create staging directory: %w", err)
+		return false, fmt.Errorf("create staging directory: %w", err)
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
 	staged := filepath.Join(dir, plan.chosen.Name)
 
 	fmt.Fprintf(out, "fetching %s …\n", plan.chosen.Name)
 	if err := sync.FetchIndexSnapshot(cmd.Context(), rcl, plan.dest, plan.chosen, staged); err != nil {
-		return err
+		return false, err
 	}
 	// runDBRestore preflights the schema version, refuses to clobber a live
 	// DB another process holds open, and preserves the outgoing one. Calling
 	// it rather than reimplementing is the point of the verb: the guided
 	// flow sequences the mechanisms, it does not fork them.
 	if err := runDBRestore(cmd, staged, opts.Force); err != nil {
-		return fmt.Errorf("install recovered index: %w", err)
+		return false, fmt.Errorf("install recovered index: %w", err)
 	}
 	recordRecovery(cmd, plan)
-	return nil
+	return true, nil
 }
 
 // recordRecovery writes the audit run for the install. A failure here is
@@ -280,7 +288,17 @@ func recordRecovery(cmd *cobra.Command, plan recoverPlan) {
 		fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not record the recovery run: %v\n", err)
 		return
 	}
-	note := fmt.Sprintf("snapshot=%s volume=%s destination=%s", plan.chosen.Name, plan.chosen.Volume, plan.dest.Name)
+	// taken_at is recorded alongside the name because it is the question a
+	// forensic reader actually asks of a recovery — how old was the catalog
+	// this index was rebuilt from — and the name alone only answers it for
+	// snapshots that follow the naming convention. "unknown" when the
+	// filename carried no parseable timestamp, never a fabricated zero time.
+	takenAt := "unknown"
+	if !plan.chosen.TakenAt.IsZero() {
+		takenAt = plan.chosen.TakenAt.UTC().Format(time.RFC3339)
+	}
+	note := fmt.Sprintf("snapshot=%s taken_at=%s volume=%s destination=%s",
+		plan.chosen.Name, takenAt, plan.chosen.Volume, plan.dest.Name)
 	if err := s.AppendRunAudit(ctx, store.RunAuditEntry{
 		RunID: runID, Transition: store.TransitionRecoverIndex, Note: note,
 	}); err != nil {
@@ -297,22 +315,22 @@ func recordRecovery(cmd *cobra.Command, plan recoverPlan) {
 // confirmation for the phase rather than one per volume — the operator has
 // already seen the list, and a per-volume prompt on a five-volume hub is
 // ceremony, not consent.
-func recoverVolumesPhase(cmd *cobra.Command, plan recoverPlan, opts recoverOptions) error {
+func recoverVolumesPhase(cmd *cobra.Command, plan recoverPlan, opts recoverOptions) (bool, error) {
 	out := cmd.OutOrStdout()
 	if !confirmPhase(cmd, opts, fmt.Sprintf(
 		"phase 2: restore %d volume(s) from %s into their configured paths?", len(plan.volumes), plan.dest.Name)) {
-		return nil
+		return false, nil
 	}
 	// The config was read before the index was replaced; volumes are keyed
 	// by name in both, so the list stays valid across the install.
 	for _, name := range plan.volumes {
 		fmt.Fprintf(out, "\nrestoring %s …\n", name)
 		if err := runRestore(cmd, name, plan.dest.Name, sync.RestoreOptions{}); err != nil {
-			return fmt.Errorf("restore %s: %w — recovery stopped here; the index is installed and "+
+			return false, fmt.Errorf("restore %s: %w — recovery stopped here; the index is installed and "+
 				"the volumes already restored are intact, so re-running continues from this volume", name, err)
 		}
 	}
-	return nil
+	return true, nil
 }
 
 // printRepairGuidance names the commands that re-establish each peer

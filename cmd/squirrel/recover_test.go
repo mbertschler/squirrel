@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -157,5 +158,82 @@ func TestSnapshotAgeUnknownIsSaid(t *testing.T) {
 	got := snapshotAge(sync.IndexSnapshot{Name: "hand-copied.db"}, time.Now())
 	if !strings.Contains(got, "unknown") {
 		t.Errorf("age of an unparsed name = %q, want it to say so", got)
+	}
+}
+
+// TestRecoverDeclinedPhaseStopsTheSequence is the regression guard for the
+// worst failure this command could have: a declined confirmation that lets
+// the sequence carry on. Continuing past a "no" on phase 1 would restore
+// volumes against an index that was never installed, and would print
+// "recovery complete" over work the operator explicitly refused.
+//
+// Stdin is empty, so confirmPhase reads EOF and treats it as a refusal —
+// which is itself the property worth pinning: absence of an answer is not
+// consent.
+func TestRecoverDeclinedPhaseStopsTheSequence(t *testing.T) {
+	requireRcloneCLI(t) // discovery lists the destination through rclone
+	cfgPath, destRoot := recoverConfig(t)
+	seedSnapshots(t, destRoot, "photos", "index-20260807T120000.000Z-run-42.db")
+
+	var buf bytes.Buffer
+	root := newRootCmd()
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+	root.SetIn(strings.NewReader("n\n"))
+	root.SetArgs([]string{"--config", cfgPath, "recover", "--from", "scratch", "--execute"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("declining a phase should not be an error: %v\n%s", err, buf.String())
+	}
+
+	out := buf.String()
+	if strings.Contains(out, "recovery complete") {
+		t.Errorf("declined phase 1 still claimed completion:\n%s", out)
+	}
+	if strings.Contains(out, "phase 2:") || strings.Contains(out, "restoring ") {
+		t.Errorf("declined phase 1 still went on to phase 2:\n%s", out)
+	}
+	if !strings.Contains(out, "stopped") {
+		t.Errorf("declining should say the sequence stopped:\n%s", out)
+	}
+}
+
+// TestConfirmPhaseTreatsAnythingButYesAsNo pins the half of the
+// stop-the-sequence property that needs no rclone: what counts as consent.
+// EOF is the case that matters most — a recovery driven from a script with
+// no stdin must stop, not proceed on an unanswered question.
+func TestConfirmPhaseTreatsAnythingButYesAsNo(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		stdin string
+		want  bool
+	}{
+		{"yes", "yes\n", true},
+		{"y", "y\n", true},
+		{"Y uppercase", "Y\n", true},
+		{"y with spaces", "  y  \n", true},
+		{"no", "n\n", false},
+		{"empty line", "\n", false},
+		{"EOF, nothing at all", "", false},
+		{"unrelated word", "maybe\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := newRootCmd()
+			cmd.SetOut(&bytes.Buffer{})
+			cmd.SetIn(strings.NewReader(tc.stdin))
+			if got := confirmPhase(cmd, recoverOptions{}, "proceed?"); got != tc.want {
+				t.Errorf("confirmPhase(%q) = %v, want %v", tc.stdin, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestConfirmPhaseAssumeOK: --yes is the rehearsed-recovery escape hatch and
+// must not consult stdin at all.
+func TestConfirmPhaseAssumeOK(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetIn(strings.NewReader("n\n"))
+	if !confirmPhase(cmd, recoverOptions{AssumeOK: true}, "proceed?") {
+		t.Error("--yes should answer yes without reading stdin")
 	}
 }

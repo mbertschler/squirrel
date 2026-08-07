@@ -51,7 +51,7 @@ func (s IndexSnapshot) Age(now time.Time) (time.Duration, bool) {
 func DiscoverIndexSnapshots(ctx context.Context, rcl *Rclone, dest *config.Destination, volumes []string) ([]IndexSnapshot, error) {
 	var out []IndexSnapshot
 	for _, vol := range volumes {
-		names, err := rcl.listSnapshots(ctx, indexDirURI(dest, vol))
+		names, err := listSnapshotsStrict(ctx, rcl, indexDirURI(dest, vol))
 		if err != nil {
 			return nil, fmt.Errorf("list index snapshots for %s/%s: %w", dest.Name, vol, err)
 		}
@@ -61,6 +61,36 @@ func DiscoverIndexSnapshots(ctx context.Context, rcl *Rclone, dest *config.Desti
 	}
 	sortSnapshots(out)
 	return out, nil
+}
+
+// listSnapshotsStrict lists one .squirrel-index/ directory, treating only a
+// genuinely absent directory as "no snapshots" and surfacing every other
+// failure.
+//
+// It deliberately does not reuse listSnapshots, whose contract is the
+// rotation path's: there, any lsf failure with empty output means "nothing
+// to rotate", and being wrong costs one skipped rotation. Here the same
+// heuristic would report a destination as carrying no catalog when the real
+// answer was a bad credential or an unreachable host — an empty recovery
+// plan presented as fact, at the moment the operator can least afford to be
+// told the wrong thing. Not-found is decided by rclone's own message, the
+// same discrimination remoteRootEmpty uses.
+func listSnapshotsStrict(ctx context.Context, rcl *Rclone, dirURI string) ([]string, error) {
+	out, err := rcl.runPlain(ctx, "lsf", "--files-only", dirURI)
+	if err != nil {
+		if isRemoteNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var names []string
+	for _, line := range strings.Split(string(out), "\n") {
+		name := strings.TrimSpace(line)
+		if strings.HasPrefix(name, snapshotPrefix) && strings.HasSuffix(name, ".db") {
+			names = append(names, name)
+		}
+	}
+	return names, nil
 }
 
 // sortSnapshots orders newest first, then by volume, then by name. Names
