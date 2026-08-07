@@ -48,7 +48,7 @@ func writeOffloadConfig(t *testing.T, requires []string) (configFixture, string)
 // run, plus a successful kind='sync' run that advances the freshness
 // watermark past the file's became-present run — the same evidence the
 // destination handlers leave behind.
-func seedOffloadEvidence(t *testing.T, dbPath, relPath string, targets []string) {
+func seedOffloadEvidence(t *testing.T, dbPath string, targets []string) {
 	t.Helper()
 	ctx := context.Background()
 	s, err := store.Open(dbPath)
@@ -60,7 +60,7 @@ func seedOffloadEvidence(t *testing.T, dbPath, relPath string, targets []string)
 	if err != nil {
 		t.Fatalf("GetVolumeByName: %v", err)
 	}
-	row, err := s.GetByPath(ctx, v.ID, relPath)
+	row, err := s.GetByPath(ctx, v.ID, "a.txt")
 	if err != nil {
 		t.Fatalf("GetByPath: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestCLIOffloadHappyPath(t *testing.T) {
 	f, volumeDir := writeOffloadConfig(t, []string{"vault"})
 	writeTestFile(t, filepath.Join(volumeDir, "a.txt"), "alpha")
 	runCLI(t, "--config", f.configPath, "index", "pics")
-	seedOffloadEvidence(t, f.dbPath, "a.txt", []string{"vault"})
+	seedOffloadEvidence(t, f.dbPath, []string{"vault"})
 
 	out := runCLI(t, "--config", f.configPath, "offload", "pics", ".")
 	if !strings.Contains(out, "offloaded a.txt") || !strings.Contains(out, "offloaded=1 not_durable=0 drift=0 errors=0") {
@@ -115,7 +115,7 @@ func TestCLIOffloadDryRun(t *testing.T) {
 	f, volumeDir := writeOffloadConfig(t, []string{"vault"})
 	writeTestFile(t, filepath.Join(volumeDir, "a.txt"), "alpha")
 	runCLI(t, "--config", f.configPath, "index", "pics")
-	seedOffloadEvidence(t, f.dbPath, "a.txt", []string{"vault"})
+	seedOffloadEvidence(t, f.dbPath, []string{"vault"})
 
 	out := runCLI(t, "--config", f.configPath, "offload", "pics", ".", "--dry-run")
 	if !strings.Contains(out, "would offload a.txt") || !strings.Contains(out, "(dry-run) offloaded=1") {
@@ -134,7 +134,7 @@ func TestCLIOffloadReportsGateFailures(t *testing.T) {
 	f, volumeDir := writeOffloadConfig(t, []string{"vault", "second"})
 	writeTestFile(t, filepath.Join(volumeDir, "a.txt"), "alpha")
 	runCLI(t, "--config", f.configPath, "index", "pics")
-	seedOffloadEvidence(t, f.dbPath, "a.txt", []string{"vault"})
+	seedOffloadEvidence(t, f.dbPath, []string{"vault"})
 
 	out := runCLI(t, "--config", f.configPath, "offload", "pics", ".")
 	for _, want := range []string{
@@ -166,7 +166,7 @@ func TestCLIOffloadPerFileListsEveryBlockedPath(t *testing.T) {
 	writeTestFile(t, filepath.Join(volumeDir, "a.txt"), "alpha")
 	writeTestFile(t, filepath.Join(volumeDir, "b.txt"), "bravo")
 	runCLI(t, "--config", f.configPath, "index", "pics")
-	seedOffloadEvidence(t, f.dbPath, "a.txt", []string{"vault"})
+	seedOffloadEvidence(t, f.dbPath, []string{"vault"})
 
 	out := runCLI(t, "--config", f.configPath, "offload", "pics", ".", "--dry-run", "--per-file")
 	for _, want := range []string{

@@ -12,11 +12,11 @@ func blockedResult(path string, failures ...Failure) FileResult {
 	return FileResult{Path: path, Outcome: OutcomeNotDurable, Failures: failures}
 }
 
-func noEvidence(target, origin, detail string) Failure {
+func noEvidence(target, detail string) Failure {
 	return Failure{
 		Target:  target,
 		Kind:    FailureNoEvidence,
-		Summary: "no durability evidence yet: " + target + " has never reported holding content that originated on " + origin,
+		Summary: "no durability evidence yet: " + target + " has never reported holding content that originated on laptop",
 		Advice:  "sync to " + target,
 		Detail:  detail,
 	}
@@ -30,9 +30,9 @@ func noEvidence(target, origin, detail string) Failure {
 func TestSummariseKeepsHeterogeneousSetsApart(t *testing.T) {
 	var rep Report
 	for i := 0; i < 25; i++ {
-		rep.record(blockedResult(pathN(i), noEvidence("cloudbox", "laptop", "coords")))
+		rep.record(blockedResult(pathN(i), noEvidence("cloudbox", "coords")))
 	}
-	rep.record(blockedResult("odd.jpg", noEvidence("s3archive", "laptop", "coords")))
+	rep.record(blockedResult("odd.jpg", noEvidence("s3archive", "coords")))
 	rep.record(FileResult{Path: "fine.jpg", Outcome: OutcomeOffloaded})
 	rep.summarise([]string{"nas", "cloudbox", "s3archive"})
 
@@ -55,7 +55,7 @@ func TestSummariseKeepsHeterogeneousSetsApart(t *testing.T) {
 // — not just the target — is part of the identity.
 func TestSummariseSplitsCausesOnOneTarget(t *testing.T) {
 	var rep Report
-	rep.record(blockedResult("a.jpg", noEvidence("cloudbox", "laptop", "coords-a")))
+	rep.record(blockedResult("a.jpg", noEvidence("cloudbox", "coords-a")))
 	rep.record(blockedResult("b.jpg", Failure{
 		Target: "cloudbox", Kind: FailureNotPushed,
 		Summary: "no whole-volume push to cloudbox has been reported for content from laptop",
@@ -79,7 +79,7 @@ func TestSummariseSplitsCausesOnOneTarget(t *testing.T) {
 // durable anywhere".
 func TestSummariseReportsWhatPassed(t *testing.T) {
 	var rep Report
-	rep.record(blockedResult("a.jpg", noEvidence("cloudbox", "laptop", "coords")))
+	rep.record(blockedResult("a.jpg", noEvidence("cloudbox", "coords")))
 	rep.record(FileResult{Path: "b.jpg", Outcome: OutcomeOffloaded})
 	rep.summarise([]string{"nas", "cloudbox", "s3archive"})
 
@@ -103,8 +103,8 @@ func TestSummariseReportsWhatPassed(t *testing.T) {
 // mistaken for the whole set.
 func TestSummariseMarksVaryingCoordinates(t *testing.T) {
 	var rep Report
-	rep.record(blockedResult("a.jpg", noEvidence("cloudbox", "laptop", "needs run 45")))
-	rep.record(blockedResult("b.jpg", noEvidence("cloudbox", "laptop", "needs run 46")))
+	rep.record(blockedResult("a.jpg", noEvidence("cloudbox", "needs run 45")))
+	rep.record(blockedResult("b.jpg", noEvidence("cloudbox", "needs run 46")))
 	rep.summarise([]string{"cloudbox"})
 
 	if len(rep.Blocked) != 1 || rep.Blocked[0].Files != 2 {
