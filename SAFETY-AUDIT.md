@@ -34,6 +34,12 @@ titles. The result:
 
 Nothing in the Critical or High tiers is open.
 
+Beyond the 22, the durability addenda: D1 is discharged, and **D2 stays
+open by design** — the read-back-decrypt `--verify` mode its sketch
+proposed was never built, so a wrong-at-upload object that preserves
+decrypted size is still theoretically undetected. The scan-back
+fingerprint narrowed the gap; the [D2 status note](#d2) has the detail.
+
 ### Still open
 
 | Finding | Why it is still open |
@@ -71,8 +77,8 @@ wrong is total.
 ## Audit checklist (proposed issue list)
 
 Each section ends with a one-line "Issue:" string that names the GitHub
-issue we should open for that item, followed by the state of that item
-today: ✅ resolved, ◐ partial, ○ open.
+issue we should open for that item. Each checklist entry below leads
+with the state of that item today: ✅ resolved, ◐ partial, ○ open.
 
 (The original list skipped numbers 12 and 13 — a numbering slip, not two
 missing findings. There have always been exactly 22.)
@@ -1281,9 +1287,9 @@ caller never sees it.
 `warnOrphanVolumes` (`cmd/squirrel/root.go`) still prints one stderr line
 per orphan on every config-aware invocation, swallows its own errors, and
 gates nothing. There is no `volumes_acks` row, no archive workflow, and no
-refusal. The `#H5` cross-reference in the mitigation is a typo for `#M8`'s
-neighbourhood — the archive workflow it points at was never specified
-anywhere.
+refusal. The `#H5` cross-reference in the mitigation is presumably a typo
+for `#M8`'s neighbourhood — the archive workflow it points at was never
+specified anywhere.
 
 What *has* changed is that squirrel now has the mechanism this needs, twice
 over. `design/ux-principles.md` principle 4 names the shape explicitly —
