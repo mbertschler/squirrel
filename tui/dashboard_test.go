@@ -3,8 +3,11 @@ package tui
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/mbertschler/squirrel/status"
 	"github.com/mbertschler/squirrel/store"
 )
 
@@ -84,5 +87,24 @@ func TestLoadDashboardDataPartitionsRuns(t *testing.T) {
 	// With no config, the coverage grid renders nothing.
 	if len(data.coverage.Volumes) != 0 {
 		t.Errorf("coverage.Volumes = %d, want 0 without config", len(data.coverage.Volumes))
+	}
+}
+
+// TestRenderConfigDrift: the dashboard grows a "Config drift" panel while
+// the latch stands (F9) and stays clean when it does not.
+func TestRenderConfigDrift(t *testing.T) {
+	m := &dashboardModel{}
+	if got := m.renderConfigDrift(); got != "" {
+		t.Errorf("renderConfigDrift with nothing latched = %q, want empty", got)
+	}
+	m.data.coverage.ConfigDrift = &status.ConfigDrift{
+		Path:  "/etc/squirrel/config.toml",
+		Since: 90 * time.Minute,
+	}
+	got := m.renderConfigDrift()
+	if !strings.Contains(got, "Config drift") ||
+		!strings.Contains(got, "restart to apply") ||
+		!strings.Contains(got, "/etc/squirrel/config.toml") {
+		t.Errorf("panel = %q, want the header, the restart sentence, and the path", got)
 	}
 }

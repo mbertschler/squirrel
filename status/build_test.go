@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -178,6 +179,53 @@ func TestBuildAlarm(t *testing.T) {
 	}
 	if rep.Level() != LevelCritical {
 		t.Errorf("report level = %v, want red", rep.Level())
+	}
+}
+
+// TestBuildConfigDrift: a standing config-drift latch (F9) surfaces on the
+// report as a node-wide amber, even when every volume is otherwise fine —
+// the whole grid was built from a file the agent is no longer running.
+func TestBuildConfigDrift(t *testing.T) {
+	s := setupStore(t)
+	ctx := context.Background()
+	root, _ := indexTree(t, s, "media")
+	loaded, disk := make([]byte, 32), make([]byte, 32)
+	disk[0] = 1
+	if _, err := s.RaiseConfigDrift(ctx, "/etc/squirrel/config.toml", loaded, disk); err != nil {
+		t.Fatalf("RaiseConfigDrift: %v", err)
+	}
+	cfg := cfgFor("media", root, nil, nil, nil, nil)
+	rep, err := Build(ctx, s, cfg)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if rep.ConfigDrift == nil {
+		t.Fatal("report carries no config drift, want the standing latch")
+	}
+	if rep.ConfigDrift.Path != "/etc/squirrel/config.toml" {
+		t.Errorf("drift path = %q, want the config path", rep.ConfigDrift.Path)
+	}
+	if rep.Level() != LevelWarn {
+		t.Errorf("report level = %v, want amber", rep.Level())
+	}
+	label := ConfigDriftLabel(*rep.ConfigDrift)
+	if !strings.Contains(label, "restart to apply") || !strings.Contains(label, "/etc/squirrel/config.toml") {
+		t.Errorf("label = %q, want the restart sentence and the path", label)
+	}
+}
+
+// TestBuildNoConfigDrift: nothing latched, nothing reported — the healthy
+// install must not grow a permanent amber line.
+func TestBuildNoConfigDrift(t *testing.T) {
+	s := setupStore(t)
+	ctx := context.Background()
+	root, _ := indexTree(t, s, "media")
+	rep, err := Build(ctx, s, cfgFor("media", root, nil, nil, nil, nil))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if rep.ConfigDrift != nil {
+		t.Fatalf("report carries config drift %+v with nothing latched", rep.ConfigDrift)
 	}
 }
 

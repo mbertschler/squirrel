@@ -79,9 +79,17 @@ func runStatus(cmd *cobra.Command, volume string) error {
 // renderStatus prints the grid and returns the worst level across the
 // volumes it printed. When volume is non-empty only that volume is shown,
 // and only its level drives the return (so a scripted per-volume check
-// isn't reddened by an unrelated volume).
+// isn't reddened by an unrelated volume) — with one deliberate exception:
+// config drift is node-wide and counts on every scope.
 func renderStatus(w io.Writer, rep status.Report, volume string) status.Level {
 	worst := status.LevelNeutral
+	// Config drift heads the output and counts towards every scope,
+	// including a single-volume one: the agent read this volume's path,
+	// targets, and cadences out of the file that has since changed (F9).
+	if rep.ConfigDrift != nil {
+		fmt.Fprintf(w, "%s\n", status.ConfigDriftLabel(*rep.ConfigDrift))
+		worst = status.LevelWarn
+	}
 	for _, v := range rep.Volumes {
 		if volume != "" && v.Name != volume {
 			continue
