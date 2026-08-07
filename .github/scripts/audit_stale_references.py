@@ -161,7 +161,10 @@ def closed_issues(repo: str, numbers: set[int]) -> set[int]:
     single API call. An unknown number (a reference to another repo, a
     typo) resolves to null and is treated as "not closed" — the audit
     reports stale documentation, not broken links, so a partial response
-    with errors alongside is used as-is rather than failing the run.
+    with errors alongside is used as-is rather than failing the run. A
+    response carrying no repository block at all is not partial, though:
+    the query failed outright, and that raises rather than reading as an
+    all-clear.
     """
     if not numbers:
         return set()
@@ -176,7 +179,17 @@ def closed_issues(repo: str, numbers: set[int]) -> set[int]:
     if not out.strip():
         raise RuntimeError("gh api graphql returned nothing")
     data = json.loads(out)
-    repository = (data.get("data") or {}).get("repository") or {}
+    repository = (data.get("data") or {}).get("repository")
+    if repository is None:
+        # No repository block at all means the query failed as a whole
+        # (rate limit, auth, a malformed alias), not that individual
+        # numbers resolved to null. Reading that as "nothing is closed"
+        # would file an empty report and close the tracking issue — a
+        # false all-clear, which is the exact failure this audit exists
+        # to catch. Fail the run and leave last week's report standing.
+        raise RuntimeError(
+            f"gh api graphql returned no repository data: {data.get('errors')}"
+        )
     closed = set()
     for key, value in repository.items():
         if value and value.get("state") in ("CLOSED", "MERGED"):
