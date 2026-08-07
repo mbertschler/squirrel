@@ -160,8 +160,41 @@ A peer that runs its own agent. See [Peer sync](/squirrel/guides/peer-sync/).
 | Key | Required | Meaning |
 |---|---|---|
 | `endpoint` | yes | Peer's sync-API URL, e.g. `https://nas.home:8443`. |
-| `path` | yes | rclone target prefix bytes are copied into. |
+| `path` | only if synced to | rclone target prefix bytes are copied into. Required when some volume's `sync_to` names this node; omit it for a peer this machine only pulls durability evidence from. See below. |
 | `auth.bearer` | yes | Bearer token this node presents to the peer. |
 | `tls.cert_fingerprint` | no | `sha256:<hex>` pin for the peer's self-signed cert. |
 | `dedup_strategy` | no | `copy` (default) or `off`. |
 | `pull_durability_every` | no | Cadence for the agent to pull this peer's durability vectors (the same merge as [`squirrel peer-sync pull-durability`](/squirrel/guides/peer-sync/)), giving evidence freshness its own clock. Lets a **receive-only** node (one this machine never syncs *to*) keep its offload-gate evidence fresh unattended. The agent never rewinds a watermark. Off when absent. |
+
+### The byte-path is an out-of-band contract
+
+`path` is where *this* machine writes bytes for the peer — an SMB/NFS mount
+point, or an rclone remote spec like `nasremote:backups`. It is deliberately
+separate from `endpoint`: the sync API and the filesystem the bytes travel
+over are independent, and often not even the same protocol.
+
+That independence is also its weakness, so it is worth being precise about
+what squirrel can and cannot tell you:
+
+- **It can tell you the local end is wrong.** A `path` that does not exist
+  or is not a directory shows as an amber `byte-path` state against that
+  target in [`squirrel status`](/squirrel/reference/cli/) and the TUI, and
+  is flagged by `squirrel config check`. Amber rather than red: the usual
+  cause is a mount that has not come up yet, which fixes itself.
+- **It cannot tell you the path is the *right* one.** A directory that
+  exists but is not actually the peer's storage looks identical to a
+  correct one from here. Bytes will land somewhere and the peer will never
+  see them. Nothing in squirrel closes that gap — verify it once when you
+  set the peer up.
+
+**Omit `path` entirely when no bytes travel.** A peer you only pull
+durability evidence from — the receive-only relationship
+`pull_durability_every` exists for — moves nothing through a byte-path, and
+requiring one would just mean inventing a value to satisfy the validator.
+Squirrel asks for a `path` exactly when some volume's `sync_to` names the
+node, and rejects the config at load time if it is missing there:
+
+```
+nodes.nas: path is required because volumes.pictures syncs to it
+(rclone target prefix the initiator copies bytes into)
+```

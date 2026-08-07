@@ -113,10 +113,9 @@ func checkNodes(cfg *config.Config, out io.Writer, tally *checkTally) {
 	fmt.Fprintf(out, "nodes (%d)\n", len(cfg.Nodes))
 	for _, name := range sortedKeys(cfg.Nodes) {
 		n := cfg.Nodes[name]
-		status, detail := statNodeBytePath(n.Path)
+		status, detail := statNodeBytePath(n)
 		tally.add(status)
-		endpoint := n.Endpoint.String()
-		printCheckLine(out, status, name, joinDetail(endpoint, "byte-path "+n.Path+detail))
+		printCheckLine(out, status, name, joinDetail(n.Endpoint.String(), detail))
 	}
 }
 
@@ -196,37 +195,26 @@ func statVolumePath(path string) (status, detail string) {
 	return statusOK, ""
 }
 
-// statNodeBytePath stats a node's rclone byte-path (F34). An rclone remote
-// spec ("remote:path") is not a local path, so it is reported as unchecked
-// rather than statted. A missing local mount is advisory: the share may
-// legitimately be down when the check runs, but a silent absence is exactly
-// what turns into undiagnosable transfer errors, so it is surfaced. The
-// returned detail is a suffix appended after the path.
-func statNodeBytePath(path string) (status, detail string) {
-	if isRcloneRemoteSpec(path) {
-		return statusOK, " (rclone remote spec — not checked)"
+// statNodeBytePath renders a node's byte-path verdict (F34) as this
+// command's status word plus a detail suffix. The rules themselves live in
+// config.Node.CheckBytePath, which the status build also calls — one set of
+// rules about what a byte-path may be, two renderings of the answer.
+//
+// A missing local mount is advisory rather than fatal: the share may
+// legitimately be down when the check runs. A node no volume syncs to is
+// reported plainly, not as an omission — it is the durability-pull-only
+// relationship, which moves no bytes and needs no path.
+func statNodeBytePath(n *config.Node) (status, detail string) {
+	state, reason := n.CheckBytePath()
+	switch state {
+	case config.BytePathNone:
+		return statusOK, "no byte-path (" + reason + ")"
+	case config.BytePathRemote:
+		return statusOK, "byte-path " + n.Path + " (" + reason + ")"
+	case config.BytePathUnavailable:
+		return statusWarn, "byte-path " + n.Path + " (" + reason + ")"
 	}
-	info, err := os.Stat(path)
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-		return statusWarn, " (does not exist — mount not up?)"
-	case err != nil:
-		return statusWarn, " (" + err.Error() + ")"
-	case !info.IsDir():
-		return statusWarn, " (not a directory)"
-	}
-	return statusOK, ""
-}
-
-// isRcloneRemoteSpec reports whether p is an rclone "remote:path" reference
-// rather than a filesystem path. An absolute path (leading /) is always a
-// filesystem path; otherwise a leading "name:" segment marks a remote.
-func isRcloneRemoteSpec(p string) bool {
-	if strings.HasPrefix(p, "/") {
-		return false
-	}
-	i := strings.IndexByte(p, ':')
-	return i > 0
+	return statusOK, "byte-path " + n.Path
 }
 
 // dirIsEmpty reports whether dir contains no entries, reading just one name

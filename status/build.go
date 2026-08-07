@@ -193,9 +193,20 @@ func buildTarget(ctx context.Context, s *store.Store, cfg *config.Config, self s
 	}
 	if alarm, ok := alarmByDest[name]; ok {
 		ts.Standing = StandingAlarm
-		ts.AlarmDetail = alarm.Detail
+		ts.StandingDetail = alarm.Detail
 	} else {
 		ts.Standing = classifyStanding(lastTerminal, ts.LastSyncAgo != nil)
+		// Only a target this volume actually syncs to can be blocked by a
+		// byte-path: a node named solely in offload_requires receives no
+		// bytes from here, so a stale path on it costs nothing and saying
+		// so would be noise. A byte-path that does not resolve outranks
+		// needs-init — the bootstrap being asked for cannot land either
+		// until the mount is back — but not refused, which names a more
+		// specific thing that broke.
+		if reason, broken := unavailableBytePath(cfg, name); broken && ts.SyncTarget && ts.Standing != StandingRefused {
+			ts.Standing = StandingBytePath
+			ts.StandingDetail = reason
+		}
 	}
 	ts.SyncLevel = syncLevel(ts, lastTerminal)
 	if indexed {
@@ -206,6 +217,27 @@ func buildTarget(ctx context.Context, s *store.Store, cfg *config.Config, self s
 		ts.Durability = dur
 	}
 	return ts, nil
+}
+
+// unavailableBytePath reports whether the named target is a peer node whose
+// byte-path is configured but does not currently resolve to a directory
+// here, with the short reason for it. Destinations, relayed names, and
+// nodes that legitimately carry no byte-path all answer false.
+//
+// The rules come from config.Node.CheckBytePath — the same reader
+// `squirrel config check` uses — so the two surfaces can never disagree
+// about what counts as a usable byte-path. It stats the filesystem on every
+// build rather than caching, because a network mount comes and goes under a
+// running agent and a stale "fine" is the failure being closed (F34).
+func unavailableBytePath(cfg *config.Config, name string) (string, bool) {
+	node, ok := cfg.Nodes[name]
+	if !ok {
+		return "", false
+	}
+	if state, reason := node.CheckBytePath(); state == config.BytePathUnavailable {
+		return reason, true
+	}
+	return "", false
 }
 
 // classifyStanding derives the standing state from the pair's latest
@@ -241,7 +273,7 @@ func syncLevel(ts TargetStatus, lastTerminal *store.Run) Level {
 	switch ts.Standing {
 	case StandingAlarm, StandingRefused:
 		return LevelCritical
-	case StandingNeedsBootstrap:
+	case StandingNeedsBootstrap, StandingBytePath:
 		return LevelWarn
 	}
 	if lastTerminal != nil {

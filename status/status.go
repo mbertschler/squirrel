@@ -102,6 +102,14 @@ const (
 	// StandingAlarm is a latched verify mismatch on the destination (F30).
 	// Red until an operator clears it.
 	StandingAlarm
+	// StandingBytePath is a peer node whose configured byte-path does not
+	// currently resolve to a directory on this machine (F34). Bytes cannot
+	// land until it does, and the failure is otherwise silent — transfers
+	// simply do not arrive — so it is surfaced without anyone having to run
+	// `squirrel config check`. Amber, not red: the usual cause is a mount
+	// that is not up yet, which resolves without an operator touching
+	// anything.
+	StandingBytePath
 )
 
 // String renders a Standing as a short word for display and tests.
@@ -113,6 +121,8 @@ func (s Standing) String() string {
 		return "refused"
 	case StandingAlarm:
 		return "alarm"
+	case StandingBytePath:
+		return "byte-path"
 	default:
 		return "ok"
 	}
@@ -221,9 +231,9 @@ type TargetStatus struct {
 	// Standing is the target's standing state (alarm / refused /
 	// needs-bootstrap / none).
 	Standing Standing
-	// AlarmDetail is the latched alarm's detail text when Standing is
+	// StandingDetail is the latched alarm's detail text when Standing is
 	// StandingAlarm, for the surface to show what tripped.
-	AlarmDetail string
+	StandingDetail string
 	// LastOutcome is the status of the pair's most recent terminal sync run
 	// (success / partial / failed / refused / aborted), or "" when this
 	// node has never run a sync against the target. It lets a surface name

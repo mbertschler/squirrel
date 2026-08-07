@@ -173,8 +173,8 @@ func TestBuildAlarm(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 	tg := rep.Volumes[0].Targets[0]
-	if tg.Standing != StandingAlarm || tg.AlarmDetail == "" {
-		t.Errorf("standing = %v detail=%q, want alarm", tg.Standing, tg.AlarmDetail)
+	if tg.Standing != StandingAlarm || tg.StandingDetail == "" {
+		t.Errorf("standing = %v detail=%q, want alarm", tg.Standing, tg.StandingDetail)
 	}
 	if rep.Level() != LevelCritical {
 		t.Errorf("report level = %v, want red", rep.Level())
@@ -299,5 +299,67 @@ func TestBuildRelayedRequiredTarget(t *testing.T) {
 	}
 	if relayed.Level() != LevelWarn {
 		t.Errorf("relayed target level = %v, want amber (evidence not yet arrived)", relayed.Level())
+	}
+}
+
+// TestBuildNodeBytePathUnavailable is F34's load-bearing case: the peer's
+// byte-path does not resolve, so no byte this machine sends can land — and
+// nothing said so until someone chose to run `squirrel config check`. The
+// status surface now carries it, amber rather than red because the usual
+// cause is a mount that is not up yet.
+func TestBuildNodeBytePathUnavailable(t *testing.T) {
+	s := setupStore(t)
+	ctx := context.Background()
+	root, _ := indexTree(t, s, "media")
+	cfg := cfgFor("media", root, []string{"nas"}, nil, nil, []string{"nas"})
+	cfg.Nodes["nas"].Path = filepath.Join(t.TempDir(), "mount-not-up")
+
+	rep, err := Build(ctx, s, cfg)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	tg := rep.Volumes[0].Targets[0]
+	if tg.Standing != StandingBytePath {
+		t.Errorf("standing = %v, want byte-path", tg.Standing)
+	}
+	if tg.StandingDetail == "" {
+		t.Error("standing carries no detail, so the surface cannot say what is wrong")
+	}
+	if got := StateLabel(tg); got != "byte-path" {
+		t.Errorf("StateLabel = %q, want %q", got, "byte-path")
+	}
+	if rep.Level() != LevelWarn {
+		t.Errorf("report level = %v, want amber", rep.Level())
+	}
+}
+
+// TestBuildNodeBytePathHealthy guards the two ways this must not fire: a
+// byte-path that resolves, and a node that legitimately has none because no
+// volume syncs to it. A false byte-path alarm on every pull-only peer would
+// make the amber meaningless.
+func TestBuildNodeBytePathHealthy(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		path   string
+		syncTo []string
+	}{
+		{"resolves to a directory", t.TempDir(), []string{"nas"}},
+		{"pull-only peer carries no byte-path", "", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := setupStore(t)
+			ctx := context.Background()
+			root, _ := indexTree(t, s, "media")
+			cfg := cfgFor("media", root, tc.syncTo, []string{"nas"}, nil, []string{"nas"})
+			cfg.Nodes["nas"].Path = tc.path
+
+			rep, err := Build(ctx, s, cfg)
+			if err != nil {
+				t.Fatalf("Build: %v", err)
+			}
+			if tg := rep.Volumes[0].Targets[0]; tg.Standing == StandingBytePath {
+				t.Errorf("standing = byte-path (%s), want no byte-path complaint", tg.StandingDetail)
+			}
+		})
 	}
 }
