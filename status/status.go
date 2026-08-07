@@ -229,10 +229,12 @@ type TargetStatus struct {
 	// never pushes to it — a relayed target).
 	LastSyncAgo *time.Duration
 	// Standing is the target's standing state (alarm / refused /
-	// needs-bootstrap / none).
+	// byte-path / needs-bootstrap / none).
 	Standing Standing
-	// StandingDetail is the latched alarm's detail text when Standing is
-	// StandingAlarm, for the surface to show what tripped.
+	// StandingDetail explains the standing state in the surface's own
+	// words: the latched alarm's detail under StandingAlarm, why the
+	// byte-path did not resolve under StandingBytePath. Empty for the
+	// standings that are fully described by their name.
 	StandingDetail string
 	// LastOutcome is the status of the pair's most recent terminal sync run
 	// (success / partial / failed / refused / aborted), or "" when this

@@ -195,6 +195,5 @@ Squirrel asks for a `path` exactly when some volume's `sync_to` names the
 node, and rejects the config at load time if it is missing there:
 
 ```
-nodes.nas: path is required because volumes.pictures syncs to it
-(rclone target prefix the initiator copies bytes into)
+nodes.nas: path is required because volumes.pictures syncs to it (rclone target prefix the initiator copies bytes into)
 ```
