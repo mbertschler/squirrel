@@ -38,17 +38,17 @@ const (
 // DestinationAlarm it is derived standing state: the permanent record of
 // every raise and clear lives in runs and runs_audit, so clearing the live
 // latch loses no history.
+// The loaded_blake3 / disk_blake3 columns are deliberately not projected
+// here. They are the episode's forensic evidence — a reader can tell "the
+// file changed once" from "it changed, was reverted, and changed again",
+// and can identify which config an agent is holding by comparing them
+// against a hash of the file — but that reading is done against the table,
+// by a human or `squirrel db`, not through this accessor. Carrying them as
+// struct fields no caller reads would be exactly the unused public surface
+// AGENTS.md rules out; the columns keep the record either way.
 type ConfigDrift struct {
 	// Path is the config file the running agent loaded.
 	Path string
-	// LoadedBlake3 is the digest of the bytes that agent parsed and
-	// DiskBlake3 the differing digest the re-check read from disk. They are
-	// the latch's evidence rather than display material: an operator who
-	// wants to know *which* config an agent is holding can compare them
-	// against a hash of the file, and a forensic reader can tell "the file
-	// changed once" from "it changed, was reverted, and changed again".
-	LoadedBlake3 []byte
-	DiskBlake3   []byte
 	// RaisedRunID is the kind='audit' run recording the detection, and
 	// RaisedAtNs when it landed — stable across repeated detections, so a
 	// surface can show "changed N ago" rather than "changed just now".
@@ -184,9 +184,9 @@ func (s *Store) ClearConfigDrift(ctx context.Context, reason string) (bool, erro
 func (s *Store) GetConfigDrift(ctx context.Context) (ConfigDrift, error) {
 	var d ConfigDrift
 	err := s.db.QueryRowContext(ctx, `
-		SELECT path, loaded_blake3, disk_blake3, raised_run_id, raised_at_ns
+		SELECT path, raised_run_id, raised_at_ns
 		FROM config_drift WHERE id = 1
-	`).Scan(&d.Path, &d.LoadedBlake3, &d.DiskBlake3, &d.RaisedRunID, &d.RaisedAtNs)
+	`).Scan(&d.Path, &d.RaisedRunID, &d.RaisedAtNs)
 	if err != nil {
 		return ConfigDrift{}, err
 	}
