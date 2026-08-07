@@ -271,8 +271,8 @@ through another node's capability report.
 
 ## Checkpoints 4–5 — trip return + offload day
 
-**F22 · S2 — gate refusals are per-file walls of jargon that can't
-distinguish "not yet" from "never".** `offload --dry-run` on 26 files
+**F22 · S2 — ~~gate refusals are per-file walls of jargon that can't
+distinguish "not yet" from "never".~~ (#164, #173, #192)** `offload --dry-run` on 26 files
 prints the identical two-line reason 26 times
 (`cloudbox: missing component for origin laptop (need 1)`), with no
 aggregation ("26 files, all blocked by the same 2 targets"), no
@@ -284,12 +284,17 @@ evidence" — F21). The user cannot tell waiting from wedged, and the
 vocabulary (component/origin/need N) is the internal vector model
 verbatim.
 
-*Partially addressed.* The waiting-vs-wedged half is gone structurally:
-a destination that can never gate is now rejected at config load (#164),
-including when only a peer can see it (#173), so a surviving refusal
-always means "not yet". **Still open:** the refusal is printed once per
-file with no aggregation, no mention of which requirements already
-passed, and in the vector model's own vocabulary.
+*Fixed in #164/#173 and #192.* The waiting-vs-wedged half went
+structurally: a destination that can never gate is rejected at config
+load (#164), including when only a peer can see it (#173), so a
+surviving refusal always means "not yet". #192 closed the remainder —
+refusals are grouped by (target, cause) with a count each (a mixed set
+stays mixed: 25 files on one target and 1 on another are two lines),
+every required target is reported with how many files it already
+satisfies, and the internal vocabulary is gone from the primary
+line — each group says what is wrong, what would clear it, and on which
+machine, with the vector coordinates on a `coordinates:` line below and
+the per-file listing behind `--per-file`.
 
 **F23 · S2 — ~~the edge machine is blind to its own safety.~~ (#177)** The
 laptop's TUI shows index/sync freshness only. For the machine whose
@@ -548,9 +553,6 @@ offload being structurally unreachable — is reachable in code.
 
 Still open, in rough priority:
 
-- **F22 · S2 (remainder)** — offload gate refusals still print once
-  per file, unaggregated, in the vector model's vocabulary. The
-  waiting-vs-wedged half is closed.
 - **F9 · S3** — the agent neither reloads config nor warns on drift
   against the file on disk. Logged S3 on the night, but it is the last
   standing violation of set-up-once-then-trust
