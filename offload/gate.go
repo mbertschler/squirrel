@@ -132,32 +132,31 @@ func loadGate(ctx context.Context, s *store.Store, volumeID int64, require []str
 //     fingerprint backs the gated object.
 //
 // The file passes only when every required target satisfies all four.
-// The returned failures name each failing target and reason; an empty
-// slice means the gate passed.
-func (g *gate) check(ctx context.Context, row store.FileRow) ([]string, error) {
+// The returned failures carry one entry per failing target — at most one
+// per target, the first condition that refused it — and an empty slice
+// means the gate passed.
+func (g *gate) check(ctx context.Context, row store.FileRow) ([]Failure, error) {
 	originNode, originRun, err := g.origin(ctx, row)
 	if err != nil {
 		return nil, err
 	}
-	var failures []string
+	var failures []Failure
 	for _, target := range g.require {
 		comp, ok := g.vectors[target][originNode]
 		switch {
 		case !ok:
-			failures = append(failures,
-				fmt.Sprintf("%s: missing component for origin %s (need %d)", target, g.nodeName(ctx, originNode), originRun))
+			failures = append(failures, g.noEvidenceFailure(ctx, target, originNode, originRun))
 			continue
 		case comp.coveredRun < originRun:
-			failures = append(failures,
-				fmt.Sprintf("%s: stale: have %d need %d (origin %s, %s)", target, comp.coveredRun, originRun, g.nodeName(ctx, originNode), g.provenance(ctx, comp)))
+			failures = append(failures, g.behindFailure(ctx, target, comp, originNode, originRun))
 			continue
 		}
-		if reason := g.staleEvidenceFailure(ctx, target, comp); reason != "" {
-			failures = append(failures, reason)
+		if f, refused := g.staleEvidenceFailure(ctx, target, comp); refused {
+			failures = append(failures, f)
 			continue
 		}
-		if reason := g.freshnessFailure(ctx, target, row, originNode, originRun); reason != "" {
-			failures = append(failures, reason)
+		if f, refused := g.freshnessFailure(ctx, target, row, originNode, originRun); refused {
+			failures = append(failures, f)
 			continue
 		}
 		verified, err := g.methodVerified(ctx, target, comp, row)
@@ -165,11 +164,98 @@ func (g *gate) check(ctx context.Context, row store.FileRow) ([]string, error) {
 			return nil, err
 		}
 		if !verified {
-			failures = append(failures,
-				fmt.Sprintf("%s: not content-verified (method %q, %s); a verified fingerprint must back the object before offload", target, displayMethod(comp.method), g.provenance(ctx, comp)))
+			failures = append(failures, g.notVerifiedFailure(ctx, target, comp, originNode))
 		}
 	}
 	return failures, nil
+}
+
+// refuse assembles one target's refusal: what is wrong (summary), where
+// the missing evidence has to come from (advice, derived from this
+// node's own push record — see route), and the vector coordinates behind
+// the decision (detail).
+func (g *gate) refuse(target string, kind FailureKind, summary, detail string) Failure {
+	return Failure{
+		Target:  target,
+		Kind:    kind,
+		Summary: summary,
+		Advice:  g.route(target, kind),
+		Detail:  detail,
+	}
+}
+
+// route names the act that would clear the refusal and the machine it has
+// to happen on. Which machine that is is read off the recorded state
+// rather than guessed: a target this node holds a completed whole-volume
+// push for is one it pushes to itself, so the act belongs here. With no
+// such push on record the target may be one only a peer reaches — the
+// relayed-evidence half of the household — so the advice names both
+// places and how the evidence gets back.
+func (g *gate) route(target string, kind FailureKind) string {
+	if g.lastPush[target] > 0 {
+		return localRoute(target, kind)
+	}
+	return fmt.Sprintf("no completed push to %s is recorded on this node, so %s must happen where %s is reachable — here, or on the peer that pushes there, whose evidence arrives with the next durability pull",
+		target, pendingAct(kind), target)
+}
+
+// localRoute phrases the fix for a target this node pushes to itself.
+func localRoute(target string, kind FailureKind) string {
+	switch kind {
+	case FailureNotPushed:
+		return fmt.Sprintf("the next whole-volume sync to %s covers it", target)
+	case FailureEvidenceStale:
+		return fmt.Sprintf("a verify pass over %s re-stamps the evidence here", target)
+	case FailureNotVerified:
+		return fmt.Sprintf("a verify pass over %s certifies the stored objects and upgrades the evidence here", target)
+	default:
+		return fmt.Sprintf("a whole-volume sync to %s, then a verify pass over it, records the evidence here", target)
+	}
+}
+
+// pendingAct names the act still owed for a target with no completed push
+// on this node, in a form that reads the same wherever it happens.
+func pendingAct(kind FailureKind) string {
+	switch kind {
+	case FailureNotPushed:
+		return "a whole-volume sync"
+	case FailureEvidenceStale, FailureNotVerified:
+		return "a verify pass"
+	default:
+		return "a whole-volume sync and then a verify pass"
+	}
+}
+
+// noEvidenceFailure refuses a target whose durability vector says nothing
+// at all about the content's origin node — the commonest refusal, and the
+// one the internal vocabulary rendered as "missing component for origin X
+// (need N)".
+func (g *gate) noEvidenceFailure(ctx context.Context, target string, originNode, originRun int64) Failure {
+	origin := g.nodeName(ctx, originNode)
+	return g.refuse(target, FailureNoEvidence,
+		fmt.Sprintf("no durability evidence yet: %s has never reported holding content that originated on %s", target, origin),
+		fmt.Sprintf("durability vector has no component for origin %s; it must cover origin run %d", origin, originRun))
+}
+
+// behindFailure refuses a target whose component for the origin exists
+// but stops short of the run this content was introduced in.
+func (g *gate) behindFailure(ctx context.Context, target string, comp component, originNode, originRun int64) Failure {
+	origin := g.nodeName(ctx, originNode)
+	return g.refuse(target, FailureEvidenceBehind,
+		fmt.Sprintf("evidence is behind: %s's coverage of content from %s stops short of this file", target, origin),
+		fmt.Sprintf("component covers origin %s through run %d, this content needs run %d (%s)",
+			origin, comp.coveredRun, originRun, g.provenance(ctx, comp)))
+}
+
+// notVerifiedFailure refuses a component that rests on presence rather
+// than on content verification, with no verified fingerprint behind the
+// gated object.
+func (g *gate) notVerifiedFailure(ctx context.Context, target string, comp component, originNode int64) Failure {
+	return g.refuse(target, FailureNotVerified,
+		fmt.Sprintf("stored but not content-verified: %s recorded %q (%s) — presence is not proof of the bytes",
+			target, displayMethod(comp.method), g.provenance(ctx, comp)),
+		fmt.Sprintf("component for origin %s covers run %d with method %q; a verified fingerprint must back the object before offload",
+			g.nodeName(ctx, originNode), comp.coveredRun, displayMethod(comp.method)))
 }
 
 // staleEvidenceFailure refuses the target when a max evidence age is
@@ -188,22 +274,24 @@ func (g *gate) check(ctx context.Context, row store.FileRow) ([]string, error) {
 // this node last heard from it. A destination gone dead behind a peer
 // that keeps answering ages out here too, and a peer that falls silent
 // still ages out because no newer assertion arrives to refresh it. A zero
-// maxEvidenceAge disables the policy entirely.
-func (g *gate) staleEvidenceFailure(ctx context.Context, target string, comp component) string {
+// maxEvidenceAge disables the policy entirely. The bool reports whether
+// the target was refused.
+func (g *gate) staleEvidenceFailure(ctx context.Context, target string, comp component) (Failure, bool) {
 	if g.maxEvidenceAge <= 0 {
-		return ""
+		return Failure{}, false
 	}
-	cutoff := g.nowNs - int64(g.maxEvidenceAge)
 	if !comp.verifiedAt.Valid {
-		return fmt.Sprintf("%s: stale evidence: never re-verified (max age %s, %s)",
-			target, g.maxEvidenceAge, g.provenance(ctx, comp))
+		return g.refuse(target, FailureEvidenceStale,
+			fmt.Sprintf("evidence age unknown: nothing records when %s's coverage was last re-verified, and this volume accepts evidence only up to %s old", target, g.maxEvidenceAge),
+			fmt.Sprintf("component carries no verification timestamp (%s); offload_max_evidence_age is %s", g.provenance(ctx, comp), g.maxEvidenceAge)), true
 	}
-	if comp.verifiedAt.Int64 < cutoff {
+	if comp.verifiedAt.Int64 < g.nowNs-int64(g.maxEvidenceAge) {
 		age := time.Duration(g.nowNs - comp.verifiedAt.Int64)
-		return fmt.Sprintf("%s: stale evidence: last verified %s ago > max age %s (%s)",
-			target, age.Round(time.Second), g.maxEvidenceAge, g.provenance(ctx, comp))
+		return g.refuse(target, FailureEvidenceStale,
+			fmt.Sprintf("evidence is too old: %s's coverage has not been re-verified within this volume's %s limit", target, g.maxEvidenceAge),
+			fmt.Sprintf("last verified %s ago, limit %s (%s)", age.Round(time.Second), g.maxEvidenceAge, g.provenance(ctx, comp))), true
 	}
-	return ""
+	return Failure{}, false
 }
 
 // freshnessFailure refuses the target when no successful whole-volume
@@ -228,27 +316,34 @@ func (g *gate) staleEvidenceFailure(ctx context.Context, target string, comp com
 //     gated content's origin run against it. Absence of freshness
 //     evidence refuses — a relayed target with no recorded push never
 //     gates.
-func (g *gate) freshnessFailure(ctx context.Context, target string, row store.FileRow, originNode, originRun int64) string {
+//
+// The bool reports whether the target was refused.
+func (g *gate) freshnessFailure(ctx context.Context, target string, row store.FileRow, originNode, originRun int64) (Failure, bool) {
 	if g.lastPush[target] > 0 {
 		changed := row.FirstSeenRunID
 		if row.StatusChangedRunID.Valid {
 			changed = row.StatusChangedRunID.Int64
 		}
 		if g.lastPush[target] < changed {
-			return fmt.Sprintf("%s: not freshly pushed: last whole-volume push run %d < became-present run %d", target, g.lastPush[target], changed)
+			return g.refuse(target, FailureNotPushed,
+				fmt.Sprintf("not pushed since this file appeared: the last whole-volume sync to %s predates the file's current presence here", target),
+				fmt.Sprintf("last whole-volume push run %d is below the became-present run %d", g.lastPush[target], changed)), true
 		}
-		return ""
+		return Failure{}, false
 	}
+	origin := g.nodeName(ctx, originNode)
 	fresh, ok := g.freshness[target][originNode]
 	if !ok {
-		return fmt.Sprintf("%s: not freshly pushed: no whole-volume push freshness for origin %s (need %d)",
-			target, g.nodeName(ctx, originNode), originRun)
+		return g.refuse(target, FailureNotPushed,
+			fmt.Sprintf("no whole-volume push to %s has been reported for content from %s", target, origin),
+			fmt.Sprintf("no push-freshness coordinate for origin %s; one covering run %d is needed", origin, originRun)), true
 	}
 	if fresh < originRun {
-		return fmt.Sprintf("%s: not freshly pushed: push freshness %d < origin run %d (origin %s)",
-			target, fresh, originRun, g.nodeName(ctx, originNode))
+		return g.refuse(target, FailureNotPushed,
+			fmt.Sprintf("the last whole-volume push to %s reported for content from %s predates this file", target, origin),
+			fmt.Sprintf("reported push freshness covers origin %s through run %d, this content needs run %d", origin, fresh, originRun)), true
 	}
-	return ""
+	return Failure{}, false
 }
 
 // methodVerified reports whether the target's component for this row

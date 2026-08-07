@@ -180,8 +180,9 @@ func TestOffloadCapableTargetPendingStillWalks(t *testing.T) {
 		t.Fatalf("report = %+v, want one not-durable result", rep)
 	}
 	res := oneResult(t, rep, "a.txt", OutcomeNotDurable)
-	if len(res.Reasons) != 1 || !strings.Contains(res.Reasons[0], "t1: missing component for origin "+self.Name) {
-		t.Fatalf("reasons = %v, want the per-file missing-component failure", res.Reasons)
+	f := oneFailure(t, res, "t1", FailureNoEvidence)
+	if !strings.Contains(f.Detail, "no component for origin "+self.Name) {
+		t.Fatalf("detail = %q, want the per-file no-evidence refusal naming origin %s", f.Detail, self.Name)
 	}
 	if rep.RunID == 0 {
 		t.Fatal("RunID = 0, want a real offload run (the walk happened)")
