@@ -30,6 +30,7 @@ squirrel volumes
 squirrel conflicts
 squirrel conflicts resolve <volume> <path>
 squirrel restore <volume>            [--from NAME] [--to PATH] [--shallow] [--dry-run] [--in-place]
+squirrel recover --from NAME         [--snapshot NAME] [--execute] [--yes] [--force]
 squirrel destination reset <dest>    [--yes] [--dry-run]
 squirrel audit   [<volume>]          [--deep | --folders]
 squirrel config check
@@ -51,8 +52,10 @@ Commands split into two families ([UX principle 2](https://github.com/mbertschle
 **introspection** (`status`, `runs`, `query`, `volumes`, `hooks`, `conflicts`,
 `config check`, `peer-sync history`, `db schema`, `db check`, `tui`) is safe at
 any time and mutates nothing; **change** (`sync --init`, `offload`, `restore`,
-`destination reset`, `conflicts resolve`, `verify ack`, `db restore`,
-`agent cert`, `node pair`) is deliberate and typed by hand on purpose.
+`recover --execute`, `destination reset`, `conflicts resolve`, `verify ack`,
+`db restore`, `agent cert`, `node pair`) is deliberate and typed by hand on
+purpose. `recover` without `--execute` belongs to the introspection half: it
+answers "what is recoverable here" and stops.
 
 [`verify`](#squirrel-verify) straddles the two on purpose, and is listed in
 neither: it is read-only *against the remote*, but writes what it learns
@@ -356,6 +359,45 @@ Exactly one positional — the volume name. See [Restoring](/squirrel/guides/res
 Restore from an [encrypted (`crypt`)](/squirrel/layouts/encrypted/) destination
 is always a size+mtime comparison (recorded shallow) even without `--shallow`,
 because rclone crypt remotes don't expose content hashes.
+
+---
+
+## squirrel recover
+
+**Walk through recovering this machine from a destination that holds its index and bytes.**
+
+```
+squirrel recover --from <destination>
+```
+
+The guided form of the [disaster runbook](/squirrel/guides/recovery/): it
+sequences the three phases that must happen in order — install the index,
+restore the volumes, re-pair the peers — and confirms each one. It decides
+nothing on its own.
+
+**It reports and stops by default.** Without `--execute` it discovers what the
+destination holds, prints the full plan, and touches nothing, so it is safe to
+run purely to find out what is recoverable.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--from` | — | Destination name to recover from. Required. A peer node is rejected: recovering a dead *edge* machine is a reverse peer push from the surviving hub, not a recover run. |
+| `--snapshot` | newest found | Index snapshot filename to install. Run without it to list what is there. |
+| `--execute` | `false` | Carry out the plan instead of only describing it. |
+| `--yes` | `false` | Answer every phase confirmation with yes, for a rehearsed recovery. Without it a non-interactive stdin stops rather than proceeding. |
+| `--force` | `false` | Skip the running-agent check when installing the index. |
+
+Phase 1 installs the index and is the only destructive step; it preserves any
+existing index beside the new one rather than deleting it, and records the
+recovery as an `audit` run **in the recovered database** — the one it replaced
+is no longer the trail anyone reads. Phase 2 runs a normal
+[`restore`](#squirrel-restore) per volume, each with its own run row. Phase 3
+prints the [`agent cert`](#squirrel-agent) and [`node pair`](#squirrel-node)
+commands; pairing needs both machines, so squirrel names them rather than
+running them.
+
+A failure stops the sequence where it happened rather than half-recovering.
+Re-running continues from the volume that failed.
 
 ---
 

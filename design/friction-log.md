@@ -438,11 +438,23 @@ recover` guided flow) that sequences fetch-snapshot → restore volumes
 → re-pair peers. Tonight that sequence took tool-author knowledge to
 assemble.
 
-*Partially addressed in #176:* `docs/guides/recovery.md` is the runbook —
-destination reset, rebuilding a machine from its hub, and the manual
-mirror / index-snapshot / packed paths, sequenced. **Still open:** the
-guided `squirrel recover` flow; today the operator follows the page by
-hand.
+*Fixed in #176 and #194.* #176 wrote the runbook —
+`docs/guides/recovery.md`, sequencing destination reset, rebuilding a
+machine from its hub, and the manual mirror / index-snapshot / packed
+paths. #194 turned the sequence into `squirrel recover`, which is the
+half a page could not be: the runbook is read exactly once, under the
+worst conditions squirrel creates for a user, and the ordering it
+prescribes is the part that is expensive to get subtly wrong.
+
+The verb sequences and confirms; it decides nothing. It discovers what a
+destination holds and stops there by default, then walks
+install-index → restore-volumes → re-pair-peers with a confirmation per
+phase, a run row per phase, and a stop-and-explain rather than a
+half-recovery when a step cannot proceed. Re-pairing is printed, not
+run: it writes to both machines and needs the peer consenting, which a
+recovery on one side cannot assume. `recovery.md` now describes the verb
+rather than carrying a parallel manual procedure, so the two cannot
+drift (#193).
 
 **Not walked:** `offload_max_evidence_age` staleness refusals (the
 gate currently refuses CA evidence earlier, on verify-method — F29 —
@@ -556,8 +568,6 @@ Still open, in rough priority:
   standing violation of set-up-once-then-trust
   (`ux-principles.md` §1), which arguably prices it higher now that
   the louder findings are gone.
-- **F31 · S3 (remainder)** — the recovery runbook is written; the
-  guided `squirrel recover` flow is not.
 - **F34 · S3 (remainder)** — `config check` flags a missing node
   byte-path, but load-time validation is still absent.
 - **Fleet view** — not a walk finding but the standing open problem in

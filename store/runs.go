@@ -224,6 +224,19 @@ func (s *Store) BeginDurabilityPullRun(ctx context.Context) (int64, error) {
 	return s.beginVolumelessAuditRun(ctx, "pull-durability")
 }
 
+// BeginRecoveryRun records the index-installation phase of a guided
+// recovery as a kind='audit' run; the snapshot and its source destination
+// land in the run's 'recover-index' runs_audit note. See
+// beginVolumelessAuditRun.
+//
+// It is called against the freshly installed index, so the run is the first
+// thing the recovered database records about its own recovery — the
+// database it replaced cannot hold the record, having stopped being the
+// live index at that moment.
+func (s *Store) BeginRecoveryRun(ctx context.Context) (int64, error) {
+	return s.beginVolumelessAuditRun(ctx, "recover-index")
+}
+
 // BeginPeerSyncRun is BeginRun's sibling for kind='sync' rows tied to a
 // peer node. It records the (peer_node_id, correlated_run_id) pair
 // alongside the regular destination name (the peer's name from the

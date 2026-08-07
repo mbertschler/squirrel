@@ -70,6 +70,16 @@ const (
 	// note is where the audit trail names the reset destination and carries
 	// the cleared counts, the runs CHECK keeping destination NULL on the row.
 	TransitionResetDestination = "reset-destination"
+	// TransitionRecoverIndex records the index-installation phase of a
+	// `squirrel recover` against its kind='audit' run: which snapshot was
+	// fetched, from which destination, and how old it was. It is written
+	// into the *recovered* index rather than the one it replaced, because
+	// that is the database that survives the phase — the one it replaced is
+	// preserved beside it but is no longer the audit trail anyone reads.
+	// Without it, a recovered index would carry no record of having been
+	// recovered, and the volume restores that follow would appear in the
+	// history with no explanation of where the catalog came from.
+	TransitionRecoverIndex = "recover-index"
 )
 
 // RunAudit is one row of the insert-only runs_audit log: a single

@@ -1,6 +1,6 @@
 ---
 title: Recovery & disaster runbooks
-description: Reset a wrecked destination, rebuild a dead machine from its hub, and the manual disaster-recovery paths that already work — mirror restore, index-snapshot recovery, and packed/content-addressed recovery.
+description: Recover a dead hub with the guided `squirrel recover` flow, reset a wrecked destination, rebuild a machine from its hub, and the mechanisms underneath — mirror restore, index-snapshot recovery, and packed/content-addressed recovery.
 ---
 
 Recovery in squirrel is deliberately a set of **explicit, human-driven acts**
@@ -102,10 +102,59 @@ The story, using the [reference setup](/squirrel/reference/configuration/)
    the temporary hub-side `sync_to`/`[nodes.laptop]` push config, and resume the
    normal edge → hub direction (`laptop` initiating to `nas`).
 
-## Manual disaster recovery that already works
+## When the hub dies: `squirrel recover`
 
-These paths need no new tooling and are the right answer for whole-repository or
-hub loss. They stay first-class.
+The mechanisms below all work on their own, but assembling them in the right
+order is the hard part — and a wrong order is expensive. Restoring volumes
+before the catalog means restoring with nothing to verify against; re-pairing
+peers before the index is back means a peer syncing into an empty node.
+
+[`squirrel recover`](/squirrel/reference/cli/#squirrel-recover) sequences them.
+Point it at a destination that carried this machine's syncs:
+
+```
+squirrel recover --from cloudbox
+```
+
+That **touches nothing**. It lists the [index snapshots](/squirrel/configuration/index-snapshots/)
+the destination holds and how old each is, then prints the whole plan — which
+snapshot it would install, which volumes it would restore, which peers need
+re-pairing — and stops. Run it as often as you like while deciding.
+
+When the plan is right:
+
+```
+squirrel recover --from cloudbox --execute
+```
+
+Each phase asks before it acts:
+
+1. **Install the index.** Fetches the snapshot (the newest unless you pass
+   `--snapshot`) and makes it the live index. Any existing index is preserved
+   beside it, never deleted. The recovery is recorded as an `audit` run *in the
+   recovered database* — the one it replaced has stopped being the trail anyone
+   reads, so that is the only place the record survives.
+2. **Restore the volumes.** A normal [`restore`](/squirrel/guides/restore/) per
+   volume, verified against the index from phase 1, each with its own run row.
+3. **Re-pair the peers.** Squirrel prints the [`agent cert`](/squirrel/reference/cli/#squirrel-agent)
+   and [`node pair`](/squirrel/reference/cli/#squirrel-node) commands for each
+   peer. Pairing writes to *both* machines and needs the peer reachable and
+   consenting, so this side names the commands rather than running them.
+
+A step that cannot proceed stops the sequence and says why, rather than
+half-recovering. Re-running picks up from the volume that failed.
+
+Two things it deliberately will not do. It **refuses a peer node as `--from`**:
+recovering a dead *edge* machine is a reverse peer push from the surviving hub
+(above), not a recover run. And it never runs unattended — `--yes` exists for a
+rehearsed recovery, but a non-interactive stdin without it stops rather than
+assuming consent.
+
+## The mechanisms underneath
+
+`recover` drives these. They remain first-class on their own, and are the right
+answer when you want one piece rather than the sequence — or when the
+destination carries bytes but no catalog to recover the index from.
 
 ### Mirror restore
 
