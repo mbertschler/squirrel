@@ -145,8 +145,8 @@ func docTableFirstColumn(t *testing.T, heading string) []string {
 			continue
 		}
 		cell := strings.Trim(strings.Split(strings.Trim(line, "|"), "|")[0], " `")
-		if cell == "" || strings.HasPrefix(cell, "-") {
-			inTable = true // header separator
+		if cell == "" || (strings.Trim(cell, ":-") == "" && strings.Contains(cell, "-")) {
+			inTable = true // header separator: ---, :---, ---:, :---:
 			continue
 		}
 		if !inTable {
