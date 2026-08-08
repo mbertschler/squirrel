@@ -317,7 +317,7 @@ Takes no arguments. Lists every kind of run — `index`, `sync`, `restore`,
 | `--failed` | `false` | Show only runs that need attention: `failed`, `refused`, `aborted`, or `partial`. |
 | `--changes` | `false` | Hide clean no-op runs; show only runs that moved content or need attention. |
 
-Under household cadences most rows are no-ops (a pair checked, nothing to do).
+Under routine cadences most rows are no-ops (a pair checked, nothing to do).
 `--changes` keys on the count of files a run actually changed, so it folds away
 bucket pushes and index runs too, not just peer-sync no-ops. Runs recorded
 before that count existed are shown rather than silently folded — their change
@@ -739,7 +739,7 @@ squirrel version
 ```
 
 No arguments, no flags. Prints the release, commit, build time, Go version, and
-platform, so a household can confirm which build a machine is running:
+platform, so you can confirm which build a machine is running:
 
 ```
 squirrel v1.2.3

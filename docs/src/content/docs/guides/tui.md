@@ -18,7 +18,7 @@ it prints help.
 ## The dashboard
 
 The first screen is ordered by urgency — anything wrong appears above the
-routine state, so a healthy household is a short screen.
+routine state, so a healthy fleet is a short screen.
 
 - **Config drift** — shown right under the agent's health when a config edit is
   not fully in force. The [agent](/squirrel/guides/agent/) applies what it can
