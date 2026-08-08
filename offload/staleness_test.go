@@ -31,12 +31,12 @@ func staleGate(maxEvidenceAge time.Duration, names map[int64]string) *gate {
 func TestStaleEvidenceRefusesOffload(t *testing.T) {
 	g := staleGate(maxAge, nil)
 	comp := component{coveredRun: 5, method: "blake3", verifiedAt: verifiedAt(fixedNow - int64(90*24*time.Hour))}
-	reason := g.staleEvidenceFailure(context.Background(), "t1", comp)
-	if !strings.Contains(reason, "stale evidence") || !strings.Contains(reason, "locally verified") {
-		t.Fatalf("reason = %q, want a stale-evidence refusal naming local provenance", reason)
+	f, refused := g.staleEvidenceFailure(context.Background(), "t1", comp)
+	if !refused || f.Kind != FailureEvidenceStale || !strings.Contains(f.Summary, "too old") {
+		t.Fatalf("failure = %+v (refused %v), want a stale-evidence refusal", f, refused)
 	}
-	if !strings.Contains(reason, "max age 720h0m0s") {
-		t.Fatalf("reason = %q, want it to name the configured max age", reason)
+	if !strings.Contains(f.Detail, "locally verified") || !strings.Contains(f.Detail, "limit 720h0m0s") {
+		t.Fatalf("detail = %q, want the age, the configured limit, and local provenance", f.Detail)
 	}
 }
 
@@ -46,14 +46,14 @@ func TestStaleEvidenceRefusesOffload(t *testing.T) {
 func TestFreshEvidencePasses(t *testing.T) {
 	g := staleGate(maxAge, nil)
 	fresh := component{coveredRun: 5, method: "blake3", verifiedAt: verifiedAt(fixedNow - int64(24*time.Hour))}
-	if reason := g.staleEvidenceFailure(context.Background(), "t1", fresh); reason != "" {
-		t.Fatalf("reason = %q, want none for fresh evidence", reason)
+	if f, refused := g.staleEvidenceFailure(context.Background(), "t1", fresh); refused {
+		t.Fatalf("failure = %+v, want none for fresh evidence", f)
 	}
 
 	disabled := staleGate(0, nil)
 	ancient := component{coveredRun: 5, method: "blake3", verifiedAt: verifiedAt(fixedNow - int64(365*24*time.Hour))}
-	if reason := disabled.staleEvidenceFailure(context.Background(), "t1", ancient); reason != "" {
-		t.Fatalf("reason = %q, want none when the staleness policy is disabled", reason)
+	if f, refused := disabled.staleEvidenceFailure(context.Background(), "t1", ancient); refused {
+		t.Fatalf("failure = %+v, want none when the staleness policy is disabled", f)
 	}
 }
 
@@ -63,11 +63,13 @@ func TestFreshEvidencePasses(t *testing.T) {
 // age is set, but unaffected when the policy is disabled.
 func TestNullVerifiedAtRefusesUnderMaxAge(t *testing.T) {
 	comp := component{coveredRun: 5, method: "blake3"}
-	if reason := staleGate(maxAge, nil).staleEvidenceFailure(context.Background(), "t1", comp); !strings.Contains(reason, "never re-verified") {
-		t.Fatalf("reason = %q, want a never-re-verified refusal", reason)
+	f, refused := staleGate(maxAge, nil).staleEvidenceFailure(context.Background(), "t1", comp)
+	if !refused || !strings.Contains(f.Summary, "evidence age unknown") ||
+		!strings.Contains(f.Detail, "no verification timestamp") {
+		t.Fatalf("failure = %+v (refused %v), want a never-re-verified refusal", f, refused)
 	}
-	if reason := staleGate(0, nil).staleEvidenceFailure(context.Background(), "t1", comp); reason != "" {
-		t.Fatalf("reason = %q, want none when the staleness policy is disabled", reason)
+	if f, refused := staleGate(0, nil).staleEvidenceFailure(context.Background(), "t1", comp); refused {
+		t.Fatalf("failure = %+v, want none when the staleness policy is disabled", f)
 	}
 }
 
@@ -83,14 +85,14 @@ func TestPeerRelayedEvidenceStaleness(t *testing.T) {
 	source := sql.NullInt64{Int64: peerID, Valid: true}
 
 	recent := component{coveredRun: 5, method: "blake3", source: source, verifiedAt: verifiedAt(fixedNow - int64(24*time.Hour))}
-	if reason := g.staleEvidenceFailure(context.Background(), "t1", recent); reason != "" {
-		t.Fatalf("reason = %q, want none for a recently pulled peer assertion", reason)
+	if f, refused := g.staleEvidenceFailure(context.Background(), "t1", recent); refused {
+		t.Fatalf("failure = %+v, want none for a recently pulled peer assertion", f)
 	}
 
 	silent := component{coveredRun: 5, method: "blake3", source: source, verifiedAt: verifiedAt(fixedNow - int64(90*24*time.Hour))}
-	reason := g.staleEvidenceFailure(context.Background(), "t1", silent)
-	if !strings.Contains(reason, "stale evidence") || !strings.Contains(reason, "asserted by peer nas") {
-		t.Fatalf("reason = %q, want a stale-evidence refusal naming peer nas", reason)
+	f, refused := g.staleEvidenceFailure(context.Background(), "t1", silent)
+	if !refused || f.Kind != FailureEvidenceStale || !strings.Contains(f.Detail, "asserted by peer nas") {
+		t.Fatalf("failure = %+v (refused %v), want a stale-evidence refusal naming peer nas", f, refused)
 	}
 }
 
