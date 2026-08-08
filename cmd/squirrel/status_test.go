@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/mbertschler/squirrel/store"
 )
 
 // writeStatusConfig lays down a volume with a sync destination, plus its
@@ -85,6 +88,48 @@ func TestCLIStatusAfterSyncIsGreen(t *testing.T) {
 	}
 	if !strings.Contains(out, "ok") {
 		t.Fatalf("expected an 'ok' target state:\n%s", out)
+	}
+}
+
+// TestCLIStatusReportsConfigDrift: an operator who edits the config and
+// forgets to restart the agent is told so by `squirrel status` — on every
+// scope, including a single volume, and with the amber exit code (F9).
+func TestCLIStatusReportsConfigDrift(t *testing.T) {
+	cfg := writeStatusConfig(t)
+	runCLI(t, "--config", cfg, "index", "pics")
+	raiseTestConfigDrift(t, filepath.Join(filepath.Dir(cfg), "index.db"), cfg)
+
+	for _, args := range [][]string{
+		{"--config", cfg, "status"},
+		{"--config", cfg, "status", "pics"},
+	} {
+		out, err := runCLIExpectErr(t, args...)
+		var ec exitCodeError
+		if !errors.As(err, &ec) || ec.code != 1 {
+			t.Fatalf("%v: exit = %v, want amber (1)", args, err)
+		}
+		if !strings.Contains(out, "restart to apply") || !strings.Contains(out, cfg) {
+			t.Fatalf("%v: status does not report the drift:\n%s", args, out)
+		}
+	}
+}
+
+// raiseTestConfigDrift opens the CLI's DB directly and latches config drift
+// as the agent's monitor would, so the introspection surfaces have a
+// standing latch to render without running an agent. The handle is closed
+// before returning so the next CLI invocation has no concurrent connection
+// from this process.
+func raiseTestConfigDrift(t *testing.T, dbPath, configPath string) {
+	t.Helper()
+	s, err := store.OpenWithOptions(dbPath, store.OpenOptions{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	loaded, disk := make([]byte, 32), make([]byte, 32)
+	disk[0] = 1
+	if _, err := s.RaiseConfigDrift(context.Background(), configPath, loaded, disk); err != nil {
+		t.Fatalf("RaiseConfigDrift: %v", err)
 	}
 }
 

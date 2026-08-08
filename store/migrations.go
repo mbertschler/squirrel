@@ -10,7 +10,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 28
+const SchemaVersion = 29
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -71,6 +71,7 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 26, up: migrateV25ToV26},
 		{version: 27, up: migrateV26ToV27},
 		{version: 28, up: migrateV27ToV28},
+		{version: 29, up: migrateV28ToV29},
 	}
 }
 
@@ -2294,4 +2295,60 @@ func migrateV27ToV28(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("record schema v28: %w", err)
 	}
 	return tx.Commit()
+}
+
+// --- v28 → v29 ---
+
+// migrateV28ToV29 adds the config_drift standing-state latch (#191, F9):
+// the agent hashes its config file at load and re-compares that digest
+// against the file on disk on a cadence, so an operator who edits the
+// config and forgets to restart is told so instead of finding out when a
+// destination has been failing for a week.
+//
+// Like destination_alarms (v25) and contested_paths (v26) it is derived
+// standing state: the permanent forensic record of every raise and clear
+// lives in runs/runs_audit, so clearing the live latch — on restart, or
+// when the operator reverts the edit — loses no history. STRICT per the
+// new-table convention; additive, so no existing table is rebuilt.
+func migrateV28ToV29(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := createConfigDriftV29(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (29)`); err != nil {
+		return fmt.Errorf("record schema v29: %w", err)
+	}
+	return tx.Commit()
+}
+
+// createConfigDriftV29 creates the config-drift latch. It is a singleton
+// table — `id INTEGER PRIMARY KEY CHECK (id = 1)` — because the drift is a
+// property of the one agent process this index belongs to, not of any
+// volume or destination: there is exactly one loaded config to compare
+// against. The PK doubles as the idempotence guard on the raise path, so
+// "changed since" stays stable across repeated detections.
+//
+// loaded_blake3 is the digest of the bytes the running agent parsed and
+// disk_blake3 the digest that differed from it, both fixed-length BLAKE3
+// like every other hash column. raised_run_id is a real FK to the
+// kind='audit' run recording the detection. No secondary index: the table
+// holds at most one row and every read is the PK lookup.
+func createConfigDriftV29(ctx context.Context, tx *sql.Tx) error {
+	const ddl = `CREATE TABLE config_drift (
+		id            INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
+		path          TEXT    NOT NULL,
+		loaded_blake3 BLOB    NOT NULL CHECK (length(loaded_blake3) = 32),
+		disk_blake3   BLOB    NOT NULL CHECK (length(disk_blake3)   = 32),
+		raised_run_id INTEGER NOT NULL REFERENCES runs(id),
+		raised_at_ns  INTEGER NOT NULL
+	) STRICT`
+	if _, err := tx.ExecContext(ctx, ddl); err != nil {
+		return fmt.Errorf("create config_drift: %w", err)
+	}
+	return nil
 }

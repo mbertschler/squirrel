@@ -137,17 +137,27 @@ docs  /home/you/Documents  [amber]
 overall: amber
 ```
 
+When the [agent](/squirrel/guides/agent/) has noticed its config file change on
+disk since it started, a line above the grid says so and holds the report at
+amber until the agent is restarted:
+
+```
+config on disk has changed since this agent started; restart to apply (/home/you/.squirrel/config.toml, noticed 12m ago)
+```
+
 The **exit code** carries the worst level, so the same command scripts a health
 check without parsing the grid:
 
 | Exit | Level | Meaning |
 |---|---|---|
 | `0` | green / neutral | Caught up within cadence and durable where policy requires; nothing to report. |
-| `1` | amber | Not caught up yet, needs a one-time bootstrap, or evidence aged past policy. Recoverable and expected. |
+| `1` | amber | Not caught up yet, needs a one-time bootstrap, evidence aged past policy, or the agent's config has drifted from the file on disk. Recoverable and expected. |
 | `2` | red | A latched alarm, a failed or regressed sync, or a pair far past its cadence. |
 
 Passing a volume name scopes both the grid and the exit code to that volume, so
-a per-volume check is not reddened by an unrelated one. The TUI dashboard
+a per-volume check is not reddened by an unrelated one. Config drift is the one
+exception: it is node-wide — every volume's paths, targets, and cadences came
+out of that file — so it is reported and counted on every scope. The TUI dashboard
 renders the same facts from the same query layer — see
 [Terminal UI](/squirrel/guides/tui/).
 

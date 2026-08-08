@@ -23,7 +23,9 @@ severity in [`friction-log.md`](friction-log.md) — the log is the
 single home for gaps; this document states only the principles they
 are measured against. (The first walk found four — F17, F21, F32, F33 —
 all since closed. One remains: F9, where a config edit still needs a
-manual agent restart.)
+manual agent restart — the agent now *notices* that the file on disk
+has changed under it and latches a standing state saying so, but
+applying the change is still typed by hand.)
 
 ## 2. The CLI is for change and for questions — never for operations
 
@@ -85,7 +87,8 @@ gate refusal, a missing `.squirrel-volume` marker — each must be loud,
 specific, and actionable ("preserved at X, do Y to inspect") — and
 must never cascade into data loss on its own. Silent degradation is
 worse than failure: a cadence that stops firing, evidence going stale,
-a hook that has been failing for a month must all surface in the TUI
+a hook that has been failing for a month, an agent still running the
+config its operator edited last week must all surface in the TUI
 without being asked.
 
 Walking these paths produced a repeatable shape: **latch, then require
