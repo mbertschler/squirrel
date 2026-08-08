@@ -154,9 +154,17 @@ relative to this one:
   FLEET      KIND         STATE     MISSING  LAST CHANGE  LAST VERIFIED  AS OF
   nas        node         same      0        4m ago       2h ago         4m ago
   htpc       node         behind    12       6d ago       6d ago         5m ago
-  s3archive  destination  ahead     0        1h ago       9h ago         1h ago
+  usb        destination  same      0        1h ago       1h ago         1h ago
+  s3archive  relayed      ahead     0        unknown      9h ago         1h ago
   laptop     node         unknown   —        20m ago      unknown        20m ago
 ```
+
+`KIND` says what sort of place it is, in this config's terms: a peer **node**, a
+**destination** this machine drives itself, or **relayed** — a name this machine
+has no config for, whose evidence arrives via a peer's
+[durability pull](/squirrel/guides/peer-sync/). An `offload_requires` entry only
+the hub can reach is relayed from every edge machine's seat, and so is a
+destination dropped from the config that still holds copies of this content.
 
 `STATE` compares that place's content with this machine's: **same**, **behind**
 (it has not received everything here — `MISSING` counts how many files), **ahead**
