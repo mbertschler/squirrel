@@ -47,9 +47,13 @@ func (s *Server) runScanLoop(ctx context.Context, logger io.Writer) {
 // scheduler keeps going regardless of an individual volume's outcome.
 // Volumes are visited in name order so log output is deterministic
 // (helpful for tests and journald inspection).
+// One snapshot of the live config serves the whole tick, so a reload
+// landing mid-tick cannot make the loop walk a volume set that never
+// existed as a whole; the next tick picks the new one up.
 func (s *Server) runScanTick(ctx context.Context, logger io.Writer) {
-	names := make([]string, 0, len(s.cfg.Volumes))
-	for name := range s.cfg.Volumes {
+	volumes := s.live.Get().Volumes
+	names := make([]string, 0, len(volumes))
+	for name := range volumes {
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -57,7 +61,7 @@ func (s *Server) runScanTick(ctx context.Context, logger io.Writer) {
 		if err := ctx.Err(); err != nil {
 			return
 		}
-		s.scanOneVolume(ctx, logger, name, s.cfg.Volumes[name])
+		s.scanOneVolume(ctx, logger, name, volumes[name])
 	}
 }
 

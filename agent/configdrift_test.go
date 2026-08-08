@@ -26,16 +26,32 @@ path = "/tmp/pictures"
 
 // driftFixture is a monitor wired to a real store and a real config file
 // on disk, plus the handles a test pokes at: the file to edit, the store to
-// read the latch from, and the agent's log.
+// read the latch from, the live config to read what the agent is running,
+// and the agent's log.
 type driftFixture struct {
 	t       *testing.T
 	monitor *configMonitor
 	store   *store.Store
+	live    *config.Live
 	path    string
 	logBuf  *bytes.Buffer
 }
 
+// newDriftFixture builds the detect-only monitor: no live config, so the
+// agent can notice an edit but not adopt it — the shape an embedder gets.
 func newDriftFixture(t *testing.T) *driftFixture {
+	t.Helper()
+	return buildDriftFixture(t, false, nil)
+}
+
+// newReloadFixture builds the reloading monitor, optionally with a prepare
+// hook standing in for the CLI's rclone.conf render.
+func newReloadFixture(t *testing.T, prepare func(context.Context, *config.Config) error) *driftFixture {
+	t.Helper()
+	return buildDriftFixture(t, true, prepare)
+}
+
+func buildDriftFixture(t *testing.T, reload bool, prepare func(context.Context, *config.Config) error) *driftFixture {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.toml")
 	if err := os.WriteFile(path, []byte(driftConfigBody), 0o600); err != nil {
@@ -52,14 +68,19 @@ func newDriftFixture(t *testing.T) *driftFixture {
 	t.Cleanup(func() { _ = s.Close() })
 
 	logBuf := &bytes.Buffer{}
-	srv, err := New(Config{
+	agentCfg := Config{
 		Listen:       "127.0.0.1:0",
 		Token:        "tok",
 		Version:      "test",
 		ConfigPath:   cfg.Path,
 		ConfigDigest: cfg.Digest,
 		Logger:       slog.New(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})),
-	}, s)
+	}
+	if reload {
+		agentCfg.Live = config.NewLive(cfg)
+		agentCfg.ConfigReloadPrepare = prepare
+	}
+	srv, err := New(agentCfg, s)
 	if err != nil {
 		t.Fatalf("agent.New: %v", err)
 	}
@@ -67,7 +88,7 @@ func newDriftFixture(t *testing.T) *driftFixture {
 	if monitor == nil {
 		t.Fatal("newConfigMonitor returned nil for a server that knows its config")
 	}
-	return &driftFixture{t: t, monitor: monitor, store: s, path: path, logBuf: logBuf}
+	return &driftFixture{t: t, monitor: monitor, store: s, live: srv.live, path: path, logBuf: logBuf}
 }
 
 // rewrite replaces the config file's contents and gives it a distinct
@@ -187,7 +208,7 @@ func TestConfigMonitorUnreadableFileDoesNotLatch(t *testing.T) {
 func TestConfigMonitorRunClearsStaleLatch(t *testing.T) {
 	f := newDriftFixture(t)
 	ctx := context.Background()
-	if _, err := f.store.RaiseConfigDrift(ctx, f.path, f.monitor.loaded, bytes.Repeat([]byte{7}, config.DigestLen)); err != nil {
+	if _, err := f.store.RaiseConfigDrift(ctx, store.ConfigDriftState{Path: f.path, Loaded: f.monitor.loaded, Disk: bytes.Repeat([]byte{7}, config.DigestLen)}); err != nil {
 		t.Fatalf("plant a previous process's latch: %v", err)
 	}
 

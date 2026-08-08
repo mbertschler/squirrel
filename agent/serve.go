@@ -138,9 +138,15 @@ func (s *Server) startScanLoop(ctx context.Context, wg *sync.WaitGroup, logger i
 // index_every cadence, a destination verify cadence (F32), or a peer
 // durability-pull cadence (F33). The WaitGroup parallel to startScanLoop's
 // usage lets Serve block on a clean exit during shutdown.
+//
+// An agent that can reload its config (#204) starts the loop regardless:
+// the cadence an operator adds an hour from now needs a scheduler already
+// running to notice it, and a tick over an empty cadence set is a map walk
+// every 30 seconds — cheaper than the alternative of making a new cadence
+// the one edit that still demands a restart.
 func (s *Server) startSchedulerLoop(ctx context.Context, wg *sync.WaitGroup) {
 	sched := newScheduler(s, s.cfg.SchedulerTick, s.cfg.Now)
-	if !sched.anyScheduledWork() {
+	if !sched.anyScheduledWork() && !s.reloadable() {
 		return
 	}
 	wg.Add(1)

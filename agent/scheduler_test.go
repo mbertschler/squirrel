@@ -148,7 +148,7 @@ func newSchedulerFixture(t *testing.T, vols ...*config.Volume) *schedulerFixture
 		Listen:     "127.0.0.1:0",
 		Token:      "tok",
 		Version:    "test",
-		Volumes:    volumes,
+		Live:       config.NewLive(&config.Config{Volumes: volumes}),
 		Logger:     logger,
 		SyncRunner: syncRunner.Runner(),
 	}, s)
@@ -171,29 +171,17 @@ func newSchedulerFixture(t *testing.T, vols ...*config.Volume) *schedulerFixture
 }
 
 // scheduler builds a scheduler against the fixture's server, with the
-// fake clock wired as the time source. The lock holder is the agent's
-// own router so we exercise the same coordination path production
-// uses.
+// fake clock wired as the time source. It goes through newScheduler so the
+// test exercises production's wiring — the agent's own router as the lock
+// holder, the same dispatcher, the same cadence resolution.
+//
+// A test may overwrite verifyEvery or pullEvery on the returned scheduler
+// to stand in for a cadence the fixture's config doesn't declare. That
+// survives ticking because the scheduler has already taken its snapshot of
+// the live config here, and re-derives the cadence maps only when that
+// snapshot is replaced — which is exactly a reload, and no fixture reloads.
 func (f *schedulerFixture) scheduler() *scheduler {
-	return &scheduler{
-		store:          f.srv.store,
-		volumes:        f.srv.cfg.Volumes,
-		dispatch:       newSyncDispatcher(f.srv.cfg.SyncRunner, f.srv.cfg.Logger, f.clock.Now, defaultMaxParallelSyncs),
-		logger:         f.srv.cfg.Logger,
-		locks:          f.srv.router,
-		tickEvery:      time.Second,
-		now:            f.clock.Now,
-		hooks:          newHookRunner(f.srv.store, f.srv.cfg.Logger),
-		verifyRun:      f.srv.cfg.VerifyRunner,
-		durabilityPull: f.srv.cfg.DurabilityPuller,
-		verifyEvery:    resolveVerifyCadences(f.srv.cfg.Destinations, f.srv.cfg.VerifyEvery),
-		pullEvery:      resolvePullCadences(f.srv.cfg.Nodes),
-		// Watermark maps are always initialised (unlike the other cadence
-		// fields, they are written) so tests that set verifyEvery/pullEvery
-		// directly on the returned scheduler don't have to remember to.
-		lastVerify: map[string]time.Time{},
-		lastPull:   map[string]time.Time{},
-	}
+	return newScheduler(f.srv, time.Second, f.clock.Now)
 }
 
 // seedFile drops a single regular file under the fixture's volume
@@ -202,7 +190,7 @@ func (f *schedulerFixture) scheduler() *scheduler {
 // produces at least one entry the indexer's worker pool processes.
 func (f *schedulerFixture) seedFile() {
 	f.t.Helper()
-	for _, vol := range f.srv.cfg.Volumes {
+	for _, vol := range f.srv.live.Get().Volumes {
 		p := filepath.Join(vol.Path, "a.txt")
 		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
 			f.t.Fatalf("write %s: %v", p, err)
@@ -404,7 +392,7 @@ func TestSchedulerSkipsWhenInFlightIndexRun(t *testing.T) {
 
 	// Resolve the volume up front (so the runs.volume_id FK has a row
 	// to point at) then plant a 'running' index row.
-	v, err := f.store.CreateVolume(context.Background(), "pics", f.srv.cfg.Volumes["pics"].Path)
+	v, err := f.store.CreateVolume(context.Background(), "pics", f.srv.live.Get().Volumes["pics"].Path)
 	if err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
@@ -440,7 +428,7 @@ func TestSchedulerSkipsWhenInFlightSyncRun(t *testing.T) {
 	})
 	f.seedFile()
 
-	v, err := f.store.CreateVolume(context.Background(), "pics", f.srv.cfg.Volumes["pics"].Path)
+	v, err := f.store.CreateVolume(context.Background(), "pics", f.srv.live.Get().Volumes["pics"].Path)
 	if err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
@@ -517,7 +505,7 @@ func TestSchedulerSkipsWhenVolumeLockHeld(t *testing.T) {
 	})
 	f.seedFile()
 
-	v, err := f.store.CreateVolume(context.Background(), "pics", f.srv.cfg.Volumes["pics"].Path)
+	v, err := f.store.CreateVolume(context.Background(), "pics", f.srv.live.Get().Volumes["pics"].Path)
 	if err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
@@ -879,7 +867,7 @@ func TestServeIntegratesSchedulerLoop(t *testing.T) {
 		Listen:        "127.0.0.1:0",
 		Token:         "tok",
 		Version:       "test",
-		Volumes:       map[string]*config.Volume{vol.Name: vol},
+		Live:          config.NewLive(&config.Config{Volumes: map[string]*config.Volume{vol.Name: vol}}),
 		SchedulerTick: 25 * time.Millisecond,
 	}, s)
 	if err != nil {

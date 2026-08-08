@@ -23,11 +23,10 @@ func capabilityTestNode(t *testing.T, dests map[string]*config.Destination, sync
 	recvStore := openStoreWithName(t, filepath.Join(root, "recv.db"), "nas")
 	recvVol := &config.Volume{Name: "pics", Path: filepath.Join(root, "pics"), SyncTo: syncTo}
 	srv, err := agent.New(agent.Config{
-		Listen:       "127.0.0.1:0",
-		Token:        "test-token",
-		Version:      "test",
-		Volumes:      map[string]*config.Volume{"pics": recvVol},
-		Destinations: dests,
+		Listen:  "127.0.0.1:0",
+		Token:   "test-token",
+		Version: "test",
+		Live:    config.NewLive(&config.Config{Volumes: map[string]*config.Volume{"pics": recvVol}, Destinations: dests}),
 	}, recvStore)
 	if err != nil {
 		t.Fatalf("agent.New: %v", err)

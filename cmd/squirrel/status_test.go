@@ -128,7 +128,7 @@ func raiseTestConfigDrift(t *testing.T, dbPath, configPath string) {
 	defer s.Close()
 	loaded, disk := make([]byte, 32), make([]byte, 32)
 	disk[0] = 1
-	if _, err := s.RaiseConfigDrift(context.Background(), configPath, loaded, disk); err != nil {
+	if _, err := s.RaiseConfigDrift(context.Background(), store.ConfigDriftState{Path: configPath, Loaded: loaded, Disk: disk}); err != nil {
 		t.Fatalf("RaiseConfigDrift: %v", err)
 	}
 }

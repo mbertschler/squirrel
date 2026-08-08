@@ -28,7 +28,14 @@ const DefaultSchedulerTick = 30 * time.Second
 // the runs table. There is no per-pair time.Ticker — a single tick
 // keeps the "missed window = one run, not many" guarantee trivial.
 type scheduler struct {
-	store     *store.Store
+	store *store.Store
+	// live is where the agent's configuration comes from, and loaded is the
+	// snapshot volumes, verifyEvery, and pullEvery were last derived from.
+	// refresh re-derives them once per reload (#204) rather than once per
+	// tick: the derivation allocates two maps, and comparing the snapshot
+	// pointer answers "has anything changed" exactly.
+	live      *config.Live
+	loaded    *config.Config
 	volumes   map[string]*config.Volume
 	dispatch  *syncDispatcher
 	logger    *slog.Logger
@@ -71,9 +78,9 @@ func newScheduler(srv *Server, tickEvery time.Duration, now func() time.Time) *s
 	if now == nil {
 		now = time.Now
 	}
-	return &scheduler{
+	s := &scheduler{
 		store:          srv.store,
-		volumes:        srv.cfg.Volumes,
+		live:           srv.live,
 		dispatch:       newSyncDispatcher(srv.cfg.SyncRunner, srv.cfg.Logger, now, defaultMaxParallelSyncs),
 		logger:         srv.cfg.Logger,
 		locks:          srv.router,
@@ -82,11 +89,28 @@ func newScheduler(srv *Server, tickEvery time.Duration, now func() time.Time) *s
 		hooks:          newHookRunner(srv.store, srv.cfg.Logger),
 		verifyRun:      srv.cfg.VerifyRunner,
 		durabilityPull: srv.cfg.DurabilityPuller,
-		verifyEvery:    resolveVerifyCadences(srv.cfg.Destinations, srv.cfg.VerifyEvery),
-		pullEvery:      resolvePullCadences(srv.cfg.Nodes),
 		lastVerify:     map[string]time.Time{},
 		lastPull:       map[string]time.Time{},
 	}
+	s.refresh()
+	return s
+}
+
+// refresh re-derives the scheduler's view of config when the agent has
+// reloaded since the last look, and is a pointer comparison otherwise. The
+// in-memory watermarks (lastVerify, lastPull) deliberately survive: a
+// destination whose cadence changed keeps its place in the rotation rather
+// than becoming instantly due, and one that left config simply stops being
+// visited.
+func (s *scheduler) refresh() {
+	cur := s.live.Get()
+	if cur == s.loaded {
+		return
+	}
+	s.loaded = cur
+	s.volumes = cur.Volumes
+	s.verifyEvery = resolveVerifyCadences(cur.Destinations, cur.AgentVerifyEvery())
+	s.pullEvery = resolvePullCadences(cur.Nodes)
 }
 
 // resolveVerifyCadences maps each verifiable (content-addressed or packed)
@@ -160,11 +184,7 @@ func ScheduledWorkInConfig(cfg *config.Config) bool {
 	if cfg == nil {
 		return false
 	}
-	var scanInterval, verifyDefault time.Duration
-	if cfg.Agent != nil {
-		scanInterval, verifyDefault = cfg.Agent.ScanInterval, cfg.Agent.VerifyEvery
-	}
-	if scanInterval > 0 {
+	if cfg.Agent != nil && cfg.Agent.ScanInterval > 0 {
 		return true
 	}
 	for _, v := range cfg.Volumes {
@@ -172,7 +192,7 @@ func ScheduledWorkInConfig(cfg *config.Config) bool {
 			return true
 		}
 	}
-	return len(resolveVerifyCadences(cfg.Destinations, verifyDefault)) > 0 ||
+	return len(resolveVerifyCadences(cfg.Destinations, cfg.AgentVerifyEvery())) > 0 ||
 		len(resolvePullCadences(cfg.Nodes)) > 0
 }
 
@@ -214,7 +234,12 @@ func (s *scheduler) run(ctx context.Context) {
 // via the logger; we never abort the tick on one volume because the
 // others still need their evaluations. Volume iteration is name-sorted
 // so log output is deterministic across runs.
+//
+// The tick boundary is where a reloaded config takes effect: cadences are
+// re-derived here and then held for the whole tick, so a swap can never
+// leave one phase evaluating the new volumes against the old destinations.
 func (s *scheduler) tick(ctx context.Context) {
+	s.refresh()
 	for _, name := range sortedVolumeNames(s.volumes) {
 		if ctx.Err() != nil {
 			return

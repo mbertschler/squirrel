@@ -35,7 +35,7 @@ func newScanServer(t *testing.T) (*Server, *store.Store, *config.Volume) {
 		Listen:       "127.0.0.1:0",
 		Token:        "test-token",
 		Version:      "test",
-		Volumes:      map[string]*config.Volume{vol.Name: vol},
+		Live:         config.NewLive(&config.Config{Volumes: map[string]*config.Volume{vol.Name: vol}}),
 		ScanInterval: 0, // tests drive runScanTick directly
 		ScanStrategy: ScanStrategyShallow,
 	}, s)

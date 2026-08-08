@@ -42,7 +42,7 @@ func newPullDurabilityFixture(t *testing.T) pullDurabilityFixture {
 		Listen:  "127.0.0.1:0",
 		Token:   "test-token",
 		Version: "test",
-		Volumes: map[string]*config.Volume{"pics": {Name: "pics", Path: recvVolPath}},
+		Live:    config.NewLive(&config.Config{Volumes: map[string]*config.Volume{"pics": {Name: "pics", Path: recvVolPath}}}),
 	}, recvStore)
 	if err != nil {
 		t.Fatalf("agent.New: %v", err)

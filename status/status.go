@@ -187,8 +187,8 @@ func (r Report) Level() Level {
 }
 
 // ConfigDrift is the node-wide "the config file changed under the running
-// agent" standing state (F9): the agent is operating on configuration the
-// operator has since edited, and will keep doing so until it is restarted.
+// agent" standing state (F9): part of the operator's edit is not in force,
+// and will not be until they act.
 //
 // Amber, not red: nothing is broken or lost, an intended change simply has
 // not taken effect — the same severity class as needs-init, an expected
@@ -196,9 +196,21 @@ func (r Report) Level() Level {
 // latching is that the failure it prevents is silent, not loud: rotated
 // credentials that only exist in the file, or a volume added to config that
 // nothing is backing up yet.
+//
+// The agent adopts what it can of an edit on its own (#204), so a standing
+// latch always carries *why* it is still standing: PendingKeys when only
+// process-shaped keys are left, ApplyError when nothing could be applied at
+// all. Both empty means the agent could not reload — an embedder, or a
+// config file it was not started from — and the whole edit awaits a restart.
 type ConfigDrift struct {
 	// Path is the config file the running agent loaded.
 	Path string
+	// PendingKeys are the config keys whose change needs an agent restart,
+	// after the agent applied everything it could in place.
+	PendingKeys []string
+	// ApplyError is why the edit could not be adopted at all: the file no
+	// longer loads, or state derived from it could not be rebuilt.
+	ApplyError string
 	// Since is how long the drift has stood — the age of the detection, not
 	// of the edit, which squirrel cannot know.
 	Since time.Duration

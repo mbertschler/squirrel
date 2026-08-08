@@ -125,27 +125,28 @@ type Config struct {
 	// Version is the agent binary version reported via /v1/health.
 	// Required so the field is never an unset zero-value in responses.
 	Version string
-	// Volumes maps volume name → resolved config-side volume. The
-	// peer-sync endpoints consult this to look up the on-disk path
-	// for a volume the initiator named in /v1/sync/begin. A nil map
-	// disables the sync endpoints (they return 404 on every volume),
-	// which is what tests of the auth/health surface want.
-	Volumes map[string]*config.Volume
-	// Destinations maps destination name → resolved config-side
-	// destination, read by two consumers.
+	// Live is the configuration the agent operates on: its volumes, its
+	// destinations, its peer nodes, and the `[agent] verify_every` default.
+	// Every consumer takes a whole snapshot from it — the peer-sync
+	// endpoints looking up the volume named in /v1/sync/begin, the
+	// durability endpoint advertising per-destination offload-gating
+	// capability (#145), the scan loop, and the cadence scheduler — so a
+	// swap is never half-observable.
 	//
-	// The durability endpoint advertises, per destination this node syncs a
-	// volume to, whether it can ever gate offload — so a peer gating on a
-	// relayed required target can fail fast when this node's destination is
-	// structurally incapable (#145). A nil map simply advertises no
-	// capabilities, degrading a peer's pre-check to the per-file gate; it
-	// never affects the sync endpoints.
-	//
-	// The scheduler consults it for the content-addressed/packed
-	// destinations that carry a verify cadence (per-destination
-	// verify_every, or the agent-level VerifyEvery default). Nil disables
-	// the verify cadence.
-	Destinations map[string]*config.Destination
+	// Setting it is also what enables reload (#204, F9): together with
+	// ConfigPath and ConfigDigest, the drift monitor loads the file itself,
+	// applies the half of an edit this process can adopt while running, and
+	// stores the result here. Leaving it nil gives a fixed, empty
+	// configuration — no volumes, no destinations, no nodes — which is what
+	// an embedder or a test of the auth/health surface wants.
+	Live *config.Live
+	// ConfigReloadPrepare, when set alongside Live, is handed each freshly
+	// loaded config before the agent swaps it in, to rebuild whatever
+	// config-derived state lives outside the agent — the CLI wires it to
+	// the rclone lookup and the squirrel-managed rclone.conf. Returning an
+	// error abandons that reload entirely: the agent keeps running the
+	// configuration it has, and the drift latch stands naming the failure.
+	ConfigReloadPrepare func(context.Context, *config.Config) error
 	// SyncRunner is the cadence scheduler's (#39) hook for invoking
 	// one (volume, destination) sync. The CLI wires this to a closure
 	// that calls sync.RunPair against a configured rclone wrapper.
@@ -158,15 +159,6 @@ type Config struct {
 	// peer-sync receiver fixture, and a direct agent→sync edge would
 	// close the cycle.
 	SyncRunner SyncRunner
-	// Nodes maps peer node name → resolved config-side node. The
-	// scheduler consults it for the per-node pull_durability_every
-	// cadence. Nil disables the durability-pull cadence.
-	Nodes map[string]*config.Node
-	// VerifyEvery is the fleet-wide default verify cadence applied to every
-	// verifiable destination that declares no verify_every of its own
-	// (cfg.Agent.VerifyEvery). Zero means no default; a per-destination
-	// cadence still applies.
-	VerifyEvery time.Duration
 	// VerifyRunner is the scheduler's hook for running one destination's
 	// verify pass (F32). Nil disables verify-kicking. The CLI wires it to a
 	// closure over sync.VerifyRemote; an agent whose config has no
@@ -227,7 +219,12 @@ type Config struct {
 // (#17) can acquire the same per-volume lock the /v1/sync/* handlers
 // use, serialising audit and sync against the same volume.
 type Server struct {
-	cfg     Config
+	cfg Config
+	// live is the configuration snapshot every volume-, destination-, and
+	// node-shaped read goes through, so a reload swaps all of them at once.
+	// Never nil: New seeds it from Config.Live, or with an empty
+	// configuration when the caller supplied none.
+	live    *config.Live
 	store   *store.Store
 	router  *peerSyncRouter
 	handler http.Handler
@@ -246,9 +243,22 @@ func New(cfg Config, s *store.Store) (*Server, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
 	}
-	srv := &Server{cfg: cfg, store: s}
+	live := cfg.Live
+	if live == nil {
+		live = config.NewLive(nil)
+	}
+	srv := &Server{cfg: cfg, live: live, store: s}
 	srv.handler = srv.buildHandler()
 	return srv, nil
+}
+
+// reloadable reports whether this agent can adopt a config edit in place:
+// it needs a config file to watch, the digest of the bytes it parsed, and a
+// live holder to swap the result into. An embedder that assembled its
+// configuration by hand has no file to reload from and gets the
+// detect-and-surface behaviour alone.
+func (s *Server) reloadable() bool {
+	return s.cfg.Live != nil && s.cfg.ConfigPath != "" && len(s.cfg.ConfigDigest) == config.DigestLen
 }
 
 // Logger returns the structured logger the agent was configured with.
@@ -313,7 +323,7 @@ func validateConfig(cfg Config) error {
 func (s *Server) buildHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", s.handleHealth)
-	s.router = newPeerSyncRouter(s, s.cfg.Volumes)
+	s.router = newPeerSyncRouter(s)
 	s.router.register(mux)
 	return mux
 }

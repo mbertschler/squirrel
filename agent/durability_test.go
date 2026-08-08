@@ -41,7 +41,7 @@ func postDurability(t *testing.T, srv *Server, body syncproto.DurabilityRequest,
 func TestDurabilityEndpointListsComponents(t *testing.T) {
 	ctx := context.Background()
 	vol := &config.Volume{Name: "pics", Path: t.TempDir()}
-	srv := newTestServer(t, Config{Volumes: map[string]*config.Volume{vol.Name: vol}})
+	srv := newTestServer(t, Config{Live: config.NewLive(&config.Config{Volumes: map[string]*config.Volume{vol.Name: vol}})})
 
 	v, err := srv.store.CreateVolume(ctx, vol.Name, vol.Path)
 	if err != nil {
@@ -105,11 +105,13 @@ func TestDurabilityEndpointRelaysVerifyCadence(t *testing.T) {
 	ctx := context.Background()
 	vol := &config.Volume{Name: "pics", Path: t.TempDir()}
 	srv := newTestServer(t, Config{
-		Volumes: map[string]*config.Volume{vol.Name: vol},
-		Destinations: map[string]*config.Destination{
-			"s3archive": {Layout: config.LayoutPacked, VerifyEvery: 168 * time.Hour},
-			"mirror":    {Layout: config.LayoutMirror},
-		},
+		Live: config.NewLive(&config.Config{
+			Volumes: map[string]*config.Volume{vol.Name: vol},
+			Destinations: map[string]*config.Destination{
+				"s3archive": {Layout: config.LayoutPacked, VerifyEvery: 168 * time.Hour},
+				"mirror":    {Layout: config.LayoutMirror},
+			},
+		}),
 	})
 
 	v, err := srv.store.CreateVolume(ctx, vol.Name, vol.Path)
@@ -160,8 +162,7 @@ func TestDurabilityEndpointAdvertisesCapabilities(t *testing.T) {
 		"s3archive": {Name: "s3archive", Type: "s3", Layout: config.LayoutPacked, Crypt: &config.Crypt{Password: "obscured"}},
 	}
 	srv := newTestServer(t, Config{
-		Volumes:      map[string]*config.Volume{vol.Name: vol},
-		Destinations: dests,
+		Live: config.NewLive(&config.Config{Volumes: map[string]*config.Volume{vol.Name: vol}, Destinations: dests}),
 	})
 
 	var resp syncproto.DurabilityResponse
@@ -188,7 +189,7 @@ func TestDurabilityEndpointAdvertisesCapabilities(t *testing.T) {
 // with an empty component list (a valid "nothing recorded yet").
 func TestDurabilityEndpointGuards(t *testing.T) {
 	vol := &config.Volume{Name: "pics", Path: t.TempDir()}
-	srv := newTestServer(t, Config{Volumes: map[string]*config.Volume{vol.Name: vol}})
+	srv := newTestServer(t, Config{Live: config.NewLive(&config.Config{Volumes: map[string]*config.Volume{vol.Name: vol}})})
 
 	if code := postDurability(t, srv, syncproto.DurabilityRequest{Volume: "ghost"}, nil); code != http.StatusNotFound {
 		t.Fatalf("undeclared volume status = %d, want 404", code)
