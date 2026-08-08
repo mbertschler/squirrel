@@ -137,6 +137,12 @@ func buildVolume(ctx context.Context, s *store.Store, cfg *config.Config, self s
 	if err != nil {
 		return VolumeStatus{}, err
 	}
+	// The fleet rows are built from the targets, so the places the config
+	// declares carry the freshness the grid already read rather than
+	// re-querying it (#187).
+	if vs.Fleet, err = buildFleet(ctx, s, cfg, vol, dbVol.ID, self.ID, vs.Targets, now); err != nil {
+		return VolumeStatus{}, err
+	}
 	if opts.SkipOffloadReadiness {
 		return vs, nil
 	}

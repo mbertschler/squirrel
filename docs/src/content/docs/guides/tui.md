@@ -38,7 +38,14 @@ routine state, so a healthy household is a short screen.
   state, durability, verify method, and evidence age, each cell coloured by
   severity. This is the per-(volume × destination) grid: a target that has been
   failing for a week cannot hide behind a fresh ✓ earned by a different one.
-  Each volume block closes with its offload readiness.
+  Each volume's header line carries its index freshness and offload readiness.
+- **Fleet** — under each volume's grid, one row per *other* place it lives: the
+  other machines as well as the destinations. Whether each is behind or ahead of
+  this machine, how many files have not reached it, when it last changed, and
+  when it was last verified. This is the answer to "where else does this volume
+  live, and is any of it out of date" without walking to another machine — and
+  it is the only place a machine that pushes *to* this one shows up at all,
+  since no target row mentions it.
 
 The coverage panel and
 [`squirrel status`](/squirrel/reference/cli/#squirrel-status) render the same
@@ -62,8 +69,9 @@ progress view. The TUI and desktop app both read the state the
 [agent](/squirrel/guides/agent/) maintains, so what you see reflects live
 activity.
 
-:::note[One node's answer]
-Every surface reads the local index, so a machine's TUI answers for *that*
-machine. In a multi-machine household each node has its own database and its own
-dashboard; there is no combined fleet view yet.
+:::note[Every row carries an "as of"]
+Fleet rows describe another machine as of the last exchange with it, not as of
+now. A peer that has gone dark reads as **unknown**, never as fine — the same
+fail-closed stance the [offload gate](/squirrel/guides/offloading/) takes toward
+stale evidence.
 :::

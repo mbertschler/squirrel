@@ -2,6 +2,7 @@ package status
 
 import (
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/mbertschler/squirrel/store"
@@ -146,6 +147,64 @@ func EvidenceLabel(t TargetStatus) string {
 		age += " STALE"
 	}
 	return age
+}
+
+// FleetStateLabel renders a fleet row's headline, folding staleness into
+// it: a row whose facts have run past the relationship's own budget reads
+// "unknown" whatever those facts say, so a place gone dark can never
+// present month-old agreement as current agreement (ux-principle 3). The
+// figures themselves stay on the row — they are the last thing known, and
+// saying so is different from claiming it still holds.
+func FleetStateLabel(p FleetPlace) string {
+	if p.Stale {
+		return "unknown"
+	}
+	return p.State.String()
+}
+
+// FleetMissingLabel renders how many present files have not reached the
+// place, or — when this node holds no coverage evidence for it at all, a
+// state that must not render as zero.
+func FleetMissingLabel(p FleetPlace) string {
+	if !p.MissingKnown {
+		return "—"
+	}
+	return strconv.Itoa(p.Missing)
+}
+
+// FleetChangeLabel renders when content at the place last changed as far as
+// this node knows. With no exchange on record it reads "never" for a place
+// this node pushes to — nothing has ever gone there — and "unknown" for one
+// whose contents only ever change at someone else's hand.
+func FleetChangeLabel(p FleetPlace) string {
+	absent := "unknown"
+	if p.SyncTarget {
+		absent = "never"
+	}
+	return agoLabel(p.LastChangeAgo, absent)
+}
+
+// FleetVerifiedLabel renders the age of the oldest verification behind the
+// place's coverage — "unknown" when any component carries none, which the
+// offload gate treats as infinitely stale.
+func FleetVerifiedLabel(p FleetPlace) string {
+	return agoLabel(p.LastVerifiedAgo, "unknown")
+}
+
+// FleetAsOfLabel renders how long ago this node last learned anything about
+// the place. It is the row's own freshness: every other cell is a fact as
+// of this moment and no later.
+func FleetAsOfLabel(p FleetPlace) string {
+	return agoLabel(p.AsOfAgo, "never")
+}
+
+// agoLabel renders an age as "4m ago", or the supplied word when the
+// instant is unknown.
+func agoLabel(d *time.Duration, absent string) string {
+	if d == nil {
+		return absent
+	}
+	return HumanAge(*d) + " ago"
 }
 
 // OffloadLabel renders the "N offloadable now" decision-support line

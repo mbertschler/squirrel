@@ -72,7 +72,13 @@ func evidenceAge(verifiedAtNs sql.NullInt64, now time.Time) *time.Duration {
 	if !verifiedAtNs.Valid {
 		return nil
 	}
-	d := now.Sub(time.Unix(0, verifiedAtNs.Int64))
+	return ageSince(verifiedAtNs.Int64, now)
+}
+
+// ageSince returns how long ago an ns-timestamp was, clamped at zero for
+// clock skew like ageOf. Never nil — the caller has an instant.
+func ageSince(ns int64, now time.Time) *time.Duration {
+	d := now.Sub(time.Unix(0, ns))
 	if d < 0 {
 		d = 0
 	}
