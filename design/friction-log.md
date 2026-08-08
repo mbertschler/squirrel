@@ -93,16 +93,30 @@ gets a marker precisely against this error class; the volume side has
 no equivalent ("path exists but is empty — new volume or wrong
 mount?").
 
-**F9 · S3 — config changes require a manual agent restart.** The agent
-neither reloads config nor notices drift between its loaded state and
-the file on disk. Editing cloudbox auth meant: edit file, kill agent,
-restart, re-check — with no warning anywhere had the restart been
-forgotten (the agent would happily keep syncing with dead credentials
-and the F6-grade error reporting).
+**F9 · S3 — config changes require a manual agent restart.
+(drift is now noticed and surfaced, #191; the restart itself remains)**
+The agent neither reloaded config nor noticed drift between its loaded
+state and the file on disk. Editing cloudbox auth meant: edit file,
+kill agent, restart, re-check — with no warning anywhere had the
+restart been forgotten (the agent would happily keep syncing with dead
+credentials and the F6-grade error reporting).
 
-*Still open* — and now the only surviving violation of "set up once,
-then trust" (`ux-principles.md` §1), since a config edit is the one
-routine flow that still ends in a hand-typed chore.
+*Half closed.* The silent half is gone: the agent hashes the config's
+contents at load, re-reads the file every minute, and on a content
+difference (never an mtime one) latches a standing state that
+`squirrel status` and the TUI both render — "config on disk has
+changed since this agent started; restart to apply" — until the agent
+is restarted or the file's bytes come back. A forgotten restart is now
+a visible amber, not a week of dead credentials.
+
+*Still open, at reduced severity:* the restart is still a hand-typed
+chore, so this remains a violation of "set up once, then trust"
+(`ux-principles.md` §1) — just no longer a silent one. Closing it
+outright means live reload, which is a different problem: re-arming
+cadences, keeping in-flight runs off a half-swapped config, and
+leaving the running agent untouched when the new file does not parse.
+Detection was landed on its own precisely because a reload that can
+wedge the agent would be worse than the restart it replaces.
 
 **F10 · S2 — ~~the scheduler pounds un-bootstrapped destinations.~~ (refused runs consume the cadence window, #174; `needs-init` standing state, #177)**
 Before `--init`, every cadence tick retried kopia-mirror (and failing
@@ -566,11 +580,10 @@ offload being structurally unreachable — is reachable in code.
 
 Still open, in rough priority:
 
-- **F9 · S3** — the agent neither reloads config nor warns on drift
-  against the file on disk. Logged S3 on the night, but it is the last
-  standing violation of set-up-once-then-trust
-  (`ux-principles.md` §1), which arguably prices it higher now that
-  the louder findings are gone.
+- **F9 · S3 (remainder)** — the agent now notices and surfaces config
+  drift (#191), so a forgotten restart is no longer silent; it still
+  does not *reload*, so the restart remains the one routine flow that
+  ends in a hand-typed chore (`ux-principles.md` §1).
 - **F31 · S3 (remainder)** — the recovery runbook is written; the
   guided `squirrel recover` flow is not.
 - **Fleet view** — not a walk finding but the standing open problem in

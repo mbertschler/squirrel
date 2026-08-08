@@ -67,7 +67,7 @@ mid-flight never completed, so the cadence re-attempts it.
 | index | `squirrel index` (and the [agent](/squirrel/guides/agent/) on cadence) |
 | sync | `squirrel sync` |
 | restore | `squirrel restore` |
-| audit | `squirrel audit`, `squirrel verify`, and `squirrel runs fail` (a `manual-fail` audit row) |
+| audit | `squirrel audit`, `squirrel verify`, `squirrel runs fail` (a `manual-fail` audit row), and the [agent](/squirrel/guides/agent/) noticing [config drift](/squirrel/guides/agent/#config-edits-need-a-restart--and-the-agent-says-so) |
 | offload | `squirrel offload` (`kind='offload'`) |
 
 These five are the whole set. `verify` in particular is **not** a kind of its

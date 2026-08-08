@@ -176,6 +176,19 @@ type Config struct {
 	// peer) durability pull (F33). Nil disables pull-kicking. The CLI wires
 	// it to a closure over sync.PullDurability.
 	DurabilityPuller DurabilityPuller
+	// ConfigPath is the config file this agent was started from, and
+	// ConfigDigest the content digest config.Load computed for the bytes it
+	// parsed (config.Config.Path and .Digest). Both set enables the
+	// config-drift monitor (#191, F9): the agent re-hashes the file on a
+	// cadence and latches a standing state when it no longer matches what
+	// it is running. Leaving either unset disables the monitor, which is
+	// what an embedder assembling a Config by hand gets.
+	ConfigPath   string
+	ConfigDigest []byte
+	// ConfigCheckEvery overrides the config-drift re-check period. Zero
+	// falls back to DefaultConfigCheckInterval; tests pin it small, and
+	// production has no reason to touch it.
+	ConfigCheckEvery time.Duration
 	// SchedulerTick overrides the scheduler's evaluation period.
 	// Zero falls back to DefaultSchedulerTick. Tests pin it to a
 	// small value; production rarely needs to touch it.

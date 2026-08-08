@@ -57,6 +57,9 @@ func BuildWithOptions(ctx context.Context, s *store.Store, cfg *config.Config, o
 		return Report{}, fmt.Errorf("list destination alarms: %w", err)
 	}
 	alarmByDest := indexAlarms(alarms)
+	if rep.ConfigDrift, err = configDrift(ctx, s, rep.Now); err != nil {
+		return Report{}, err
+	}
 	for _, name := range sortedVolumeNames(cfg) {
 		vs, err := buildVolume(ctx, s, cfg, self, alarmByDest, cfg.Volumes[name], rep.Now, opts)
 		if err != nil {
@@ -65,6 +68,22 @@ func BuildWithOptions(ctx context.Context, s *store.Store, cfg *config.Config, o
 		rep.Volumes = append(rep.Volumes, vs)
 	}
 	return rep, nil
+}
+
+// configDrift reads the standing config-drift latch the agent maintains
+// (F9), or nil when the running config still matches the file on disk. It
+// is read from the index rather than recomputed here because only the agent
+// knows which bytes it actually loaded — an introspection command hashing
+// the file itself could only ever compare it against itself.
+func configDrift(ctx context.Context, s *store.Store, now time.Time) (*ConfigDrift, error) {
+	d, err := s.GetConfigDrift(ctx)
+	if store.IsNotFound(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("look up config drift: %w", err)
+	}
+	return &ConfigDrift{Path: d.Path, Since: now.Sub(time.Unix(0, d.RaisedAtNs))}, nil
 }
 
 // indexAlarms keys the active alarms by destination name for O(1) lookup

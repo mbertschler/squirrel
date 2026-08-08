@@ -1,6 +1,6 @@
 ---
 title: Terminal UI
-description: The trust surface — answer "am I safe?" at a glance, with per-target coverage, durability, standing alarms, and contested paths, plus live runs and an ncdu-style index browser.
+description: The trust surface — answer "am I safe?" at a glance, with per-target coverage, durability, standing alarms, contested paths, and config drift, plus live runs and an ncdu-style index browser.
 ---
 
 `squirrel tui` opens an interactive terminal UI. Its job is to answer one
@@ -20,6 +20,11 @@ it prints help.
 The first screen is ordered by urgency — anything wrong appears above the
 routine state, so a healthy household is a short screen.
 
+- **Config drift** — shown right under the agent's health when the config file
+  on disk no longer matches the one the [agent](/squirrel/guides/agent/) is
+  running: *"config on disk has changed since this agent started; restart to
+  apply"*. It stands until the agent is restarted or the file's contents come
+  back, so a forgotten restart cannot hide.
 - **Alarms** — standing per-destination alarms raised by a
   [verify](/squirrel/guides/verification/) mismatch. An alarm latches: it
   outlives the run that found it and stays until a clean pass or an explicit

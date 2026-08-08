@@ -134,8 +134,18 @@ func TestMigrateV26ToV27PreservesEveryRow(t *testing.T) {
 			t.Errorf("%s rows = %d after migration, want %d", table, after, want)
 		}
 	}
-	if got, want := len(countsAfter), len(countsBefore); got != want {
+	// Open carries the fixture past v27 to SchemaVersion, so tables created
+	// by later migrations are legitimately present after the rebuild and
+	// absent from the v26 fixture. Naming them keeps the count assertion
+	// exact — a table the rebuild itself invented would still fail here.
+	addedAfterV27 := []string{"config_drift"} // v29 (#191)
+	if got, want := len(countsAfter), len(countsBefore)+len(addedAfterV27); got != want {
 		t.Errorf("table count = %d after migration, want %d", got, want)
+	}
+	for _, table := range addedAfterV27 {
+		if _, ok := countsAfter[table]; !ok {
+			t.Errorf("table %s missing after migration to v%d", table, SchemaVersion)
+		}
 	}
 	if after := schemaObjectNames(t, s.db); !equalStrings(after, objectsBefore) {
 		t.Errorf("indexes/triggers after migration = %v, want %v", after, objectsBefore)

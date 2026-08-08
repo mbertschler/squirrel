@@ -58,8 +58,9 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 // When Config.ScanInterval is non-zero the drift-detection scheduler
 // (#17) runs in a sibling goroutine off the same context; when any
 // volume declares a sync_every / index_every cadence the cadence
-// scheduler (#39) runs in another sibling. Cancelling ctx stops all of
-// them.
+// scheduler (#39) runs in another sibling; and when the agent knows its
+// config file the config-drift monitor (#191) runs in a third. Cancelling
+// ctx stops all of them.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	httpSrv := &http.Server{
 		Handler:           s.handler,
@@ -76,6 +77,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	var loopWG sync.WaitGroup
 	s.startScanLoop(loopCtx, &loopWG, s.scanLogger())
 	s.startSchedulerLoop(loopCtx, &loopWG)
+	s.startConfigDriftLoop(loopCtx, &loopWG)
 
 	select {
 	case <-ctx.Done():
@@ -97,16 +99,19 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 // an HTTP listener — the listener-less agent mode (F35) for cadence-only
 // machines that never receive peer syncs. It blocks until ctx is
 // cancelled, then waits for an in-flight loop tick to finish its volume,
-// mirroring Serve's shutdown discipline minus the HTTP server. The two
-// loops are gated exactly as under Serve (scan only when ScanInterval is
-// set; scheduler only when a volume declares a cadence), so an agent with
-// nothing scheduled runs no goroutines and simply waits for cancellation.
+// mirroring Serve's shutdown discipline minus the HTTP server. The loops
+// are gated exactly as under Serve (scan only when ScanInterval is set;
+// scheduler only when a volume declares a cadence; config-drift monitor
+// only when the agent knows its config file), so an agent with nothing
+// scheduled and no config path runs no goroutines and simply waits for
+// cancellation.
 func (s *Server) RunSchedulers(ctx context.Context) error {
 	loopCtx, cancelLoops := context.WithCancel(ctx)
 	defer cancelLoops()
 	var loopWG sync.WaitGroup
 	s.startScanLoop(loopCtx, &loopWG, s.scanLogger())
 	s.startSchedulerLoop(loopCtx, &loopWG)
+	s.startConfigDriftLoop(loopCtx, &loopWG)
 	<-ctx.Done()
 	cancelLoops()
 	loopWG.Wait()
@@ -142,6 +147,24 @@ func (s *Server) startSchedulerLoop(ctx context.Context, wg *sync.WaitGroup) {
 	go func() {
 		defer wg.Done()
 		sched.run(ctx)
+	}()
+}
+
+// startConfigDriftLoop spins up the config-drift monitor (#191, F9) in a
+// sibling goroutine, but only when the agent knows which config file it was
+// started from. It runs under both Serve and RunSchedulers, and regardless
+// of whether anything is scheduled: an agent whose only job is receiving
+// peer syncs is just as capable of running config its operator has since
+// edited.
+func (s *Server) startConfigDriftLoop(ctx context.Context, wg *sync.WaitGroup) {
+	monitor := newConfigMonitor(s)
+	if monitor == nil {
+		return
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		monitor.run(ctx)
 	}()
 }
 

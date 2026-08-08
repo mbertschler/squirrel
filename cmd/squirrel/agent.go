@@ -74,6 +74,11 @@ func runAgent(cmd *cobra.Command) error {
 		ScanStrategy:     cfg.Agent.ScanStrategy,
 		ScanLogger:       cmd.ErrOrStderr(),
 		Logger:           logger,
+		// The file this process parsed and the digest of its bytes: the
+		// agent re-reads the same path on a cadence and says so when it no
+		// longer matches what it is running (F9).
+		ConfigPath:   cfg.Path,
+		ConfigDigest: cfg.Digest,
 	}, s)
 	if err != nil {
 		return err

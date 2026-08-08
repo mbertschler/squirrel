@@ -62,6 +62,13 @@ type Config struct {
 	// an absent table resolves to DefaultBackups (snapshot-on-sync on with
 	// sensible defaults).
 	Backups Backups
+	// Digest is the content identity of the file this Config was loaded
+	// from: the BLAKE3-256 of the exact bytes Load decoded (DigestLen
+	// bytes). The agent records it at startup and re-compares it against
+	// the file on disk on a cadence, so an edit that has not been applied
+	// yet is noticed rather than silently ignored (F9). Comparing content
+	// rather than mtime means a same-bytes rewrite is not a change.
+	Digest []byte
 }
 
 // Volume is one indexable root.
@@ -280,6 +287,9 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid config %s: %w", path, err)
 	}
+	// Hash the exact bytes that produced this Config, so the agent's later
+	// drift check compares like with like (F9).
+	cfg.Digest = digestBytes(data)
 	return cfg, nil
 }
 
