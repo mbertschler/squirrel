@@ -148,8 +148,14 @@ check without parsing the grid:
 | Exit | Level | Meaning |
 |---|---|---|
 | `0` | green / neutral | Caught up within cadence and durable where policy requires; nothing to report. |
-| `1` | amber | Not caught up yet, needs a one-time bootstrap, evidence aged past policy, or the agent's config has drifted from the file on disk. Recoverable and expected. |
+| `1` | amber | Not caught up yet, needs a one-time bootstrap, has a peer byte-path that does not currently resolve, evidence aged past policy, or the agent's config has drifted from the file on disk. Recoverable and expected. |
 | `2` | red | A latched alarm, a failed or regressed sync, or a pair far past its cadence. |
+
+A target sitting on a peer node also reports `byte-path` when that node's
+configured [`path`](/squirrel/reference/configuration/) does not currently
+resolve to a directory — bytes cannot land until it does, and the symptom
+otherwise is only that transfers never arrive. It is checked on every status
+build rather than cached, so a mount coming back is reflected immediately.
 
 Passing a volume name scopes both the grid and the exit code to that volume, so
 a per-volume check is not reddened by an unrelated one. Config drift is the one

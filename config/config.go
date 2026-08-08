@@ -387,6 +387,9 @@ func (r *rawConfig) resolve(path string) (*Config, error) {
 		}
 		cfg.Volumes[name] = vol
 	}
+	if err := validateNodeBytePaths(cfg); err != nil {
+		return nil, err
+	}
 	if r.Agent != nil {
 		a, err := resolveAgent(r.Agent)
 		if err != nil {
