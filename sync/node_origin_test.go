@@ -105,7 +105,7 @@ func newChainPeer(t *testing.T, root, name string) *chainPeer {
 		Listen:  "127.0.0.1:0",
 		Token:   "test-token",
 		Version: "test",
-		Volumes: map[string]*config.Volume{"pics": vol},
+		Live:    config.NewLive(&config.Config{Volumes: map[string]*config.Volume{"pics": vol}}),
 	}, s)
 	if err != nil {
 		t.Fatalf("agent.New(%s): %v", name, err)

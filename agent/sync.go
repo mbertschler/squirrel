@@ -71,9 +71,13 @@ var maxPlanEntries = 1 << 20
 // endpoints: the volume-level lock map (one in-flight session per
 // volume) and the session table (transient state between /begin and
 // /close, keyed by receiver_run_id).
+// The volume set is deliberately not a field: it is read from the server's
+// live config per request, so an operator adding a volume to config gets a
+// receiver that hosts it without a restart (#204). The lock map is not — an
+// in-flight session's lock must outlive any reload — and a session captures
+// its *config.Volume at /begin, so one sync run always sees one policy.
 type peerSyncRouter struct {
 	srv      *Server
-	volumes  map[string]*config.Volume
 	mu       sync.Mutex
 	locks    map[int64]bool         // volume_id → busy
 	sessions map[int64]*peerSession // receiver_run_id → state
@@ -156,10 +160,9 @@ type sessionEntry struct {
 	copyFromPath string
 }
 
-func newPeerSyncRouter(srv *Server, volumes map[string]*config.Volume) *peerSyncRouter {
+func newPeerSyncRouter(srv *Server) *peerSyncRouter {
 	return &peerSyncRouter{
 		srv:      srv,
-		volumes:  volumes,
 		locks:    make(map[int64]bool),
 		sessions: make(map[int64]*peerSession),
 	}
@@ -301,7 +304,7 @@ func (r *peerSyncRouter) beginSession(ctx context.Context, body syncproto.BeginR
 	if err != nil {
 		return syncproto.BeginResponse{}, http.StatusBadRequest, err
 	}
-	vol, ok := r.volumes[body.Volume]
+	vol, ok := r.srv.live.Get().Volumes[body.Volume]
 	if !ok {
 		return syncproto.BeginResponse{}, http.StatusNotFound, fmt.Errorf("volume %q is not declared on this node", body.Volume)
 	}

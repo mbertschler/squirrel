@@ -138,13 +138,17 @@ docs  /home/you/Documents  [amber]
 overall: amber
 ```
 
-When the [agent](/squirrel/guides/agent/) has noticed its config file change on
-disk since it started, a line above the grid says so and holds the report at
-amber until the agent is restarted:
+The [agent](/squirrel/guides/agent/) applies a config edit itself, but part of
+one can need a restart — its listener, its credentials, its scan loop. When it
+does, a line above the grid names exactly which keys, and holds the report at
+amber until the restart happens:
 
 ```
-config on disk has changed since this agent started; restart to apply (/home/you/.squirrel/config.toml, noticed 12m ago)
+config on disk has changed; the agent applied what it could and agent.auth.token still need a restart (/home/you/.squirrel/config.toml, noticed 12m ago)
 ```
+
+The same line reports an edit the agent could not adopt at all — a file that no
+longer parses — in which case it is still running the last config it loaded.
 
 Below the target grid, a **fleet** block answers where else the volume lives —
 the other machines as well as the destinations — and how current each copy is

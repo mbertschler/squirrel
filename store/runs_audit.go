@@ -72,8 +72,14 @@ const (
 	// against the run that raised it. The note carries the reason — the
 	// agent restarted onto the config on disk, or the file's content came
 	// back to what the running agent loaded. No operator: the resolving act
-	// is a restart or an edit, not a typed command.
+	// is a restart, a reload, or an edit, not a typed command.
 	TransitionConfigDriftClear = "config-drift-clear"
+	// TransitionConfigReload records the agent adopting a config edit while
+	// running (#204, F9), against its own kind='audit' run. The note carries
+	// the config path, the keys applied in place, and the keys that still
+	// want a restart — so "the agent changed its own operating configuration
+	// at 02:14, and this is what it changed" survives in the audit trail.
+	TransitionConfigReload = "config-reload"
 	// TransitionResetDestination records a `squirrel destination reset`:
 	// the operator forgetting a destination's recorded upload and
 	// durability state (ResetDestination). It shares the destination-scoped

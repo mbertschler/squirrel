@@ -93,30 +93,36 @@ gets a marker precisely against this error class; the volume side has
 no equivalent ("path exists but is empty — new volume or wrong
 mount?").
 
-**F9 · S3 — config changes require a manual agent restart.
-(drift is now noticed and surfaced, #191; the restart itself remains)**
+**F9 · S3 — ~~config changes require a manual agent restart.~~
+(detection #191, reload #204)**
 The agent neither reloaded config nor noticed drift between its loaded
 state and the file on disk. Editing cloudbox auth meant: edit file,
 kill agent, restart, re-check — with no warning anywhere had the
 restart been forgotten (the agent would happily keep syncing with dead
 credentials and the F6-grade error reporting).
 
-*Half closed.* The silent half is gone: the agent hashes the config's
-contents at load, re-reads the file every minute, and on a content
-difference (never an mtime one) latches a standing state that
-`squirrel status` and the TUI both render — "config on disk has
-changed since this agent started; restart to apply" — until the agent
-is restarted or the file's bytes come back. A forgotten restart is now
-a visible amber, not a week of dead credentials.
+*Closed in two halves.* #191 removed the silence: the agent hashes the
+config's contents at load, re-reads the file every minute, and acts on
+a content difference (never an mtime one). #204 turned that detection
+into application. The agent now loads and validates the file itself
+and swaps the policy layer — volumes, destinations, nodes, backups,
+the `[agent] verify_every` default — into force atomically, between
+scheduler ticks and between requests, so nothing in flight is
+disturbed and no reader ever sees half a config. Editing cloudbox
+auth today means: edit file.
 
-*Still open, at reduced severity:* the restart is still a hand-typed
-chore, so this remains a violation of "set up once, then trust"
-(`ux-principles.md` §1) — just no longer a silent one. Closing it
-outright means live reload, which is a different problem: re-arming
-cadences, keeping in-flight runs off a half-swapped config, and
-leaving the running agent untouched when the new file does not parse.
-Detection was landed on its own precisely because a reload that can
-wedge the agent would be worse than the restart it replaces.
+*What a restart still owes, and why that is not the same finding:*
+the keys that shape the process rather than its policy — `listen`,
+the TLS pair, `auth.token`, `auth.peers`, `scan_interval`,
+`scan_strategy`, `db`, `node_name` — cannot change under a bound
+listener or an armed loop. Those latch a standing state that **names
+them**, so the operator is told "`agent.auth.token` needs a restart",
+not "something changed"; a file that no longer loads latches the parse
+error instead and leaves the running agent entirely untouched. The
+principle the original finding was measured against —
+`ux-principles.md` §1, no routine action typed by hand — holds: a
+config edit is no longer a routine restart, and the one class that
+still is says so by name.
 
 **F10 · S2 — ~~the scheduler pounds un-bootstrapped destinations.~~ (refused runs consume the cadence window, #174; `needs-init` standing state, #177)**
 Before `--init`, every cadence tick retried kopia-mirror (and failing
@@ -591,12 +597,15 @@ were open at the end of the walk (F13, F21, F26, F29, F30) are closed,
 as are all four product bugs. What the walk called the flagship gap —
 offload being structurally unreachable — is reachable in code.
 
-Still open, in rough priority:
+Both entries that stood open here at the end of the walk have since
+closed, and are kept struck through rather than deleted because each
+left a boundary worth knowing about:
 
-- **F9 · S3 (remainder)** — the agent now notices and surfaces config
-  drift (#191), so a forgotten restart is no longer silent; it still
-  does not *reload*, so the restart remains the one routine flow that
-  ends in a hand-typed chore (`ux-principles.md` §1).
+- **~~F9 · S3 (remainder)~~** — the agent notices config drift (#191)
+  *and* applies it (#204): the policy layer reloads in place, and an
+  edit to the process-shaped keys latches a standing state naming
+  exactly which ones a restart still owes. The last routine flow that
+  ended in a hand-typed chore no longer does (`ux-principles.md` §1).
 - **~~Fleet view~~ (the fleet block on `status` and the dashboard,
   #187)** — not a walk finding but the standing open problem in
   `ux-principles.md` §3: every surface answered for one node, and the

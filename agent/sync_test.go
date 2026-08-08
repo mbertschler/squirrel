@@ -49,7 +49,7 @@ func newPreStageFixture(t *testing.T) *preStageFixture {
 	ctx := context.Background()
 	volRoot := t.TempDir()
 	vol := &config.Volume{Name: "pics", Path: volRoot}
-	srv := newTestServer(t, Config{Volumes: map[string]*config.Volume{vol.Name: vol}})
+	srv := newTestServer(t, Config{Live: config.NewLive(&config.Config{Volumes: map[string]*config.Volume{vol.Name: vol}})})
 
 	v, err := srv.store.CreateVolume(ctx, vol.Name, vol.Path)
 	if err != nil {
@@ -654,7 +654,7 @@ func TestSessionBoundToCaller(t *testing.T) {
 // entry count that stays within the byte ceiling.
 func TestPlanRejectsOversizedBody(t *testing.T) {
 	vol := &config.Volume{Name: "pics", Path: t.TempDir()}
-	srv := newTestServer(t, Config{Volumes: map[string]*config.Volume{vol.Name: vol}})
+	srv := newTestServer(t, Config{Live: config.NewLive(&config.Config{Volumes: map[string]*config.Volume{vol.Name: vol}})})
 
 	t.Run("body over the byte cap", func(t *testing.T) {
 		prev := maxPlanBodyBytes
@@ -716,7 +716,7 @@ func TestPeerTokenSessionBinding(t *testing.T) {
 	vol := &config.Volume{Name: "pics", Path: t.TempDir()}
 	srv := newTestServer(t, Config{
 		Token:      "shared",
-		Volumes:    map[string]*config.Volume{vol.Name: vol},
+		Live:       config.NewLive(&config.Config{Volumes: map[string]*config.Volume{vol.Name: vol}}),
 		PeerTokens: map[string]string{"owner-token": "owner", "intruder-token": "intruder"},
 	})
 
@@ -744,7 +744,7 @@ func TestBeginRejectsImpersonatedNodeName(t *testing.T) {
 	vol := &config.Volume{Name: "pics", Path: t.TempDir()}
 	srv := newTestServer(t, Config{
 		Token:      "shared",
-		Volumes:    map[string]*config.Volume{vol.Name: vol},
+		Live:       config.NewLive(&config.Config{Volumes: map[string]*config.Volume{vol.Name: vol}}),
 		PeerTokens: map[string]string{"owner-token": "owner"},
 	})
 	code := postJSON(t, srv, "/v1/sync/begin", "owner-token", syncproto.BeginRequest{

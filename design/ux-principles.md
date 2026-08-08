@@ -21,11 +21,15 @@ The corollary: **any routine action that must be typed by hand is a
 design bug.** Every known violation is catalogued with evidence and a
 severity in [`friction-log.md`](friction-log.md) — the log is the
 single home for gaps; this document states only the principles they
-are measured against. (The first walk found four — F17, F21, F32, F33 —
-all since closed. One remains: F9, where a config edit still needs a
-manual agent restart — the agent now *notices* that the file on disk
-has changed under it and latches a standing state saying so, but
-applying the change is still typed by hand.)
+are measured against. (The first walk found five — F17, F21, F32, F33,
+F9 — all since closed. F9, the last of them, was a config edit needing
+a manual agent restart: the agent now reloads its volumes,
+destinations, nodes, backups, and verify cadence in place, and where
+an edit touches the shape of the process itself — its listener, its
+credentials, its scan loop — it latches a standing state naming those
+specific keys rather than the whole file. A restart is no longer a
+routine step, only the residue of one narrow class of edit, and the
+agent says precisely when that class is what you typed.)
 
 ## 2. The CLI is for change and for questions — never for operations
 

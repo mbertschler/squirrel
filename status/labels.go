@@ -220,11 +220,12 @@ func OffloadLabel(o OffloadReadiness) string {
 
 // ConfigDriftLabel renders the standing config-drift latch (F9): the one
 // sentence both surfaces print, followed by the file it is about and how
-// long the drift has stood. The wording is the store's, so the CLI, the
-// TUI, the agent's log line, and the audit trail all say it identically.
+// long the drift has stood. The wording is the store's — chosen there from
+// what the agent managed to do about the edit — so the CLI, the TUI, the
+// agent's log line, and the audit trail all say it identically.
 func ConfigDriftLabel(d ConfigDrift) string {
 	return fmt.Sprintf("%s (%s, noticed %s ago)",
-		store.ConfigDriftMessage, d.Path, HumanAge(d.Since))
+		store.ConfigDriftMessageFor(d.PendingKeys, d.ApplyError), d.Path, HumanAge(d.Since))
 }
 
 // TrafficLight maps a level to the green/amber/red word the CLI summary

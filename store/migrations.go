@@ -10,7 +10,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 29
+const SchemaVersion = 30
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -72,6 +72,7 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 27, up: migrateV26ToV27},
 		{version: 28, up: migrateV27ToV28},
 		{version: 29, up: migrateV28ToV29},
+		{version: 30, up: migrateV29ToV30},
 	}
 }
 
@@ -2351,4 +2352,46 @@ func createConfigDriftV29(ctx context.Context, tx *sql.Tx) error {
 		return fmt.Errorf("create config_drift: %w", err)
 	}
 	return nil
+}
+
+// --- v29 → v30 ---
+
+// migrateV29ToV30 widens the config_drift latch from "something changed" to
+// "here is what is left to do about it" (#204, F9). The agent now applies
+// the reloadable half of a config edit in place, so the latch has three
+// distinct things to say rather than one, and a surface can only say them
+// if the row records which:
+//
+//   - pending_keys — the config keys whose change this process cannot adopt
+//     while running (its listener, its credentials, its scan loop). The
+//     policy half was applied; these still want a restart, and naming them
+//     is the difference between "restart now, credentials are stale" and
+//     "restart whenever".
+//   - apply_error — set when the file on disk changed but could not be
+//     adopted at all: it no longer parses, or the state derived from it
+//     could not be rebuilt. The agent keeps running its last good config,
+//     which is a materially different state from a pending restart.
+//
+// Both default to empty, which is exactly the pre-#204 meaning ("the whole
+// edit is pending a restart"), so an index migrated from v29 with a latch
+// standing keeps saying what it said. Additive columns on a STRICT table:
+// no rebuild, and TEXT NOT NULL DEFAULT ” is a constant default ALTER
+// TABLE accepts.
+func migrateV29ToV30(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	for _, col := range []string{"pending_keys", "apply_error"} {
+		stmt := fmt.Sprintf(`ALTER TABLE config_drift ADD COLUMN %s TEXT NOT NULL DEFAULT ''`, col)
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("add config_drift.%s: %w", col, err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (30)`); err != nil {
+		return fmt.Errorf("record schema v30: %w", err)
+	}
+	return tx.Commit()
 }

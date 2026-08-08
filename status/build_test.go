@@ -191,7 +191,7 @@ func TestBuildConfigDrift(t *testing.T) {
 	root, _ := indexTree(t, s, "media")
 	loaded, disk := make([]byte, 32), make([]byte, 32)
 	disk[0] = 1
-	if _, err := s.RaiseConfigDrift(ctx, "/etc/squirrel/config.toml", loaded, disk); err != nil {
+	if _, err := s.RaiseConfigDrift(ctx, store.ConfigDriftState{Path: "/etc/squirrel/config.toml", Loaded: loaded, Disk: disk}); err != nil {
 		t.Fatalf("RaiseConfigDrift: %v", err)
 	}
 	cfg := cfgFor("media", root, nil, nil, nil, nil)

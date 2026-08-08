@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/mbertschler/squirrel/config"
@@ -18,36 +19,49 @@ import (
 // it, and Config.ConfigCheckEvery already lets a test pin it.
 const DefaultConfigCheckInterval = time.Minute
 
-// configMonitor answers one question on a cadence: is the config file on
-// disk still the file this agent is running? It compares the BLAKE3 of the
-// file's bytes against the digest config.Load computed for the bytes it
-// parsed at startup, and on a difference raises the standing config-drift
-// latch every squirrel surface renders (ux-principle 4's latch shape, the
-// one `verify` alarms and contested paths already use).
+// configMonitor answers one question on a cadence — is the config file on
+// disk still the file this agent is running? — and, when it can, does
+// something about the answer. It compares the BLAKE3 of the file's bytes
+// against the digest config.Load computed for the bytes the agent is
+// running; on a difference it reloads what it can and latches what it
+// cannot, so every squirrel surface renders the remainder (ux-principle 4's
+// latch shape, the one `verify` alarms and contested paths already use).
 //
 // Content, not mtime: a rewrite producing identical bytes — a `touch`, an
 // editor saving an unmodified buffer, a configuration-management tool
-// re-rendering the same template — leaves the digest unchanged and raises
-// nothing.
+// re-rendering the same template — leaves the digest unchanged and does
+// nothing at all.
 //
-// Detection only. The agent never swaps its live config: re-arming
-// cadences under in-flight runs is a separate, far more delicate change,
-// and a reload that can wedge the agent would be worse than the restart it
-// replaces. The latch says "restart to apply" and means it.
+// The reload is automatic and needs no trigger, because a routine action
+// that must be typed by hand is a design bug (ux-principle 1) and a
+// `squirrel agent reload` command would be exactly the third kind of
+// command principle 2 rules out — neither a change nor a question, but a
+// chore the agent should have done. What it will not do is guess: a file
+// that no longer loads, or one whose derived state cannot be rebuilt,
+// leaves the running agent untouched and raises a latch saying why. The
+// agent keeps serving the last configuration it knows works.
+//
+// A monitor built without a reloader (an embedder, a test) keeps the
+// original detect-and-surface behaviour: the latch says "restart to apply"
+// and means it.
 type configMonitor struct {
 	store  *store.Store
 	logger *slog.Logger
 	// path is the config file to watch and loaded the digest of the bytes
-	// this process parsed from it.
+	// the agent is currently running — advanced by every applied reload, so
+	// the comparison always asks "is what I am running still what is on
+	// disk", never "is it still what I started with".
 	path   string
 	loaded []byte
 	every  time.Duration
-	// latched mirrors the latch this monitor raised, so a steady state (no
-	// drift, nothing latched) touches the database not at all and a
-	// standing drift is not re-raised every tick. It starts false because
-	// run() clears any latch left behind by a previous process before its
-	// first tick. A failed raise leaves it false so the next tick retries.
-	latched bool
+	// reload applies an edit in place. Nil disables reloading entirely.
+	reload *reloader
+	// standing mirrors the latch this monitor last wrote, so a steady state
+	// touches the database not at all and an unchanged finding is not
+	// re-written every tick. It starts nil because run() clears any latch
+	// left behind by a previous process before its first tick, and a failed
+	// write leaves it nil so the next tick retries.
+	standing *store.ConfigDriftState
 }
 
 // newConfigMonitor builds the monitor for a server, or returns nil when the
@@ -62,20 +76,28 @@ func newConfigMonitor(srv *Server) *configMonitor {
 	if every <= 0 {
 		every = DefaultConfigCheckInterval
 	}
-	return &configMonitor{
+	m := &configMonitor{
 		store:  srv.store,
 		logger: srv.cfg.Logger,
 		path:   srv.cfg.ConfigPath,
 		loaded: srv.cfg.ConfigDigest,
 		every:  every,
 	}
+	if srv.reloadable() {
+		m.reload = &reloader{
+			live:    srv.cfg.Live,
+			booted:  srv.cfg.Live.Get(),
+			prepare: srv.cfg.ConfigReloadPrepare,
+		}
+	}
+	return m
 }
 
 // run clears any latch a previous agent process left standing — this one
 // has just loaded the file on disk, so the restart the latch asked for has
 // happened — and then re-checks on the cadence until ctx is cancelled. If
-// the file changed again between load and startup, the first tick raises a
-// fresh latch for that newer edit.
+// the file changed again between load and startup, the first tick reloads
+// or latches for that newer edit.
 func (m *configMonitor) run(ctx context.Context) {
 	m.clear(ctx, store.ConfigDriftClearedByRestart)
 	t := time.NewTicker(m.every)
@@ -92,9 +114,9 @@ func (m *configMonitor) run(ctx context.Context) {
 
 // check performs one comparison. A read failure answers neither "changed"
 // nor "unchanged" — an editor writing via a rename makes the file briefly
-// absent, and latching on that would raise a drift episode for an edit that
-// never happened — so it is logged and skipped. The next tick, reading a
-// settled file, decides.
+// absent, and acting on that would reload or latch for an edit that never
+// happened — so it is logged and skipped. The next tick, reading a settled
+// file, decides.
 func (m *configMonitor) check(ctx context.Context) {
 	disk, err := config.FileDigest(m.path)
 	if err != nil {
@@ -103,29 +125,86 @@ func (m *configMonitor) check(ctx context.Context) {
 		return
 	}
 	if bytes.Equal(disk, m.loaded) {
-		if m.latched {
+		// The file is the one the agent is running, so any latch about it
+		// being ahead is resolved — unless the latch is a pending restart,
+		// which by construction stands *while* the agent runs the file on
+		// disk. That one is resolved by a restart, or by a later edit
+		// putting the process-shaped keys back, and both are decided
+		// elsewhere.
+		if m.standing != nil && len(m.standing.PendingKeys) == 0 {
 			m.clear(ctx, store.ConfigDriftClearedByRevert)
 		}
 		return
 	}
-	m.raise(ctx, disk)
-}
-
-// raise latches the drift once per episode. The store's insert is
-// idempotent on its own; the in-memory flag keeps the steady standing state
-// from issuing a write transaction every tick.
-func (m *configMonitor) raise(ctx context.Context, disk []byte) {
-	if m.latched {
+	if m.reload == nil {
+		m.raise(ctx, store.ConfigDriftState{Path: m.path, Loaded: m.loaded, Disk: disk})
 		return
 	}
-	raised, err := m.store.RaiseConfigDrift(ctx, m.path, m.loaded, disk)
+	m.applyOnDisk(ctx, disk)
+}
+
+// applyOnDisk adopts the edit on disk, or explains why it could not. The
+// three outcomes are the three things the operator needs told apart: the
+// edit is live, part of it waits for a restart, or none of it took and the
+// agent is still running what it had.
+func (m *configMonitor) applyOnDisk(ctx context.Context, disk []byte) {
+	res, err := m.reload.apply(ctx, m.path)
+	if err != nil {
+		m.logger.Error("config reload refused", "config", m.path, "err", err.Error())
+		m.raise(ctx, store.ConfigDriftState{
+			Path: m.path, Loaded: m.loaded, Disk: disk, ApplyError: err.Error(),
+		})
+		return
+	}
+	// From here the agent is running the file on disk, whatever else is
+	// still owed — so the comparison baseline moves with it. The digest is
+	// the one Load computed for the bytes it actually parsed, not the one
+	// this tick hashed, in case the file changed between the two reads.
+	m.loaded = res.cfg.Digest
+	m.record(ctx, res)
+	if len(res.pending) == 0 {
+		m.logger.Info("config reloaded", "config", m.path, "applied", res.applied)
+		m.clear(ctx, store.ConfigDriftClearedByReload)
+		return
+	}
+	m.logger.Warn(store.ConfigDriftMessageFor(res.pending, ""),
+		"config", m.path, "applied", res.applied, "pending", res.pending)
+	m.raise(ctx, store.ConfigDriftState{
+		Path: m.path, Loaded: m.loaded, Disk: disk, PendingKeys: res.pending,
+	})
+}
+
+// record writes the audit run for one applied reload — the agent changed
+// its own operating configuration, and automatic work is never invisible
+// (ux-principle 5). A reload that resolved to no change at all (a comment,
+// a reformat) writes nothing: there is no work to be visible about, and a
+// run per cosmetic edit would be noise in a trail that is never pruned.
+func (m *configMonitor) record(ctx context.Context, res reloadResult) {
+	if len(res.applied) == 0 && len(res.pending) == 0 {
+		return
+	}
+	if _, err := m.store.RecordConfigReload(ctx, m.path, res.applied, res.pending); err != nil {
+		m.logger.Error("config reload record failed",
+			"config", m.path, "err", err.Error())
+	}
+}
+
+// raise latches the finding, writing only when it differs from what this
+// monitor last wrote. The store call is idempotent per episode on its own;
+// the in-memory mirror keeps a standing, unchanged state from issuing a
+// write transaction every tick.
+func (m *configMonitor) raise(ctx context.Context, want store.ConfigDriftState) {
+	if m.standing != nil && sameDriftState(*m.standing, want) {
+		return
+	}
+	raised, err := m.store.RaiseConfigDrift(ctx, want)
 	if err != nil {
 		m.logger.Error("config drift raise failed",
 			"config", m.path, "err", err.Error())
 		return
 	}
-	m.latched = true
-	if raised {
+	m.standing = &want
+	if raised && want.ApplyError == "" && len(want.PendingKeys) == 0 {
 		m.logger.Warn(store.ConfigDriftMessage, "config", m.path)
 	}
 }
@@ -141,8 +220,18 @@ func (m *configMonitor) clear(ctx context.Context, reason string) {
 			"config", m.path, "err", err.Error())
 		return
 	}
-	m.latched = false
+	m.standing = nil
 	if cleared {
 		m.logger.Info("config drift cleared", "config", m.path, "reason", reason)
 	}
+}
+
+// sameDriftState reports whether two findings say the same thing, so an
+// unchanged one is not rewritten on every tick.
+func sameDriftState(a, b store.ConfigDriftState) bool {
+	return a.Path == b.Path &&
+		bytes.Equal(a.Loaded, b.Loaded) &&
+		bytes.Equal(a.Disk, b.Disk) &&
+		a.ApplyError == b.ApplyError &&
+		slices.Equal(a.PendingKeys, b.PendingKeys)
 }

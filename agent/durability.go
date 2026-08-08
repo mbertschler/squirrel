@@ -25,7 +25,7 @@ func (r *peerSyncRouter) handleDurability(w http.ResponseWriter, req *http.Reque
 		writeError(w, http.StatusBadRequest, "volume is required")
 		return
 	}
-	if _, ok := r.volumes[body.Volume]; !ok {
+	if _, ok := r.srv.live.Get().Volumes[body.Volume]; !ok {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("volume %q is not declared on this node", body.Volume))
 		return
 	}
@@ -66,7 +66,8 @@ func (r *peerSyncRouter) durabilityResponse(ctx context.Context, volumeName stri
 	// The effective verify cadence per destination, relayed so a puller can
 	// apply the fingerprint-verified cadence coupling against this
 	// responder's own re-confirmation schedule (see DurabilityComponent).
-	cadences := resolveVerifyCadences(r.srv.cfg.Destinations, r.srv.cfg.VerifyEvery)
+	live := r.srv.live.Get()
+	cadences := resolveVerifyCadences(live.Destinations, live.AgentVerifyEvery())
 	names := make(map[int64]string, 4)
 	resolve := func(nodeID int64) (string, error) {
 		if name, ok := names[nodeID]; ok {
@@ -126,7 +127,8 @@ func (r *peerSyncRouter) durabilityResponse(ctx context.Context, volumeName stri
 // the volume is unknown or names no local destinations — a puller then
 // falls back to the per-file gate.
 func (r *peerSyncRouter) destinationCapabilities(volumeName string) []syncproto.DestinationCapability {
-	vol, ok := r.volumes[volumeName]
+	live := r.srv.live.Get()
+	vol, ok := live.Volumes[volumeName]
 	if !ok {
 		return nil
 	}
@@ -136,7 +138,7 @@ func (r *peerSyncRouter) destinationCapabilities(volumeName string) []syncproto.
 		if _, dup := seen[name]; dup {
 			continue
 		}
-		d, ok := r.srv.cfg.Destinations[name]
+		d, ok := live.Destinations[name]
 		if !ok {
 			continue
 		}

@@ -87,7 +87,7 @@ func buildInstrumentedFixture(t *testing.T) (*nodeFixture, *walkStats) {
 		Listen:  "127.0.0.1:0",
 		Token:   "test-token",
 		Version: "test",
-		Volumes: map[string]*config.Volume{"pics": recvVol},
+		Live:    config.NewLive(&config.Config{Volumes: map[string]*config.Volume{"pics": recvVol}}),
 	}, recvStore)
 	if err != nil {
 		t.Fatalf("agent.New: %v", err)

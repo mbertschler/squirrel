@@ -83,7 +83,12 @@ func configDrift(ctx context.Context, s *store.Store, now time.Time) (*ConfigDri
 	if err != nil {
 		return nil, fmt.Errorf("look up config drift: %w", err)
 	}
-	return &ConfigDrift{Path: d.Path, Since: now.Sub(time.Unix(0, d.RaisedAtNs))}, nil
+	return &ConfigDrift{
+		Path:        d.Path,
+		PendingKeys: d.PendingKeys,
+		ApplyError:  d.ApplyError,
+		Since:       now.Sub(time.Unix(0, d.RaisedAtNs)),
+	}, nil
 }
 
 // indexAlarms keys the active alarms by destination name for O(1) lookup
