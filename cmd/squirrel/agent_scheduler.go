@@ -31,11 +31,13 @@ import (
 type schedulerTools struct {
 	// out receives the rclone version preflight's advisories.
 	out io.Writer
+	// rcl is nil only until the first config that needs rclone locates it.
+	// Once set it is replaced but never cleared — see rebuild.
 	rcl atomic.Pointer[sync.Rclone]
 }
 
-// rclone returns the wrapper scheduled work should use, or nil when the
-// configuration in force needs none.
+// rclone returns the wrapper scheduled work should use, or nil when no
+// configuration this process has run ever needed one.
 func (t *schedulerTools) rclone() *sync.Rclone { return t.rcl.Load() }
 
 // rebuild re-derives the tools from cfg. It locates rclone only when the
@@ -54,11 +56,19 @@ func (t *schedulerTools) rclone() *sync.Rclone { return t.rcl.Load() }
 // gets a clear startup error — or, on a reload, a latch naming the reason —
 // rather than a midnight pager when the first scheduled sync fires and
 // rclone rejects the flag.
+// A config that needs no rclone leaves whatever was already located in
+// place rather than clearing it. Clearing would race the scheduler: a tick
+// that decided to kick a sync under the previous config can reach the
+// dispatcher just after the swap, and finding no rclone there would fail
+// that kick with a confusing "the configuration in force did not call for
+// rclone" — turning a cadence the operator merely removed into a failed run
+// in a trail that is never pruned. The retained wrapper is still correct for
+// exactly that kick: it addresses the rclone.conf describing the
+// destinations the kick was planned against.
 func (t *schedulerTools) rebuild(ctx context.Context, cfg *config.Config) error {
 	needsSync := anyVolumeNeedsScheduledSync(cfg)
 	needsVerify := anyDestinationNeedsScheduledVerify(cfg)
 	if !needsSync && !needsVerify {
-		t.rcl.Store(nil)
 		return nil
 	}
 	rcl, err := sync.Find()

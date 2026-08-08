@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"io"
 	"testing"
 	"time"
 
@@ -89,5 +91,22 @@ func TestAnyNodeNeedsScheduledPull(t *testing.T) {
 	cfg.Nodes["b"] = &config.Node{PullDurabilityEvery: time.Hour}
 	if !anyNodeNeedsScheduledPull(cfg) {
 		t.Fatalf("node b has a pull cadence")
+	}
+}
+
+// TestSchedulerToolsRebuildKeepsRclone: a reload to a config that needs no
+// rclone must not take the wrapper away from a sync the scheduler decided to
+// kick a moment earlier, under the config that did. Losing the race would
+// turn a cadence the operator merely removed into a failed run.
+func TestSchedulerToolsRebuildKeepsRclone(t *testing.T) {
+	tools := &schedulerTools{out: io.Discard}
+	located := &sync.Rclone{}
+	tools.rcl.Store(located)
+
+	if err := tools.rebuild(context.Background(), &config.Config{}); err != nil {
+		t.Fatalf("rebuild against an rclone-less config: %v", err)
+	}
+	if got := tools.rclone(); got != located {
+		t.Fatalf("rclone() = %p after a reload that needs none, want the located wrapper %p", got, located)
 	}
 }
