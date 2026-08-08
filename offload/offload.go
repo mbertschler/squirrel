@@ -102,7 +102,7 @@ const (
 	// and re-run to offload it.
 	OutcomeDrift
 	// OutcomeError: an operational failure (open, unlink, or the status
-	// flip) left this file unprocessed; details in Reasons.
+	// flip) left this file unprocessed; details in Detail.
 	OutcomeError
 )
 
@@ -111,10 +111,13 @@ const (
 type FileResult struct {
 	Path    string
 	Outcome Outcome
-	// Reasons carries the per-target gate failures for
-	// OutcomeNotDurable (one entry per failing target) and the single
-	// drift or error detail otherwise. Empty for OutcomeOffloaded.
-	Reasons []string
+	// Failures carries the per-target gate refusals for
+	// OutcomeNotDurable — one entry per failing required target, in
+	// policy order. Empty for every other outcome.
+	Failures []Failure
+	// Detail carries the single drift or operational-error explanation
+	// for OutcomeDrift and OutcomeError. Empty otherwise.
+	Detail string
 }
 
 // Report summarises one Offload invocation. Offloaded + NotDurable +
@@ -128,6 +131,17 @@ type Report struct {
 	Drift      int
 	Errors     int
 	Results    []FileResult
+	// Blocked aggregates the gate refusals by (target, cause) with a
+	// count each, so a large volume reports "25 files blocked by X"
+	// rather than repeating one explanation per file. A file refused by
+	// several targets appears in one group per target, so the counts can
+	// sum to more than NotDurable.
+	Blocked []BlockedGroup
+	// Requirements reports, per offload_requires target in policy order,
+	// how many evaluated files it already covers and how many it blocks —
+	// the affirmative half of the report, which is what separates "one
+	// target away" from "nothing is durable anywhere".
+	Requirements []RequirementStatus
 	// SelectorMisses lists path selectors that matched no present file
 	// — usually a typo'd path — so a no-op invocation explains itself.
 	SelectorMisses []string
@@ -183,6 +197,7 @@ func Offload(ctx context.Context, s *store.Store, root string, opts Options) (re
 
 	if opts.DryRun {
 		err := evaluateOnly(ctx, g, candidates, &report)
+		report.summarise(opts.Require)
 		return report, err
 	}
 
@@ -194,6 +209,7 @@ func Offload(ctx context.Context, s *store.Store, root string, opts Options) (re
 	defer func() { finishRun(ctx, s, runID, &report, err) }()
 
 	err = offloadFiles(ctx, s, g, root, vol.ID, runID, candidates, &report)
+	report.summarise(opts.Require)
 	return report, err
 }
 
@@ -347,7 +363,7 @@ func evaluateOnly(ctx context.Context, g *gate, candidates []store.FileRow, repo
 			return err
 		}
 		if len(failures) > 0 {
-			report.record(FileResult{Path: row.Path, Outcome: OutcomeNotDurable, Reasons: failures})
+			report.record(FileResult{Path: row.Path, Outcome: OutcomeNotDurable, Failures: failures})
 			continue
 		}
 		report.record(FileResult{Path: row.Path, Outcome: OutcomeOffloaded})
@@ -416,22 +432,22 @@ func offloadFiles(ctx context.Context, s *store.Store, g *gate, root string, vol
 			return fmt.Errorf("gate %s: %w", row.Path, err)
 		}
 		if len(failures) > 0 {
-			report.record(FileResult{Path: row.Path, Outcome: OutcomeNotDurable, Reasons: failures})
+			report.record(FileResult{Path: row.Path, Outcome: OutcomeNotDurable, Failures: failures})
 			continue
 		}
 		drift, opErr := verifyAndRemove(dir, row, buf)
 		switch {
 		case opErr != nil:
-			report.record(FileResult{Path: row.Path, Outcome: OutcomeError, Reasons: []string{opErr.Error()}})
+			report.record(FileResult{Path: row.Path, Outcome: OutcomeError, Detail: opErr.Error()})
 			continue
 		case drift != "":
-			report.record(FileResult{Path: row.Path, Outcome: OutcomeDrift, Reasons: []string{drift}})
+			report.record(FileResult{Path: row.Path, Outcome: OutcomeDrift, Detail: drift})
 			continue
 		}
 		if err := s.MarkOffloaded(ctx, volumeID, row.Path, row.ContentID, runID); err != nil {
-			report.record(FileResult{Path: row.Path, Outcome: OutcomeError, Reasons: []string{
-				fmt.Sprintf("bytes removed but the status flip failed — the next index run will report the path as missing: %v", err),
-			}})
+			report.record(FileResult{Path: row.Path, Outcome: OutcomeError, Detail: fmt.Sprintf(
+				"bytes removed but the status flip failed — the next index run will report the path as missing: %v", err),
+			})
 			continue
 		}
 		report.record(FileResult{Path: row.Path, Outcome: OutcomeOffloaded})

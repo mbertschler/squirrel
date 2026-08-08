@@ -522,18 +522,29 @@ func validateCryptRemoteNames(dests map[string]*Destination) error {
 	return nil
 }
 
+// universalDestKeys are the destination keys every type accepts, resolved
+// outside the per-type destSchema: squirrel's own concepts (type, root,
+// crypt, layout) and the layout knobs, each validated by its own resolver
+// above. They are part of the destination config surface exactly like the
+// schema fields, so they live at package level rather than inline in the
+// unknown-field check that consumes them.
+var universalDestKeys = []string{
+	"type", "root", "crypt", "layout",
+	"hash_algo", "checkers", "force_path_style",
+	"pack_threshold", "pack_size", "zstd_level",
+	"verify_every",
+}
+
 // validateAndResolveParams walks the schema, pulling each declared field
 // out of raw and (for secrets) resolving { env = "..." } references. After
-// the walk, any keys still in raw beyond {type, root, schema-known} are
+// the walk, any keys still in raw beyond {universal, schema-known} are
 // unknown fields and surface as an error — strictness keeps typos from
 // silently disabling a field at rclone time.
 func validateAndResolveParams(schema destSchema, raw map[string]any) (map[string]string, error) {
 	out := make(map[string]string)
-	seen := map[string]bool{
-		"type": true, "root": true, "crypt": true, "layout": true,
-		"hash_algo": true, "checkers": true, "force_path_style": true,
-		"pack_threshold": true, "pack_size": true, "zstd_level": true,
-		"verify_every": true,
+	seen := make(map[string]bool, len(universalDestKeys))
+	for _, key := range universalDestKeys {
+		seen[key] = true
 	}
 	for _, key := range schema.requiredString {
 		v, err := requireString(raw, key)

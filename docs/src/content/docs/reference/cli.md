@@ -21,7 +21,7 @@ squirrel sync    [<volume>]          [--to DEST] [--shallow] [--dry-run] [--init
 squirrel status  [<volume>]
 squirrel verify  [<destination>]
 squirrel verify ack <destination>
-squirrel offload <volume> [path...]  [--older-than DUR] [--dry-run]
+squirrel offload <volume> [path...]  [--older-than DUR] [--dry-run] [--per-file]
 squirrel query   [<hash-or-path>]    [--history] [--duplicates] [--missing] [--from NODE]
 squirrel runs                        [--volume NAME] [--limit N] [--failed] [--changes]
 squirrel runs fail <id>
@@ -200,13 +200,16 @@ squirrel offload <volume> [path...]
 
 First positional is the volume; remaining positionals are volume-relative file or
 directory-prefix paths. At least one selector (a path or `--older-than`) is
-required; a volume without an `offload_requires` policy is refused. See
-[Offloading](/squirrel/guides/offloading/).
+required; a volume without an `offload_requires` policy is refused. Gate refusals
+are reported in aggregate — grouped by target and cause, with each required
+target's satisfied count — see
+[Reading a refusal](/squirrel/guides/offloading/#reading-a-refusal).
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--older-than` | — | Only files whose indexed mtime is older than this duration (Go durations like `720h`, or whole days like `90d`). |
-| `--dry-run` | `false` | Print the per-file durability gate decisions without deleting anything. |
+| `--dry-run` | `false` | Report the durability gate decisions without deleting anything. |
+| `--per-file` | `false` | Also list every blocked file with its own gate reasons; refusals are aggregated by target and cause otherwise. |
 
 ---
 

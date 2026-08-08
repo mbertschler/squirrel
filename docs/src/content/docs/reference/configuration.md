@@ -15,6 +15,7 @@ table resolved at load time.
 | Key | Required | Meaning |
 |---|---|---|
 | `db` | no | Path to the SQLite index database. Default `~/.squirrel/index.db`. |
+| `node_name` | no | This host's identity for [peer sync](/squirrel/guides/peer-sync/), and the origin recorded on content it indexes. Defaults to the machine's hostname. |
 
 ## `[volumes.<name>]`
 
@@ -22,6 +23,8 @@ table resolved at load time.
 |---|---|---|
 | `path` | yes | Absolute (or `~`-relative) root directory of the volume. |
 | `sync_to` | no | List of destination names to push to. |
+| `sync_every` | no | Duration; the [agent](/squirrel/guides/agent/) syncs this volume to every target in `sync_to` on this cadence. Absent = no scheduled sync. |
+| `index_every` | no | Duration; cadence for *standalone* index passes between syncs (a sync indexes first anyway). Absent = no extra indexing. |
 | `offload_requires` | no | List of targets whose durability must cover a file before its local bytes may be [offloaded](/squirrel/guides/offloading/). A volume without this key refuses to offload. |
 | `offload_max_evidence_age` | no | Duration; a target whose durability evidence was last re-verified longer ago than this refuses the offload. Default disabled. |
 
@@ -56,8 +59,10 @@ See [Hooks](/squirrel/guides/hooks/).
 | Key | Meaning |
 |---|---|
 | `host` | Server hostname. |
+| `port` | SSH port (optional; rclone's default when omitted). |
 | `user` | SSH user. |
 | `password` | Secret (literal or `{ env }`). |
+| `key_file` | Path to a private key file, as an alternative to `password` (optional). |
 | `root` | Base path on the server. |
 | `known_hosts_file` | Path to a known_hosts file; **validates the server host key** (recommended). Without it, rclone connects to whatever host answers. |
 | `host_key_algorithms` | Space-separated list pinning accepted host-key algorithms (optional). |
@@ -70,14 +75,28 @@ See [Hooks](/squirrel/guides/hooks/).
 | `region` | Bucket region. |
 | `bucket` | Bucket name. |
 | `root` | Sub-path within the bucket. |
+| `endpoint` | Custom S3 endpoint URL for a non-AWS or self-hosted provider (optional). |
 | `access_key_id` | Secret. |
 | `secret_access_key` | Secret. |
 | `storage_class` | Optional; maps to rclone's s3 `storage_class`. Use the exact value your provider documents. |
 
-### `b2` / `gcs`
+### `b2`
 
-rclone-backed object stores; provide the credentials rclone's b2/gcs backends
-expect (as literal or `{ env }` secrets) plus `root`.
+| Key | Meaning |
+|---|---|
+| `bucket` | Bucket name. |
+| `root` | Sub-path within the bucket. |
+| `account_id` | Secret; the B2 key ID (rendered as rclone's `account`). |
+| `application_key` | Secret; the B2 application key (rendered as rclone's `key`). |
+
+### `gcs`
+
+| Key | Meaning |
+|---|---|
+| `bucket` | Bucket name. |
+| `root` | Sub-path within the bucket. |
+| `service_account_file` | Path to a service-account JSON file (optional). |
+| `service_account_credentials` | Secret; the service-account JSON itself, as an alternative to the file. |
 
 ### `kopia`
 
@@ -85,6 +104,7 @@ expect (as literal or `{ env }` secrets) plus `root`.
 |---|---|
 | `root` | Kopia repository path. |
 | `password` | Repository password (passed to kopia via environment). |
+| `verify_files_percent` | Percentage in (0, 100] of snapshot file bytes `kopia snapshot verify` reads back on every sync. Default `10`. Zero is rejected: a kopia leg gates [offload](/squirrel/guides/offloading/) as content-verified, so it must read real content. |
 
 A `kopia` destination rejects a `crypt` block, `--dry-run`, and `--shallow`. See
 [Kopia](/squirrel/layouts/kopia/).
@@ -148,7 +168,10 @@ optional. See [The agent](/squirrel/guides/agent/#listener-less-cadence-only-mac
 |---|---|---|
 | `listen` | no | Bind address, e.g. `0.0.0.0:8443`. Omit for listener-less, scheduler-only mode (above). |
 | `db` | no | Agent-specific index path; wins over the top-level `db`. |
+| `tls.cert` | no | Path to the agent's TLS certificate. Set together with `tls.key`; generate both with [`squirrel agent cert`](/squirrel/guides/agent/). Absent = plain HTTP. |
+| `tls.key` | no | Path to the matching private key. |
 | `auth.token` | with `listen` | Shared bearer token. Required only when the agent binds an HTTP surface. |
+| `auth.peers.<name>.bearer` | no | Per-peer bearer token this agent accepts from node `<name>`. Must equal that node's `[nodes.<this node>].auth.bearer`; [`squirrel node pair`](/squirrel/guides/peer-sync/) emits both halves so they match by construction. |
 | `scan_interval` | no | Drift-scan cadence over every hosted volume. Off when absent. |
 | `scan_strategy` | no | `shallow` (default) or `deep` (re-hash everything — bit-rot detection). |
 | `verify_every` | no | Fleet-wide default verify cadence applied to every content-addressed/packed destination that declares no `verify_every` of its own. Off when absent. |

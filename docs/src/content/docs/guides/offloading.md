@@ -10,7 +10,7 @@ delete. It is the **only** squirrel command that deletes user data.
 ```sh
 squirrel offload pictures 2019/             # a subtree
 squirrel offload pictures --older-than 90d  # by age (indexed mtime)
-squirrel offload pictures . --dry-run       # print the gate decisions, touch nothing
+squirrel offload pictures . --dry-run       # report the gate decisions, touch nothing
 ```
 
 Selectors are volume-relative paths/prefixes plus `--older-than` (combinable);
@@ -57,9 +57,8 @@ three of these hold, for **every** required target:
 3. **Freshness** — if [`offload_max_evidence_age`](#evidence-staleness-opt-in)
    is set, the evidence must have been re-verified within it.
 
-Files failing the gate are skipped and reported per target
-(`missing component for origin X` / `stale: have 40 need 45` /
-`not content-verified (method "presence+size", asserted by peer nas)`).
+Files failing the gate are skipped and reported per target — see
+[Reading a refusal](#reading-a-refusal).
 
 ### How a component becomes content-verified
 
@@ -83,6 +82,58 @@ pack would vouch for content only reachable through it. Verify certifies the
 outstanding set and re-attempts the advance itself, so the vector does not wait
 for the next content-writing sync to notice.
 :::
+
+## Reading a refusal
+
+A refusal is reported **in aggregate**, not once per file: refusals are grouped
+by target and cause, with a count each, the act that would clear them, and the
+durability-vector coordinates one line below. Every required target is then
+listed with how many of the checked files it already covers — so "one target
+away" reads differently from "nothing is durable anywhere".
+
+```
+$ squirrel offload photos . --dry-run
+
+26 files blocked by the durability gate (of 26 selected):
+  cloudbox: 26 files — no durability evidence yet: cloudbox has never reported
+      holding content that originated on laptop
+      next: no completed push to cloudbox is recorded on this node, so a
+      whole-volume sync and then a verify pass must happen where cloudbox is
+      reachable — here, or on the peer that pushes there, whose evidence arrives
+      with the next durability pull
+      coordinates (e.g. 2019/p1.jpg): durability vector has no component for
+      origin laptop; it must cover origin run 1
+  s3archive: 1 file — evidence is behind: s3archive's coverage of content from
+      laptop stops short of this file
+      next: a whole-volume sync to s3archive, then a verify pass over it, records
+      the evidence here
+      coordinates (2020/odd.jpg): component covers origin laptop through run 1,
+      this content needs run 2 (locally verified)
+  (--per-file lists every blocked path with its own reasons)
+
+durability requirements (26 files checked):
+  nas        satisfied for 26 of 26
+  cloudbox   satisfied for 0 of 26   blocks 26 files
+  s3archive  satisfied for 25 of 26  blocks 1 file
+(dry-run) offloaded=0 not_durable=26 drift=0 errors=0
+```
+
+Grouping is by (target, cause), so a mixed refusal never collapses: 25 files
+blocked on one target and one blocked on another stay two lines, as do two
+different causes on the same target. The `coordinates:` line keeps the exact
+version-vector numbers reachable — it names the file it came from, and says `all
+N files` when every member of the group shares them. `--per-file` additionally
+lists every blocked path with its own reasons.
+
+The causes, in the order the gate applies them:
+
+| Cause | Means |
+|---|---|
+| **no durability evidence yet** | The target has never reported holding content from that origin node — nothing recorded at all. |
+| **evidence is behind** | The target's coverage of that origin stops at an earlier run than this file's. |
+| **evidence is too old** | Coverage is sound but was last re-verified outside [`offload_max_evidence_age`](#evidence-staleness-opt-in). |
+| **not pushed since this file appeared** | No completed whole-volume sync covers the run in which the path became present (re-acquisition). |
+| **stored but not content-verified** | The component rests on presence, not on proof of the bytes; a verify pass upgrades it. |
 
 ## Evidence staleness (opt-in)
 
@@ -121,6 +172,7 @@ becomes `missing`), and re-acquiring the bytes ([restore](/squirrel/guides/resto
 or copy-back) flips the row back to `present`.
 
 :::tip[Preview first]
-Run with `--dry-run` to print the per-file durability gate decisions without
-deleting anything.
+Run with `--dry-run` to report the durability gate decisions without deleting
+anything — add `--per-file` when you want every blocked path listed
+individually.
 :::
