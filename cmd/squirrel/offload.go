@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"regexp"
 	"strconv"
 	"time"
@@ -26,21 +25,23 @@ func newOffloadCmd() *cobra.Command {
 	var (
 		olderThan string
 		dryRun    bool
+		perFile   bool
 	)
 	cmd := &cobra.Command{
 		Use:   "offload <volume> [path...]",
 		Short: "Delete local bytes whose content is durable on every required target",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runOffload(cmd, args[0], args[1:], olderThan, dryRun)
+			return runOffload(cmd, args[0], args[1:], olderThan, dryRun, perFile)
 		},
 	}
 	cmd.Flags().StringVar(&olderThan, "older-than", "", "only files whose indexed mtime is older than this duration (Go durations like 720h, or whole days like 90d)")
-	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print the per-file durability gate decisions without deleting anything")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "report the durability gate decisions without deleting anything")
+	cmd.Flags().BoolVar(&perFile, "per-file", false, "also list every blocked file with its own gate reasons (refusals are aggregated by target and cause otherwise)")
 	return cmd
 }
 
-func runOffload(cmd *cobra.Command, volumeName string, paths []string, olderThanStr string, dryRun bool) error {
+func runOffload(cmd *cobra.Command, volumeName string, paths []string, olderThanStr string, dryRun, perFile bool) error {
 	cfg, err := requireConfig(cmd)
 	if err != nil {
 		return err
@@ -79,7 +80,7 @@ func runOffload(cmd *cobra.Command, volumeName string, paths []string, olderThan
 		VerifyCadenced: cfg.VerifyCadencedTargets(vol.OffloadRequires),
 		DryRun:         dryRun,
 	})
-	printOffloadReport(cmd.OutOrStdout(), cmd.ErrOrStderr(), rep, dryRun)
+	printOffloadReport(cmd.OutOrStdout(), cmd.ErrOrStderr(), rep, dryRun, perFile)
 	if err != nil {
 		return err
 	}
@@ -201,46 +202,4 @@ func parseOlderThan(s string) (time.Duration, error) {
 		return 0, fmt.Errorf("--older-than must be a positive duration, got %s", s)
 	}
 	return d, nil
-}
-
-// printOffloadReport renders the per-file lines and the summary. Skips
-// (gate failures, drift) go to stdout — they are decisions, part of the
-// normal report — while selector warnings and per-file errors go to
-// stderr.
-func printOffloadReport(out, errOut io.Writer, rep offload.Report, dryRun bool) {
-	for _, miss := range rep.SelectorMisses {
-		fmt.Fprintf(errOut, "warning: selector %q matched no present files\n", miss)
-	}
-	verb := "offloaded"
-	if dryRun {
-		verb = "would offload"
-	}
-	for _, r := range rep.Results {
-		switch r.Outcome {
-		case offload.OutcomeOffloaded:
-			fmt.Fprintf(out, "%s %s\n", verb, r.Path)
-		case offload.OutcomeNotDurable:
-			fmt.Fprintf(out, "skipped %s: not durable\n", r.Path)
-			for _, reason := range r.Reasons {
-				fmt.Fprintf(out, "  %s\n", reason)
-			}
-		case offload.OutcomeDrift:
-			fmt.Fprintf(out, "skipped %s: disk differs from index: %s\n", r.Path, r.Reasons[0])
-		case offload.OutcomeError:
-			fmt.Fprintf(errOut, "error %s: %s\n", r.Path, r.Reasons[0])
-		}
-	}
-	if rep.FinishErr != nil {
-		fmt.Fprintf(errOut, "warning: failed to record terminal run state: %v\n", rep.FinishErr)
-	}
-	prefix := ""
-	if dryRun {
-		prefix = "(dry-run) "
-	}
-	fmt.Fprintf(out, "%soffloaded=%d not_durable=%d drift=%d errors=%d", prefix,
-		rep.Offloaded, rep.NotDurable, rep.Drift, rep.Errors)
-	if rep.RunID != 0 {
-		fmt.Fprintf(out, " run=%d", rep.RunID)
-	}
-	fmt.Fprintln(out)
 }

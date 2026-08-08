@@ -71,8 +71,8 @@ func TestOffloadDriftSkips(t *testing.T) {
 		"mtime.txt":   "mtime changed",
 	} {
 		res := oneResult(t, rep, path, OutcomeDrift)
-		if !strings.Contains(res.Reasons[0], wantReason) {
-			t.Fatalf("%s reason = %v, want %q", path, res.Reasons, wantReason)
+		if !strings.Contains(res.Detail, wantReason) {
+			t.Fatalf("%s reason = %v, want %q", path, res.Detail, wantReason)
 		}
 		mustExist(t, filepath.Join(root, path))
 		if row := rowAt(t, s, v.ID, path); row.Status != store.StatusPresent {
@@ -101,8 +101,8 @@ func TestOffloadMissingOnDiskSkips(t *testing.T) {
 		t.Fatalf("Offload: %v", err)
 	}
 	res := oneResult(t, rep, "a.txt", OutcomeDrift)
-	if !strings.Contains(res.Reasons[0], "missing on disk") {
-		t.Fatalf("reason = %v, want missing-on-disk drift", res.Reasons)
+	if !strings.Contains(res.Detail, "missing on disk") {
+		t.Fatalf("reason = %v, want missing-on-disk drift", res.Detail)
 	}
 	if row := rowAt(t, s, v.ID, "a.txt"); row.Status != store.StatusPresent {
 		t.Fatalf("status = %q, want present (only the indexer records absence)", row.Status)
@@ -134,8 +134,8 @@ func TestOffloadSymlinkFileRefused(t *testing.T) {
 		t.Fatalf("Offload: %v", err)
 	}
 	res := oneResult(t, rep, "a.txt", OutcomeDrift)
-	if !strings.Contains(res.Reasons[0], "symlink") {
-		t.Fatalf("reason = %v, want symlink refusal", res.Reasons)
+	if !strings.Contains(res.Detail, "symlink") {
+		t.Fatalf("reason = %v, want symlink refusal", res.Detail)
 	}
 	mustExist(t, filepath.Join(root, "a.txt"))
 	mustExist(t, filepath.Join(root, "target.txt"))
@@ -166,8 +166,8 @@ func TestOffloadSymlinkParentRefused(t *testing.T) {
 		t.Fatalf("Offload: %v", err)
 	}
 	res := oneResult(t, rep, "dir/c.txt", OutcomeDrift)
-	if !strings.Contains(res.Reasons[0], "parent dir is a symlink") {
-		t.Fatalf("reason = %v, want parent-symlink refusal", res.Reasons)
+	if !strings.Contains(res.Detail, "parent dir is a symlink") {
+		t.Fatalf("reason = %v, want parent-symlink refusal", res.Detail)
 	}
 	mustExist(t, filepath.Join(root, "dir2", "c.txt"))
 }
@@ -203,8 +203,8 @@ func TestOffloadPartialRun(t *testing.T) {
 	}
 	oneResult(t, rep, "a.txt", OutcomeOffloaded)
 	res := oneResult(t, rep, "ro/b.txt", OutcomeError)
-	if !strings.Contains(res.Reasons[0], "remove") {
-		t.Fatalf("reason = %v, want remove failure", res.Reasons)
+	if !strings.Contains(res.Detail, "remove") {
+		t.Fatalf("reason = %v, want remove failure", res.Detail)
 	}
 	mustBeGone(t, filepath.Join(root, "a.txt"))
 	mustExist(t, filepath.Join(root, "ro", "b.txt"))

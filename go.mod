@@ -13,6 +13,7 @@ require (
 	github.com/minio/minio-go/v7 v7.2.1
 	github.com/pelletier/go-toml/v2 v2.3.1
 	github.com/spf13/cobra v1.10.2
+	github.com/spf13/pflag v1.0.10
 	github.com/wailsapp/wails/v3 v3.0.0-alpha.95
 	github.com/zeebo/blake3 v0.2.4
 	modernc.org/sqlite v1.50.1
@@ -73,7 +74,6 @@ require (
 	github.com/samber/lo v1.52.0 // indirect
 	github.com/sergi/go-diff v1.4.0 // indirect
 	github.com/skeema/knownhosts v1.3.2 // indirect
-	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/tinylib/msgp v1.6.1 // indirect
 	github.com/wailsapp/wails/webview2 v1.0.24 // indirect
 	github.com/xanzy/ssh-agent v0.3.3 // indirect

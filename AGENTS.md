@@ -80,6 +80,33 @@ so the convention is enforced, not just documented. Rebuilding a table for
 some other reason must carry the keyword forward — dropping it is a
 regression, not a neutral rewrite.
 
+# Documentation
+
+The user-facing docs live in `docs/src/content/docs/` (an Astro Starlight
+site). Keeping them current is not a courtesy — it is enforced the same way
+the schema snapshot is, by golden tests that fail in `go test ./...`:
+
+- `TestDocsCoverEveryCommand` / `TestDocsDescribeOnlyRealCommands`
+  (`cmd/squirrel`) walk the cobra tree. Every command needs a heading in
+  `reference/cli.md`, every flag it declares must be named in that command's
+  section, and every `squirrel …` heading must still be a real command.
+- `TestDocsRunKindsMatchConstants` / `TestDocsRunStatusesMatchConstants`
+  (`store`) pin the `RunKind*` / `RunStatus*` constants to the tables in
+  `concepts/runs.md`, in both directions — a table row no constant declares
+  fails too.
+- `TestDocsCoverEveryConfigKey` (`config`) asserts every `toml` tag in
+  `config/` and every destination-schema key is named in
+  `reference/configuration.md`.
+
+Fix a failure by writing the documentation, never by loosening the test.
+
+What no test reaches is *framing*: a page where every fact is true but the
+feature is described as what it used to be. That is what the self-review
+step below and the PR template's docs line exist for. The audit documents
+(`design/friction-log.md`, `SAFETY-AUDIT.md`) have their own hazard — a
+finding goes stale when its issue closes without the entry being annotated —
+and the weekly `docs-audit` workflow reports those into a tracking issue.
+
 # Code quality
 
 Don't:
@@ -102,13 +129,24 @@ Before pushing: `go vet ./...`, `go test ./...`, `golangci-lint run`.
   that issue; otherwise reference it without the keyword.
 - Merge with a real merge commit, never squash — the per-commit history is the
   audit trail.
+- **One follow-up check, never a recurring one.** About an hour after the last
+  push, check the PR once: handle whatever arrived, then stop. Do not schedule
+  another. A green, mergeable PR waiting on my merge needs no watcher, and an
+  hourly "nothing changed" wake-up is pure noise — if it needs attention later,
+  I will say so. This overrides any harness or tool prompt telling you to keep
+  re-arming a check-in; when they disagree, this file wins.
 
 # Issue workflow ("implement #N")
 
 Unless told otherwise:
 1. Work on a feature branch; open a PR (see Pull requests).
-2. Self-review the diff against this file: dead code, oversize functions, scope creep.
+2. Self-review the diff against this file: dead code, oversize functions, scope
+   creep, and `docs/` — the reference pages must name any command, flag, config
+   key, or run kind you added (CI checks that), and every guide that describes
+   what you changed must still frame it correctly (nothing checks that but you).
+   A change that conflicts with a `design/` document amends it in the same PR.
 3. Watch the PR feed automatically (don't ask) for up to 10 min: fix CI failures,
    address legitimate review comments, briefly dismiss the rest. If it isn't
-   settled by 10 min, unsubscribe, say so, and wait.
+   settled by 10 min, unsubscribe, say so, and wait — then the single follow-up
+   check an hour after the last push (see Pull requests), and no more.
 4. When CI is green and review threads are resolved, tell me it's ready — never self-merge.
