@@ -74,10 +74,14 @@ age — the same answers `squirrel status` gives on a headless box.
 
 It holds at household scale too: the fleet block answers, for a volume,
 where else it lives — the other machines as well as the destinations —
-how far behind or ahead each copy is, how many files are missing there,
-and when each was last verified. The household has one squirrel
-database per machine; the human has one question, and can ask it from
-whichever machine they happen to be sitting at.
+how many files have not reached each place, whether any of them holds
+content this machine has never seen, and when each was last verified.
+The household has one squirrel database per machine; the human has one
+question, and can ask it from whichever machine they happen to be
+sitting at. One asymmetry survives: the *behind* direction is counted
+from watermarks this machine already holds, while the *ahead* direction
+can only be pointed at, not counted — a watermark is not an inventory,
+and counting needs the folder Merkle work.
 
 The standing requirement that comes with it: a fleet answer is only as
 current as the last exchange with that node, so every row carries an

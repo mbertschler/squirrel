@@ -126,7 +126,8 @@ squirrel status [<volume>]
 Optional single positional; omitted = every declared volume. No flags. The
 read-only "am I safe?" answer: per volume, when it was last indexed, then one
 row per configured target with its role, last sync, state, durability coverage,
-verify method, and evidence age — plus the volume's offload readiness.
+verify method, and evidence age — then the fleet block below, and the volume's
+offload readiness.
 
 ```
 docs  /home/you/Documents  [amber]
@@ -150,17 +151,36 @@ the other machines as well as the destinations — and how current each copy is
 relative to this one:
 
 ```
-  FLEET       BEHIND  MISSING  LAST CHANGE  LAST VERIFIED  AS OF
-  nas         0       0        4m ago       2h ago         4m ago
-  htpc        12      12       6d ago       6d ago         5m ago
-  s3archive   0       0        1h ago       9h ago         1h ago
+  FLEET      KIND         STATE     MISSING  LAST CHANGE  LAST VERIFIED  AS OF
+  nas        node         same      0        4m ago       2h ago         4m ago
+  htpc       node         behind    12       6d ago       6d ago         5m ago
+  s3archive  destination  ahead     0        1h ago       9h ago         1h ago
+  laptop     node         unknown   —        20m ago      unknown        20m ago
 ```
 
-`BEHIND` and `MISSING` are relative to this machine's content. `AS OF` is when
-this machine last heard from that place — a peer that has gone dark keeps its
-last known figures but ages its `AS OF`, so it reads as **unknown** rather than
-healthy. A row can also be *ahead*, which is how a hub sees content on a laptop
-it has never received.
+`STATE` compares that place's content with this machine's: **same**, **behind**
+(it has not received everything here — `MISSING` counts how many files), **ahead**
+(it holds content this machine has never seen), **diverged** (both), or
+**unknown**. A `MISSING` of `—` is not zero: it means nothing here records what
+that place holds, which is the normal reading for a machine that pushes *to* this
+one, and for any pair that compares by size+mtime rather than by content.
+
+`LAST CHANGE` is when content there last moved as far as this machine knows.
+`LAST VERIFIED` is the age of the *oldest* verification behind that place's
+coverage, so one freshly checked component cannot make the rest look checked.
+`AS OF` is when this machine last heard from that place at all — every other cell
+in the row is a fact as of that moment and no later. A place that has gone dark
+past its cadence keeps its last known figures and its `STATE` reverts to
+**unknown**, so it reads as out of contact rather than healthy. A row's severity
+is the age of what this machine knows, judged against the same cadence the grid
+uses — so the block sharpens the answer without ever reddening a report the grid
+calls green, and a backlog waiting for the next scheduled sync is not a fault.
+
+Every figure is computed from this machine's own index — the durability
+watermarks that already flow between peers — so the block costs no network round
+trip and works the same on a laptop as on the hub. The one thing it cannot count
+is the *ahead* direction: a watermark says content exists somewhere this machine
+has not seen, but not how many files, so `MISSING` never fills in for it.
 
 The **exit code** carries the worst level, so the same command scripts a health
 check without parsing the grid:

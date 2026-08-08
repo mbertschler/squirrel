@@ -597,9 +597,15 @@ Still open, in rough priority:
   drift (#191), so a forgotten restart is no longer silent; it still
   does not *reload*, so the restart remains the one routine flow that
   ends in a hand-typed chore (`ux-principles.md` §1).
-- **Fleet view** — not a walk finding but the standing open problem in
-  `ux-principles.md` §3: every surface answers for one node, and the
-  household has five databases.
+- **~~Fleet view~~ (the fleet block on `status` and the dashboard,
+  #187)** — not a walk finding but the standing open problem in
+  `ux-principles.md` §3: every surface answered for one node, and the
+  household has five databases. Every node now names the other places
+  each of its volumes lives on and how current each copy is, computed
+  from the watermarks the durability vector already carries. One half
+  stays out of reach without an inventory to compare: *how many* files
+  a place holds that this one has never seen — the row reports the
+  direction and leaves the count to #44.
 
 The one thing code cannot close: **#129**, the end-to-end offload
 shakedown on real backends. The walk exercised the chain against the

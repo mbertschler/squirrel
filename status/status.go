@@ -218,14 +218,20 @@ type VolumeStatus struct {
 	// nil when the volume has never been indexed.
 	LastIndexAgo *time.Duration
 	Targets      []TargetStatus
+	// Fleet is every other place the volume lives — peer nodes and
+	// destinations alike — with how current each copy is relative to this
+	// one (#187). Where Targets answers "is this target caught up with my
+	// pushes", Fleet answers "where else does this volume live, and how
+	// far behind is each copy", including places this node never pushes to.
+	Fleet []FleetPlace
 	// Offload is the volume's offload-readiness tally ("N GB offloadable
 	// now"). Offload.Applicable is false for a volume with no offload
 	// policy.
 	Offload OffloadReadiness
 }
 
-// Level is the worst level across the volume's targets, escalated to amber
-// when the volume has never been indexed.
+// Level is the worst level across the volume's targets and fleet places,
+// escalated to amber when the volume has never been indexed.
 func (v VolumeStatus) Level() Level {
 	l := LevelNeutral
 	if !v.Indexed {
@@ -233,6 +239,9 @@ func (v VolumeStatus) Level() Level {
 	}
 	for _, t := range v.Targets {
 		l = worst(l, t.Level())
+	}
+	for _, p := range v.Fleet {
+		l = worst(l, p.Level)
 	}
 	return l
 }
@@ -285,6 +294,118 @@ func (t TargetStatus) Level() Level {
 		l = worst(l, t.Durability.Level)
 	}
 	return l
+}
+
+// FleetState is a fleet row's headline: how the content at that place
+// compares with the content this machine holds.
+type FleetState int
+
+const (
+	// FleetUnknown means this node holds no coverage evidence about the
+	// place — it has never put anything there, or the evidence predates
+	// durability vectors. It is deliberately the zero value: a row that
+	// nothing has answered must not read as agreement.
+	FleetUnknown FleetState = iota
+	// FleetSame means every present file here is covered by that place's
+	// recorded coverage, and nothing suggests it holds more.
+	FleetSame
+	// FleetBehind means content here has not reached that place. Missing
+	// counts how much.
+	FleetBehind
+	// FleetAhead means that place asserts coverage of content this node has
+	// never seen — the hub's view of a laptop whose photos it has not
+	// received yet. It is an inference from a watermark, not an inventory
+	// (see FleetPlace.Ahead), so it never escalates severity on its own.
+	FleetAhead
+	// FleetDiverged is both at once: each side holds content the other
+	// does not.
+	FleetDiverged
+)
+
+// String renders a FleetState as the short lowercase word both surfaces
+// print. Stable — golden tests key on it.
+func (f FleetState) String() string {
+	switch f {
+	case FleetSame:
+		return "same"
+	case FleetBehind:
+		return "behind"
+	case FleetAhead:
+		return "ahead"
+	case FleetDiverged:
+		return "diverged"
+	default:
+		return "unknown"
+	}
+}
+
+// FleetPlace is one other place a volume lives — a peer node or a
+// destination — described from this machine's index. It is a peer of
+// TargetStatus rather than a field on it: TargetStatus answers "is my push
+// to this target caught up and is my content durable there", while a fleet
+// row answers the different question "how much of what I hold has reached
+// that place, when did it last change, and how old is everything I just
+// said". Places this node never pushes to (an edge machine that pushes to
+// this hub, a destination only a peer can reach) have a fleet row and no
+// target row.
+//
+// Every figure here is computed from the local index — the durability
+// vector's per-origin watermarks against this volume's own origin
+// coordinates — so a fleet row needs no new exchange with the place it
+// describes. What it costs instead is currency: the row is only as fresh as
+// AsOfAgo, which is why that column is not optional (ux-principle 3).
+type FleetPlace struct {
+	Name string
+	Kind TargetKind
+	// SyncTarget and Required carry the same meaning as on TargetStatus:
+	// this node pushes to the place, and/or its durability gates offload.
+	// A place with neither is one this node exchanges with but puts
+	// nothing on — informational, never a reason to leave green.
+	SyncTarget bool
+	Required   bool
+	// State is the row's headline. It is what the place's recorded
+	// coverage says, without regard to how old that recording is; Stale
+	// carries that separately, and FleetStateLabel folds the two together
+	// so no surface can print a stale claim as a current one.
+	State FleetState
+	// Missing is the number of present files here that the place's
+	// recorded coverage does not reach. MissingKnown is false when this
+	// node holds no coverage evidence for the place at all, in which case
+	// Missing is zero because nothing is known, not because nothing is
+	// missing.
+	Missing      int
+	MissingKnown bool
+	// Ahead reports that the place asserts durability for content beyond
+	// this node's highest known origin run — it holds something never seen
+	// here. It is a watermark comparison, not an inventory: it cannot say
+	// how many files, and a place that holds nothing new can still read
+	// ahead if it once relayed a coordinate this node later lost track of.
+	// Hence it is reported, never scored.
+	Ahead bool
+	// LastChangeAgo is how long ago content at that place last changed as
+	// far as this node knows — the freshest of its own successful sync to
+	// the place and, for a peer, the last exchange the peer initiated. Nil
+	// when no exchange has ever landed.
+	LastChangeAgo *time.Duration
+	// LastVerifiedAgo is the age of the *oldest* verification among the
+	// place's durability components — the weakest link, so a place cannot
+	// read freshly checked on the strength of one recent component while
+	// another has not been looked at in months. Nil when unknown, which
+	// includes a component that carries no verification instant at all.
+	LastVerifiedAgo *time.Duration
+	// AsOfAgo is how long ago this node last learned anything about the
+	// place: its last successful push, its last exchange, or the last
+	// durability component that landed for it. Nil when this node has
+	// never heard from it. Every other field in the row is a fact as of
+	// this moment and no later.
+	AsOfAgo *time.Duration
+	// Stale is true when AsOfAgo has run past the budget this relationship
+	// declares — the volume's sync cadence for a place this node pushes
+	// to, its offload_max_evidence_age for a place whose evidence only
+	// arrives relayed. A stale row keeps its last known figures and stops
+	// claiming they are current.
+	Stale bool
+	Level Level
 }
 
 // Durability is the local-content durability of a volume on one target.

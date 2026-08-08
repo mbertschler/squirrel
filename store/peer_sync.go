@@ -81,6 +81,41 @@ func (s *Store) GetPeerSyncState(ctx context.Context, volumeID, peerNodeID int64
 	return p, err
 }
 
+// VolumePeerSync is one peer this node has exchanged the volume with,
+// with the peer's name resolved. It is PeerSyncState plus the identity the
+// fleet view names the row by, and exists so a surface can enumerate the
+// peers a volume has actually met without joining the nodes table itself.
+//
+// The listing matters because the receiver of a peer sync records this row
+// and nothing else: on a hub, an edge machine that pushes to it appears in
+// no config target list and in no durability vector, so this is the only
+// evidence the volume also lives there.
+type VolumePeerSync struct {
+	PeerNodeID      int64
+	PeerName        string
+	LastSharedRunID sql.NullInt64
+	LastSyncedAtNs  int64
+}
+
+// ListVolumePeerSyncStates returns every peer with recorded exchange state
+// for the volume, ordered by peer name. An empty slice means the volume has
+// never synced with a peer in either direction.
+func (s *Store) ListVolumePeerSyncStates(ctx context.Context, volumeID int64) ([]VolumePeerSync, error) {
+	return queryRows(ctx, s.db, `
+		SELECT p.peer_node_id, n.name, p.last_shared_run_id, p.last_synced_at
+		FROM peer_sync_state p
+		JOIN nodes n ON n.id = p.peer_node_id
+		WHERE p.volume_id = ?
+		ORDER BY n.name
+	`, scanVolumePeerSync, volumeID)
+}
+
+func scanVolumePeerSync(s rowScanner) (VolumePeerSync, error) {
+	var p VolumePeerSync
+	err := s.Scan(&p.PeerNodeID, &p.PeerName, &p.LastSharedRunID, &p.LastSyncedAtNs)
+	return p, err
+}
+
 // UpsertPeerSyncState advances the watermark for one (volume, peer)
 // pair to the supplied initiator run-id, stamped with the current
 // time. Called only at a successful sync close — failed or partial

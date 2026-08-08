@@ -38,12 +38,14 @@ routine state, so a healthy household is a short screen.
   state, durability, verify method, and evidence age, each cell coloured by
   severity. This is the per-(volume × destination) grid: a target that has been
   failing for a week cannot hide behind a fresh ✓ earned by a different one.
-  Each volume block closes with its offload readiness.
-- **Fleet** — per volume, one row per *other* place it lives: the other machines
-  as well as the destinations. How far behind or ahead each is relative to this
-  machine, how many files are missing there, when it last changed, and when it
-  was last verified. This is the answer to "where else does this volume live,
-  and is any of it out of date" without walking to another machine.
+  Each volume's header line carries its index freshness and offload readiness.
+- **Fleet** — under each volume's grid, one row per *other* place it lives: the
+  other machines as well as the destinations. Whether each is behind or ahead of
+  this machine, how many files have not reached it, when it last changed, and
+  when it was last verified. This is the answer to "where else does this volume
+  live, and is any of it out of date" without walking to another machine — and
+  it is the only place a machine that pushes *to* this one shows up at all,
+  since no target row mentions it.
 
 The coverage panel and
 [`squirrel status`](/squirrel/reference/cli/#squirrel-status) render the same

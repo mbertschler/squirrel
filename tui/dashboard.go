@@ -304,10 +304,11 @@ func (m *dashboardModel) renderCoverage() string {
 	return strings.Join(blocks, "\n\n")
 }
 
-// renderVolumeCoverage renders one volume's coverage block. The
-// offload-readiness figure comes from the throttled cache (the grid itself
-// rebuilds every tick with readiness skipped), falling back to the volume's
-// own tally when the cache has no entry yet.
+// renderVolumeCoverage renders one volume's coverage block: its target grid
+// and, under it, its fleet block. The offload-readiness figure comes from
+// the throttled cache (the grid itself rebuilds every tick with readiness
+// skipped), falling back to the volume's own tally when the cache has no
+// entry yet.
 func (m *dashboardModel) renderVolumeCoverage(v status.VolumeStatus) string {
 	dot := lipgloss.NewStyle().Foreground(levelColour(v.Level())).Render("●")
 	title := fmt.Sprintf("%s %s  %s", dot, v.Name, styleMuted.Render(v.Path))
@@ -317,18 +318,62 @@ func (m *dashboardModel) renderVolumeCoverage(v status.VolumeStatus) string {
 	}
 	meta := styleMuted.Render(fmt.Sprintf("index %s · %s",
 		status.IndexLabel(v), status.OffloadLabel(offload)))
-	if len(v.Targets) == 0 {
-		return title + "\n" + meta + "\n" + styleMuted.Render("  no targets configured")
+	blocks := []string{title, meta, renderVolumeTargets(v.Targets)}
+	// A volume with no targets can still live elsewhere — the hub's copy of
+	// a volume an edge machine pushes to it names no target at all — so the
+	// fleet block is appended either way.
+	if fleet := renderVolumeFleet(v.Fleet); fleet != "" {
+		blocks = append(blocks, fleet)
+	}
+	return strings.Join(blocks, "\n")
+}
+
+// renderVolumeTargets renders the volume's per-target coverage and
+// durability rows, or the muted note that it declares none.
+func renderVolumeTargets(targets []status.TargetStatus) string {
+	if len(targets) == 0 {
+		return styleMuted.Render("  no targets configured")
 	}
 	rows := [][]string{{"TARGET", "ROLE", "LAST SYNC", "STATE", "DURABLE", "METHOD", "EVIDENCE"}}
-	for _, t := range v.Targets {
+	for _, t := range targets {
 		rows = append(rows, []string{
 			t.Name, status.RoleLabel(t), status.LastSyncLabel(t), status.StateLabel(t),
 			status.DurableLabel(t), status.MethodLabel(t), status.EvidenceLabel(t),
 		})
 	}
-	tbl := renderTableColoured(rows, nil, coverageCellColour(v.Targets))
-	return title + "\n" + meta + "\n" + tbl
+	return renderTableColoured(rows, nil, coverageCellColour(targets))
+}
+
+// renderVolumeFleet renders the volume's fleet block — where else this
+// volume lives and how current each copy is (#187) — directly under its
+// target grid, so the two questions the same machine can answer about the
+// same volume read as one block. Returns "" when the volume lives nowhere
+// else, keeping a single-machine install's dashboard short.
+func renderVolumeFleet(places []status.FleetPlace) string {
+	if len(places) == 0 {
+		return ""
+	}
+	rows := [][]string{{"FLEET", "KIND", "STATE", "MISSING", "LAST CHANGE", "LAST VERIFIED", "AS OF"}}
+	for _, p := range places {
+		rows = append(rows, []string{
+			p.Name, string(p.Kind), status.FleetStateLabel(p), status.FleetMissingLabel(p),
+			status.FleetChangeLabel(p), status.FleetVerifiedLabel(p), status.FleetAsOfLabel(p),
+		})
+	}
+	return renderTableColoured(rows, nil, fleetCellColour(places))
+}
+
+// fleetCellColour paints the STATE column by each place's level, so "how
+// current is this copy" reads at a glance the way the coverage grid's STATE
+// and DURABLE columns do.
+func fleetCellColour(places []status.FleetPlace) func(rowIdx, colIdx int) lipgloss.Color {
+	const stateCol = 2
+	return func(rowIdx, colIdx int) lipgloss.Color {
+		if rowIdx == 0 || rowIdx > len(places) || colIdx != stateCol {
+			return ""
+		}
+		return levelColour(places[rowIdx-1].Level)
+	}
 }
 
 // coverageCellColour paints the STATE column by each target's coverage

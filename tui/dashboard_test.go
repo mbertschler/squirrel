@@ -108,3 +108,43 @@ func TestRenderConfigDrift(t *testing.T) {
 		t.Errorf("panel = %q, want the header, the restart sentence, and the path", got)
 	}
 }
+
+// TestRenderVolumeFleet: the fleet block rides under the volume's target
+// grid, naming every other place the volume lives with the same words
+// `squirrel status` prints — including the peer that pushes here, which no
+// target row mentions.
+func TestRenderVolumeFleet(t *testing.T) {
+	if got := renderVolumeFleet(nil); got != "" {
+		t.Errorf("fleet block for a volume that lives nowhere else = %q, want none", got)
+	}
+	fresh := 4 * time.Minute
+	places := []status.FleetPlace{
+		{
+			Name: "nas", Kind: status.KindNode, SyncTarget: true, State: status.FleetSame,
+			MissingKnown: true, LastChangeAgo: &fresh, LastVerifiedAgo: &fresh, AsOfAgo: &fresh,
+			Level: status.LevelOK,
+		},
+		{Name: "laptop", Kind: status.KindNode, Level: status.LevelNeutral},
+	}
+	got := renderVolumeFleet(places)
+	for _, want := range []string{"FLEET", "AS OF", "nas", "same", "laptop", "unknown", "4m ago"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("fleet block missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestRenderVolumeCoverageKeepsFleetWithoutTargets: a hub's copy of a
+// volume an edge machine pushes to it declares no target at all, and the
+// fleet block is the only thing that can say where that volume lives. It
+// must survive the no-targets path.
+func TestRenderVolumeCoverageKeepsFleetWithoutTargets(t *testing.T) {
+	m := &dashboardModel{}
+	got := m.renderVolumeCoverage(status.VolumeStatus{
+		Name:  "photos",
+		Fleet: []status.FleetPlace{{Name: "laptop", Kind: status.KindNode}},
+	})
+	if !strings.Contains(got, "no targets configured") || !strings.Contains(got, "laptop") {
+		t.Errorf("block = %q, want the no-targets note and the fleet row", got)
+	}
+}

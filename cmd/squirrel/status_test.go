@@ -161,3 +161,90 @@ func TestCLIStatusRequiresConfig(t *testing.T) {
 		t.Fatalf("error must reach the user, not be silenced:\n%s", out)
 	}
 }
+
+// seedFleetEvidence records what a verified sync to the destination would
+// leave behind — a durability component covering the volume's present set
+// and a successful sync run — without needing rclone on the test machine.
+func seedFleetEvidence(t *testing.T, dbPath, destination string) {
+	t.Helper()
+	ctx := context.Background()
+	s, err := store.OpenWithOptions(dbPath, store.OpenOptions{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	vol, err := s.GetVolumeByName(ctx, "pics")
+	if err != nil {
+		t.Fatalf("GetVolumeByName: %v", err)
+	}
+	self, err := s.GetSelfNode(ctx)
+	if err != nil {
+		t.Fatalf("GetSelfNode: %v", err)
+	}
+	components, err := s.PresentOriginMaxima(ctx, vol.ID, self.ID)
+	if err != nil {
+		t.Fatalf("PresentOriginMaxima: %v", err)
+	}
+	if err := s.AdvanceDestinationVectorTo(ctx, vol.ID, destination, store.VerifyMethodBlake3, components); err != nil {
+		t.Fatalf("AdvanceDestinationVectorTo: %v", err)
+	}
+	id, err := s.BeginRun(ctx, store.RunKindSync, vol.ID, destination, false)
+	if err != nil {
+		t.Fatalf("BeginRun: %v", err)
+	}
+	if err := s.FinishRun(ctx, id, store.RunStatusSuccess, "", 2); err != nil {
+		t.Fatalf("FinishRun: %v", err)
+	}
+}
+
+// TestCLIStatusRendersFleetBlock: under the target grid, `squirrel status`
+// answers where else the volume lives and how current that copy is — the
+// fleet block (#187), rendered from the same query layer as the grid.
+func TestCLIStatusRendersFleetBlock(t *testing.T) {
+	cfg := writeStatusConfig(t)
+	runCLI(t, "--config", cfg, "index", "pics")
+	seedFleetEvidence(t, filepath.Join(filepath.Dir(cfg), "index.db"), "scratch")
+
+	out := runCLI(t, "--config", cfg, "status")
+	if !strings.Contains(out, "FLEET") || !strings.Contains(out, "AS OF") {
+		t.Fatalf("status has no fleet block:\n%s", out)
+	}
+	fleetRow := statusLineWith(t, out, "scratch", "same")
+	if !strings.Contains(fleetRow, "destination") {
+		t.Errorf("fleet row does not say what kind of place it is: %q", fleetRow)
+	}
+	if strings.Contains(out, "overall: green") == false {
+		t.Errorf("a covered, freshly synced volume should be green:\n%s", out)
+	}
+}
+
+// TestCLIStatusFleetSaysUnknownNotZero: with nothing ever pushed there, the
+// row must say the coverage is unknown rather than render a confident zero
+// — the fail-closed reading the whole view depends on.
+func TestCLIStatusFleetSaysUnknownNotZero(t *testing.T) {
+	cfg := writeStatusConfig(t)
+	runCLI(t, "--config", cfg, "index", "pics")
+
+	out, err := runCLIExpectErr(t, "--config", cfg, "status")
+	var ec exitCodeError
+	if !errors.As(err, &ec) || ec.code != 1 {
+		t.Fatalf("exit = %v, want amber (1)", err)
+	}
+	row := statusLineWith(t, out, "scratch", "unknown")
+	if !strings.Contains(row, "—") {
+		t.Errorf("unknown coverage must not render as a count: %q", row)
+	}
+}
+
+// statusLineWith returns the single output line containing both substrings,
+// failing the test when no line does.
+func statusLineWith(t *testing.T, out, first, second string) string {
+	t.Helper()
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, first) && strings.Contains(line, second) {
+			return line
+		}
+	}
+	t.Fatalf("no line contains %q and %q:\n%s", first, second, out)
+	return ""
+}

@@ -103,19 +103,45 @@ func renderStatus(w io.Writer, rep status.Report, volume string) status.Level {
 	return worst
 }
 
-// renderStatusVolume prints one volume's header, its target grid, and its
-// offload-readiness line, reusing the shared status labels so the wording
-// matches the TUI exactly.
+// renderStatusVolume prints one volume's header, its target grid, its fleet
+// block, and its offload-readiness line, reusing the shared status labels
+// so the wording matches the TUI exactly.
 func renderStatusVolume(w io.Writer, v status.VolumeStatus) {
 	fmt.Fprintf(w, "\n%s  %s  [%s]\n", v.Name, v.Path, status.TrafficLight(v.Level()))
 	fmt.Fprintf(w, "  index: %s\n", status.IndexLabel(v))
+	renderStatusTargets(w, v.Targets)
+	renderStatusFleet(w, v.Fleet)
+	fmt.Fprintf(w, "  %s\n", status.OffloadLabel(v.Offload))
+}
+
+// renderStatusTargets prints the per-(volume × target) coverage and
+// durability grid: is each configured target caught up, and is this
+// machine's content durable there.
+func renderStatusTargets(w io.Writer, targets []status.TargetStatus) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "  TARGET\tROLE\tLAST SYNC\tSTATE\tDURABLE\tMETHOD\tEVIDENCE")
-	for _, t := range v.Targets {
+	for _, t := range targets {
 		fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			t.Name, status.RoleLabel(t), status.LastSyncLabel(t), status.StateLabel(t),
 			status.DurableLabel(t), status.MethodLabel(t), status.EvidenceLabel(t))
 	}
 	_ = tw.Flush()
-	fmt.Fprintf(w, "  %s\n", status.OffloadLabel(v.Offload))
+}
+
+// renderStatusFleet prints the fleet block: where else the volume lives and
+// how current each of those copies is (#187). Absent for a volume with no
+// other place — a never-indexed volume lives nowhere yet, and an empty
+// table would be noise on a single-machine install.
+func renderStatusFleet(w io.Writer, places []status.FleetPlace) {
+	if len(places) == 0 {
+		return
+	}
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "  FLEET\tKIND\tSTATE\tMISSING\tLAST CHANGE\tLAST VERIFIED\tAS OF")
+	for _, p := range places {
+		fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			p.Name, p.Kind, status.FleetStateLabel(p), status.FleetMissingLabel(p),
+			status.FleetChangeLabel(p), status.FleetVerifiedLabel(p), status.FleetAsOfLabel(p))
+	}
+	_ = tw.Flush()
 }
