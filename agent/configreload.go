@@ -55,7 +55,7 @@ const (
 // listener was already using.
 //
 // Comparison is by value throughout — a config whose file was reformatted,
-// recommented, or reordered resolves to the same entities and lands in
+// commented, or reordered resolves to the same entities and lands in
 // neither list, so a cosmetic edit reloads to nothing and latches nothing.
 func configChanges(running, booted, next *config.Config) (applied, pending []string) {
 	if !reflect.DeepEqual(running.Volumes, next.Volumes) {
