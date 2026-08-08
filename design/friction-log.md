@@ -515,14 +515,27 @@ any node stops refreshing when nothing changes — exactly when
 `offload_max_evidence_age` starts counting against it. Evidence
 freshness needs its own cadence, not a piggyback.
 
-**F34 · S3 — the node byte-path is an unvalidated, undocumented
-out-of-band contract.** `[nodes.X] path` silently assumes an SMB/NFS
-mount or rclone-style prefix that squirrel neither validates at load
-time nor mentions when it's wrong (bytes just fail to land); the
-htpc even needs a `[nodes.nas]` entry with a mandatory `path` that no
+**F34 · S3 — ~~the node byte-path is an unvalidated, undocumented
+out-of-band contract.~~ (#171, #195)** `[nodes.X] path` silently assumed an
+SMB/NFS mount or rclone-style prefix that squirrel neither validated at
+load time nor mentioned when it was wrong (bytes just failed to land); the
+htpc even needed a `[nodes.nas]` entry with a mandatory `path` that no
 bytes ever traverse, purely to enable durability pulls.
-*Partially addressed in #171: `squirrel config check` now stats and
-flags a missing node byte-path; load-time validation is still absent.*
+*Fixed in #171 and #195.* #171 gave `squirrel config check` a stat of each
+byte-path. #195 closed both halves of the remainder. The mandatory-path
+half is gone by deletion rather than by reporting: `path` is now required
+only of a node some volume actually syncs to, so the durability-pull-only
+relationship — the htpc's `[nodes.nas]` — declares none, and nobody has to
+invent a value to satisfy a validator. The silence half is closed by a
+standing state: a configured byte-path that does not resolve to a directory
+shows as amber `byte-path` on the target in `squirrel status` and the TUI,
+so it is visible without choosing to run a command. Amber, not red, because
+the usual cause is a mount that is not up yet and resolves on its own.
+
+The out-of-band part is inherent and stays: squirrel can stat the local end,
+but whether the mount points where the operator believes is not checkable
+from here. `reference/configuration.md` now says so rather than leaving it
+implied.
 
 **F35 · S3 — ~~cadence-only machines must still run the full agent.~~ (fixed in #175)**
 A machine that never receives (laptop) runs the HTTP listener and
@@ -584,8 +597,6 @@ Still open, in rough priority:
   drift (#191), so a forgotten restart is no longer silent; it still
   does not *reload*, so the restart remains the one routine flow that
   ends in a hand-typed chore (`ux-principles.md` §1).
-- **F34 · S3 (remainder)** — `config check` flags a missing node
-  byte-path, but load-time validation is still absent.
 - **Fleet view** — not a walk finding but the standing open problem in
   `ux-principles.md` §3: every surface answers for one node, and the
   household has five databases.
