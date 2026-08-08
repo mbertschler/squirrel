@@ -1,8 +1,11 @@
-# Positioning brief — proposed
+# Positioning brief — adopted
 
-*Draft for review. Not adopted yet: nothing in `docs/` or `README.md` has
-been changed to match. If accepted, this becomes the source for the
-landing page and README rewrite.*
+*Adopted and shipped (#189). The landing page
+(`docs/src/content/docs/index.mdx`), the site-wide meta description
+(`docs/astro.config.mjs`) and `README.md` carry this copy; the "What changes,
+concretely" table below records what they said before. This file stays the
+source for that copy — a change to the front-page framing amends this brief in
+the same PR.*
 
 ## The problem
 
@@ -157,5 +160,6 @@ never make the small setup feel like the degenerate case.
    than one computer would have asked the question anyway. Same rule as
    #129: fix anything the implementation turns up inside that ticket.
 
-Nothing is open. This brief is ready to be turned into landing-page and
-README copy on the maintainer's word.
+Nothing is open. The copy shipped in #189, after #187 landed the fleet view
+pillar 2 depends on — the preferred sequencing in that issue, so the page makes
+the glance claim about behaviour that exists.

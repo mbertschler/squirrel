@@ -1,6 +1,20 @@
 # squirrel
 
-Backup tool for your own NAS + cloud offsite storage.
+**Set up once, then trust.** Squirrel keeps your files safe — on one computer, or across every device you own — and proves it, so you never have to wonder.
+
+Configure each machine once. From then on squirrel's agent owns the loop: indexing, syncing, verification, snapshots, and durability exchange all happen on their own cadences. A correct setup goes months without anyone typing a command — and loses nothing.
+
+## Why squirrel
+
+- **Set up once, then trust.** Install and configure a machine once. The agent handles indexing, syncing, verification and evidence exchange on their cadences. Every command squirrel has is either a deliberate change or a question you asked — never a chore it should have done for you.
+- **One glance, one answer.** `squirrel status` and the TUI answer "am I safe?" for a volume everywhere it lives — every destination and every other machine: whether each is caught up, how far behind it is, whether it is durable, and when its evidence was last actually *verified*. Green means you can close the laptop. Anything else says what to do about it — and says it until you deal with it, because alarms latch instead of scrolling away.
+- **Verified, not assumed.** Every upload is checked against what actually landed, and offsite copies are re-checked on their own schedule long after the transfer succeeded. "The upload didn't error" is not evidence; a fingerprint that still matches months later is.
+- **Deleting locally never deletes your backup.** Most backup tools mirror your deletions. Squirrel never propagates a delete — which is what makes freeing up space safe: `squirrel offload` removes local bytes *on purpose*, and only once the content is verified on every destination you required.
+- **Nothing is ever lost.** Content is addressed by BLAKE3, so a hash ever observed stays retrievable. Destinations are append-only, both sides of a sync conflict survive, and the audit trail is never auto-pruned.
+
+Squirrel works the same at any size: one machine backing up to one destination, or many machines sharing several — local drives, network storage, cloud buckets, cold archive. Same config file, same commands. Add machines and destinations as you get them.
+
+## Under the hood
 
 Squirrel indexes a local file tree by BLAKE3 content hash and syncs it to one or more remote destinations (NAS, S3, B2, GCS, SFTP, …) via rclone. Every upload is BLAKE3-verified end-to-end. Destinations are append-only: an overwrite at the destination moves the prior bytes into `.squirrel-history/run-<id>/`, never deletes them.
 

@@ -1,9 +1,10 @@
 ---
 title: Squirrel
-description: Content-addressed backup tool for your own NAS plus cloud offsite storage. Every upload is verified; destinations are append-only.
+description: Squirrel keeps your files safe — on one computer, or across every device you own — and proves it. An agent runs the loop on its own cadences, and one glance tells you whether everything is safe.
 template: splash
 hero:
-  tagline: Backup tool for your own NAS + cloud offsite storage. Indexes by BLAKE3 content hash, verifies every upload, and never deletes history.
+  title: Set up once, then trust.
+  tagline: Squirrel keeps your files safe — on one computer, or across every device you own — and proves it, so you never have to wonder.
   actions:
     - text: Get started
       link: /squirrel/start/install/
@@ -17,18 +18,67 @@ hero:
 
 import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
-Squirrel indexes a local file tree by BLAKE3 content hash and syncs it to one or
-more remote destinations (NAS, S3, B2, GCS, SFTP, …) via
-[rclone](https://rclone.org). Every upload is verified — BLAKE3 end-to-end for
-standard destinations, and a size+mtime or provider-checksum check for encrypted
-and cold-archive layouts (see [verification](/squirrel/guides/verification/)).
-Destinations are append-only: an overwrite at the destination moves the prior
-bytes into `.squirrel-history/run-<id>/`, never deletes them.
+Configure each machine once. From then on squirrel's [agent](/squirrel/guides/agent/)
+owns the loop: indexing, syncing, verification, snapshots, and durability
+exchange all happen on their own cadences. A correct setup goes months without
+anyone typing a command — and loses nothing.
 
 ## Why squirrel
 
 <CardGrid stagger>
-  <Card title="Content, not paths" icon="approve-check">
+  <Card title="Set up once, then trust" icon="rocket">
+    Install and configure a machine once. The agent handles indexing, syncing,
+    verification and evidence exchange on their cadences. Every command squirrel
+    has is either a deliberate change or a question you asked — never a chore it
+    should have done for you.
+  </Card>
+  <Card title="One glance, one answer" icon="magnifier">
+    [`squirrel status`](/squirrel/reference/cli/#squirrel-status) and the
+    [TUI](/squirrel/guides/tui/) answer "am I safe?" for a volume everywhere it
+    lives — every destination and every other machine: whether each is caught
+    up, how far behind it is, whether it is durable, and when its evidence was
+    last actually *verified*. Green means you can close the laptop. Anything
+    else says what to do about it — and says it until you deal with it, because
+    alarms latch instead of scrolling away.
+  </Card>
+  <Card title="Verified, not assumed" icon="approve-check">
+    Every upload is checked against what actually landed, and offsite copies are
+    [re-checked](/squirrel/guides/verification/) on their own schedule long
+    after the transfer succeeded. "The upload didn't error" is not evidence; a
+    fingerprint that still matches months later is. When a check fails, squirrel
+    says so and keeps saying so.
+  </Card>
+  <Card title="Deleting locally never deletes your backup" icon="laptop">
+    Most backup tools mirror your deletions — remove a file at the source and
+    the copy is gone too, sometimes before you notice. Squirrel never propagates
+    a delete. That is what makes freeing up space safe:
+    [`squirrel offload`](/squirrel/guides/offloading/) removes local bytes *on
+    purpose*, and only once the content is verified on every destination you
+    required. Old photos leave your laptop; they don't leave your archive.
+  </Card>
+  <Card title="Nothing is ever lost" icon="document">
+    Content is addressed by BLAKE3, so a hash ever observed stays
+    [retrievable](/squirrel/start/principle/). Destinations are append-only — an
+    overwrite preserves the prior bytes. Both sides of a sync conflict survive.
+    The [audit trail](/squirrel/concepts/runs/) is never auto-pruned. This is
+    the floor everything else stands on.
+  </Card>
+</CardGrid>
+
+## From one computer to every device you own
+
+Squirrel works the same at any size: one machine backing up to one destination,
+or many machines sharing several — local drives, network storage, cloud buckets,
+cold archive. Same config file, same commands. Add machines and destinations as
+you get them.
+
+## Under the hood
+
+The engine the guarantees rest on, for anyone comparing squirrel against restic,
+kopia or borg.
+
+<CardGrid>
+  <Card title="Content, not paths" icon="approve-check-circle">
     A BLAKE3 hash that has ever been observed stays retrievable. Paths are
     observations of content, not the other way around — `squirrel query <hash>`
     still finds a hash whose path now holds different content.
@@ -38,7 +88,7 @@ bytes into `.squirrel-history/run-<id>/`, never deletes them.
     remotes fall back to size+mtime, and cold-archive tiers get a metadata-only
     scan-back fingerprint check that never re-downloads a byte.
   </Card>
-  <Card title="Append-only by design" icon="document">
+  <Card title="Append-only by design" icon="seti:folder">
     Overwrites are preserved under `.squirrel-history/`, and sync never deletes
     at the destination even when the local copy is gone. History is an audit
     trail, never auto-pruned.
@@ -46,7 +96,8 @@ bytes into `.squirrel-history/run-<id>/`, never deletes them.
   <Card title="Many backends, one config" icon="setting">
     Mirror, encrypted, kopia, content-addressed, and packed layouts across
     local, sftp, s3, b2, and gcs — all declared in one TOML file. Squirrel owns
-    the rclone command line so you never run `rclone config`.
+    the [rclone](https://rclone.org) command line so you never run
+    `rclone config`.
   </Card>
 </CardGrid>
 
@@ -55,6 +106,7 @@ bytes into `.squirrel-history/run-<id>/`, never deletes them.
 <CardGrid>
   <LinkCard title="Installation" href="/squirrel/start/install/" description="Install squirrel and rclone." />
   <LinkCard title="Quickstart" href="/squirrel/start/quickstart/" description="Index a volume and sync it in a few commands." />
+  <LinkCard title="The agent" href="/squirrel/guides/agent/" description="Hand the routine loop over and stop typing commands." />
   <LinkCard title="The core principle" href="/squirrel/start/principle/" description="Why squirrel indexes content, not paths." />
   <LinkCard title="CLI reference" href="/squirrel/reference/cli/" description="Every command, flag, and argument." />
 </CardGrid>
