@@ -3,6 +3,8 @@ package status
 import (
 	"fmt"
 	"time"
+
+	"github.com/mbertschler/squirrel/store"
 )
 
 // This file holds the neutral text labels every surface renders from a
@@ -153,6 +155,15 @@ func OffloadLabel(o OffloadReadiness) string {
 	return fmt.Sprintf("offloadable now: %s (%d files) of %s present (%d files)",
 		HumanBytes(o.OffloadableBytes), o.OffloadableFiles,
 		HumanBytes(o.PresentBytes), o.PresentFiles)
+}
+
+// ConfigDriftLabel renders the standing config-drift latch (F9): the one
+// sentence both surfaces print, followed by the file it is about and how
+// long the drift has stood. The wording is the store's, so the CLI, the
+// TUI, the agent's log line, and the audit trail all say it identically.
+func ConfigDriftLabel(d ConfigDrift) string {
+	return fmt.Sprintf("%s (%s, noticed %s ago)",
+		store.ConfigDriftMessage, d.Path, HumanAge(d.Since))
 }
 
 // TrafficLight maps a level to the green/amber/red word the CLI summary

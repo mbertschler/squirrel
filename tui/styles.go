@@ -17,6 +17,7 @@ var (
 	styleTitle = lipgloss.NewStyle().Bold(true).Foreground(colourAccent)
 	styleMuted = lipgloss.NewStyle().Foreground(colourMuted)
 	styleErr   = lipgloss.NewStyle().Foreground(colourFailure)
+	styleWarn  = lipgloss.NewStyle().Foreground(colourWarning)
 
 	styleTab = lipgloss.NewStyle().
 			Padding(0, 2).

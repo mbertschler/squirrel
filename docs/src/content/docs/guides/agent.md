@@ -34,6 +34,9 @@ The agent requires an `[agent]` block in config.
 - **HTTP server** — exposes a health endpoint, serves peer syncs, and drives
   the state the [TUI](/squirrel/guides/tui/) and desktop app read. Only when
   `[agent] listen` is set (see below).
+- **Config drift detection** — notices when the config file on disk stops
+  matching the one it is running, and says so on every surface until it is
+  restarted (see below).
 
 ## One slow destination cannot stall the rest
 
@@ -49,6 +52,52 @@ destination from occupying its own worker forever:
 
 A pair that is already syncing when its cadence comes round again is skipped and
 logged, not queued up behind itself.
+
+## Config edits need a restart — and the agent says so
+
+The agent reads its config **once**, at startup. Editing the file changes
+nothing about the running process: rotated credentials stay unrotated in memory,
+a newly declared volume is not indexed, a removed destination is still synced to.
+
+What the agent will *not* do is stay quiet about it. It hashes the config file's
+contents at load and re-reads that file every minute. When the bytes on disk stop
+matching the ones it parsed, it raises a **standing state** — the same latch shape
+a [verify](/squirrel/guides/verification/) alarm uses — and both
+[`squirrel status`](/squirrel/reference/cli/#squirrel-status) and the
+[TUI](/squirrel/guides/tui/) then say:
+
+```
+config on disk has changed since this agent started; restart to apply
+```
+
+The latch outlives the check that found it and stays up until one of two things
+happens:
+
+- **you restart the agent**, which is what applies the edit; or
+- **the file's contents come back** to what the agent loaded — you undid the
+  edit, so there is nothing left to apply.
+
+Two properties are worth knowing:
+
+- **It compares content, not timestamps.** A rewrite that produces identical
+  bytes — `touch`, an editor saving an unmodified buffer, a
+  configuration-management tool re-rendering the same template — is not a change
+  and raises nothing.
+- **It detects; it does not reload.** Swapping a live config under in-flight runs
+  and armed cadences is a different and far more delicate thing, and a reload
+  that could wedge the agent would be worse than the restart it replaced.
+
+Each drift episode is recorded once as an `audit`
+[run](/squirrel/concepts/runs/), and the clear is recorded against that same run,
+so "the config changed at 02:14 and was applied at 09:30" survives in the audit
+trail after the latch itself is gone.
+
+:::note[Drift is not a config check]
+The latch answers "is the running agent up to date with the file?", not "is the
+file valid?". For the second question — does it parse, do the `{ env = "…" }`
+secrets resolve, do the paths exist — run
+[`squirrel config check`](/squirrel/reference/cli/#squirrel-config-check).
+:::
 
 ## Orphaned runs are reaped at startup
 

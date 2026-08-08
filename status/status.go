@@ -154,16 +154,44 @@ func HumanBytes(n int64) string {
 type Report struct {
 	Now     time.Time
 	Volumes []VolumeStatus
+	// ConfigDrift is the standing config-drift latch (F9) when the agent
+	// has noticed its config file change on disk since it loaded it, or nil
+	// when the running config still matches the file. Unlike everything
+	// else in the report it is node-wide: the agent's whole picture of
+	// volumes, destinations, and cadences comes from that one file.
+	ConfigDrift *ConfigDrift
 }
 
-// Level is the worst level across every volume — the report's single
-// "am I safe?" answer and the basis for the CLI exit code.
+// Level is the worst level across every volume, floored at amber while
+// config drift stands — the report's single "am I safe?" answer and the
+// basis for the CLI exit code.
 func (r Report) Level() Level {
 	l := LevelNeutral
+	if r.ConfigDrift != nil {
+		l = LevelWarn
+	}
 	for _, v := range r.Volumes {
 		l = worst(l, v.Level())
 	}
 	return l
+}
+
+// ConfigDrift is the node-wide "the config file changed under the running
+// agent" standing state (F9): the agent is operating on configuration the
+// operator has since edited, and will keep doing so until it is restarted.
+//
+// Amber, not red: nothing is broken or lost, an intended change simply has
+// not taken effect — the same severity class as needs-init, an expected
+// human step standing between the machine and green. What makes it worth
+// latching is that the failure it prevents is silent, not loud: rotated
+// credentials that only exist in the file, or a volume added to config that
+// nothing is backing up yet.
+type ConfigDrift struct {
+	// Path is the config file the running agent loaded.
+	Path string
+	// Since is how long the drift has stood — the age of the detection, not
+	// of the edit, which squirrel cannot know.
+	Since time.Duration
 }
 
 // VolumeStatus is one configured volume's coverage and durability.

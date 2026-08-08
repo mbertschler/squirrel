@@ -63,6 +63,17 @@ const (
 	// rewind counters — the runs CHECK keeps volume_id and destination NULL
 	// on audit rows, so this entry is where the audit trail names them.
 	TransitionPullDurability = "pull-durability"
+	// TransitionConfigDriftRaise records a config_drift latch being raised
+	// against the kind='audit' run that detected it (#191, F9): the config
+	// file on disk no longer matches the bytes the agent loaded. The note
+	// carries the config path. Written once per drift episode.
+	TransitionConfigDriftRaise = "config-drift-raise"
+	// TransitionConfigDriftClear records a config_drift latch being cleared,
+	// against the run that raised it. The note carries the reason — the
+	// agent restarted onto the config on disk, or the file's content came
+	// back to what the running agent loaded. No operator: the resolving act
+	// is a restart or an edit, not a typed command.
+	TransitionConfigDriftClear = "config-drift-clear"
 	// TransitionResetDestination records a `squirrel destination reset`:
 	// the operator forgetting a destination's recorded upload and
 	// durability state (ResetDestination). It shares the destination-scoped

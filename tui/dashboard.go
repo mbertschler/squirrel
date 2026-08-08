@@ -149,6 +149,9 @@ func (m *dashboardModel) View() string {
 	sections := []string{
 		m.renderAgentBlock(),
 	}
+	if drift := m.renderConfigDrift(); drift != "" {
+		sections = append(sections, drift)
+	}
 	if alarms := m.renderAlarms(); alarms != "" {
 		sections = append(sections, alarms)
 	}
@@ -161,6 +164,22 @@ func (m *dashboardModel) View() string {
 		m.renderRecentRuns(),
 	)
 	return strings.Join(sections, "\n\n")
+}
+
+// renderConfigDrift shows the standing config-drift latch (#191, F9)
+// directly under the agent block: it is a property of the agent process
+// rather than of any volume or destination, and "the agent you see running
+// is running yesterday's config" belongs next to "is the agent up?". It
+// sits above the red panels despite being amber for the same reason — an
+// alarm about a destination is read in the light of which config the agent
+// is holding. Returns "" when the running config matches disk, so the
+// section is absent on a healthy install.
+func (m *dashboardModel) renderConfigDrift() string {
+	d := m.data.coverage.ConfigDrift
+	if d == nil {
+		return ""
+	}
+	return styleWarn.Render("Config drift") + "\n" + status.ConfigDriftLabel(*d)
 }
 
 // renderAlarms shows the standing per-destination alarms (#157, F30) high

@@ -290,6 +290,7 @@ bootstrap the household should run itself. Today's coverage:
 | Durability pull after node sync | ✅ initiator side only |
 | Offsite fingerprint re-check (`verify_every`) | ✅ agent, per-destination or an `[agent]` default (F32) |
 | Durability refresh on a *receive-only* node (htpc) | ✅ agent, per-node `pull_durability_every` (F33) |
+| Applying a config edit | ❌ still a manual agent restart; the *drift* is detected and latched automatically ([F9](friction-log.md)) |
 | Offload | ❌ manual by design; the *readiness signal* should still be automatic ([F17](friction-log.md)) |
 
 ## Lifecycle checkpoints
