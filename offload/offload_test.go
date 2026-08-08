@@ -141,13 +141,28 @@ func oneResult(t *testing.T, rep Report, relPath string, outcome Outcome) FileRe
 	for _, r := range rep.Results {
 		if r.Path == relPath {
 			if r.Outcome != outcome {
-				t.Fatalf("%s outcome = %d (%v), want %d", relPath, r.Outcome, r.Reasons, outcome)
+				t.Fatalf("%s outcome = %d (%v %s), want %d", relPath, r.Outcome, r.Failures, r.Detail, outcome)
 			}
 			return r
 		}
 	}
 	t.Fatalf("no result for %s in %+v", relPath, rep.Results)
 	return FileResult{}
+}
+
+// oneFailure asserts the result carries exactly one gate refusal, names
+// the expected target, and classifies as the expected kind, then returns
+// it so the caller can assert on the wording or the coordinates.
+func oneFailure(t *testing.T, res FileResult, target string, kind FailureKind) Failure {
+	t.Helper()
+	if len(res.Failures) != 1 {
+		t.Fatalf("failures = %v, want exactly one", res.Failures)
+	}
+	f := res.Failures[0]
+	if f.Target != target || f.Kind != kind {
+		t.Fatalf("failure = (%s, %s), want (%s, %s)", f.Target, f.Kind, target, kind)
+	}
+	return f
 }
 
 // TestOffloadHappyPath: with every required target's vector covering
@@ -225,8 +240,10 @@ func TestOffloadGateMissingComponent(t *testing.T) {
 		t.Fatalf("report = %+v", rep)
 	}
 	res := oneResult(t, rep, "a.txt", OutcomeNotDurable)
-	if len(res.Reasons) != 1 || !strings.Contains(res.Reasons[0], "t2: missing component for origin "+self.Name) {
-		t.Fatalf("reasons = %v, want one t2 missing-component failure", res.Reasons)
+	f := oneFailure(t, res, "t2", FailureNoEvidence)
+	if !strings.Contains(f.Summary, "content that originated on "+self.Name) ||
+		!strings.Contains(f.Detail, "no component for origin "+self.Name) {
+		t.Fatalf("failure = %+v, want the t2 no-evidence refusal naming origin %s", f, self.Name)
 	}
 	mustExist(t, filepath.Join(root, "a.txt"))
 	if row := rowAt(t, s, v.ID, "a.txt"); row.Status != store.StatusPresent {
@@ -265,9 +282,10 @@ func TestOffloadGateStaleComponent(t *testing.T) {
 	}
 	oneResult(t, rep, "a.txt", OutcomeOffloaded)
 	res := oneResult(t, rep, "b.txt", OutcomeNotDurable)
-	want := fmt.Sprintf("t1: stale: have %d need %d", first.RunID, second.RunID)
-	if len(res.Reasons) != 1 || !strings.Contains(res.Reasons[0], want) {
-		t.Fatalf("reasons = %v, want %q", res.Reasons, want)
+	f := oneFailure(t, res, "t1", FailureEvidenceBehind)
+	want := fmt.Sprintf("through run %d, this content needs run %d", first.RunID, second.RunID)
+	if !strings.Contains(f.Detail, want) {
+		t.Fatalf("detail = %q, want %q", f.Detail, want)
 	}
 	mustBeGone(t, filepath.Join(root, "a.txt"))
 	mustExist(t, filepath.Join(root, "b.txt"))
@@ -322,8 +340,10 @@ func TestOffloadPeerOriginContent(t *testing.T) {
 	}
 	oneResult(t, rep, "covered.txt", OutcomeOffloaded)
 	res := oneResult(t, rep, "ahead.txt", OutcomeNotDurable)
-	if !strings.Contains(res.Reasons[0], "t1: stale: have 7 need 9 (origin peer1, locally verified)") {
-		t.Fatalf("reasons = %v, want stale failure naming origin peer1 and local provenance", res.Reasons)
+	f := oneFailure(t, res, "t1", FailureEvidenceBehind)
+	if !strings.Contains(f.Summary, "coverage of content from peer1") ||
+		!strings.Contains(f.Detail, "covers origin peer1 through run 7, this content needs run 9 (locally verified)") {
+		t.Fatalf("failure = %+v, want a behind refusal naming origin peer1 and local provenance", f)
 	}
 	mustBeGone(t, filepath.Join(root, "covered.txt"))
 	mustExist(t, filepath.Join(root, "ahead.txt"))

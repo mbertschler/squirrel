@@ -65,9 +65,7 @@ func TestOffloadPackedMemberGatesViaPack(t *testing.T) {
 		t.Fatalf("Offload (pending pack): %v", err)
 	}
 	res := oneResult(t, rep, "a.txt", OutcomeNotDurable)
-	if len(res.Reasons) != 1 || !strings.Contains(res.Reasons[0], "not content-verified") {
-		t.Fatalf("reasons = %v, want a not-content-verified failure", res.Reasons)
-	}
+	oneFailure(t, res, "offsite", FailureNotVerified)
 	mustExist(t, filepath.Join(root, "a.txt"))
 
 	// Fingerprint the pack: the member now gates via its verified pack.
@@ -134,8 +132,9 @@ func TestOffloadFreshnessRefusesReacquiredFile(t *testing.T) {
 		t.Fatalf("Offload: %v", err)
 	}
 	res := oneResult(t, rep, "a.txt", OutcomeNotDurable)
-	if len(res.Reasons) != 1 || !strings.Contains(res.Reasons[0], "not freshly pushed") {
-		t.Fatalf("reasons = %v, want one freshness failure", res.Reasons)
+	f := oneFailure(t, res, "t1", FailureNotPushed)
+	if !strings.Contains(f.Detail, "below the became-present run") {
+		t.Fatalf("detail = %q, want the local-push freshness coordinates", f.Detail)
 	}
 	mustExist(t, filepath.Join(root, "a.txt"))
 
@@ -177,8 +176,9 @@ func TestOffloadFreshnessRefusesUnpushedTarget(t *testing.T) {
 		t.Fatalf("Offload: %v", err)
 	}
 	res := oneResult(t, rep, "a.txt", OutcomeNotDurable)
-	if len(res.Reasons) != 1 || !strings.Contains(res.Reasons[0], "no whole-volume push freshness") {
-		t.Fatalf("reasons = %v, want a no-freshness-evidence failure", res.Reasons)
+	f := oneFailure(t, res, "t1", FailureNotPushed)
+	if !strings.Contains(f.Detail, "no push-freshness coordinate") {
+		t.Fatalf("detail = %q, want a no-freshness-evidence refusal", f.Detail)
 	}
 	mustExist(t, filepath.Join(root, "a.txt"))
 }
@@ -248,8 +248,9 @@ func TestOffloadPeerRelayedTargetGatesOnPulledFreshness(t *testing.T) {
 			t.Fatalf("Offload: %v", err)
 		}
 		res := oneResult(t, rep, "a.txt", OutcomeNotDurable)
-		if len(res.Reasons) != 1 || !strings.Contains(res.Reasons[0], "push freshness") {
-			t.Fatalf("reasons = %v, want a stale-freshness failure", res.Reasons)
+		f := oneFailure(t, res, target, FailureNotPushed)
+		if !strings.Contains(f.Detail, "reported push freshness covers origin") {
+			t.Fatalf("detail = %q, want a stale-freshness refusal", f.Detail)
 		}
 		mustExist(t, filepath.Join(root, "a.txt"))
 	})
@@ -272,8 +273,9 @@ func TestOffloadPeerRelayedTargetGatesOnPulledFreshness(t *testing.T) {
 			t.Fatalf("Offload: %v", err)
 		}
 		res := oneResult(t, rep, "a.txt", OutcomeNotDurable)
-		if len(res.Reasons) != 1 || !strings.Contains(res.Reasons[0], "no whole-volume push freshness") {
-			t.Fatalf("reasons = %v, want a no-freshness-evidence failure", res.Reasons)
+		f := oneFailure(t, res, target, FailureNotPushed)
+		if !strings.Contains(f.Detail, "no push-freshness coordinate") {
+			t.Fatalf("detail = %q, want a no-freshness-evidence refusal", f.Detail)
 		}
 		mustExist(t, filepath.Join(root, "a.txt"))
 	})
@@ -314,8 +316,9 @@ func TestOffloadLocalPushTargetIgnoresRelayedFreshness(t *testing.T) {
 		t.Fatalf("Offload: %v", err)
 	}
 	res := oneResult(t, rep, "a.txt", OutcomeNotDurable)
-	if len(res.Reasons) != 1 || !strings.Contains(res.Reasons[0], "last whole-volume push run") {
-		t.Fatalf("reasons = %v, want a local-push freshness failure", res.Reasons)
+	f := oneFailure(t, res, "t1", FailureNotPushed)
+	if !strings.Contains(f.Detail, "last whole-volume push run") {
+		t.Fatalf("detail = %q, want a local-push freshness refusal", f.Detail)
 	}
 	mustExist(t, filepath.Join(root, "a.txt"))
 }
@@ -356,9 +359,7 @@ func TestOffloadPresenceSizeHeldOutUntilFingerprint(t *testing.T) {
 		t.Fatalf("Offload (pending fingerprint): %v", err)
 	}
 	res := oneResult(t, rep, "a.txt", OutcomeNotDurable)
-	if len(res.Reasons) != 1 || !strings.Contains(res.Reasons[0], "not content-verified") {
-		t.Fatalf("reasons = %v, want a not-content-verified failure", res.Reasons)
-	}
+	oneFailure(t, res, "offsite", FailureNotVerified)
 	mustExist(t, filepath.Join(root, "a.txt"))
 
 	// The scan-back pass records a fingerprint and confirms it in one write:
@@ -448,8 +449,9 @@ func TestOffloadGateNamesPeerProvenance(t *testing.T) {
 		t.Fatalf("Offload: %v", err)
 	}
 	res := oneResult(t, rep, "a.txt", OutcomeNotDurable)
-	if len(res.Reasons) != 1 || !strings.Contains(res.Reasons[0], "asserted by peer nas") {
-		t.Fatalf("reasons = %v, want the stale failure naming the asserting peer nas", res.Reasons)
+	f := oneFailure(t, res, "t1", FailureEvidenceBehind)
+	if !strings.Contains(f.Detail, "asserted by peer nas") {
+		t.Fatalf("detail = %q, want the behind refusal naming the asserting peer nas", f.Detail)
 	}
 	mustExist(t, filepath.Join(root, "a.txt"))
 }
@@ -576,9 +578,7 @@ func TestOffloadFingerprintVerifiedRelayedBakedDownRefused(t *testing.T) {
 		t.Fatalf("Offload: %v", err)
 	}
 	res := oneResult(t, rep, "a.txt", OutcomeNotDurable)
-	if len(res.Reasons) != 1 || !strings.Contains(res.Reasons[0], "not content-verified") {
-		t.Fatalf("reasons = %v, want a not-content-verified refusal", res.Reasons)
-	}
+	oneFailure(t, res, target, FailureNotVerified)
 	mustExist(t, filepath.Join(root, "a.txt"))
 }
 
@@ -626,9 +626,7 @@ func TestOffloadFingerprintVerifiedLocalCadenceCoupling(t *testing.T) {
 			t.Fatalf("Offload: %v", err)
 		}
 		res := oneResult(t, rep, "a.txt", OutcomeNotDurable)
-		if len(res.Reasons) != 1 || !strings.Contains(res.Reasons[0], "not content-verified") {
-			t.Fatalf("reasons = %v, want a not-content-verified refusal", res.Reasons)
-		}
+		oneFailure(t, res, target, FailureNotVerified)
 		mustExist(t, filepath.Join(root, "a.txt"))
 	})
 
