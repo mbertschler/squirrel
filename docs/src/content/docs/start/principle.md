@@ -42,9 +42,14 @@ Any feature that touches stored state (sync, prune, dedup, GC) preserves both
 guarantees: **no deleting or overwriting history without an explicit, opt-in
 retention policy.**
 
-The one command that deletes user data — [`squirrel offload`](/squirrel/guides/offloading/)
-— never does a blind delete: it removes a local copy only after proving the
-content is durable on every target the volume's offload policy requires.
+## Freeing space is not a deletion
+
+Squirrel never propagates a delete, in either direction: removing a file locally
+leaves every durable copy where it is, and sync never deletes at the
+destination. That separation is what makes
+[`squirrel offload`](/squirrel/guides/offloading/) safe rather than frightening
+— it reclaims local bytes *on purpose*, and only after proving the content is
+durable on every target the volume's offload policy requires.
 
 ## Learn more
 

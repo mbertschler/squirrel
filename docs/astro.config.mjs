@@ -12,7 +12,7 @@ export default defineConfig({
     starlight({
       title: "Squirrel",
       description:
-        "Content-addressed backup tool for your own NAS plus cloud offsite storage. Every upload is verified; destinations are append-only.",
+        "Squirrel keeps your files safe — on one computer, or across every device you own — and proves it. An agent runs the loop on its own cadences, and one glance tells you whether everything is safe.",
       social: [
         {
           icon: "github",

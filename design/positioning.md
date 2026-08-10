@@ -1,15 +1,20 @@
-# Positioning brief — proposed
+# Positioning brief — adopted
 
-*Draft for review. Not adopted yet: nothing in `docs/` or `README.md` has
-been changed to match. If accepted, this becomes the source for the
-landing page and README rewrite.*
+*Adopted and shipped (#189). The landing page
+(`docs/src/content/docs/index.mdx`), the site-wide meta description
+(`docs/astro.config.mjs`) and `README.md` carry this copy; the "What changes,
+concretely" table below records what they said before. This file stays the
+source for that copy — a change to the front-page framing amends this brief in
+the same PR.*
 
 ## The problem
 
-The front page sells the **storage engine**. The product is now an
+*The state of the front page before #189, kept as the rationale.*
+
+The front page sold the **storage engine**. The product is now an
 **unattended system that spans every device you own**.
 
-Today's four cards are "Content, not paths", "Verified uploads",
+The four cards it led with were "Content, not paths", "Verified uploads",
 "Append-only by design", "Many backends, one config". All true, all
 still worth saying — and all describing the layer *underneath* the
 thing someone actually adopts. The word *agent* does not appear on the
@@ -62,10 +67,10 @@ succeeded. "The upload didn't error" is not evidence; a fingerprint
 that still matches months later is. When a check fails, squirrel says
 so and keeps saying so.
 
-**4 · Deleting locally never deletes your backup.**
-Most backup tools mirror your deletions — remove a file at the source
-and the copy is gone too, sometimes before you notice. Squirrel never
-propagates a delete. That is what makes freeing up space safe:
+**4 · Deleting locally never deletes the copy.**
+Squirrel never propagates a delete. Removing a file locally leaves every
+durable copy exactly where it is, and a destination keeps content the
+source no longer has. That is what makes freeing up space safe:
 `squirrel offload` removes local bytes *on purpose*, and only once the
 content is verified on every destination you required. Old photos
 leave your laptop; they don't leave your archive.
@@ -106,12 +111,40 @@ range, not the entry price. Name categories of destination rather than a
 particular topology — the point is that the shape is yours to choose, and
 a concrete example here would read as the required one.
 
-Avoid "house" and "household" in shipped copy. Plenty of readers don't
-live in a house, and "household" is insider vocabulary borrowed from
+## Standing rules for shipped copy
+
+**Avoid "house" and "household."** Plenty of readers don't live in a
+house, and "household" is insider vocabulary borrowed from
 `reference-setup.md` that tells a newcomer nothing. Say *devices* — it
 covers the apartment, the desk, and the rack equally.
 
+**Name no other tool, and never invite the comparison.** Shipped copy
+says what squirrel does on its own terms. No "unlike most backup tools",
+no "restic, kopia or borg" — a comparison makes the reader evaluate
+squirrel inside someone else's category, and the interesting half of
+squirrel is the part that category has no slot for. State the behaviour
+and let it be obvious that it is more than a scheduled copy.
+
+**Don't lead with "backup" as the category.** Backup is a large part of
+what squirrel does and the word is fine deeper in a sentence, but it is
+not the opening claim: it sets the reader up to expect snapshots that
+expire and a source that is authoritative forever, and squirrel is
+neither. The hero says *keeps your files safe … and proves it* precisely
+because it commits to no category. See also the archival note below.
+
+**Squirrel is not purely a backup tool, and not purely an archive.**
+The local tree is authoritative *until you offload*; from then on the
+destinations are, permanently. Nothing expires — there is no content
+retention or pruning anywhere in the tree by design, only explicit
+operator-driven `db backup --keep` for index artifacts. Offload is the
+verb that moves content across that line, and it is gated on proof. Copy
+that implies expiry, or implies the destination is only ever a mirror of
+the source, is wrong on both counts.
+
 ## Why this framing
+
+*Internal rationale. The comparisons in this section are for us; they do
+not appear in shipped copy — see the standing rules above.*
 
 Restic, kopia and borg are **backup programs you schedule**. Squirrel
 **runs itself and can prove what's safe**. That is the difference worth
@@ -135,11 +168,18 @@ never make the small setup feel like the degenerate case.
 
 ## Decisions
 
-1. ~~**Does offload get a card?**~~ **Yes — pillar 4.** And it leads
-   with the comparison, not the mechanism: most backup tools mirror a
-   deletion from source to destination, and squirrel does not. That is
-   the feature, and it is what makes offload safe rather than
-   frightening. The proof-gating is the second sentence, not the first.
+1. ~~**Does offload get a card?**~~ **Yes — pillar 4.** It leads with
+   the behaviour, not the mechanism: squirrel never propagates a delete,
+   and a destination keeps content the source no longer has. That is the
+   feature, and it is what makes offload safe rather than frightening.
+   The proof-gating is the second sentence, not the first.
+
+   *Amended in #189 (maintainer's call):* this originally led with the
+   comparison — "most backup tools mirror a deletion, and squirrel does
+   not". Shipped copy no longer names or implies other tools at all, so
+   the card states squirrel's own behaviour and lets the reader draw the
+   contrast. See the standing rules above; the comparison survives only
+   as internal rationale under "Why this framing".
 2. ~~**How loudly do we say "household"?**~~ **Not at all — say the
    range, in devices.** Smallest first: one machine and one destination,
    scaling up to every computer and drive you own. "Household" is
@@ -157,5 +197,6 @@ never make the small setup feel like the degenerate case.
    than one computer would have asked the question anyway. Same rule as
    #129: fix anything the implementation turns up inside that ticket.
 
-Nothing is open. This brief is ready to be turned into landing-page and
-README copy on the maintainer's word.
+Nothing is open. The copy shipped in #189, after #187 landed the fleet view
+pillar 2 depends on — the preferred sequencing in that issue, so the page makes
+the glance claim about behaviour that exists.
