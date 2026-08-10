@@ -48,10 +48,10 @@ anyone typing a command — and loses nothing.
     fingerprint that still matches months later is. When a check fails, squirrel
     says so and keeps saying so.
   </Card>
-  <Card title="Deleting locally never deletes your backup" icon="laptop">
-    Most backup tools mirror your deletions — remove a file at the source and
-    the copy is gone too, sometimes before you notice. Squirrel never propagates
-    a delete. That is what makes freeing up space safe:
+  <Card title="Deleting locally never deletes the copy" icon="laptop">
+    Squirrel never propagates a delete. Removing a file locally leaves every
+    durable copy exactly where it is, and a destination keeps content the source
+    no longer has. That is what makes freeing up space safe:
     [`squirrel offload`](/squirrel/guides/offloading/) removes local bytes *on
     purpose*, and only once the content is verified on every destination you
     required. Old photos leave your laptop; they don't leave your archive.
@@ -74,8 +74,7 @@ you get them.
 
 ## Under the hood
 
-The engine these guarantees rest on, for anyone comparing squirrel against
-restic, kopia or borg.
+How the guarantees above are enforced, one layer down.
 
 <CardGrid>
   <Card title="Content, not paths" icon="approve-check-circle">
