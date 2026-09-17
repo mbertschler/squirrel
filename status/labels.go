@@ -77,8 +77,6 @@ func StateLabel(t TargetStatus) string {
 		return "alarm"
 	case StandingRefused:
 		return "refused"
-	case StandingBytePath:
-		return "byte-path"
 	case StandingNeedsBootstrap:
 		return "needs-init"
 	}
