@@ -4,6 +4,8 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/base64"
+	"errors"
+	"fmt"
 )
 
 // rcloneObscureKey is rclone's fixed, published AES-256 key for its
@@ -63,4 +65,27 @@ func rcloneObscure(plaintext string) string {
 	buf := make([]byte, aes.BlockSize+len(plaintext))
 	cipher.NewCTR(rcloneObscureCipher, buf[:aes.BlockSize]).XORKeyStream(buf[aes.BlockSize:], []byte(plaintext))
 	return base64.RawURLEncoding.EncodeToString(buf)
+}
+
+// rcloneReveal is the inverse of rcloneObscure, reproducing rclone's
+// obscure.Reveal: base64 raw-URL decode, read the leading block as the
+// AES-CTR IV, and XOR the remainder back to plaintext.
+//
+// It reads the IV from the value rather than assuming rcloneObscure's fixed
+// zero one, so a credential obscured by `rclone obscure` (which draws a
+// random IV) reveals identically to one squirrel rendered. That is what
+// lets DeriveNamingKey run on the revealed plaintext and derive the same
+// key from both config forms — a config that supplies a pre-obscured
+// password and one that supplies the plaintext name their artifacts alike.
+func rcloneReveal(obscured string) (string, error) {
+	buf, err := base64.RawURLEncoding.DecodeString(obscured)
+	if err != nil {
+		return "", fmt.Errorf("not a valid rclone-obscured value: %w", err)
+	}
+	if len(buf) < aes.BlockSize {
+		return "", errors.New("not a valid rclone-obscured value: shorter than its initialisation vector")
+	}
+	out := make([]byte, len(buf)-aes.BlockSize)
+	cipher.NewCTR(rcloneObscureCipher, buf[:aes.BlockSize]).XORKeyStream(out, buf[aes.BlockSize:])
+	return string(out), nil
 }

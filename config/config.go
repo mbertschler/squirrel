@@ -257,6 +257,13 @@ type Crypt struct {
 	// Password2 is the salt, in the same obscured form as Password.
 	// Optional but recommended, matching rclone's crypt config.
 	Password2 string
+	// NamingKey is the artifact-naming key derived from the two passwords
+	// at load time (DeriveNamingKey), used by the destinations whose
+	// layout hides artifact names (Destination.HidesArtifactNames). Load
+	// populates it whenever a crypt block resolves; it is derived rather
+	// than configured so an operator keeps no secret beyond the passwords
+	// themselves.
+	NamingKey [32]byte
 }
 
 // nameRE is the syntactic rule for volume and destination names. We pick a
