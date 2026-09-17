@@ -153,13 +153,13 @@ func rcloneConfigPathFor(cfg *config.Config) string {
 }
 
 // pairsNeedRclone reports whether any pair in the batch drives rclone.
-// Peer nodes (Destination nil) transfer bytes with rclone, as do every
-// non-kopia bucket destination; only a batch composed entirely of kopia
-// destinations skips rclone. Used to suppress the rclone preamble on a
-// kopia-only sync (F11b).
+// Every non-kopia bucket destination does; kopia drives its own binary
+// and a peer node streams its bytes over the sync API, so a batch of
+// those alone skips rclone entirely — no binary lookup, no version
+// preflight, no "rclone.conf updated" line (F11b).
 func pairsNeedRclone(pairs []sync.Pair) bool {
 	for _, p := range pairs {
-		if p.Destination == nil || p.Destination.Type != "kopia" {
+		if p.Destination != nil && p.Destination.Type != "kopia" {
 			return true
 		}
 	}

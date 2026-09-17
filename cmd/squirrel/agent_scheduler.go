@@ -97,10 +97,20 @@ func (t *schedulerTools) rebuild(ctx context.Context, cfg *config.Config) error 
 	return nil
 }
 
+// anyVolumeNeedsScheduledSync reports whether a scheduled sync will
+// invoke rclone. Only bucket destinations count: a cadence whose sync_to
+// names peer nodes alone streams its bytes over the sync API, so a
+// peer-only household member runs its whole schedule without rclone
+// installed.
 func anyVolumeNeedsScheduledSync(cfg *config.Config) bool {
 	for _, v := range cfg.Volumes {
-		if v.SyncEvery > 0 && len(v.SyncTo) > 0 {
-			return true
+		if v.SyncEvery <= 0 {
+			continue
+		}
+		for _, target := range v.SyncTo {
+			if _, isNode := cfg.Nodes[target]; !isNode {
+				return true
+			}
 		}
 	}
 	return false
@@ -146,13 +156,17 @@ func anyNodeNeedsScheduledPull(cfg *config.Config) bool {
 func buildSchedulerSyncRunner(live *config.Live, s *store.Store, tools *schedulerTools) agent.SyncRunner {
 	return func(ctx context.Context, vol *config.Volume, destName string) agent.SyncRunReport {
 		cfg := live.Get()
-		rcl := tools.rclone()
-		if rcl == nil {
-			return agent.SyncRunReport{Err: errors.New("scheduled sync needs rclone, which the configuration in force did not call for")}
-		}
 		pair, err := schedulerPairFor(cfg, vol, destName)
 		if err != nil {
 			return agent.SyncRunReport{Err: err}
+		}
+		// A peer pair needs no rclone: it streams over the sync API, and
+		// its snapshot never rides along to a bucket. Demanding the
+		// wrapper for it would fail a peer-only schedule on a host that
+		// has no reason to install rclone at all.
+		rcl := tools.rclone()
+		if rcl == nil && !pair.IsNode() {
+			return agent.SyncRunReport{Err: errors.New("scheduled sync needs rclone, which the configuration in force did not call for")}
 		}
 		// Per-kick because the kopia lookup belongs to the kicks that
 		// target a kopia destination: a host whose schedule never
