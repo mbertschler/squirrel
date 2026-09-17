@@ -27,10 +27,12 @@ const (
 	// ObjectsDirName holds one immutable object per BLAKE3 content
 	// hash at the destination root: objects/<lowercase hex>, raw file
 	// bytes (encrypted by the crypt overlay when the destination has
-	// one). The directory is destination-global — shared by every
-	// volume, matching remote_objects' (content, destination) key —
-	// so duplicated content across volumes uploads once. An object is
-	// uploaded once and never moved, overwritten, or deleted.
+	// one). On an encrypted destination the basename is keyed instead
+	// of the hash itself (see objectName), so the remote discloses no
+	// content hash. The directory is destination-global — shared by
+	// every volume, matching remote_objects' (content, destination)
+	// key — so duplicated content across volumes uploads once. An
+	// object is uploaded once and never moved, overwritten, or deleted.
 	ObjectsDirName = "objects"
 	// ManifestDirName holds one immutable manifest segment per sync
 	// run, per volume: <volume>/index/run-<run id>, the JSONL

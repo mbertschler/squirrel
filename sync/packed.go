@@ -29,7 +29,9 @@ import (
 // destination-global — packs are addressed by the BLAKE3 of their
 // compressed bytes, so an identical pack assembled from an identical
 // content set names the same file — and run ids are globally unique, so a
-// map name never collides across volumes.
+// map name never collides across volumes. An encrypted destination keys
+// the pack basename (see packName); the map keeps its run id, which
+// recovery needs in order to replay in order.
 const PacksDirName = "packs"
 
 // packMapPrefix names a run's placement map under PacksDirName.
