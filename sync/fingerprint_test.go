@@ -128,7 +128,7 @@ func TestCaptureReadsUnderlyingRemote(t *testing.T) {
 	for _, want := range []string{
 		"offsite:/data/objects",
 		"--hash-type sha256",
-		"--include " + blake3Hex("alpha"),
+		"--include " + listedRemoteName(f.dest(), objectName(f.dest(), mustHex(t, blake3Hex("alpha")))),
 	} {
 		if !strings.Contains(line, want) {
 			t.Fatalf("capture argv lacks %q:\n%s", want, line)

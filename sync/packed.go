@@ -134,7 +134,13 @@ func (h *packedHandler) Push(ctx context.Context, opts Options) (Report, error) 
 		return rep, err
 	}
 	if opts.DryRun {
+		if _, err := h.checkNamingScheme(ctx); err != nil {
+			return rep, err
+		}
 		return rep, h.previewDryRun(ctx, &rep, volID)
+	}
+	if err := h.ensureNamingScheme(ctx); err != nil {
+		return rep, err
 	}
 	if err := h.ensureMarker(ctx, opts.Init); err != nil {
 		return rep, err
@@ -339,7 +345,7 @@ func (h *packedHandler) capturePackFingerprints(ctx context.Context, rep *Report
 		}
 		packID := pack.ID
 		targets = append(targets, captureTarget{
-			name:  hex.EncodeToString(w.Pack.PackKey),
+			name:  packName(h.dest, w.Pack.PackKey),
 			label: "pack",
 			record: func(ctx context.Context, algo, value string) error {
 				return h.store.SetRemotePackFingerprint(ctx, packID, h.dest.Name, algo, value, store.NowNs())
@@ -485,7 +491,7 @@ func (h *packedHandler) buildOnePack(srcs []store.PathDelta, start int, level zs
 func (h *packedHandler) uploadPack(ctx context.Context, pack assembledPack) error {
 	defer func() { _ = os.Remove(pack.tmpPath) }()
 	hexKey := hex.EncodeToString(pack.key)
-	uri := h.packURI(hexKey)
+	uri := h.packURI(pack.key)
 	if err := h.rcl.copyTo(ctx, pack.tmpPath, uri, checkersArgs(h.dest)...); err != nil {
 		return fmt.Errorf("upload pack %s: %w", hexKey, err)
 	}
@@ -513,9 +519,11 @@ func (h *packedHandler) uploadPlacementMap(ctx context.Context, placements []Pla
 
 // uploadBytes stages body in a temp file, copies it to uri through the
 // crypt overlay, and confirms it landed at len(body). what names the
-// artifact in error messages.
-func (h *packedHandler) uploadBytes(ctx context.Context, body []byte, uri, what string) error {
-	tmp, err := os.CreateTemp("", "squirrel-packmeta-*")
+// artifact in error messages. It lives on contentPusher because every
+// small artifact both layouts write — manifest segment, placement map,
+// naming marker — lands through it.
+func (h *contentPusher) uploadBytes(ctx context.Context, body []byte, uri, what string) error {
+	tmp, err := os.CreateTemp("", "squirrel-meta-*")
 	if err != nil {
 		return fmt.Errorf("stage %s: %w", what, err)
 	}
@@ -541,11 +549,10 @@ func (h *packedHandler) uploadBytes(ctx context.Context, body []byte, uri, what 
 }
 
 // packURI addresses one pack under the destination-root packs/ directory,
-// through the crypt overlay when the destination has one. The pack name is
-// its content-addressed key, opaque already, so no filename encryption is
-// needed.
-func (h *packedHandler) packURI(hexKey string) string {
-	return remoteSubpathURI(h.dest, path.Join(PacksDirName, hexKey))
+// through the crypt overlay when the destination has one. The basename is
+// packName's, keyed on an encrypted destination.
+func (h *packedHandler) packURI(packKey []byte) string {
+	return remoteSubpathURI(h.dest, path.Join(PacksDirName, packName(h.dest, packKey)))
 }
 
 // mapURI addresses one run's placement map under the destination-root

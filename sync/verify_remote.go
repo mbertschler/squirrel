@@ -198,7 +198,7 @@ func verifyRecordedObjects(ctx context.Context, s *store.Store, rcl *Rclone, des
 	matched := 0
 	for _, row := range rows {
 		hash := hex.EncodeToString(row.Blake3)
-		hashes, ok := byName[hash]
+		hashes, ok := byName[objectName(dest, row.Blake3)]
 		if !ok {
 			rep.Missing = append(rep.Missing, hash)
 			continue
@@ -230,7 +230,7 @@ func verifyRecordedObjects(ctx context.Context, s *store.Store, rcl *Rclone, des
 }
 
 // readObjectChecksums reads the provider checksums verification compares,
-// keyed by object basename (blake3 hex) then rclone hash name. s3 reads raw
+// keyed by object basename (objectName) then rclone hash name. s3 reads raw
 // ETags straight from the S3 API — the only surface exposing a multipart
 // composite ETag — and presents each under the "md5" slot so the shared
 // comparison path (extractChecksum, algoHashType) treats it like any other
@@ -306,7 +306,7 @@ func verifyRecordedPacks(ctx context.Context, s *store.Store, rcl *Rclone, dest 
 	}
 	for _, row := range packs {
 		key := hex.EncodeToString(row.PackKey)
-		hashes, ok := byName[key]
+		hashes, ok := byName[packName(dest, row.PackKey)]
 		if !ok {
 			rep.PacksMissing = append(rep.PacksMissing, key)
 			continue
@@ -336,7 +336,7 @@ func verifyRecordedPacks(ctx context.Context, s *store.Store, rcl *Rclone, dest 
 }
 
 // readPackChecksums reads the provider checksums the pack sweep compares,
-// keyed by pack key hex then rclone hash name. s3 reads raw ETags from the
+// keyed by pack basename (packName) then rclone hash name. s3 reads raw ETags from the
 // S3 API over the packs/ prefix — every pack is a multipart object, so its
 // composite ETag is only visible here, not through rclone. Every other
 // backend reads one batched `rclone lsjson --hash` over the packs/

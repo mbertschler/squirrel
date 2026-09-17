@@ -230,7 +230,7 @@ func TestVerifyRemoteMissingObject(t *testing.T) {
 	if _, err := f.sync(t); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
-	if err := os.Remove(f.remoteBlob(ObjectsDirName, blake3Hex("alpha"))); err != nil {
+	if err := os.Remove(f.objectBlob(t, blake3Hex("alpha"))); err != nil {
 		t.Fatalf("remove remote object: %v", err)
 	}
 

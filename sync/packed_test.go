@@ -47,6 +47,22 @@ password = "obscured-pw"
 	return f
 }
 
+// setupPlainPackedFixture is setupPackedFixture without the crypt block,
+// for the layout guards (see setupPlainContentAddressedFixture).
+func setupPlainPackedFixture(t *testing.T, threshold string) *caFixture {
+	t.Helper()
+	return setupCAFixture(t, fmt.Sprintf(`[destinations.offsite]
+type   = "sftp"
+host   = "remote.invalid"
+user   = "u"
+root   = "/data"
+layout = "packed"
+pack_threshold = %q
+pack_size      = "512MiB"
+zstd_level     = 3
+`, threshold), "/data")
+}
+
 func (f *caFixture) readPlacementMap(t *testing.T, runID int64) []PlacementEntry {
 	t.Helper()
 	data, err := os.ReadFile(f.remoteBlob(PacksDirName, fmt.Sprintf("map-%d", runID)))
@@ -84,10 +100,10 @@ func TestPackedSizeRouting(t *testing.T) {
 		t.Fatalf("Status = %q, want success", rep.Status)
 	}
 	// The large file is a plain object; the small file is not.
-	if _, err := os.Stat(f.remoteBlob(ObjectsDirName, blake3Hex(strings.Repeat("B", 64)))); err != nil {
+	if _, err := os.Stat(f.objectBlob(t, blake3Hex(strings.Repeat("B", 64)))); err != nil {
 		t.Fatalf("large file did not land as an object: %v", err)
 	}
-	if _, err := os.Stat(f.remoteBlob(ObjectsDirName, blake3Hex("tiny"))); err == nil {
+	if _, err := os.Stat(f.objectBlob(t, blake3Hex("tiny"))); err == nil {
 		t.Fatalf("small file wrongly landed as an object")
 	}
 
@@ -127,26 +143,51 @@ func TestPackedSizeRouting(t *testing.T) {
 	}
 }
 
-// mustPackKeyOf returns the single pack key present at the destination,
-// derived from the one pack file the fixture produced.
+// mustPackKeyOf returns the single pack key the fixture produced, read out
+// of the placement maps at the destination.
+//
+// The key comes from the map rather than from the pack's filename because
+// an encrypted destination names its packs by a key derived from its crypt
+// secrets (packName), so the filename is no longer the pack key. The map
+// records the true key — which is what lets a recovery script find a pack
+// at all — so reading it here keeps the helper remote-only, deriving
+// nothing from the local store.
 func mustPackKeyOf(t *testing.T, f *caFixture) []byte {
 	t.Helper()
 	entries, err := os.ReadDir(f.remotePath(PacksDirName))
 	if err != nil {
 		t.Fatalf("read packs dir: %v", err)
 	}
+	seen := map[string]bool{}
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "map-") {
+		if !strings.HasPrefix(e.Name(), packMapPrefix) {
 			continue
 		}
-		name := strings.TrimSuffix(e.Name(), os.Getenv("RCLONE_FAKE_CRYPT_SUFFIX"))
-		key, err := hex.DecodeString(name)
+		data, err := os.ReadFile(f.remotePath(PacksDirName, e.Name()))
 		if err != nil {
-			t.Fatalf("pack name %q not hex: %v", name, err)
+			t.Fatalf("read placement map %s: %v", e.Name(), err)
+		}
+		for _, line := range strings.Split(strings.TrimSuffix(string(data), "\n"), "\n") {
+			if line == "" {
+				continue
+			}
+			var pe PlacementEntry
+			if err := json.Unmarshal([]byte(line), &pe); err != nil {
+				t.Fatalf("parse placement line %q: %v", line, err)
+			}
+			seen[pe.Pack] = true
+		}
+	}
+	if len(seen) != 1 {
+		t.Fatalf("want exactly one pack at the destination, placement maps name %d", len(seen))
+	}
+	for hexKey := range seen {
+		key, err := hex.DecodeString(hexKey)
+		if err != nil {
+			t.Fatalf("pack key %q not hex: %v", hexKey, err)
 		}
 		return key
 	}
-	t.Fatalf("no pack file at destination")
 	return nil
 }
 
@@ -419,7 +460,7 @@ func TestPackedDRReplay(t *testing.T) {
 			t.Fatalf("no placement for %s (%s)", name, hash)
 		}
 		// Fetch and decompress the pack, then slice by offset/length.
-		packBytes, err := os.ReadFile(f.remoteBlob(PacksDirName, place.Pack))
+		packBytes, err := os.ReadFile(f.packBlob(t, place.Pack))
 		if err != nil {
 			t.Fatalf("read pack %s: %v", place.Pack, err)
 		}
@@ -478,7 +519,7 @@ func TestPackedDedupAcrossRuns(t *testing.T) {
 // success looks content-addressed (a segment but no placement map) is
 // refused rather than diffed against the wrong baseline.
 func TestPackedWatermarkGuardRefusesContentAddressed(t *testing.T) {
-	f := setupPackedFixture(t, "1MiB")
+	f := setupPlainPackedFixture(t, "1MiB")
 	f.write(t, "a.txt", "tiny")
 	f.index(t)
 
@@ -492,7 +533,7 @@ func TestPackedWatermarkGuardRefusesContentAddressed(t *testing.T) {
 	if err := f.store.FinishRun(ctx, caRun, store.RunStatusSuccess, "", 1); err != nil {
 		t.Fatalf("finish ca-era run: %v", err)
 	}
-	segPath := f.remoteBlob("pics", ManifestDirName, fmt.Sprintf("run-%d", caRun))
+	segPath := f.volumeBlob(t, "pics", ManifestDirName, fmt.Sprintf("run-%d", caRun))
 	if err := os.MkdirAll(filepath.Dir(segPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -515,7 +556,7 @@ func TestPackedWatermarkGuardRefusesContentAddressed(t *testing.T) {
 // TestPackedWatermarkGuardRefusesMirror: a mirror-era success (no segment,
 // no map) is refused too.
 func TestPackedWatermarkGuardRefusesMirror(t *testing.T) {
-	f := setupPackedFixture(t, "1MiB")
+	f := setupPlainPackedFixture(t, "1MiB")
 	f.write(t, "a.txt", "tiny")
 	f.index(t)
 
@@ -624,7 +665,7 @@ func TestPackedDryRunPreview(t *testing.T) {
 	if has, _ := f.store.HasPackMember(context.Background(), smallRow.ContentID); has {
 		t.Fatalf("dry-run recorded a pack member for small.txt")
 	}
-	if _, err := os.Stat(f.remoteBlob(ObjectsDirName, blake3Hex(strings.Repeat("B", 64)))); err == nil {
+	if _, err := os.Stat(f.objectBlob(t, blake3Hex(strings.Repeat("B", 64)))); err == nil {
 		t.Fatalf("dry-run uploaded an object")
 	}
 	if entries, err := os.ReadDir(f.remotePath(PacksDirName)); err == nil && len(entries) > 0 {
@@ -637,7 +678,7 @@ func TestPackedDryRunPreview(t *testing.T) {
 // placement map) is refused in preview exactly as in a real push — and
 // the refusal writes no runs row.
 func TestPackedDryRunRefusesLayoutFlip(t *testing.T) {
-	f := setupPackedFixture(t, "1MiB")
+	f := setupPlainPackedFixture(t, "1MiB")
 	f.write(t, "a.txt", "tiny")
 	f.index(t)
 
