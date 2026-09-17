@@ -77,3 +77,47 @@ To recover one packed file end-to-end:
    (Decrypt with the `crypt` password first if the destination has one.)
 
 The recovered bytes hash back to `<blake3>`, so recovery is **self-checking**.
+
+### Deriving the stored names on an encrypted destination
+
+On an encrypted destination the names in steps 2 and 3 are not the hashes
+themselves: an [encrypted](/squirrel/layouts/encrypted/) content-addressed or
+packed destination stores each artifact under a **keyed** name, so the remote
+discloses no content hash. The hashes inside the manifest segments and placement
+maps are unchanged — it is only the filename that is keyed — so recovery needs
+one extra derivation, from the crypt passwords you already need in order to
+decrypt:
+
+```
+naming_key       = BLAKE3_derive_key(context = "squirrel destination artifact naming v1",
+                                     material = password || 0x00 || password2)
+name(domain, x)  = hex(BLAKE3_keyed(naming_key, domain || 0x00 || x))
+```
+
+This applies to a root that carries the `.squirrel-naming` marker. An archive
+written before keyed naming existed has no marker and stores the literal names of
+the previous section; squirrel itself resolves which of the two a root uses
+before reading it, and so should any script you write.
+
+`password` and `password2` are the **plaintext** crypt passwords (if your config
+stores them pre-obscured, reveal them with `rclone reveal` first), and
+`password2` is the empty string when no salt is configured. `domain` is the
+literal `object`, `pack`, or `volume`; `x` is the raw 32 bytes of the content
+hash or pack key, or the volume name as bytes. So:
+
+- `objects/<blake3>` → `objects/<name("object", blake3)>`
+- `packs/<pack>` → `packs/<name("pack", pack)>`
+- `<volume>/index/run-<id>` → `<name("volume", volume)>/index/run-<id>`
+
+Run identifiers stay in clear, so segments and placement maps still sort into
+replay order without the key. Both BLAKE3 modes are stock — `b3sum --derive-key`
+and `b3sum --keyed` expose them, as does any BLAKE3 library.
+
+:::caution[The naming key is derived, never stored]
+Nothing at the destination holds the key, and the marker that records the scheme
+(`.squirrel-naming`) carries no key material — so losing the destination loses
+nothing extra, but **losing the crypt passwords now also loses the ability to
+locate an artifact**, not just to decrypt it. The passwords were already
+required for recovery; this does not add a secret, it widens what the existing
+one protects.
+:::

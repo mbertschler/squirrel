@@ -158,6 +158,15 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Only the append-only layouts derive artifact names from the crypt
+	// secrets, so only they need the key — and only they are held to a
+	// password squirrel can reveal. A crypt mirror keeps passing whatever
+	// pre-obscured value it always did straight through to rclone.
+	if crypt != nil && layoutHidesArtifactNames(layout) {
+		if err := crypt.deriveNamingKey(); err != nil {
+			return nil, err
+		}
+	}
 	hashAlgo, err := resolveHashAlgo(raw, typ, layout)
 	if err != nil {
 		return nil, err
@@ -466,6 +475,30 @@ func resolveCrypt(raw map[string]any, typ string) (*Crypt, error) {
 	return &Crypt{Password: password, Password2: password2}, nil
 }
 
+// deriveNamingKey fills NamingKey from the plaintext behind the two stored
+// passwords. Both are held obscured, so both are revealed first: that
+// normalisation is what makes the key — and every artifact name derived
+// from it — identical whether the config supplied plaintext or a
+// pre-obscured value, whose initialisation vectors differ.
+//
+// A value that cannot be revealed is a malformed `obscured = true` entry,
+// which rclone would reject too; failing here names the field instead of
+// leaving it to a later transfer.
+func (c *Crypt) deriveNamingKey() error {
+	password, err := rcloneReveal(c.Password)
+	if err != nil {
+		return fmt.Errorf("crypt.password: %w", err)
+	}
+	var password2 string
+	if c.Password2 != "" {
+		if password2, err = rcloneReveal(c.Password2); err != nil {
+			return fmt.Errorf("crypt.password2: %w", err)
+		}
+	}
+	c.NamingKey = DeriveNamingKey(password, password2)
+	return nil
+}
+
 // cryptObscuredFlag reads the optional `obscured` marker. Its default —
 // false — means the password fields carry plaintext squirrel obscures
 // itself; true means they already hold rclone-obscured values and must be
@@ -757,6 +790,28 @@ func sortedSubset(in []string) []string {
 	out := append([]string(nil), in...)
 	sort.Strings(out)
 	return out
+}
+
+// HidesArtifactNames reports whether this destination names the artifacts
+// it stores by a key derived from its crypt passwords instead of by content
+// hash. Content objects, packs, and per-volume directories then carry a
+// keyed BLAKE3 hex name, so the remote discloses neither a path nor a
+// content hash — without the passwords, a candidate file cannot be tested
+// against the archive.
+//
+// It holds for an encrypted destination on the append-only layouts, whose
+// names squirrel owns outright. A mirror replicates the volume's own tree,
+// so its names are the operator's paths and belong to them; an unencrypted
+// destination has no key to derive from.
+func (d *Destination) HidesArtifactNames() bool {
+	return d.Crypt != nil && layoutHidesArtifactNames(d.Layout)
+}
+
+// layoutHidesArtifactNames reports whether layout names artifacts squirrel
+// chose rather than paths the operator chose, which is what makes keying
+// them possible at all.
+func layoutHidesArtifactNames(layout string) bool {
+	return layout == LayoutContentAddressed || layout == LayoutPacked
 }
 
 // CanEverGateOffload reports whether a durability push to this destination

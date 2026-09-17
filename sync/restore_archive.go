@@ -37,6 +37,7 @@ type archiveRestore struct {
 	rcl      *Rclone
 	vol      *config.Volume
 	dest     *config.Destination
+	names    namer // naming scheme dest's root is written in
 	volID    int64
 	runID    int64
 	target   string // resolved local directory (vol.Path or --to)
@@ -55,7 +56,13 @@ func restoreArchive(ctx context.Context, s *store.Store, rcl *Rclone, vol *confi
 	if opts.ToPath != "" {
 		target = opts.ToPath
 	}
-	ar := newArchiveRestore(s, rcl, vol, dest, volID, runID, target, targetInPlace && opts.InPlace, opts.DryRun)
+	// Address the root under the scheme it is written in, so an encrypted
+	// archive uploaded before keyed naming still restores.
+	names, err := resolveNamer(ctx, rcl, dest)
+	if err != nil {
+		return err
+	}
+	ar := newArchiveRestore(s, rcl, vol, dest, names, volID, runID, target, targetInPlace && opts.InPlace, opts.DryRun)
 	runErr := ar.run(ctx, rep, opts.IncludeFromFile)
 	if runErr != nil && rep.RcloneResult.Errors == 0 {
 		rep.RcloneResult.FatalError = true
@@ -68,9 +75,9 @@ func restoreArchive(ctx context.Context, s *store.Store, rcl *Rclone, vol *confi
 // newArchiveRestore builds the restorer. preserve is set only for an
 // in-place restore that must keep any overwritten bytes, mirroring the
 // mirror layout's --backup-dir contract.
-func newArchiveRestore(s *store.Store, rcl *Rclone, vol *config.Volume, dest *config.Destination, volID, runID int64, target string, preserve, dryRun bool) *archiveRestore {
+func newArchiveRestore(s *store.Store, rcl *Rclone, vol *config.Volume, dest *config.Destination, names namer, volID, runID int64, target string, preserve, dryRun bool) *archiveRestore {
 	return &archiveRestore{
-		store: s, rcl: rcl, vol: vol, dest: dest,
+		store: s, rcl: rcl, vol: vol, dest: dest, names: names,
 		volID: volID, runID: runID, target: target, preserve: preserve, dryRun: dryRun,
 	}
 }
@@ -222,7 +229,7 @@ func (ar *archiveRestore) restoreObject(ctx context.Context, rep *Report, c rest
 		ar.countContent(rep, c)
 		return
 	}
-	tmp, err := ar.fetch(ctx, path.Join(ObjectsDirName, hex.EncodeToString(c.blake3)))
+	tmp, err := ar.fetch(ctx, path.Join(ObjectsDirName, ar.names.object(c.blake3)))
 	if err != nil {
 		ar.recordFailure(rep, c.firstPath(), err)
 		return
@@ -249,7 +256,7 @@ func (ar *archiveRestore) restorePack(ctx context.Context, rep *Report, g *packG
 		}
 		return
 	}
-	tmp, err := ar.fetch(ctx, path.Join(PacksDirName, hex.EncodeToString(g.key)))
+	tmp, err := ar.fetch(ctx, path.Join(PacksDirName, ar.names.pack(g.key)))
 	if err != nil {
 		ar.failMembers(rep, g.members, err)
 		return

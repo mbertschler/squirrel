@@ -143,7 +143,7 @@ func (sn *Snapshotter) ensureLocalSnapshot(ctx context.Context, runID int64) (st
 // cloudKeep snapshots. The uploaded copy keeps the snapshot's filename so
 // the catalog is traceable to its producing run on the destination too.
 func (sn *Snapshotter) rideAlong(ctx context.Context, localPath string, dest *config.Destination, volumeName string) error {
-	dirURI := indexDirURI(dest, volumeName)
+	dirURI := indexDirURI(namerFor(dest), volumeName)
 	name := filepath.Base(localPath)
 	if err := sn.rcl.copyTo(ctx, localPath, dirURI+"/"+name); err != nil {
 		return fmt.Errorf("ride-along upload to %s: %w", dest.Name, err)
@@ -182,8 +182,8 @@ func (sn *Snapshotter) rotateCloud(ctx context.Context, dirURI string) error {
 // indexDirURI returns the rclone URI of the per-volume .squirrel-index/
 // directory under dest, addressed the same way the data transfer is
 // (through the crypt overlay when the destination has one).
-func indexDirURI(dest *config.Destination, volumeName string) string {
-	return remoteSubpathURI(dest, path.Join(volumeName, IndexDirName))
+func indexDirURI(names namer, volumeName string) string {
+	return remoteSubpathURI(names.dest, path.Join(names.volumeDir(volumeName), IndexDirName))
 }
 
 // rotateSnapshots deletes the oldest snapshot-on-sync files in dir until

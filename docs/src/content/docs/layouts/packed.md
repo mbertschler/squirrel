@@ -45,6 +45,14 @@ The destination root therefore holds three streams:
   `<volume>/index/run-<id>` manifest segment the content-addressed layout writes.
   See the [placement map format](/squirrel/reference/formats/#placement-map-format).
 
+:::note[On an encrypted destination these names are keyed]
+Add a [`crypt`](/squirrel/layouts/encrypted/) block and packs and objects are
+named by a keyed BLAKE3 hash derived from the crypt passwords rather than by
+their own key, and the per-volume directory with them. Placement maps keep their
+`map-<run>` names so replay order survives without the key. See
+[Encrypted](/squirrel/layouts/encrypted/).
+:::
+
 ## Three-artifact durability
 
 Durability is **transactional per run and three-artifact**: a run advances the

@@ -122,13 +122,20 @@ func VerifyRemote(ctx context.Context, s *store.Store, rcl *Rclone, dest *config
 	if len(rows) == 0 && len(packs) == 0 {
 		return rep, nil
 	}
+	// Name artifacts under the scheme the root is actually written in, so a
+	// pre-keying encrypted archive verifies as it stands instead of
+	// reporting every object missing and latching a false alarm.
+	names, err := resolveNamer(ctx, rcl, dest)
+	if err != nil {
+		return rep, err
+	}
 	runID, err := s.BeginRemoteVerifyRun(ctx)
 	if err != nil {
 		return rep, fmt.Errorf("record verify run: %w", err)
 	}
 	rep.RunID = runID
 
-	verifyErr := verifyRecorded(ctx, s, rcl, dest, rows, packs, &rep)
+	verifyErr := verifyRecorded(ctx, s, rcl, names, rows, packs, &rep)
 	if err := recordVerifyOutcome(ctx, s, &rep, verifyErr); err != nil {
 		return rep, err
 	}
@@ -174,14 +181,14 @@ func upgradeFingerprintVectors(ctx context.Context, s *store.Store, destination 
 // large-file per-object sweep, shared with content-addressed) and, for a
 // packed destination, its recorded packs — one fingerprint check per pack
 // vouching for all its members. Either sweep can be empty.
-func verifyRecorded(ctx context.Context, s *store.Store, rcl *Rclone, dest *config.Destination, rows []store.RemoteObjectRecord, packs []store.RemotePackRecord, rep *RemoteVerifyReport) error {
+func verifyRecorded(ctx context.Context, s *store.Store, rcl *Rclone, names namer, rows []store.RemoteObjectRecord, packs []store.RemotePackRecord, rep *RemoteVerifyReport) error {
 	if len(rows) > 0 {
-		if err := verifyRecordedObjects(ctx, s, rcl, dest, rows, rep); err != nil {
+		if err := verifyRecordedObjects(ctx, s, rcl, names, rows, rep); err != nil {
 			return err
 		}
 	}
 	if len(packs) > 0 {
-		if err := verifyRecordedPacks(ctx, s, rcl, dest, packs, rep); err != nil {
+		if err := verifyRecordedPacks(ctx, s, rcl, names, packs, rep); err != nil {
 			return err
 		}
 	}
@@ -190,7 +197,8 @@ func verifyRecorded(ctx context.Context, s *store.Store, rcl *Rclone, dest *conf
 
 // verifyRecordedObjects compares the remote listing against the recorded
 // rows and applies the per-object outcome to the store and the report.
-func verifyRecordedObjects(ctx context.Context, s *store.Store, rcl *Rclone, dest *config.Destination, rows []store.RemoteObjectRecord, rep *RemoteVerifyReport) error {
+func verifyRecordedObjects(ctx context.Context, s *store.Store, rcl *Rclone, names namer, rows []store.RemoteObjectRecord, rep *RemoteVerifyReport) error {
+	dest := names.dest
 	byName, err := readObjectChecksums(ctx, rcl, dest, rows)
 	if err != nil {
 		return fmt.Errorf("read object checksums from %q: %w", dest.Name, err)
@@ -198,7 +206,7 @@ func verifyRecordedObjects(ctx context.Context, s *store.Store, rcl *Rclone, des
 	matched := 0
 	for _, row := range rows {
 		hash := hex.EncodeToString(row.Blake3)
-		hashes, ok := byName[hash]
+		hashes, ok := byName[names.object(row.Blake3)]
 		if !ok {
 			rep.Missing = append(rep.Missing, hash)
 			continue
@@ -230,7 +238,7 @@ func verifyRecordedObjects(ctx context.Context, s *store.Store, rcl *Rclone, des
 }
 
 // readObjectChecksums reads the provider checksums verification compares,
-// keyed by object basename (blake3 hex) then rclone hash name. s3 reads raw
+// keyed by object basename (objectName) then rclone hash name. s3 reads raw
 // ETags straight from the S3 API — the only surface exposing a multipart
 // composite ETag — and presents each under the "md5" slot so the shared
 // comparison path (extractChecksum, algoHashType) treats it like any other
@@ -299,14 +307,15 @@ func verifyObjectHashTypes(dest *config.Destination, rows []store.RemoteObjectRe
 // recorded pack rows and applies the per-pack outcome. One fingerprint
 // check per pack vouches for every content it holds, so a packed
 // destination is swept per pack rather than per member.
-func verifyRecordedPacks(ctx context.Context, s *store.Store, rcl *Rclone, dest *config.Destination, packs []store.RemotePackRecord, rep *RemoteVerifyReport) error {
+func verifyRecordedPacks(ctx context.Context, s *store.Store, rcl *Rclone, names namer, packs []store.RemotePackRecord, rep *RemoteVerifyReport) error {
+	dest := names.dest
 	byName, err := readPackChecksums(ctx, rcl, dest, packs)
 	if err != nil {
 		return fmt.Errorf("read pack checksums from %q: %w", dest.Name, err)
 	}
 	for _, row := range packs {
 		key := hex.EncodeToString(row.PackKey)
-		hashes, ok := byName[key]
+		hashes, ok := byName[names.pack(row.PackKey)]
 		if !ok {
 			rep.PacksMissing = append(rep.PacksMissing, key)
 			continue
@@ -336,7 +345,7 @@ func verifyRecordedPacks(ctx context.Context, s *store.Store, rcl *Rclone, dest 
 }
 
 // readPackChecksums reads the provider checksums the pack sweep compares,
-// keyed by pack key hex then rclone hash name. s3 reads raw ETags from the
+// keyed by pack basename (packName) then rclone hash name. s3 reads raw ETags from the
 // S3 API over the packs/ prefix — every pack is a multipart object, so its
 // composite ETag is only visible here, not through rclone. Every other
 // backend reads one batched `rclone lsjson --hash` over the packs/

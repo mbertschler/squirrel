@@ -116,7 +116,7 @@ password2 = { env = "OFFSITE_CRYPT_SALT" }    # salt — optional but recommende
 
 Two properties to be aware of:
 
-- **Contents only.** File and directory names are stored in clear at the destination (`filename_encryption = off`, fixed by design) — the tree stays browsable and keeps the same layout as an unencrypted destination. If the names themselves are sensitive, this overlay does not hide them.
+- **What the destination discloses depends on the layout.** rclone's own filename encryption stays off (`filename_encryption = off`, fixed by design). On the content-addressed and packed layouts squirrel names every artifact — objects, packs, and the per-volume directory — by a keyed BLAKE3 hash derived from the crypt passwords, so the remote discloses neither a path nor a content hash, and nobody holding a candidate file can test whether the archive stores it. On a mirror the names *are* your tree, replicated path for path, and stay in clear; if the names themselves are sensitive, use an append-only layout rather than a mirror.
 - **Verification falls back to size+mtime.** rclone crypt remotes cannot expose content hashes, so the end-to-end BLAKE3 check (`--checksum --hash blake3`) cannot pass through the overlay. Transfers to and from an encrypted destination compare by size+mtime instead — the same comparison `--shallow` uses — and say so in the run output; the runs row records the transfer as shallow. Content-addressed destinations regain deeper verification through provider-side ciphertext fingerprints — see [Offsite verification](#offsite-verification-squirrel-verify).
 
 ### Kopia destinations
@@ -159,6 +159,8 @@ Instead of a browsable tree, the destination holds two streams:
 
 - **`objects/<hash>`** (at the destination root, shared by all volumes) — one object per BLAKE3 content hash (lowercase hex), the raw file bytes (encrypted client-side when the destination has a `crypt` block). Each hash is uploaded **exactly once** per destination and never moved, overwritten, or deleted. A local rename or reorg changes only the path mapping — no re-upload, no server-side copy — and content duplicated across volumes is stored once.
 - **`<volume>/index/run-<id>`** — one immutable **manifest segment** per sync run, per volume: the path-level delta of that run (see the format below). Replaying a volume's segments in run order yields its full current path→content mapping, and any past state.
+
+The names above are what an **unencrypted** destination stores. Add a [`crypt`](#encrypted-destinations) block and squirrel names each object and each per-volume directory by a keyed BLAKE3 hash derived from the crypt passwords instead, so the remote discloses neither a path nor a content hash; run ids stay in clear. Deduplication is unaffected — identical content still derives one name and uploads once.
 
 Durability is **transactional per run**: the run only counts as successful — and only then feeds the durability evidence squirrel records per destination — once *both* all its content objects *and* its manifest segment are confirmed on the remote (each transfer's success plus a follow-up presence/size listing). A failed run may leave objects without a segment; they are harmless (nothing maps them) and the next run skips re-uploading anything already recorded, pushing only what's missing.
 
@@ -241,6 +243,8 @@ Routing is by **size**: content at or above `pack_threshold` lands as `objects/<
 - **`packs/<pack-key>`** — one immutable **tar.zst pack** per bundle: small files, hash-sorted into a normalized PAX tar and solid-compressed with zstd (encrypted client-side when the destination has a `crypt` block). The file name is the BLAKE3 of the compressed bytes, so an identical bundle names the same file. A pack is written once and never rewritten or deleted; content already packed is never re-packed.
 - **`packs/map-<run>`** — one **placement map** per sync run: JSONL locating each newly packed content inside its pack (see the format below), alongside the same `<volume>/index/run-<id>` manifest segment the content-addressed layout writes.
 
+As with the content-addressed layout, an [encrypted](#encrypted-destinations) destination keys the object and pack basenames and the per-volume directory; `map-<run>` keeps its run id so replay order survives without the key.
+
 Durability is **transactional per run and three-artifact**: a run advances the destination's durability evidence only once *all three* of its artifacts — every pack, the run's `packs/map-<run>`, and its `index/run-<run>` segment — are confirmed on the remote **and** every pack has a verified scan-back fingerprint. A pack's fingerprint is read straight back from the provider after upload (one check per ~512 MB pack vouches for every file it holds — the packed analogue of the per-object scan-back); if that read is unavailable the pack is left **pending** with a warning and the vector is *not* advanced, so unverified packed content is never counted durable. [`squirrel verify`](#offsite-verification-squirrel-verify) fills any pending pack fingerprint and re-confirms the rest, per pack.
 
 Properties match the content-addressed layout: verification is presence+size (recorded shallow), the layout is chosen at first use and refuses to run against a differently-shaped history, and `--dry-run` is not supported yet on the push. **`squirrel restore` restores the layout too**: it locates each present path's content in the local index (a pack member via `pack_members`, or a per-hash object), fetches each pack **once** to serve all its requested members, decompresses the tar.zst stream, and re-hashes every extracted member before writing. When the local index is lost, the format still recovers without squirrel (below).
@@ -270,6 +274,8 @@ The path→hash mapping comes from the manifest segments exactly as in the conte
    ```
 
    (decrypt with the `crypt` password first if the destination has one). The recovered bytes hash back to `<blake3>`, so recovery is self-checking.
+
+On an **encrypted** destination the literal names above are not what is stored: `objects/<blake3>`, `packs/<pack>`, and `<volume>/` each carry a keyed name instead. Recovery derives them from the same crypt passwords it needs to decrypt — the derivation is written out step by step in [Manifest & pack formats](https://mbertschler.github.io/squirrel/reference/formats/#deriving-the-stored-names-on-an-encrypted-destination). Run ids are unchanged, so step 1 and step 2 still sort as written.
 
 ### Offloading
 

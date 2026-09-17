@@ -18,6 +18,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,7 +28,6 @@ import (
 
 	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/runevents"
-	"github.com/mbertschler/squirrel/volmark"
 )
 
 // MinRcloneVersion is the lowest rclone version this binary supports.
@@ -659,13 +659,15 @@ func (r *Rclone) deleteFile(ctx context.Context, fileURI string) error {
 // `squirrel destination reset` — as a fresh start rather than a layout
 // conflict.
 //
-// Per-volume markers (volmark.MarkerName) do not count as content. A root
-// that was wiped and re-bootstrapped carries a marker again — the marker gate
-// writes one on `--init` before any layout guard runs — so counting markers
-// would make the fresh-start recognition unreachable in exactly the situation
-// it exists for. Anything else present, including a single stray file, still
-// reads as non-empty and keeps the caller's refusal.
-func (r *Rclone) remoteRootEmpty(ctx context.Context, rootURI string, extraArgs ...string) (bool, error) {
+// exempt names basenames that do not count as content — squirrel's own
+// markers, each written by a gate that runs before the guard consulting
+// this, so counting them would make fresh-start recognition unreachable in
+// exactly the situation it exists for. Which markers those are is the
+// caller's to say, because it differs by guard: the naming gate discounts
+// only its own marker, since a volume marker in clear is itself evidence
+// of a root written under the older scheme. Anything not exempt, including
+// a single stray file, reads as non-empty and keeps the caller's refusal.
+func (r *Rclone) remoteRootEmpty(ctx context.Context, rootURI string, exempt []string, extraArgs ...string) (bool, error) {
 	args := append([]string{"lsf", "-R", "--files-only"}, extraArgs...)
 	out, err := r.runPlain(ctx, append(args, rootURI)...)
 	if err != nil {
@@ -675,9 +677,11 @@ func (r *Rclone) remoteRootEmpty(ctx context.Context, rootURI string, extraArgs 
 		return false, err
 	}
 	for _, line := range strings.Split(string(out), "\n") {
-		if name := strings.TrimSpace(line); name != "" && path.Base(name) != volmark.MarkerName {
-			return false, nil
+		name := strings.TrimSpace(line)
+		if name == "" || slices.Contains(exempt, path.Base(name)) {
+			continue
 		}
+		return false, nil
 	}
 	return true, nil
 }

@@ -150,7 +150,7 @@ func TestArchiveRestoreVerifyOnExtract(t *testing.T) {
 		t.Fatalf("sync: %v", err)
 	}
 	// Tamper with the stored object: same length, different bytes.
-	obj := f.remoteBlob(ObjectsDirName, blake3Hex("alpha"))
+	obj := f.objectBlob(t, blake3Hex("alpha"))
 	if err := os.WriteFile(obj, []byte("BRAVO"), 0o644); err != nil {
 		t.Fatalf("corrupt object: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestPackedRestoreVerifyOnExtractMember(t *testing.T) {
 	// every other member's offset is unchanged), then recompress and write the
 	// pack back. The pack key no longer matches the tampered bytes, but restore
 	// verifies per member, not per pack — so only s2.txt's re-hash must fail.
-	packPath := f.remoteBlob(PacksDirName, corrupt.Pack)
+	packPath := f.packBlob(t, corrupt.Pack)
 	packBytes, err := os.ReadFile(packPath)
 	if err != nil {
 		t.Fatalf("read pack: %v", err)

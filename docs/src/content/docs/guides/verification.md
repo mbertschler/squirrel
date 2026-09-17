@@ -109,6 +109,11 @@ Because crypt encrypts with a random per-file nonce, the fingerprint is a
 property of the *uploaded ciphertext*, not of the content — which is exactly
 right here: the layout is append-only and each object is uploaded once, so the
 fingerprint is stable for the life of the object.
+
+On an [encrypted](/squirrel/layouts/encrypted/) destination the listing is keyed
+by the artifact's keyed name rather than its content hash, which squirrel derives
+locally from the crypt passwords. Verification is otherwise identical, so keying
+the names costs no depth of checking and no offload eligibility.
 :::
 
 ## Related knobs

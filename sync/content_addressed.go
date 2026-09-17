@@ -27,10 +27,12 @@ const (
 	// ObjectsDirName holds one immutable object per BLAKE3 content
 	// hash at the destination root: objects/<lowercase hex>, raw file
 	// bytes (encrypted by the crypt overlay when the destination has
-	// one). The directory is destination-global — shared by every
-	// volume, matching remote_objects' (content, destination) key —
-	// so duplicated content across volumes uploads once. An object is
-	// uploaded once and never moved, overwritten, or deleted.
+	// one). On an encrypted destination the basename is keyed instead
+	// of the hash itself (see objectName), so the remote discloses no
+	// content hash. The directory is destination-global — shared by
+	// every volume, matching remote_objects' (content, destination)
+	// key — so duplicated content across volumes uploads once. An
+	// object is uploaded once and never moved, overwritten, or deleted.
 	ObjectsDirName = "objects"
 	// ManifestDirName holds one immutable manifest segment per sync
 	// run, per volume: <volume>/index/run-<run id>, the JSONL
@@ -102,6 +104,11 @@ type contentPusher struct {
 	dest  *config.Destination
 }
 
+// names is the naming scheme a push writes under: the destination's own,
+// since ensureNamingScheme has already refused a root written under any
+// other.
+func (h *contentPusher) names() namer { return namerFor(h.dest) }
+
 // ensureMarker gates a remote content-layout push on the destination's
 // per-volume .squirrel-volume marker, exactly as the mirror layout does
 // (the marker sits at the volume root regardless of layout). Local
@@ -143,7 +150,13 @@ func (h *contentAddressedHandler) Push(ctx context.Context, opts Options) (Repor
 		return rep, err
 	}
 	if opts.DryRun {
+		if _, err := h.checkNamingScheme(ctx); err != nil {
+			return rep, err
+		}
 		return rep, h.previewDryRun(ctx, &rep, volID)
+	}
+	if err := h.ensureNamingScheme(ctx); err != nil {
+		return rep, err
 	}
 	if err := h.ensureMarker(ctx, opts.Init); err != nil {
 		return rep, err
@@ -284,7 +297,7 @@ func (h *contentAddressedHandler) watermark(ctx context.Context, volID int64) (i
 	}
 	segURI := h.segmentURI(last.ID)
 	if _, err := h.rcl.statRemote(ctx, segURI, checkersArgs(h.dest)...); err != nil {
-		if freshStartOnEmptyRoot(ctx, h.rcl, h.dest) {
+		if freshStartOnEmptyRoot(ctx, h.rcl, h.dest, rootMarkerNames(h.dest)...) {
 			return 0, nil
 		}
 		return 0, fmt.Errorf("destination %q: the last successful sync (run %d) left no manifest segment at %s — its history does not look content-addressed; point the layout at a fresh destination or root, or (after wiping the remote root) run `squirrel destination reset %s`, instead of switching an existing one: %w: %w", h.dest.Name, last.ID, segURI, h.dest.Name, err, ErrRefused)
@@ -387,7 +400,7 @@ func (h *contentPusher) captureFingerprints(ctx context.Context, rep *Report, co
 	for _, d := range confirmed {
 		d := d
 		targets = append(targets, captureTarget{
-			name:  hex.EncodeToString(d.Blake3),
+			name:  h.names().object(d.Blake3),
 			label: "object",
 			record: func(ctx context.Context, algo, value string) error {
 				return h.store.SetRemoteObjectFingerprint(ctx, d.ContentID, h.dest.Name, algo, value, store.NowNs())
@@ -449,7 +462,7 @@ func (h *contentPusher) uploadOneObject(ctx context.Context, runID int64, d stor
 			errContentDrift, d.Path, hex.EncodeToString(digest), hex.EncodeToString(d.Blake3), h.vol.Name)
 	}
 	hash := hex.EncodeToString(d.Blake3)
-	uri := h.objectURI(hash)
+	uri := h.objectURI(d.Blake3)
 	if err := h.rcl.copyTo(ctx, src, uri, checkersArgs(h.dest)...); err != nil {
 		return err
 	}
@@ -494,42 +507,21 @@ func (h *contentPusher) uploadSegment(ctx context.Context, delta []store.PathDel
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp("", "squirrel-manifest-*")
-	if err != nil {
-		return fmt.Errorf("stage manifest segment: %w", err)
-	}
-	defer func() { _ = os.Remove(tmp.Name()) }()
-	if _, err := tmp.Write(body); err != nil {
-		tmp.Close()
-		return fmt.Errorf("write manifest segment: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close manifest segment: %w", err)
-	}
-
-	uri := h.segmentURI(runID)
-	if err := h.rcl.copyTo(ctx, tmp.Name(), uri, checkersArgs(h.dest)...); err != nil {
-		return fmt.Errorf("upload manifest segment to %s: %w", uri, err)
-	}
-	size, err := h.rcl.statRemote(ctx, uri, checkersArgs(h.dest)...)
-	if err != nil {
-		return fmt.Errorf("confirm manifest segment at %s: %w", uri, err)
-	}
-	if size != int64(len(body)) {
-		return fmt.Errorf("manifest segment at %s landed with size %d, want %d", uri, size, len(body))
-	}
-	return nil
+	return h.uploadBytes(ctx, body, h.segmentURI(runID), "manifest segment")
 }
 
 // objectURI addresses one content object under the destination-root
 // objects/ directory, through the crypt overlay when the destination
-// has one.
-func (h *contentPusher) objectURI(hash string) string {
-	return remoteSubpathURI(h.dest, path.Join(ObjectsDirName, hash))
+// has one. The basename is objectName's, so an encrypted destination
+// addresses the object by its keyed name rather than its content hash.
+func (h *contentPusher) objectURI(contentHash []byte) string {
+	return remoteSubpathURI(h.dest, path.Join(ObjectsDirName, h.names().object(contentHash)))
 }
 
 // segmentURI addresses one run's manifest segment under the
-// destination's per-volume index/ directory.
+// destination's per-volume index/ directory. The run id stays in clear:
+// replaying the segments in run order is what recovers a volume without
+// squirrel, and that ordering has to survive without the naming key.
 func (h *contentPusher) segmentURI(runID int64) string {
-	return remoteSubpathURI(h.dest, path.Join(h.vol.Name, ManifestDirName, "run-"+strconv.FormatInt(runID, 10)))
+	return remoteSubpathURI(h.dest, path.Join(h.names().volumeDir(h.vol.Name), ManifestDirName, "run-"+strconv.FormatInt(runID, 10)))
 }
