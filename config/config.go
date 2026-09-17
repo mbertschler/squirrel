@@ -258,11 +258,12 @@ type Crypt struct {
 	// Optional but recommended, matching rclone's crypt config.
 	Password2 string
 	// NamingKey is the artifact-naming key derived from the two passwords
-	// at load time (DeriveNamingKey), used by the destinations whose
-	// layout hides artifact names (Destination.HidesArtifactNames). Load
-	// populates it whenever a crypt block resolves; it is derived rather
-	// than configured so an operator keeps no secret beyond the passwords
-	// themselves.
+	// at load time (DeriveNamingKey). Load populates it for the layouts
+	// that name artifacts by key — the append-only ones, where
+	// Destination.HidesArtifactNames holds — and leaves it zero on a crypt
+	// mirror, which names artifacts by the operator's own paths and so
+	// needs no key. It is derived rather than configured so an operator
+	// keeps no secret beyond the passwords themselves.
 	NamingKey [32]byte
 }
 

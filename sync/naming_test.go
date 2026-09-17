@@ -84,17 +84,18 @@ func TestPlainDestinationKeepsContentHashNames(t *testing.T) {
 func TestKeyedNameDomainsSeparate(t *testing.T) {
 	dest := keyedTestDest(t)
 	raw := mustHex(t, blake3Hex("alpha"))
-	obj, pack := objectName(dest, raw), packName(dest, raw)
+	n := namerFor(dest)
+	obj, pack := n.object(raw), n.pack(raw)
 	if obj == pack {
 		t.Fatalf("object and pack names collide for identical input: %s", obj)
 	}
 	if obj == hex.EncodeToString(raw) {
 		t.Fatal("keyed object name equals the content hash")
 	}
-	if vol := volumeDirName(dest, "pics"); vol == "pics" || vol == obj {
+	if vol := n.volumeDir("pics"); vol == "pics" || vol == obj {
 		t.Fatalf("volume directory name %q is not independently keyed", vol)
 	}
-	for _, name := range []string{obj, pack, volumeDirName(dest, "pics")} {
+	for _, name := range []string{obj, pack, n.volumeDir("pics")} {
 		if len(name) != 64 {
 			t.Errorf("keyed name %q is %d chars, want 64 hex", name, len(name))
 		}
@@ -111,7 +112,7 @@ func TestKeyedNamesFollowTheKey(t *testing.T) {
 	raw := mustHex(t, blake3Hex("alpha"))
 	a, b := keyedTestDest(t), keyedTestDest(t)
 	b.Crypt.NamingKey = config.DeriveNamingKey("a-different-password", "")
-	if objectName(a, raw) == objectName(b, raw) {
+	if namerFor(a).object(raw) == namerFor(b).object(raw) {
 		t.Fatal("two naming keys produced one object name")
 	}
 }
@@ -153,7 +154,7 @@ func TestNamingMarkerBootstrapped(t *testing.T) {
 // refuses and names the remedy.
 func TestNamingRefusesPopulatedRootWithoutMarker(t *testing.T) {
 	f := setupContentAddressedFixture(t)
-	seedRemoteFile(t, f, ObjectsDirName, blake3Hex("previously-uploaded"))
+	f.makeLegacyRoot(t, "previously-uploaded")
 	f.write(t, "a.txt", "alpha")
 	f.index(t)
 
@@ -223,7 +224,7 @@ func TestNamingRefusesUnreadableMarker(t *testing.T) {
 // no marker — an honest rehearsal refuses what the real push would refuse.
 func TestNamingGateHoldsOnDryRun(t *testing.T) {
 	f := setupContentAddressedFixture(t)
-	seedRemoteFile(t, f, ObjectsDirName, blake3Hex("previously-uploaded"))
+	f.makeLegacyRoot(t, "previously-uploaded")
 	f.write(t, "a.txt", "alpha")
 	f.index(t)
 
@@ -237,6 +238,7 @@ func TestNamingGateHoldsOnDryRun(t *testing.T) {
 // dry run against a fresh root leaves the remote as it found it.
 func TestDryRunWritesNoNamingMarker(t *testing.T) {
 	f := setupContentAddressedFixture(t)
+	f.wipeRemote(t)
 	f.write(t, "a.txt", "alpha")
 	f.index(t)
 	if _, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, f.pair, Options{DryRun: true}); err != nil {
@@ -244,6 +246,157 @@ func TestDryRunWritesNoNamingMarker(t *testing.T) {
 	}
 	if _, err := os.Stat(f.remoteBlob(NamingMarkerName)); err == nil {
 		t.Fatalf("a dry run wrote %s", NamingMarkerName)
+	}
+}
+
+// TestKeyedVolumeDirFoundByRecovery covers the disaster-recovery entry
+// point across the keyed volume directory: the ride-along index snapshot
+// lands under the keyed directory, and DiscoverIndexSnapshots — which
+// derives that directory from the volume names in the config — finds it
+// again.
+//
+// It is the one path where a naming mistake would be silent rather than
+// loud: a wrongly derived directory lists as absent, and absent is
+// reported as "this destination holds no snapshots for you" at the moment
+// an operator has least to work with.
+func TestKeyedVolumeDirFoundByRecovery(t *testing.T) {
+	f := setupContentAddressedFixture(t)
+	f.write(t, "a.txt", "alpha")
+	f.index(t)
+	sn := NewSnapshotter(f.store, f.rcl, SnapshotConfig{Dir: t.TempDir(), Keep: 7, Cloud: true, CloudKeep: 7})
+	rep, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, f.pair, Options{Snapshot: sn})
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if rep.SnapshotErr != nil {
+		t.Fatalf("SnapshotErr = %v, want nil", rep.SnapshotErr)
+	}
+
+	keyed := namerFor(f.dest()).volumeDir("pics")
+	if keyed == "pics" {
+		t.Fatal("volume directory was not keyed; the test proves nothing")
+	}
+	if _, err := os.Stat(f.remotePath(keyed, IndexDirName)); err != nil {
+		t.Fatalf("ride-along snapshot dir not under the keyed volume directory: %v", err)
+	}
+
+	snaps, err := DiscoverIndexSnapshots(context.Background(), f.rcl, f.dest(), []string{"pics", "docs"})
+	if err != nil {
+		t.Fatalf("DiscoverIndexSnapshots: %v", err)
+	}
+	var found *IndexSnapshot
+	for i := range snaps {
+		if snaps[i].Volume == "pics" {
+			found = &snaps[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("recovery found no snapshot for pics under its keyed directory: %+v", snaps)
+	}
+	if found.RunID != rep.RunID {
+		t.Errorf("snapshot RunID = %d, want %d", found.RunID, rep.RunID)
+	}
+	if found.TakenAt.IsZero() {
+		t.Error("snapshot timestamp did not parse; the name does not follow the convention")
+	}
+}
+
+// TestLegacyRootStaysReadable is the compatibility guarantee: an encrypted
+// archive uploaded before keyed naming existed keeps its content-hash
+// names, and the read paths address it as it stands. A hash ever observed
+// must stay retrievable, so a squirrel upgrade must not be the thing that
+// strands an archive — only *adding* to such a root is refused.
+//
+// The push here runs against a root that is still legacy-free (the fixture
+// seeded the naming marker), then the root is rewritten into the legacy
+// shape with the same content under its plain hash, which is exactly what
+// an older squirrel would have left.
+func TestLegacyRootStaysReadable(t *testing.T) {
+	f := setupContentAddressedFixture(t)
+	f.write(t, "a.txt", "alpha")
+	f.index(t)
+	if _, err := f.sync(t); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	// Re-shape the remote as an older squirrel would have written it:
+	// objects under their own hash, no naming marker.
+	keyedObj := f.objectBlob(t, blake3Hex("alpha"))
+	body, err := os.ReadFile(keyedObj)
+	if err != nil {
+		t.Fatalf("read pushed object: %v", err)
+	}
+	f.wipeRemote(t)
+	legacy := f.remoteBlob(ObjectsDirName, blake3Hex("alpha"))
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacy, body, 0o644); err != nil {
+		t.Fatalf("seed legacy object: %v", err)
+	}
+
+	names, err := resolveNamer(context.Background(), f.rcl, f.dest())
+	if err != nil {
+		t.Fatalf("resolveNamer: %v", err)
+	}
+	if names.keyed {
+		t.Fatal("a root with files and no marker resolved as keyed")
+	}
+	if got := names.object(mustHex(t, blake3Hex("alpha"))); got != blake3Hex("alpha") {
+		t.Fatalf("legacy object name = %s, want the content hash", got)
+	}
+
+	// Verify must read it as it stands rather than report every recorded
+	// object missing and latch a false corruption alarm.
+	rep, err := VerifyRemote(context.Background(), f.store, f.rcl, f.dest())
+	if err != nil {
+		t.Fatalf("VerifyRemote on a legacy root: %v", err)
+	}
+	if !rep.Clean() {
+		t.Fatalf("verify on a legacy root was not clean: missing=%v mismatched=%+v", rep.Missing, rep.Mismatched)
+	}
+	if rep.AlarmRaised {
+		t.Error("verify latched a standing alarm on a legacy root")
+	}
+	if rep.Objects == 0 {
+		t.Fatal("verify examined no recorded objects; the test proves nothing")
+	}
+}
+
+// TestLegacyRootRestores covers the other half of the same guarantee: the
+// bytes come back out of a pre-keying root.
+func TestLegacyRootRestores(t *testing.T) {
+	f := setupContentAddressedFixture(t)
+	f.write(t, "a.txt", "alpha")
+	f.index(t)
+	if _, err := f.sync(t); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	body, err := os.ReadFile(f.objectBlob(t, blake3Hex("alpha")))
+	if err != nil {
+		t.Fatalf("read pushed object: %v", err)
+	}
+	f.wipeRemote(t)
+	legacy := f.remoteBlob(ObjectsDirName, blake3Hex("alpha"))
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacy, body, 0o644); err != nil {
+		t.Fatalf("seed legacy object: %v", err)
+	}
+
+	target := t.TempDir()
+	rep, err := Restore(context.Background(), f.store, f.rcl, f.pair.Volume, f.dest(), RestoreOptions{ToPath: target})
+	if err != nil {
+		t.Fatalf("Restore from a legacy root: %v (rep=%+v)", err, rep)
+	}
+	got, err := os.ReadFile(filepath.Join(target, "a.txt"))
+	if err != nil {
+		t.Fatalf("restored file missing: %v", err)
+	}
+	if string(got) != "alpha" {
+		t.Fatalf("restored %q, want %q", got, "alpha")
 	}
 }
 

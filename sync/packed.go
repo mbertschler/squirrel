@@ -347,7 +347,7 @@ func (h *packedHandler) capturePackFingerprints(ctx context.Context, rep *Report
 		}
 		packID := pack.ID
 		targets = append(targets, captureTarget{
-			name:  packName(h.dest, w.Pack.PackKey),
+			name:  h.names().pack(w.Pack.PackKey),
 			label: "pack",
 			record: func(ctx context.Context, algo, value string) error {
 				return h.store.SetRemotePackFingerprint(ctx, packID, h.dest.Name, algo, value, store.NowNs())
@@ -377,7 +377,7 @@ func (h *packedHandler) watermark(ctx context.Context, volID int64) (int64, erro
 	}
 	mapURI := h.mapURI(last.ID)
 	if _, err := h.rcl.statRemote(ctx, mapURI, checkersArgs(h.dest)...); err != nil {
-		if freshStartOnEmptyRoot(ctx, h.rcl, h.dest) {
+		if freshStartOnEmptyRoot(ctx, h.rcl, h.dest, rootMarkerNames(h.dest)...) {
 			return 0, nil
 		}
 		return 0, fmt.Errorf("destination %q: the last successful sync (run %d) left no pack placement map at %s — its history is not packed (a mirror or content-addressed root); point the layout at a fresh destination or root, or (after wiping the remote root) run `squirrel destination reset %s`, instead of switching an existing one: %w: %w", h.dest.Name, last.ID, mapURI, h.dest.Name, err, ErrRefused)
@@ -554,7 +554,7 @@ func (h *contentPusher) uploadBytes(ctx context.Context, body []byte, uri, what 
 // through the crypt overlay when the destination has one. The basename is
 // packName's, keyed on an encrypted destination.
 func (h *packedHandler) packURI(packKey []byte) string {
-	return remoteSubpathURI(h.dest, path.Join(PacksDirName, packName(h.dest, packKey)))
+	return remoteSubpathURI(h.dest, path.Join(PacksDirName, h.names().pack(packKey)))
 }
 
 // mapURI addresses one run's placement map under the destination-root

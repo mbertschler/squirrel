@@ -44,6 +44,7 @@ password = "obscured-pw"
 	// The crypt suffix is now in force, so the marker must be re-seeded
 	// at the suffixed path the overlay resolves to.
 	f.seedMarker(t, "pics", "docs")
+	f.seedNamingMarker(t)
 	return f
 }
 

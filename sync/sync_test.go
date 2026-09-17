@@ -737,7 +737,7 @@ func TestBuildRestoreArgsCryptAddressing(t *testing.T) {
 // TestIndexDirURICrypt: the snapshot ride-along lands inside the encrypted
 // tree, addressed through the same overlay as the data transfer.
 func TestIndexDirURICrypt(t *testing.T) {
-	if got := indexDirURI(cryptFixtureDest(), "pics"); got != "offsite-crypt:pics/"+IndexDirName {
+	if got := indexDirURI(namerFor(cryptFixtureDest()), "pics"); got != "offsite-crypt:pics/"+IndexDirName {
 		t.Fatalf("indexDirURI = %q, want offsite-crypt:pics/%s", got, IndexDirName)
 	}
 }

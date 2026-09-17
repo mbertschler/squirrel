@@ -128,7 +128,7 @@ func TestCaptureReadsUnderlyingRemote(t *testing.T) {
 	for _, want := range []string{
 		"offsite:/data/objects",
 		"--hash-type sha256",
-		"--include " + listedRemoteName(f.dest(), objectName(f.dest(), mustHex(t, blake3Hex("alpha")))),
+		"--include " + listedRemoteName(f.dest(), namerFor(f.dest()).object(mustHex(t, blake3Hex("alpha")))),
 	} {
 		if !strings.Contains(line, want) {
 			t.Fatalf("capture argv lacks %q:\n%s", want, line)
@@ -337,6 +337,7 @@ checkers = 3
 [destinations.offsite.crypt]
 password = "obscured-pw"
 `, "/data")
+	f.seedNamingMarker(t)
 	f.write(t, "a.txt", "alpha")
 	f.index(t)
 	if _, err := f.sync(t); err != nil {

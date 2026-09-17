@@ -94,6 +94,11 @@ naming_key       = BLAKE3_derive_key(context = "squirrel destination artifact na
 name(domain, x)  = hex(BLAKE3_keyed(naming_key, domain || 0x00 || x))
 ```
 
+This applies to a root that carries the `.squirrel-naming` marker. An archive
+written before keyed naming existed has no marker and stores the literal names of
+the previous section; squirrel itself resolves which of the two a root uses
+before reading it, and so should any script you write.
+
 `password` and `password2` are the **plaintext** crypt passwords (if your config
 stores them pre-obscured, reveal them with `rclone reveal` first), and
 `password2` is the empty string when no salt is configured. `domain` is the

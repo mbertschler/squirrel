@@ -18,6 +18,7 @@ import (
 	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/index"
 	"github.com/mbertschler/squirrel/store"
+	"github.com/mbertschler/squirrel/volmark"
 )
 
 // fakeRcloneScript is the PATH-shim stand-in for the rclone binary,
@@ -165,11 +166,14 @@ lsf)
     dir="$RCLONE_FAKE_ROOT/$p" ;;
   *) dir="$a1" ;;
   esac
-  # Listed through a crypt overlay, rclone reports decrypted names — without
-  # the data suffix it appends on the underlying remote. Strip it so callers
-  # that match on a file's name (the emptiness probe skipping volume
-  # markers) see what real rclone would show them.
+  # Real rclone lsf prints each name *relative* to the directory it was
+  # given, so callers that match on a file's own name work (the emptiness
+  # probe skipping volume markers, the snapshot listings matching the
+  # index- prefix). Listed through a crypt overlay it reports decrypted
+  # names too — without the data suffix it appends on the underlying
+  # remote — so the suffix comes off here as well.
   [ -d "$dir" ] && find "$dir" -type f | while IFS= read -r n; do
+    n="${n#"$dir"/}"
     [ -n "$lsfsfx" ] && n="${n%"$lsfsfx"}"
     printf '%s\n' "$n"
   done
@@ -212,6 +216,10 @@ password = "obscured-pw"
 	// The crypt suffix is now in force, so the marker must be re-seeded
 	// at the suffixed path the overlay resolves to.
 	f.seedMarker(t, "pics", "docs")
+	// An established keyed root records its naming scheme; the volume
+	// markers just seeded are at keyed paths, and without the naming marker
+	// the gate would read them as a root written under the older scheme.
+	f.seedNamingMarker(t)
 	return f
 }
 
@@ -325,6 +333,37 @@ func (f *caFixture) seedMarker(t *testing.T, volumes ...string) {
 	}
 }
 
+// seedNamingMarker stamps the naming marker on the fixture's fake remote
+// through the real write path, so the root looks like one an earlier keyed
+// push established.
+func (f *caFixture) seedNamingMarker(t *testing.T) {
+	t.Helper()
+	h := &contentPusher{store: f.store, rcl: f.rcl, dest: f.cfg.Destinations["offsite"]}
+	if err := h.writeNamingMarker(context.Background()); err != nil {
+		t.Fatalf("seed %s: %v", NamingMarkerName, err)
+	}
+}
+
+// wipeRemote empties the fake remote, leaving the destination root as
+// squirrel would find a brand-new one.
+func (f *caFixture) wipeRemote(t *testing.T) {
+	t.Helper()
+	if err := os.RemoveAll(f.fakeRoot); err != nil {
+		t.Fatalf("wipe remote: %v", err)
+	}
+}
+
+// makeLegacyRoot leaves the remote as an encrypted archive written before
+// keyed naming: content under its own BLAKE3 name, the volume tree under
+// the volume name in clear, and no naming marker.
+func (f *caFixture) makeLegacyRoot(t *testing.T, contents ...string) {
+	t.Helper()
+	f.wipeRemote(t)
+	for _, c := range contents {
+		seedRemoteFile(t, f, ObjectsDirName, blake3Hex(c))
+	}
+}
+
 func (f *caFixture) write(t *testing.T, name, content string) {
 	t.Helper()
 	p := filepath.Join(f.pair.Volume.Path, name)
@@ -388,21 +427,21 @@ func (f *caFixture) dest() *config.Destination { return f.cfg.Destinations["offs
 // on an encrypted destination is keyed rather than the hash itself.
 func (f *caFixture) objectBlob(t *testing.T, hashHex string) string {
 	t.Helper()
-	return f.remoteBlob(ObjectsDirName, objectName(f.dest(), mustHex(t, hashHex)))
+	return f.remoteBlob(ObjectsDirName, namerFor(f.dest()).object(mustHex(t, hashHex)))
 }
 
 // packBlob is objectBlob for a pack, named by the pack key a placement map
 // records.
 func (f *caFixture) packBlob(t *testing.T, packHex string) string {
 	t.Helper()
-	return f.remoteBlob(PacksDirName, packName(f.dest(), mustHex(t, packHex)))
+	return f.remoteBlob(PacksDirName, namerFor(f.dest()).pack(mustHex(t, packHex)))
 }
 
 // volumeBlob joins parts under the destination's directory for volume,
 // which is keyed on an encrypted destination.
 func (f *caFixture) volumeBlob(t *testing.T, volume string, parts ...string) string {
 	t.Helper()
-	return f.remoteBlob(append([]string{volumeDirName(f.dest(), volume)}, parts...)...)
+	return f.remoteBlob(append([]string{namerFor(f.dest()).volumeDir(volume)}, parts...)...)
 }
 
 func mustHex(t *testing.T, s string) []byte {
@@ -689,7 +728,7 @@ func TestContentAddressedObjectFailureIsTransactional(t *testing.T) {
 // the segment's missing piece is re-pushed.
 func TestContentAddressedSegmentFailureThenRecovery(t *testing.T) {
 	f := setupContentAddressedFixture(t)
-	t.Setenv("RCLONE_FAKE_FAIL_GLOB", "*"+volumeDirName(f.dest(), "pics")+"/"+ManifestDirName+"/*")
+	t.Setenv("RCLONE_FAKE_FAIL_GLOB", "*"+namerFor(f.dest()).volumeDir("pics")+"/"+ManifestDirName+"/*")
 	f.write(t, "a.txt", "alpha")
 	f.index(t)
 
@@ -818,7 +857,7 @@ func TestRemoteRootEmptyClassifiesErrors(t *testing.T) {
 
 	// A canonical directory-not-found is a fresh root.
 	t.Setenv("RCLONE_FAKE_LSF_ERROR", "2020/01/01 ERROR : directory not found")
-	empty, err := f.rcl.remoteRootEmpty(ctx, "offsite:/data")
+	empty, err := f.rcl.remoteRootEmpty(ctx, "offsite:/data", []string{volmark.MarkerName})
 	if err != nil || !empty {
 		t.Fatalf("not-found lsf = (%t, %v), want (true, nil)", empty, err)
 	}
@@ -826,7 +865,7 @@ func TestRemoteRootEmptyClassifiesErrors(t *testing.T) {
 	// An auth/network error must surface so the guard fails closed — never
 	// reported as an empty root just because stdout was empty.
 	t.Setenv("RCLONE_FAKE_LSF_ERROR", "Failed to create file system: 401 Unauthorized")
-	empty, err = f.rcl.remoteRootEmpty(ctx, "offsite:/data")
+	empty, err = f.rcl.remoteRootEmpty(ctx, "offsite:/data", []string{volmark.MarkerName})
 	if err == nil {
 		t.Fatalf("auth lsf error swallowed (empty=%t); guard would proceed instead of refusing", empty)
 	}

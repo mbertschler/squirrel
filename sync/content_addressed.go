@@ -104,6 +104,11 @@ type contentPusher struct {
 	dest  *config.Destination
 }
 
+// names is the naming scheme a push writes under: the destination's own,
+// since ensureNamingScheme has already refused a root written under any
+// other.
+func (h *contentPusher) names() namer { return namerFor(h.dest) }
+
 // ensureMarker gates a remote content-layout push on the destination's
 // per-volume .squirrel-volume marker, exactly as the mirror layout does
 // (the marker sits at the volume root regardless of layout). Local
@@ -292,7 +297,7 @@ func (h *contentAddressedHandler) watermark(ctx context.Context, volID int64) (i
 	}
 	segURI := h.segmentURI(last.ID)
 	if _, err := h.rcl.statRemote(ctx, segURI, checkersArgs(h.dest)...); err != nil {
-		if freshStartOnEmptyRoot(ctx, h.rcl, h.dest) {
+		if freshStartOnEmptyRoot(ctx, h.rcl, h.dest, rootMarkerNames(h.dest)...) {
 			return 0, nil
 		}
 		return 0, fmt.Errorf("destination %q: the last successful sync (run %d) left no manifest segment at %s — its history does not look content-addressed; point the layout at a fresh destination or root, or (after wiping the remote root) run `squirrel destination reset %s`, instead of switching an existing one: %w: %w", h.dest.Name, last.ID, segURI, h.dest.Name, err, ErrRefused)
@@ -395,7 +400,7 @@ func (h *contentPusher) captureFingerprints(ctx context.Context, rep *Report, co
 	for _, d := range confirmed {
 		d := d
 		targets = append(targets, captureTarget{
-			name:  objectName(h.dest, d.Blake3),
+			name:  h.names().object(d.Blake3),
 			label: "object",
 			record: func(ctx context.Context, algo, value string) error {
 				return h.store.SetRemoteObjectFingerprint(ctx, d.ContentID, h.dest.Name, algo, value, store.NowNs())
@@ -510,7 +515,7 @@ func (h *contentPusher) uploadSegment(ctx context.Context, delta []store.PathDel
 // has one. The basename is objectName's, so an encrypted destination
 // addresses the object by its keyed name rather than its content hash.
 func (h *contentPusher) objectURI(contentHash []byte) string {
-	return remoteSubpathURI(h.dest, path.Join(ObjectsDirName, objectName(h.dest, contentHash)))
+	return remoteSubpathURI(h.dest, path.Join(ObjectsDirName, h.names().object(contentHash)))
 }
 
 // segmentURI addresses one run's manifest segment under the
@@ -518,5 +523,5 @@ func (h *contentPusher) objectURI(contentHash []byte) string {
 // replaying the segments in run order is what recovers a volume without
 // squirrel, and that ordering has to survive without the naming key.
 func (h *contentPusher) segmentURI(runID int64) string {
-	return remoteSubpathURI(h.dest, path.Join(volumeDirName(h.dest, h.vol.Name), ManifestDirName, "run-"+strconv.FormatInt(runID, 10)))
+	return remoteSubpathURI(h.dest, path.Join(h.names().volumeDir(h.vol.Name), ManifestDirName, "run-"+strconv.FormatInt(runID, 10)))
 }

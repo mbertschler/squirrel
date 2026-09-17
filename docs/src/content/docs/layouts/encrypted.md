@@ -78,10 +78,26 @@ squirrel](/squirrel/reference/formats/#disaster-recovery-without-squirrel), and
 that ordering has to survive without the key.
 
 The `.squirrel-naming` marker records *which* scheme a root was written under so
-two naming generations are never mixed into one root. A destination whose root
-already holds artifacts written before keyed naming is **refused** rather than
-mixed — point it at a fresh root, or wipe the remote root and run
-`squirrel destination reset <name>`.
+two naming generations are never mixed into one root.
+
+### An archive written before keyed naming
+
+Encrypted archives uploaded by an earlier squirrel store their objects under the
+content hash and their segments under the volume name. Such a root keeps working,
+with one restriction:
+
+- **Reading it is unaffected.** `squirrel restore`, `squirrel verify`, and
+  snapshot discovery resolve the naming scheme from the root itself and address
+  it as it stands. A hash ever observed stays retrievable, so upgrading squirrel
+  never strands an archive.
+- **Adding to it is refused.** A push to a root holding files without a marker
+  stops with an error naming the remedy: point the destination at a fresh root,
+  or wipe the remote root and run `squirrel destination reset <name>`. Writing
+  keyed names alongside the existing ones would leave those disclosing exactly
+  what they always did while squirrel treated the root as private.
+
+So an existing archive stays readable for as long as you keep it, and the names
+become private from the first push to a fresh root onward.
 
 :::note[The key is derived from your passwords, not stored]
 The naming key comes from `password` and `password2` through a key-derivation
