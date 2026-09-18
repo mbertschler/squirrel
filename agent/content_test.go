@@ -132,7 +132,9 @@ func TestPutContentMaterializesEveryAwaitingPath(t *testing.T) {
 // invariant at the one place a peer's bytes enter the volume. A body
 // that does not hash to the digest it was addressed to — or is not the
 // length /plan declared — must leave the destination absent, not
-// half-written.
+// half-written. Each is 400: the caller's bytes are what is wrong, as
+// distinct from a receiver-side write failure, which is a 500 the
+// initiator can only retry.
 func TestPutContentRefusesWrongBytes(t *testing.T) {
 	declared := []byte("the planned bytes")
 	for _, tc := range []struct {
@@ -142,7 +144,7 @@ func TestPutContentRefusesWrongBytes(t *testing.T) {
 	}{
 		{"different content, same length", []byte("the PLANNED bytes"), "hashes to"},
 		{"truncated", []byte("the planned"), "plan declared"},
-		{"longer than declared", []byte("the planned bytes and more"), ""},
+		{"longer than declared", []byte("the planned bytes and more"), "exceeds the"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newPreStageFixture(t)

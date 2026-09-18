@@ -58,7 +58,7 @@ func (r *peerSyncRouter) handlePutContent(w http.ResponseWriter, req *http.Reque
 	}
 	body := http.MaxBytesReader(w, req.Body, size)
 	if err := r.materializeContent(sess, digest, targets, size, mtimeNs, body); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeError(w, contentErrorStatus(err), err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, syncproto.ContentResponse{Paths: targets})
@@ -127,6 +127,23 @@ func awaitsTransfer(disposition string) bool {
 	return false
 }
 
+// errRejected marks a failure the *caller's bytes* caused — a body that is
+// the wrong length or hashes to the wrong digest. Everything else that can
+// fail here is the receiver's own filesystem (no space, a permission, a
+// failed fsync), and telling a peer its request was bad when the receiver's
+// disk is full sends the operator looking on the wrong machine.
+var errRejected = errors.New("upload rejected")
+
+// contentErrorStatus maps a materialise failure onto the status that names
+// which side has to act: 400 for bytes the receiver refused, 500 for a
+// receiver-side failure the initiator can only retry.
+func contentErrorStatus(err error) int {
+	if errors.Is(err, errRejected) {
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
+}
+
 // materializeContent lands the streamed body at the first target and
 // copies it to any remaining ones. The stream is written once and hashed
 // in the same pass, so the digest covers exactly the bytes that reached
@@ -168,7 +185,14 @@ func streamToPath(dstAbs string, body io.Reader, want []byte, size, mtimeNs int6
 	if err != nil {
 		_ = tmp.Close()
 		cleanup()
-		return fmt.Errorf("read body: %w", err)
+		// Overrunning the declared size is the caller's doing; any other
+		// copy failure is this machine's disk or a dropped connection, and
+		// must not be reported to the peer as a bad request.
+		var overrun *http.MaxBytesError
+		if errors.As(err, &overrun) {
+			return fmt.Errorf("%w: body exceeds the %d bytes plan declared", errRejected, size)
+		}
+		return fmt.Errorf("write incoming bytes: %w", err)
 	}
 	if err := verifyReceived(hasher.Sum(nil), want, written, size); err != nil {
 		_ = tmp.Close()
@@ -187,10 +211,10 @@ func streamToPath(dstAbs string, body io.Reader, want []byte, size, mtimeNs int6
 // addressed them to.
 func verifyReceived(got, want []byte, written, size int64) error {
 	if written != size {
-		return fmt.Errorf("body is %d bytes, plan declared %d", written, size)
+		return fmt.Errorf("%w: body is %d bytes, plan declared %d", errRejected, written, size)
 	}
 	if !bytesEqual(got, want) {
-		return fmt.Errorf("body hashes to %s, addressed as %s",
+		return fmt.Errorf("%w: body hashes to %s, addressed as %s", errRejected,
 			hex.EncodeToString(got), hex.EncodeToString(want))
 	}
 	return nil
