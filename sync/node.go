@@ -413,11 +413,11 @@ func (d *nodeSyncDriver) phaseBegin() error {
 }
 
 // requireInlineTransfer refuses a peer that negotiated below
-// ProtocolVersionInlineTransfer. Earlier versions expected the bytes to
-// arrive out-of-band through the node's separately configured byte-path,
-// which this version no longer has — so continuing would negotiate a
-// plan, move nothing, and fail at /verify with a mismatch per path. The
-// refusal names the fix instead.
+// ProtocolVersionInlineTransfer. Such a peer expects its bytes to arrive
+// out-of-band through a separately configured byte-path; this version
+// delivers them over the sync API, so continuing would negotiate a plan,
+// move nothing, and fail at /verify with a mismatch per path. Refusing
+// up front names the fix instead.
 func (d *nodeSyncDriver) requireInlineTransfer() error {
 	if d.protocolVersion >= syncproto.ProtocolVersionInlineTransfer {
 		return nil
@@ -802,10 +802,9 @@ func (d *nodeSyncDriver) emitProgress(total int) {
 	})
 }
 
-// contentHashesByPath indexes the plan's dispositions by path. The
-// receiver echoes the initiator's own digest back on every disposition,
-// so this is the initiator's claim round-tripped, not a receiver
-// assertion about content it does not yet hold.
+// contentHashesByPath indexes the plan's dispositions by path. The digest
+// on each disposition is the initiator's own claim, echoed back by the
+// receiver, so this recovers what the plan was built from.
 func contentHashesByPath(plan syncproto.PlanResponse) map[string]string {
 	out := make(map[string]string, len(plan.Dispositions))
 	for _, disp := range plan.Dispositions {
@@ -1051,10 +1050,16 @@ func (c *nodeClient) putContent(ctx context.Context, receiverRunID int64, blake3
 	return nil
 }
 
+// maxPeerErrorBody bounds how much of a non-2xx reply is read before
+// rendering it as a diagnostic. The receiver's error bodies are one JSON
+// object with a single message; the cap keeps a misbehaving peer from
+// streaming unbounded bytes into a run row.
+const maxPeerErrorBody = 4 << 10
+
 // responseError renders a non-2xx reply as a diagnostic, preferring the
 // receiver's structured `error` field over a bare status line.
 func responseError(resp *http.Response) string {
-	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxStderrCapture))
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxPeerErrorBody))
 	var errBody syncproto.ErrorResponse
 	_ = json.Unmarshal(bodyBytes, &errBody)
 	if errBody.Error != "" {
