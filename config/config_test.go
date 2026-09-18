@@ -1173,7 +1173,6 @@ func TestLoadNodeBlock(t *testing.T) {
 	p := writeConfig(t, `
 [nodes.nas]
 endpoint = "https://nas.local:8443"
-path     = "/srv/squirrel"
 auth     = { bearer = { env = "NAS_TOKEN" } }
 tls      = { cert_fingerprint = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" }
 `)
@@ -1191,9 +1190,6 @@ tls      = { cert_fingerprint = "sha256:0123456789abcdef0123456789abcdef01234567
 	if n.Token != "supersecret" {
 		t.Fatalf("Token = %q, want resolved literal", n.Token)
 	}
-	if n.Path != "/srv/squirrel" {
-		t.Fatalf("Path = %q", n.Path)
-	}
 	if !strings.HasPrefix(n.CertFingerprint, "sha256:") || len(n.CertFingerprint) != len("sha256:")+64 {
 		t.Fatalf("CertFingerprint = %q", n.CertFingerprint)
 	}
@@ -1204,7 +1200,6 @@ func TestLoadNodeBlockMinimal(t *testing.T) {
 	p := writeConfig(t, `
 [nodes.lan]
 endpoint = "http://10.0.0.1:8000"
-path     = "/data"
 auth     = { bearer = "literal-bearer" }
 `)
 	cfg, err := Load(p)
@@ -1242,7 +1237,6 @@ func TestLoadNodeDedupStrategy(t *testing.T) {
 			cfg, err := Load(writeConfig(t, `
 [nodes.lan]
 endpoint = "http://lan.local"
-path     = "/r"
 auth     = { bearer = "t" }
 `+c.body))
 			if c.wantErr != "" {
@@ -1271,15 +1265,12 @@ func TestLoadNodeRejectsBadEndpoint(t *testing.T) {
 		want string
 	}{
 		{"missing", `[nodes.x]
-path = "/r"
 auth = { bearer = "t" }`, "endpoint is required"},
 		{"bad scheme", `[nodes.x]
 endpoint = "ftp://x"
-path     = "/r"
 auth     = { bearer = "t" }`, "scheme must be http or https"},
 		{"no host", `[nodes.x]
 endpoint = "http://"
-path     = "/r"
 auth     = { bearer = "t" }`, "host is required"},
 	}
 	for _, c := range cases {
@@ -1299,7 +1290,6 @@ func TestLoadNodeRejectsBadFingerprint(t *testing.T) {
 	p := writeConfig(t, `
 [nodes.nas]
 endpoint = "https://nas.local"
-path     = "/r"
 auth     = { bearer = "t" }
 tls      = { cert_fingerprint = "sha256:tooshort" }
 `)
@@ -1316,7 +1306,6 @@ func TestLoadVolumeSyncToAcceptsNodeName(t *testing.T) {
 	p := writeConfig(t, `
 [nodes.nas]
 endpoint = "http://nas.local"
-path     = "/r"
 auth     = { bearer = "t" }
 
 [destinations.offsite]
@@ -1343,7 +1332,6 @@ func TestLoadRejectsCollidingNodeAndDestinationName(t *testing.T) {
 	p := writeConfig(t, `
 [nodes.shared]
 endpoint = "http://x"
-path     = "/r"
 auth     = { bearer = "t" }
 
 [destinations.shared]
@@ -1709,7 +1697,6 @@ func TestLoadNodePullDurabilityEvery(t *testing.T) {
 	p := writeConfig(t, `
 [nodes.nas]
 endpoint              = "https://nas.local:8443"
-path                  = "/mnt/nas-export"
 pull_durability_every = "24h"
 auth                  = { bearer = "b" }
 `)
@@ -1727,7 +1714,6 @@ func TestLoadNodePullDurabilityEveryDefaultsZero(t *testing.T) {
 	p := writeConfig(t, `
 [nodes.nas]
 endpoint = "https://nas.local:8443"
-path     = "/mnt/nas-export"
 auth     = { bearer = "b" }
 `)
 	cfg, err := Load(p)
@@ -1744,7 +1730,6 @@ func TestLoadRejectsBadPullDurabilityEvery(t *testing.T) {
 	p := writeConfig(t, `
 [nodes.nas]
 endpoint              = "https://nas.local:8443"
-path                  = "/mnt/nas-export"
 pull_durability_every = "soon"
 auth                  = { bearer = "b" }
 `)

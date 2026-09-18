@@ -94,8 +94,7 @@ type chainPeer struct {
 // root, mirroring buildNodeFixture's receiver half.
 func newChainPeer(t *testing.T, root, name string) *chainPeer {
 	t.Helper()
-	volParent := filepath.Join(root, name)
-	volPath := filepath.Join(volParent, "pics")
+	volPath := filepath.Join(root, name, "pics")
 	if err := os.MkdirAll(volPath, 0o755); err != nil {
 		t.Fatalf("mkdir %s: %v", volPath, err)
 	}
@@ -119,7 +118,7 @@ func newChainPeer(t *testing.T, root, name string) *chainPeer {
 	return &chainPeer{
 		store: s,
 		vol:   vol,
-		node:  &config.Node{Name: name, Endpoint: endpoint, Token: "test-token", Path: volParent},
+		node:  &config.Node{Name: name, Endpoint: endpoint, Token: "test-token"},
 	}
 }
 
@@ -132,12 +131,7 @@ func newChainPeer(t *testing.T, root, name string) *chainPeer {
 // cleanly (no conflicts): supersede-vs-conflict is judged by delivery,
 // not by the forwarded origin.
 func TestNodeSyncOriginCarriedVerbatimAcrossChain(t *testing.T) {
-	rcl := requireRclone(t)
 	root := t.TempDir()
-	rcl.Config = filepath.Join(root, "rclone.conf")
-	if err := os.WriteFile(rcl.Config, []byte{}, 0o600); err != nil {
-		t.Fatalf("write rclone.conf: %v", err)
-	}
 	ctx := context.Background()
 
 	volAPath := filepath.Join(root, "alpha", "pics")
@@ -166,7 +160,7 @@ func TestNodeSyncOriginCarriedVerbatimAcrossChain(t *testing.T) {
 	introRun := rowA.FirstSeenRunID
 
 	// Hop 1: alpha → bravo.
-	rep1, err := SyncNode(ctx, storeA, rcl, volA, bravo.node, Options{Shallow: true})
+	rep1, err := SyncNode(ctx, storeA, volA, bravo.node, Options{Shallow: true})
 	if err != nil || rep1.Status != store.RunStatusSuccess {
 		t.Fatalf("hop 1: err=%v status=%q", err, rep1.Status)
 	}
@@ -194,7 +188,7 @@ func TestNodeSyncOriginCarriedVerbatimAcrossChain(t *testing.T) {
 	if _, err := index.Index(ctx, bravo.store, bravo.vol.Path, index.Options{Name: "pics"}); err != nil {
 		t.Fatalf("index bravo: %v", err)
 	}
-	rep2, err := SyncNode(ctx, bravo.store, rcl, bravo.vol, charlie.node, Options{Shallow: true})
+	rep2, err := SyncNode(ctx, bravo.store, bravo.vol, charlie.node, Options{Shallow: true})
 	if err != nil || rep2.Status != store.RunStatusSuccess {
 		t.Fatalf("hop 2: err=%v status=%q", err, rep2.Status)
 	}
@@ -276,7 +270,7 @@ func TestNodeSyncAdvancesVectorAndPullsDurabilityAtClose(t *testing.T) {
 	}
 	f.indexInitiator(t)
 
-	rep, err := SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	rep, err := SyncNode(ctx, f.initStore, f.initVol, f.node, Options{Shallow: true})
 	if err != nil || rep.Status != store.RunStatusSuccess {
 		t.Fatalf("SyncNode: err=%v status=%q", err, rep.Status)
 	}
@@ -353,7 +347,7 @@ func TestNodeSyncPeerAdvanceSnapshotPinned(t *testing.T) {
 		t.Fatalf("PresentOriginMaxima: %v", err)
 	}
 
-	rep, err := SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	rep, err := SyncNode(ctx, f.initStore, f.initVol, f.node, Options{Shallow: true})
 	if err != nil || rep.Status != store.RunStatusSuccess {
 		t.Fatalf("SyncNode: err=%v status=%q", err, rep.Status)
 	}

@@ -53,7 +53,12 @@ type Node struct {
 // it transparently — accepting either a literal string or
 // `{ env = "VAR" }`.
 type rawNode struct {
-	Endpoint            string       `toml:"endpoint"`
+	Endpoint string `toml:"endpoint"`
+	// Path is accepted only so an obsolete `path` can be rejected by
+	// name. Bytes travel over the endpoint now; leaving the key to the
+	// decoder's strict mode would report it as an unrecognised field and
+	// leave the operator guessing whether they had typoed it.
+	Path                string       `toml:"path"`
 	DedupStrategy       string       `toml:"dedup_strategy"`
 	PullDurabilityEvery string       `toml:"pull_durability_every"`
 	Auth                *rawNodeAuth `toml:"auth"`
@@ -93,6 +98,9 @@ func resolveDedupStrategy(raw string) (string, error) {
 func resolveNode(name string, r *rawNode) (*Node, error) {
 	if !nameRE.MatchString(name) {
 		return nil, fmt.Errorf("invalid node name (must match %s)", nameRE)
+	}
+	if r.Path != "" {
+		return nil, errors.New("path is obsolete: peer syncs now stream bytes over the node's endpoint, so there is no separate byte-path to configure — delete the line")
 	}
 	if r.Endpoint == "" {
 		return nil, errors.New("endpoint is required")

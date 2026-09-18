@@ -34,7 +34,7 @@ func TestCLIConfigCheckAffirmative(t *testing.T) {
 		"node_name = \"thisnode\"\n\n" +
 		"[volumes.photos]\npath = \"" + photos + "\"\nsync_to = [\"scratch\"]\n\n" +
 		"[destinations.scratch]\ntype = \"local\"\nroot = \"" + dest + "\"\n\n" +
-		"[nodes.peer]\nendpoint = \"https://peer.home:8443\"\npath = \"" + nodePath + "\"\n" +
+		"[nodes.peer]\nendpoint = \"https://peer.home:8443\"\n" +
 		"[nodes.peer.auth]\nbearer = \"tok\"\n"
 	cfgPath := writeCheckConfig(t, body)
 

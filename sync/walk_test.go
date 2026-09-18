@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -104,7 +105,6 @@ func buildInstrumentedFixture(t *testing.T) (*nodeFixture, *walkStats) {
 		Name:     "nas",
 		Endpoint: endpoint,
 		Token:    "test-token",
-		Path:     recvVolRoot,
 	}
 	return &nodeFixture{
 		initStore: initStore,
@@ -125,12 +125,6 @@ func buildInstrumentedFixture(t *testing.T) (*nodeFixture, *walkStats) {
 // folder's file count, not the volume's, is what holds that promise.
 func TestNodeSyncMerkleWalkSecondSyncIsScoped(t *testing.T) {
 	f, stats := buildInstrumentedFixture(t)
-	rcl := requireRclone(t)
-	rcl.Config = filepath.Join(filepath.Dir(f.initVol.Path), "rclone.conf")
-	if err := os.WriteFile(rcl.Config, []byte{}, 0o600); err != nil {
-		t.Fatalf("write rclone.conf: %v", err)
-	}
-	f.rcl = rcl
 
 	const filesPerLeaf = 32
 	leaves := []string{
@@ -155,7 +149,7 @@ func TestNodeSyncMerkleWalkSecondSyncIsScoped(t *testing.T) {
 	totalFiles := len(leaves) * filesPerLeaf
 
 	// First sync: every file transfers and lands on the receiver.
-	rep1, err := SyncNode(context.Background(), f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	rep1, err := SyncNode(context.Background(), f.initStore, f.initVol, f.node, Options{Shallow: true})
 	if err != nil {
 		t.Fatalf("first SyncNode: %v (rep=%+v)", err, rep1)
 	}
@@ -181,7 +175,7 @@ func TestNodeSyncMerkleWalkSecondSyncIsScoped(t *testing.T) {
 	}
 	f.indexInitiator(t)
 
-	rep2, err := SyncNode(context.Background(), f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	rep2, err := SyncNode(context.Background(), f.initStore, f.initVol, f.node, Options{Shallow: true})
 	if err != nil {
 		t.Fatalf("second SyncNode: %v (rep=%+v)", err, rep2)
 	}
@@ -233,12 +227,6 @@ func TestNodeSyncMerkleWalkSecondSyncIsScoped(t *testing.T) {
 // first Present=false reply lands, not by the subtree's own depth.
 func TestNodeSyncMerkleWalkInitiatorOnlySubtreeShortCircuits(t *testing.T) {
 	f, stats := buildInstrumentedFixture(t)
-	rcl := requireRclone(t)
-	rcl.Config = filepath.Join(filepath.Dir(f.initVol.Path), "rclone.conf")
-	if err := os.WriteFile(rcl.Config, []byte{}, 0o600); err != nil {
-		t.Fatalf("write rclone.conf: %v", err)
-	}
-	f.rcl = rcl
 
 	// Six-level chain on the initiator; receiver has nothing — every
 	// folder is initiator-only. Without the short-circuit, the walk
@@ -254,7 +242,7 @@ func TestNodeSyncMerkleWalkInitiatorOnlySubtreeShortCircuits(t *testing.T) {
 	}
 	f.indexInitiator(t)
 
-	if _, err := SyncNode(context.Background(), f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true}); err != nil {
+	if _, err := SyncNode(context.Background(), f.initStore, f.initVol, f.node, Options{Shallow: true}); err != nil {
 		t.Fatalf("SyncNode: %v", err)
 	}
 	// One request for the root (which finds the whole subtree
@@ -270,19 +258,17 @@ func TestNodeSyncMerkleWalkInitiatorOnlySubtreeShortCircuits(t *testing.T) {
 	}
 }
 
-// TestNodeSyncFallsBackToFlatPlanForLegacyReceiver simulates a
-// legacy receiver that doesn't advertise ProtocolVersionMerkleWalk:
-// the initiator must transparently fall back to the v1 full-volume
-// /plan exchange. We force the legacy behaviour by stripping the
-// receiver's ProtocolVersion field from /v1/sync/begin responses.
-func TestNodeSyncFallsBackToFlatPlanForLegacyReceiver(t *testing.T) {
+// TestNodeSyncRefusesLegacyReceiver pins the one protocol bump that has
+// no fallback. Up to v3 the bytes travelled out-of-band through a
+// separately configured byte-path; v4 sends them over the sync API and
+// that path is gone, so there is nothing to degrade to. Negotiating down
+// would plan a sync, move nothing, and fail every path at /verify — a
+// confusing way to say "upgrade the peer". The refusal lands before
+// /plan, so no pre-staging runs on the receiver either. We force the
+// legacy behaviour by stripping the receiver's ProtocolVersion field
+// from /v1/sync/begin responses.
+func TestNodeSyncRefusesLegacyReceiver(t *testing.T) {
 	f, stats := buildInstrumentedFixture(t)
-	rcl := requireRclone(t)
-	rcl.Config = filepath.Join(filepath.Dir(f.initVol.Path), "rclone.conf")
-	if err := os.WriteFile(rcl.Config, []byte{}, 0o600); err != nil {
-		t.Fatalf("write rclone.conf: %v", err)
-	}
-	f.rcl = rcl
 
 	// Wrap the existing test server's handler with a /begin response
 	// rewriter that zeroes ProtocolVersion. httptest doesn't expose
@@ -314,20 +300,25 @@ func TestNodeSyncFallsBackToFlatPlanForLegacyReceiver(t *testing.T) {
 		t.Fatalf("seed file: %v", err)
 	}
 	f.indexInitiator(t)
-	if _, err := SyncNode(context.Background(), f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true}); err != nil {
-		t.Fatalf("SyncNode: %v", err)
+	_, err := SyncNode(context.Background(), f.initStore, f.initVol, f.node, Options{Shallow: true})
+	if err == nil {
+		t.Fatal("SyncNode succeeded against a v1 receiver; want a refusal")
 	}
-	if stats.planFoldersCalls.Load() != 0 {
-		t.Fatalf("/plan-folders called %d times; legacy receiver should have forced the flat fallback",
-			stats.planFoldersCalls.Load())
+	for _, want := range []string{"protocol v1", "needs v4", "upgrade squirrel"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %v, want substring %q", err, want)
+		}
 	}
-	if stats.planCalls.Load() == 0 {
-		t.Fatalf("/plan never called; the flat fallback should still drive at least one exchange")
+	if stats.planCalls.Load() != 0 {
+		t.Errorf("/plan called %d times; the refusal must precede planning", stats.planCalls.Load())
+	}
+	if _, statErr := os.Stat(filepath.Join(f.recvVol.Path, "single.txt")); statErr == nil {
+		t.Error("receiver holds single.txt; a refused sync must move no bytes")
 	}
 }
 
 // forwardRequest copies r to baseURL+path and writes the response into
-// w. Used by TestNodeSyncFallsBackToFlatPlanForLegacyReceiver to splice
+// w. Used by TestNodeSyncRefusesLegacyReceiver to splice
 // a response rewriter in front of the agent without re-implementing the
 // agent handler.
 func forwardRequest(t *testing.T, baseURL string, r *http.Request, w http.ResponseWriter) {
