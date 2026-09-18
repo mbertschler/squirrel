@@ -77,9 +77,8 @@ offload_requires = ["offsite-a"]
 
 [nodes.nas]
 endpoint = %q
-path     = %q
 auth     = { bearer = "test-token" }
-`, dbPath, srcVol, ts.URL, filepath.Join(root, "recv"))
+`, dbPath, srcVol, ts.URL)
 	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}

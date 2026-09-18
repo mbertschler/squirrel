@@ -16,6 +16,34 @@ destinations, so a node can trust that content is durable on a target that only
 a *peer* pushes to. This feeds the [offload](/squirrel/guides/offloading/)
 durability gate.
 
+## How the bytes travel
+
+A peer sync is one conversation over one connection. The initiator opens a
+session against the peer's `endpoint`, negotiates a per-path plan, streams
+each content object it owes straight to that same endpoint, and asks the
+receiver to verify and commit. Bearer token, TLS, and the optional
+certificate pin cover the transfer exactly as they cover the plan — there is
+no second address to configure and no second trust anchor to get right.
+
+Two properties fall out of keying the transfer by content hash rather than
+by path:
+
+- **Duplicate files cross the wire once.** Several paths wanting the same
+  BLAKE3 in one run are satisfied by a single upload, which the receiver
+  fans out locally.
+- **The receiver is the authority on what landed.** It hashes the stream as
+  it writes and refuses anything that does not match the digest it was
+  addressed to, so a file edited between indexing and sending is rejected
+  rather than stored under the wrong hash. The verify phase then re-reads
+  what is on disk, and only a clean verify advances durability.
+
+Peer sync uses no external binary — [rclone](/squirrel/start/install/) is for
+bucket destinations. A machine whose only targets are peers needs none
+installed.
+
+Both ends must speak peer-sync protocol v4 or later. An older peer is refused
+with an upgrade instruction rather than silently degraded.
+
 ## Watermark history
 
 ```sh

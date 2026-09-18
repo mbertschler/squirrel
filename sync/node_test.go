@@ -33,29 +33,15 @@ type nodeFixture struct {
 	initVol   *config.Volume
 	recvVol   *config.Volume
 	node      *config.Node
-	rcl       *Rclone
 	server    *httptest.Server
 }
 
+// setupNodeFixture lays down the on-disk volume dirs, opens initiator and
+// receiver stores, and spins an in-process agent to back the receiver.
+// Peer sync drives no external binary, so every test in this package can
+// use the one fixture — there is no rclone-present variant to pick
+// between any more.
 func setupNodeFixture(t *testing.T) *nodeFixture {
-	t.Helper()
-	f, root := buildNodeFixture(t)
-	rcl := requireRclone(t)
-	rcl.Config = filepath.Join(root, "rclone.conf")
-	if err := os.WriteFile(rcl.Config, []byte{}, 0o600); err != nil {
-		t.Fatalf("write rclone.conf: %v", err)
-	}
-	f.rcl = rcl
-	return f
-}
-
-// buildNodeFixture is the rclone-agnostic core of setupNodeFixture:
-// it lays down the on-disk volume dirs, opens initiator and receiver
-// stores, and spins an in-process agent to back the receiver. Tests
-// that need rclone wrap with the requireRclone skip + config write
-// via setupNodeFixture; tests that drive the HTTP surface directly
-// call this helper and leave fixture.rcl nil.
-func buildNodeFixture(t *testing.T) (*nodeFixture, string) {
 	t.Helper()
 	root := t.TempDir()
 	initVolPath := filepath.Join(root, "init", "pics")
@@ -90,13 +76,10 @@ func buildNodeFixture(t *testing.T) (*nodeFixture, string) {
 		t.Fatalf("parse test URL: %v", err)
 	}
 
-	// nodeRcloneDest joins node.Path + volumeName/, so node.Path is
-	// the receiver's "volume parent" directory.
 	node := &config.Node{
 		Name:     "nas",
 		Endpoint: endpoint,
 		Token:    "test-token",
-		Path:     recvVolRoot,
 	}
 
 	return &nodeFixture{
@@ -106,7 +89,7 @@ func buildNodeFixture(t *testing.T) (*nodeFixture, string) {
 		recvVol:   recvVol,
 		node:      node,
 		server:    ts,
-	}, root
+	}
 }
 
 func openStoreWithName(t *testing.T, path, name string) *store.Store {
@@ -149,13 +132,7 @@ func TestNodeSyncTransfersFiles(t *testing.T) {
 	}
 	f.indexInitiator(t)
 
-	// Sub-volume directory must exist on the receiver side; rclone
-	// will create per-file subdirs but it expects the volume root.
-	if err := os.MkdirAll(filepath.Join(f.recvVol.Path), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	rep, err := SyncNode(context.Background(), f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	rep, err := SyncNode(context.Background(), f.initStore, f.initVol, f.node, Options{Shallow: true})
 	if err != nil {
 		t.Fatalf("SyncNode: %v (rep=%+v)", err, rep)
 	}
@@ -258,7 +235,7 @@ func TestNodeSyncSupersedeMovesPriorBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.indexInitiator(t)
-	if _, err := SyncNode(context.Background(), f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true}); err != nil {
+	if _, err := SyncNode(context.Background(), f.initStore, f.initVol, f.node, Options{Shallow: true}); err != nil {
 		t.Fatalf("first SyncNode: %v", err)
 	}
 
@@ -266,7 +243,7 @@ func TestNodeSyncSupersedeMovesPriorBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.indexInitiator(t)
-	rep, err := SyncNode(context.Background(), f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	rep, err := SyncNode(context.Background(), f.initStore, f.initVol, f.node, Options{Shallow: true})
 	if err != nil {
 		t.Fatalf("second SyncNode: %v", err)
 	}
@@ -344,7 +321,7 @@ func TestNodeSyncResolvesConflictOnLocalWriteOnReceiver(t *testing.T) {
 	}
 	f.indexInitiator(t)
 
-	rep, err := SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	rep, err := SyncNode(ctx, f.initStore, f.initVol, f.node, Options{Shallow: true})
 	if err != nil {
 		t.Fatalf("SyncNode: %v (rep=%+v)", err, rep)
 	}
@@ -439,7 +416,7 @@ func TestNodeSyncResolvesConflictOnLocalWriteOnReceiver(t *testing.T) {
 	// Re-running sync immediately must produce zero conflicts: the
 	// receiver's new doc.md row is sourced from the initiator at the
 	// just-closed run, which is ≤ the watermark.
-	rep2, err := SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	rep2, err := SyncNode(ctx, f.initStore, f.initVol, f.node, Options{Shallow: true})
 	if err != nil {
 		t.Fatalf("second SyncNode: %v", err)
 	}
@@ -501,7 +478,7 @@ func TestNodeSyncContestedFreezeEndToEnd(t *testing.T) {
 	f.indexInitiator(t)
 
 	// Round 1: conflict. Initiator wins live; the loser is preserved once.
-	rep, err := SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	rep, err := SyncNode(ctx, f.initStore, f.initVol, f.node, Options{Shallow: true})
 	if err != nil || len(rep.NodeConflicts) != 1 {
 		t.Fatalf("round 1: err=%v conflicts=%+v, want one conflict", err, rep.NodeConflicts)
 	}
@@ -527,7 +504,7 @@ func TestNodeSyncContestedFreezeEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.indexInitiator(t)
-	rep2, err := SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	rep2, err := SyncNode(ctx, f.initStore, f.initVol, f.node, Options{Shallow: true})
 	if err != nil {
 		t.Fatalf("round 2 SyncNode: %v", err)
 	}
@@ -553,7 +530,7 @@ func TestNodeSyncContestedFreezeEndToEnd(t *testing.T) {
 
 	// Round 3: with the freeze lifted, the initiator's pending edit flows
 	// through as an ordinary supersede.
-	rep3, err := SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	rep3, err := SyncNode(ctx, f.initStore, f.initVol, f.node, Options{Shallow: true})
 	if err != nil {
 		t.Fatalf("round 3 SyncNode: %v", err)
 	}
@@ -570,12 +547,12 @@ func TestNodeSyncContestedFreezeEndToEnd(t *testing.T) {
 // latch even when the sync fails *after* /plan. The receiver already
 // pre-staged the loser and froze the path during /plan, so recording the
 // badge only on a successful close would hide it on the losing edge
-// exactly when a sync broke mid-flight (#158, F27). A bogus rclone binary
-// fails the transfer deterministically without needing rclone installed —
-// begin + plan run over the in-process HTTP receiver.
+// exactly when a sync broke mid-flight (#158, F27). Removing the source
+// file after indexing fails the transfer deterministically: /plan still
+// classifies the conflict from the index, and the upload phase then finds
+// nothing to send.
 func TestNodeSyncContestedMirroredOnTransferFailure(t *testing.T) {
-	f, root := buildNodeFixture(t)
-	f.rcl = &Rclone{Binary: filepath.Join(root, "no-such-rclone-binary")}
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 
 	// Receiver holds a local-write doc.md; the initiator diverges → conflict.
@@ -602,9 +579,13 @@ func TestNodeSyncContestedMirroredOnTransferFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.indexInitiator(t)
+	// Indexed, then gone: /plan still sees the conflict, the upload cannot
+	// read the bytes.
+	if err := os.Remove(filepath.Join(f.initVol.Path, "doc.md")); err != nil {
+		t.Fatal(err)
+	}
 
-	// The transfer must fail (bogus binary), so the sync returns an error.
-	_, err = SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	_, err = SyncNode(ctx, f.initStore, f.initVol, f.node, Options{Shallow: true})
 	if err == nil {
 		t.Fatal("SyncNode succeeded, want a transfer failure")
 	}
@@ -640,7 +621,7 @@ func TestNodeSyncIdempotentRerun(t *testing.T) {
 	}
 	f.indexInitiator(t)
 
-	rep1, err := SyncNode(context.Background(), f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	rep1, err := SyncNode(context.Background(), f.initStore, f.initVol, f.node, Options{Shallow: true})
 	if err != nil {
 		t.Fatalf("first SyncNode: %v", err)
 	}
@@ -648,7 +629,7 @@ func TestNodeSyncIdempotentRerun(t *testing.T) {
 		t.Fatalf("first run status = %q", rep1.Status)
 	}
 
-	rep2, err := SyncNode(context.Background(), f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	rep2, err := SyncNode(context.Background(), f.initStore, f.initVol, f.node, Options{Shallow: true})
 	if err != nil {
 		t.Fatalf("second SyncNode: %v", err)
 	}
@@ -683,7 +664,7 @@ func TestNodeSyncRejectsUnknownVolume(t *testing.T) {
 		index.Options{Name: other.Name}); err != nil {
 		t.Fatalf("re-index: %v", err)
 	}
-	_, err := SyncNode(context.Background(), f.initStore, f.rcl, &other, f.node, Options{Shallow: true})
+	_, err := SyncNode(context.Background(), f.initStore, &other, f.node, Options{Shallow: true})
 	if err == nil {
 		t.Fatalf("expected error; got nil")
 	}
@@ -964,7 +945,7 @@ func TestNodeSyncEndToEndConflictAfterAgentSideIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.indexInitiator(t)
-	rep1, err := SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	rep1, err := SyncNode(ctx, f.initStore, f.initVol, f.node, Options{Shallow: true})
 	if err != nil {
 		t.Fatalf("round 1 SyncNode: %v", err)
 	}
@@ -1005,7 +986,7 @@ func TestNodeSyncEndToEndConflictAfterAgentSideIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.indexInitiator(t)
-	rep2, err := SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	rep2, err := SyncNode(ctx, f.initStore, f.initVol, f.node, Options{Shallow: true})
 	if err != nil {
 		t.Fatalf("round 2 SyncNode: %v", err)
 	}
@@ -1099,7 +1080,7 @@ func TestNodeSyncConflictWhenPriorRowFromDifferentPeer(t *testing.T) {
 	}
 	f.indexInitiator(t)
 
-	rep, err := SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	rep, err := SyncNode(ctx, f.initStore, f.initVol, f.node, Options{Shallow: true})
 	if err != nil {
 		t.Fatalf("SyncNode: %v", err)
 	}
@@ -1196,7 +1177,7 @@ func TestCollectIndexEntriesSkipsReservedDirs(t *testing.T) {
 // rclone) so the agent→syncproto→client→Report propagation is
 // pinned without depending on the rclone binary at test time.
 func TestBeginPendingWarningsSurfaceAuditDrift(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 
 	// Seed a present row on the receiver attributed to the initiator.
@@ -1283,7 +1264,7 @@ func TestBeginPendingWarningsSurfaceAuditDrift(t *testing.T) {
 // receiver only counted modifications and silently dropped pure
 // deletions (Copilot review on PR 31).
 func TestBeginPendingWarningsSurfaceMissing(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 
 	v, err := f.recvStore.CreateVolume(ctx, f.recvVol.Name, f.recvVol.Path)
@@ -1363,7 +1344,7 @@ func TestBeginPendingWarningsSurfaceMissing(t *testing.T) {
 // watermark advances on the receiver via UpsertPeerSyncState, which
 // /close calls automatically on success.
 func TestBeginPendingWarningsEmptyAfterWatermark(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 
 	v, err := f.recvStore.CreateVolume(ctx, f.recvVol.Name, f.recvVol.Path)
@@ -1424,17 +1405,6 @@ func TestBeginPendingWarningsEmptyAfterWatermark(t *testing.T) {
 	}
 }
 
-// setupNodeFixtureNoRclone is the lighter-weight variant of
-// setupNodeFixture for tests that drive the agent HTTP surface
-// directly. Skipping the rclone-prerequisite means these tests run
-// under CI conditions where rclone is missing or below the supported
-// version.
-func setupNodeFixtureNoRclone(t *testing.T) *nodeFixture {
-	t.Helper()
-	f, _ := buildNodeFixture(t)
-	return f
-}
-
 // bytesDigest returns a 32-byte buffer filled with b for compact
 // fixture digests.
 func bytesDigest(b byte) []byte {
@@ -1482,7 +1452,7 @@ func TestNodeSyncCopyFromExistingDedup(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.indexInitiator(t)
-	if _, err := SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true}); err != nil {
+	if _, err := SyncNode(ctx, f.initStore, f.initVol, f.node, Options{Shallow: true}); err != nil {
 		t.Fatalf("first SyncNode: %v", err)
 	}
 
@@ -1501,7 +1471,7 @@ func TestNodeSyncCopyFromExistingDedup(t *testing.T) {
 	}
 	f.indexInitiator(t)
 
-	rep, err := SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	rep, err := SyncNode(ctx, f.initStore, f.initVol, f.node, Options{Shallow: true})
 	if err != nil {
 		t.Fatalf("second SyncNode: %v", err)
 	}
@@ -1557,7 +1527,7 @@ func TestNodeSyncCopyFromExistingDedup(t *testing.T) {
 // CopyFromExisting and the pre-stage must have left the bytes at the
 // new path with an independent inode.
 func TestPlanCopyFromExistingDirectAPI(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 
 	body := []byte("dedup-me-locally")
@@ -1655,7 +1625,7 @@ func TestPlanCopyFromExistingDirectAPI(t *testing.T) {
 // path. No pre-stage copy must happen; the initiator's rclone is the
 // only path that will deliver the bytes.
 func TestPlanDedupStrategyOff(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 
 	body := []byte("dedup-disabled")
@@ -1729,7 +1699,7 @@ func TestPlanDedupStrategyOff(t *testing.T) {
 // ordering, the dedup branch would paper over real content
 // divergences the provenance check should surface.
 func TestPlanSupersedeWinsOverDedup(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 
 	// Receiver holds two rows: target path has content Y (from this
@@ -1824,7 +1794,7 @@ func TestPlanSupersedeWinsOverDedup(t *testing.T) {
 // validation: a typo'd strategy must surface at /begin (400), not as
 // silently-applied wrong behaviour during classify.
 func TestBeginRejectsUnknownDedupStrategy(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 
 	initSelf, _ := f.initStore.GetSelfNode(ctx)
@@ -1875,7 +1845,7 @@ func TestNodeSyncCopyFromExistingPreservesOutOfBandFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.indexInitiator(t)
-	if _, err := SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true}); err != nil {
+	if _, err := SyncNode(ctx, f.initStore, f.initVol, f.node, Options{Shallow: true}); err != nil {
 		t.Fatalf("seed SyncNode: %v", err)
 	}
 
@@ -1906,7 +1876,7 @@ func TestNodeSyncCopyFromExistingPreservesOutOfBandFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rep, err := SyncNode(ctx, f.initStore, f.rcl, f.initVol, f.node, Options{Shallow: true})
+	rep, err := SyncNode(ctx, f.initStore, f.initVol, f.node, Options{Shallow: true})
 	if err != nil {
 		t.Fatalf("dedup SyncNode: %v", err)
 	}

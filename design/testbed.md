@@ -11,7 +11,7 @@ machines are five processes on loopback ports.
 | Reference | Testbed stand-in | Why it's faithful |
 |---|---|---|
 | nas, laptop, homepc, htpc | 4 × `squirrel agent`, each with its own config + db + `node_name`, on `127.0.0.1:750{1..4}` | Node identity lives in (config, db, name) — the code never cares that the "machines" share a kernel |
-| LAN + SMB/NFS byte-paths | `[nodes.X] path` pointing at the peer's volume directory on local disk | `Node.Path` is an rclone-style prefix; a local absolute path is its simplest legal value |
+| LAN between household machines | the peer-sync API itself — bytes stream to `[nodes.X] endpoint` alongside the plan | Since v4 a peer is one address; there is no separate byte-path to stand in for, and the loopback agents exercise the real transport |
 | cloudbox (pure SFTP, no programs) | `rclone serve sftp --user u123456 --pass …` on `127.0.0.1:2222`, serving an empty dir | Exactly the product shape: an SFTP endpoint you cannot run code on. Presents a real host key, so the `known_hosts_file` UX is exercised too |
 | s3archive | SeaweedFS `weed server -s3` on `127.0.0.1:8333` (same creds/config as `test/integration/s3config.json`) | Already the reference S3 endpoint for the integration tests; proven to produce the composite multipart ETags the fingerprint path depends on |
 | kopia-mirror | `kopia` binary + a repo directory | Same as production: squirrel drives the CLI |

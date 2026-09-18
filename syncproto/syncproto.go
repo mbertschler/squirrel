@@ -8,7 +8,11 @@
 //	POST /v1/sync/begin   handshake → receiver allocates a run id
 //	POST /v1/sync/plan    initiator sends index slice; receiver
 //	                      returns per-path dispositions
-//	POST /v1/sync/verify  initiator notifies "rclone done"; receiver
+//	PUT  /v1/sync/content/{run}/{blake3}
+//	                      initiator streams one content object's bytes;
+//	                      receiver hashes the stream and materialises it
+//	                      at every path in the session wanting that content
+//	POST /v1/sync/verify  initiator notifies "bytes sent"; receiver
 //	                      re-hashes transfer+supersede paths
 //	POST /v1/sync/close   initiator finalises; receiver commits the
 //	                      index updates and advances the watermark
@@ -37,6 +41,8 @@
 //   - Field names are part of the protocol; do not rename them
 //     without bumping the version path.
 package syncproto
+
+import "strconv"
 
 // DispositionAlreadyCorrect — both sides have the same (path, blake3).
 // rclone need not touch this path.
@@ -128,6 +134,23 @@ const ProtocolVersionMerkleWalk = 2
 // folder walk is unchanged from v2; this only widens the /plan verdict
 // set for initiators that opt in.
 const ProtocolVersionContested = 3
+
+// ProtocolVersionInlineTransfer moves the bytes themselves onto the
+// sync API. Up to ProtocolVersionContested the initiator negotiated a
+// plan over HTTP and then delivered the bytes out-of-band, through an
+// rclone target prefix the operator configured separately (`[nodes.X]
+// path`) and squirrel could not validate: a directory that existed but
+// was not the peer's storage looked identical to a correct one, and the
+// bytes landed somewhere the receiver never saw (friction log F34).
+// From v4 the initiator PUTs each content object to ContentPath on the
+// same authenticated, fingerprint-pinned connection the plan travelled
+// over, so there is exactly one address and one trust anchor per peer.
+//
+// Unlike the earlier bumps this one has no fallback: a receiver below v4
+// has no endpoint to accept bytes on, and the initiator no longer has a
+// byte-path to reach it by. The initiator refuses the sync with an
+// upgrade instruction rather than silently transferring nothing.
+const ProtocolVersionInlineTransfer = 4
 
 // BeginRequest opens a peer-sync session.
 type BeginRequest struct {
@@ -519,4 +542,24 @@ type DestinationCapability struct {
 // errorResponse type but is exported so client-side decoding can name it.
 type ErrorResponse struct {
 	Error string `json:"error"`
+}
+
+// ContentPath builds the upload URL path for one content object in a
+// session: PUT <ContentPath(run, blake3hex)> with the object's bytes as
+// the request body. Keying by BLAKE3 rather than by path is what makes
+// the endpoint safe and cheap — the hex digest is a fixed 64-character
+// alphabet the receiver validates before it touches the filesystem, so
+// no peer-supplied path ever reaches a filesystem join, and one upload
+// satisfies every path in the session that wants that content.
+func ContentPath(receiverRunID int64, blake3Hex string) string {
+	return "/v1/sync/content/" + strconv.FormatInt(receiverRunID, 10) + "/" + blake3Hex
+}
+
+// ContentResponse acknowledges one accepted content upload. Paths lists
+// the volume-relative paths the receiver materialised from these bytes,
+// in sorted order — normally one, more when the same content lands at
+// several paths in the same run. The initiator surfaces the count; the
+// authoritative check remains /verify, which re-reads what is on disk.
+type ContentResponse struct {
+	Paths []string `json:"paths"`
 }

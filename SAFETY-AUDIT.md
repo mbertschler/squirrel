@@ -45,7 +45,7 @@ fingerprint narrowed the gap; the [D2 status note](#d2) has the detail.
 | Finding | Why it is still open |
 |---|---|
 | **M7** — orphan-volume warning is only a warning | `warnOrphanVolumes` (`cmd/squirrel/root.go`) still only prints a stderr advisory; nothing refuses to run and there is no acknowledgement to clear. The latch-then-acknowledge shape this needs now exists twice over (`destination_alarms` + `verify ack`; `contested_paths` + `conflicts resolve`), so closing it is wiring, not design. See [principle 4](design/ux-principles.md#4-scary-moments-are-first-class-ux). |
-| **L3** — no rclone-version gate on restore-from-node | Still prospective, as written: `restoreFromNode` does not exist, so there is nothing to gate. `runRestore` now calls `EnsureMinVersion` unconditionally before any transfer, so a restore-from-node routed through that command would inherit the gate for free; a separate code path would not. Keep the placeholder. |
+| **L3** — ~~no rclone-version gate on restore-from-node~~ | **Moot.** Peer syncs no longer invoke rclone at all — the bytes stream over the peer's sync API — so a restore-from-node has no rclone version to gate. The BLAKE3 guarantee it was reaching for is now structural: the receiver hashes each stream as it writes and the initiator hashes as it sends, on every peer transfer, with no flag to get wrong. |
 
 ### Partial
 
@@ -362,6 +362,14 @@ The finding's own aside — "the same risk exists on the disposition
 symmetric `preStageTransfers` pass, which applies the same Lstat-and-
 preserve treatment to every rclone-delivered path. Both passes now share
 the same contract.
+
+The finding's reasoning about *why* the Transfer path was less exposed —
+"rclone's `--checksum --hash blake3` would catch the divergence" — was
+wrong twice over, which is worth recording rather than quietly dropping.
+`--hash` is not a comparison-hash selector on `rclone copy` (it is the
+lsf report-format flag), so `--checksum` was in fact comparing MD5; and
+peer syncs no longer run rclone at all. `preStageTransfers` is what
+actually holds the contract, and it does not depend on the comparison.
 
 **Issue:** [#62 — agent: CopyFromExisting pre-stage must preserve any out-of-band file at the destination path](https://github.com/mbertschler/squirrel/issues/62)
 

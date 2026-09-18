@@ -175,6 +175,7 @@ func (r *peerSyncRouter) register(mux *http.ServeMux) {
 	mux.Handle("POST /v1/sync/begin", r.srv.requireBearer(http.HandlerFunc(r.handleBegin)))
 	mux.Handle("POST /v1/sync/plan", r.srv.requireBearer(http.HandlerFunc(r.handlePlan)))
 	mux.Handle("POST /v1/sync/plan-folders", r.srv.requireBearer(http.HandlerFunc(r.handlePlanFolders)))
+	mux.Handle("PUT /v1/sync/content/{run}/{blake3}", r.srv.requireBearer(http.HandlerFunc(r.handlePutContent)))
 	mux.Handle("POST /v1/sync/verify", r.srv.requireBearer(http.HandlerFunc(r.handleVerify)))
 	mux.Handle("POST /v1/sync/close", r.srv.requireBearer(http.HandlerFunc(r.handleClose)))
 	mux.Handle("POST /v1/sync/durability", r.srv.requireBearer(http.HandlerFunc(r.handleDurability)))
@@ -401,10 +402,10 @@ func (r *peerSyncRouter) finishBegin(ctx context.Context, body syncproto.BeginRe
 // An initiator that omits the field (or sends zero) is treated as
 // ProtocolVersionFlat — the only behaviour we ever spoke before #44.
 // A future initiator that asks for a version this receiver doesn't
-// know is clamped down to ProtocolVersionMerkleWalk rather than
-// rejected, so a partial rollout doesn't break syncs.
+// know is clamped down to receiverMax rather than rejected, so a partial
+// rollout doesn't break syncs.
 func negotiateProtocol(requested int) int {
-	const receiverMax = syncproto.ProtocolVersionContested
+	const receiverMax = syncproto.ProtocolVersionInlineTransfer
 	if requested <= 0 {
 		return syncproto.ProtocolVersionFlat
 	}
@@ -1591,6 +1592,17 @@ func (r *peerSyncRouter) closeSession(ctx context.Context, sess *peerSession, st
 	}
 	origins := newOriginResolver(r.srv.store, sess)
 	committed := 0
+	// A failed close commits no path at all. `failed` reaches here from
+	// the initiator's abort, which carries no FailedPaths — it gave up
+	// mid-flight and cannot say which uploads landed. Committing the
+	// unlisted paths would record `present` rows for bytes that never
+	// arrived, which is worse than losing the run: the index would claim
+	// content the volume does not hold. A `partial` close is different —
+	// the initiator enumerated exactly what failed — so it still commits
+	// the rest.
+	if status == store.RunStatusFailed {
+		sess.dispositions = nil
+	}
 	for path, entry := range sess.dispositions {
 		if !materializesAtPath(entry.disposition) {
 			continue

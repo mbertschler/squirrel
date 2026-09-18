@@ -114,10 +114,7 @@ type Handler interface {
 func HandlerFor(s *store.Store, tools Tools, p Pair) (Handler, error) {
 	switch {
 	case p.IsNode():
-		if tools.Rclone == nil {
-			return nil, fmt.Errorf("node %q: rclone wrapper is required", p.Node.Name)
-		}
-		return &peerHandler{store: s, rcl: tools.Rclone, vol: p.Volume, node: p.Node}, nil
+		return &peerHandler{store: s, vol: p.Volume, node: p.Node}, nil
 	case p.Destination == nil:
 		return nil, errors.New("pair names no destination or node")
 	case p.Destination.Type == "kopia":
@@ -162,7 +159,6 @@ func (h *rcloneHandler) sealed() {}
 // peerHandler pushes to a peer node via the SyncNode handshake.
 type peerHandler struct {
 	store *store.Store
-	rcl   *Rclone
 	vol   *config.Volume
 	node  *config.Node
 }
@@ -170,7 +166,7 @@ type peerHandler struct {
 func (h *peerHandler) TargetName() string { return h.node.Name }
 
 func (h *peerHandler) Push(ctx context.Context, opts Options) (Report, error) {
-	return SyncNode(ctx, h.store, h.rcl, h.vol, h.node, opts)
+	return SyncNode(ctx, h.store, h.vol, h.node, opts)
 }
 
 func (h *peerHandler) sealed() {}
