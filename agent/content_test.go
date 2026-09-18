@@ -93,6 +93,30 @@ func TestPutContentLandsBytes(t *testing.T) {
 	}
 }
 
+// TestPutContentAcceptsEmptyFile pins the zero-length case, where the
+// declared size and the body-size cap are both zero. Empty files are
+// ordinary volume content, and the cap must admit them rather than
+// treating "no bytes" as an overrun.
+func TestPutContentAcceptsEmptyFile(t *testing.T) {
+	f := newPreStageFixture(t)
+	sess := f.newSession()
+	var empty []byte
+	f.awaitContent(sess, "empty.txt", empty)
+	f.router.storeSession(sess)
+
+	code, body := putContent(t, f.srv, f.recvRun, blakeHex(empty), empty)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d (%s), want 200", code, body)
+	}
+	info, err := os.Stat(filepath.Join(f.vol.Path, "empty.txt"))
+	if err != nil {
+		t.Fatalf("stat landed file: %v", err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("size = %d, want 0", info.Size())
+	}
+}
+
 // TestPutContentMaterializesEveryAwaitingPath is the payoff of keying by
 // content rather than by path: the same bytes wanted at several paths in
 // one run travel the wire once and the receiver fans them out.
