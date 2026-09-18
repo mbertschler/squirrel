@@ -64,7 +64,7 @@ func instrumentAgent(h http.Handler, stats *walkStats) http.Handler {
 	})
 }
 
-// buildInstrumentedFixture is a near-clone of buildNodeFixture that
+// buildInstrumentedFixture is a near-clone of setupNodeFixture that
 // also wires a walkStats counter through an http handler middleware.
 // Kept separate so the unrelated nodeFixture stays simple.
 func buildInstrumentedFixture(t *testing.T) (*nodeFixture, *walkStats) {

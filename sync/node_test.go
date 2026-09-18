@@ -36,20 +36,12 @@ type nodeFixture struct {
 	server    *httptest.Server
 }
 
-// setupNodeFixture builds the fixture and discards the root path, for the
-// tests that only drive the public API. Peer sync needs no external
-// binary, so there is nothing else to arrange.
+// setupNodeFixture lays down the on-disk volume dirs, opens initiator and
+// receiver stores, and spins an in-process agent to back the receiver.
+// Peer sync drives no external binary, so every test in this package can
+// use the one fixture — there is no rclone-present variant to pick
+// between any more.
 func setupNodeFixture(t *testing.T) *nodeFixture {
-	t.Helper()
-	f, _ := buildNodeFixture(t)
-	return f
-}
-
-// buildNodeFixture lays down the on-disk volume dirs, opens initiator and
-// receiver stores, and spins an in-process agent to back the receiver. It
-// returns the temp root for the few tests that place extra files beside
-// the volumes.
-func buildNodeFixture(t *testing.T) (*nodeFixture, string) {
 	t.Helper()
 	root := t.TempDir()
 	initVolPath := filepath.Join(root, "init", "pics")
@@ -97,7 +89,7 @@ func buildNodeFixture(t *testing.T) (*nodeFixture, string) {
 		recvVol:   recvVol,
 		node:      node,
 		server:    ts,
-	}, root
+	}
 }
 
 func openStoreWithName(t *testing.T, path, name string) *store.Store {
@@ -560,7 +552,7 @@ func TestNodeSyncContestedFreezeEndToEnd(t *testing.T) {
 // classifies the conflict from the index, and the upload phase then finds
 // nothing to send.
 func TestNodeSyncContestedMirroredOnTransferFailure(t *testing.T) {
-	f, _ := buildNodeFixture(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 
 	// Receiver holds a local-write doc.md; the initiator diverges → conflict.
@@ -1185,7 +1177,7 @@ func TestCollectIndexEntriesSkipsReservedDirs(t *testing.T) {
 // rclone) so the agent→syncproto→client→Report propagation is
 // pinned without depending on the rclone binary at test time.
 func TestBeginPendingWarningsSurfaceAuditDrift(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 
 	// Seed a present row on the receiver attributed to the initiator.
@@ -1272,7 +1264,7 @@ func TestBeginPendingWarningsSurfaceAuditDrift(t *testing.T) {
 // receiver only counted modifications and silently dropped pure
 // deletions (Copilot review on PR 31).
 func TestBeginPendingWarningsSurfaceMissing(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 
 	v, err := f.recvStore.CreateVolume(ctx, f.recvVol.Name, f.recvVol.Path)
@@ -1352,7 +1344,7 @@ func TestBeginPendingWarningsSurfaceMissing(t *testing.T) {
 // watermark advances on the receiver via UpsertPeerSyncState, which
 // /close calls automatically on success.
 func TestBeginPendingWarningsEmptyAfterWatermark(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 
 	v, err := f.recvStore.CreateVolume(ctx, f.recvVol.Name, f.recvVol.Path)
@@ -1411,17 +1403,6 @@ func TestBeginPendingWarningsEmptyAfterWatermark(t *testing.T) {
 	if len(resp.PendingWarnings) != 0 {
 		t.Fatalf("PendingWarnings = %v, want empty (audit predates watermark)", resp.PendingWarnings)
 	}
-}
-
-// setupNodeFixtureNoRclone is the lighter-weight variant of
-// setupNodeFixture for tests that drive the agent HTTP surface
-// directly. Skipping the rclone-prerequisite means these tests run
-// under CI conditions where rclone is missing or below the supported
-// version.
-func setupNodeFixtureNoRclone(t *testing.T) *nodeFixture {
-	t.Helper()
-	f, _ := buildNodeFixture(t)
-	return f
 }
 
 // bytesDigest returns a 32-byte buffer filled with b for compact
@@ -1546,7 +1527,7 @@ func TestNodeSyncCopyFromExistingDedup(t *testing.T) {
 // CopyFromExisting and the pre-stage must have left the bytes at the
 // new path with an independent inode.
 func TestPlanCopyFromExistingDirectAPI(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 
 	body := []byte("dedup-me-locally")
@@ -1644,7 +1625,7 @@ func TestPlanCopyFromExistingDirectAPI(t *testing.T) {
 // path. No pre-stage copy must happen; the initiator's rclone is the
 // only path that will deliver the bytes.
 func TestPlanDedupStrategyOff(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 
 	body := []byte("dedup-disabled")
@@ -1718,7 +1699,7 @@ func TestPlanDedupStrategyOff(t *testing.T) {
 // ordering, the dedup branch would paper over real content
 // divergences the provenance check should surface.
 func TestPlanSupersedeWinsOverDedup(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 
 	// Receiver holds two rows: target path has content Y (from this
@@ -1813,7 +1794,7 @@ func TestPlanSupersedeWinsOverDedup(t *testing.T) {
 // validation: a typo'd strategy must surface at /begin (400), not as
 // silently-applied wrong behaviour during classify.
 func TestBeginRejectsUnknownDedupStrategy(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 
 	initSelf, _ := f.initStore.GetSelfNode(ctx)

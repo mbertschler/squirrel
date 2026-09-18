@@ -20,7 +20,7 @@ import (
 // the content in the volume, not the duplicate's), and content with a
 // recorded origin travels verbatim under the origin node's name.
 func TestCollectIndexEntriesMaterialisesOrigins(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 
 	v, err := f.initStore.CreateVolume(ctx, f.initVol.Name, f.initVol.Path)
@@ -91,7 +91,7 @@ type chainPeer struct {
 }
 
 // newChainPeer stands up one agent-backed receiver named name under
-// root, mirroring buildNodeFixture's receiver half.
+// root, mirroring setupNodeFixture's receiver half.
 func newChainPeer(t *testing.T, root, name string) *chainPeer {
 	t.Helper()
 	volPath := filepath.Join(root, name, "pics")

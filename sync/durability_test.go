@@ -88,7 +88,7 @@ func seedReceiverFreshness(t *testing.T, f *nodeFixture, coords map[string]int64
 // evidence reaches a node that never pushes there. The merge is
 // monotonic: a stale pull below a higher local value is ignored.
 func TestPullDurabilityMergesFreshness(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 	f.initVol.OffloadRequires = []string{"offsite-a"}
 	f.initVol.SyncTo = []string{"offsite-b"}
@@ -130,7 +130,7 @@ func TestPullDurabilityMergesFreshness(t *testing.T) {
 // under the same destination names, with origin node names mapped to
 // local rows (created on first contact).
 func TestPullDurabilityCopiesComponents(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 	f.initVol.OffloadRequires = []string{"offsite-a"}
 	f.initVol.SyncTo = []string{"offsite-b"}
@@ -171,7 +171,7 @@ func TestPullDurabilityCopiesComponents(t *testing.T) {
 // offload gate can weigh peer-asserted evidence as a distinct, revocable
 // class. Locally-verified components written here directly stay untagged.
 func TestPullDurabilityTagsSourcePeer(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 	f.initVol.OffloadRequires = []string{"offsite-a"}
 	f.initVol.SyncTo = nil
@@ -226,7 +226,7 @@ func TestPullDurabilityTagsSourcePeer(t *testing.T) {
 // strictly later instant and so keep a dead-destination-behind-a-live-peer
 // looking perpetually fresh.
 func TestPullDurabilityRelaysVerifiedAt(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 	f.initVol.OffloadRequires = []string{"offsite-a"}
 	f.initVol.SyncTo = nil
@@ -277,7 +277,7 @@ func TestPullDurabilityRelaysVerifiedAt(t *testing.T) {
 // destination — counted and reported, never stored, and without
 // aborting the merge of the legitimate components.
 func TestPullDurabilityDropsUnconfiguredDestinations(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 	f.initVol.OffloadRequires = []string{"offload-target"}
 	f.initVol.SyncTo = []string{"sync-target"}
@@ -325,7 +325,7 @@ func TestPullDurabilityDropsUnconfiguredDestinations(t *testing.T) {
 // counted (Kind "freshness") just like a stray vector component, so a
 // peer can't seed push-freshness for a destination this node never uses.
 func TestPullDurabilityDropsUnconfiguredFreshness(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 	f.initVol.OffloadRequires = []string{"offsite-a"}
 	f.initVol.SyncTo = nil
@@ -357,7 +357,7 @@ func TestPullDurabilityDropsUnconfiguredFreshness(t *testing.T) {
 // Drops slice, so neither the report nor the output it feeds can grow
 // unbounded under an adversarial peer.
 func TestPullDurabilityCapsDropSamples(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 	junk := make(map[string]int64, 50)
 	for i := range 50 {
@@ -384,7 +384,7 @@ func TestPullDurabilityCapsDropSamples(t *testing.T) {
 // recorded value is refused and reported, leaving the local value in
 // place; the allow-rewind opt-in accepts it.
 func TestPullDurabilityRefusesRewind(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 	f.initVol.OffloadRequires = []string{"offsite-a"}
 	f.initVol.SyncTo = []string{"offsite-b"}
@@ -441,7 +441,7 @@ func TestPullDurabilityRefusesRewind(t *testing.T) {
 // local volume id, so a volume with no local index row fails fast with
 // a pointer at `index` rather than inventing a row.
 func TestPullDurabilityRequiresLocalVolume(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	seedReceiverDurability(t, f, map[string]int64{"offsite-a": 12})
 
 	_, err := PullDurability(context.Background(), f.initStore, f.initVol, f.node, false)
@@ -486,7 +486,7 @@ func TestValidateComponentVerifyMethod(t *testing.T) {
 // distinct-origin components on the receiver, all on one accepted
 // destination, and asserts the pull fails with the cap message.
 func TestPullDurabilityCapsOriginNodeCreation(t *testing.T) {
-	f := setupNodeFixtureNoRclone(t)
+	f := setupNodeFixture(t)
 	ctx := context.Background()
 	f.initVol.OffloadRequires = []string{"offsite-a"}
 
