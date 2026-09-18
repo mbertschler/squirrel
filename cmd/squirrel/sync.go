@@ -62,9 +62,15 @@ func runSync(cmd *cobra.Command, volumeName, destinationName string, progress bo
 	}
 	defer s.Close()
 
-	rcl, err := sync.Find()
-	if err != nil {
-		return err
+	// Locate rclone only when a pair in this batch drives it. A peer-only
+	// or kopia-only sync must start on a host that has no rclone at all —
+	// looking first would fail the run on a binary it never invokes.
+	var rcl *sync.Rclone
+	if pairsNeedRclone(pairs) {
+		rcl, err = sync.Find()
+		if err != nil {
+			return err
+		}
 	}
 	tools, err := sync.ToolsFor(cfg, pairs, rcl)
 	if err != nil {
@@ -74,11 +80,10 @@ func runSync(cmd *cobra.Command, volumeName, destinationName string, progress bo
 	if opts.Shallow {
 		fmt.Fprintln(out, shallowSyncWarning)
 	}
-	// Skip the rclone preamble entirely when every pair targets kopia:
-	// kopia never invokes rclone, so a version check is pointless and
-	// "rclone.conf updated" is misleading noise on a kopia-only sync
-	// (friction F11b).
-	if pairsNeedRclone(pairs) {
+	// The preamble runs only for a batch that actually drives rclone: a
+	// version check is pointless otherwise and "rclone.conf updated" is
+	// misleading noise on a kopia- or peer-only sync (friction F11b).
+	if rcl != nil {
 		if err := sync.EnsureMinVersion(cmd.Context(), rcl, out, sync.ShallowForPairs(pairs, opts.Shallow)); err != nil {
 			return err
 		}

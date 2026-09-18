@@ -98,22 +98,37 @@ func (t *schedulerTools) rebuild(ctx context.Context, cfg *config.Config) error 
 }
 
 // anyVolumeNeedsScheduledSync reports whether a scheduled sync will
-// invoke rclone. Only bucket destinations count: a cadence whose sync_to
-// names peer nodes alone streams its bytes over the sync API, so a
-// peer-only household member runs its whole schedule without rclone
-// installed.
+// invoke rclone. Only rclone-backed destinations count: a peer node
+// streams its bytes over the sync API and a kopia destination drives its
+// own binary, so a cadence naming only those runs its whole schedule on a
+// host with no rclone installed.
 func anyVolumeNeedsScheduledSync(cfg *config.Config) bool {
 	for _, v := range cfg.Volumes {
 		if v.SyncEvery <= 0 {
 			continue
 		}
 		for _, target := range v.SyncTo {
-			if _, isNode := cfg.Nodes[target]; !isNode {
+			if targetNeedsRclone(cfg, target) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// targetNeedsRclone reports whether a sync_to name resolves to a
+// destination squirrel reaches through rclone. An unknown name counts as
+// needing it: config validation rejects those before the scheduler runs,
+// and guessing "no" here would trade a clear startup error for a
+// midnight one.
+func targetNeedsRclone(cfg *config.Config, target string) bool {
+	if _, isNode := cfg.Nodes[target]; isNode {
+		return false
+	}
+	if dest, ok := cfg.Destinations[target]; ok && dest.Type == "kopia" {
+		return false
+	}
+	return true
 }
 
 // anyDestinationNeedsScheduledVerify reports whether any verifiable

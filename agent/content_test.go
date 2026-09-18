@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/zeebo/blake3"
 
+	"github.com/mbertschler/squirrel/store"
 	"github.com/mbertschler/squirrel/syncproto"
 )
 
@@ -270,5 +272,91 @@ func TestPutContentRequiresBearer(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(f.vol.Path, "a.txt")); !os.IsNotExist(err) {
 		t.Errorf("a.txt exists after an unauthenticated upload (stat err = %v)", err)
+	}
+}
+
+// TestFailedCloseCommitsNothing is the invariant that keeps a broken
+// transfer from poisoning the receiver's index. `failed` reaches
+// closeSession from the initiator's abort, which carries no FailedPaths
+// because it gave up mid-flight and cannot say which uploads landed.
+// Committing the unlisted paths would write `present` rows for bytes that
+// never arrived — the index claiming content the volume does not hold,
+// which is worse than losing the run.
+//
+// A `partial` close is the contrasting case: there the initiator
+// enumerated exactly what failed, so the rest is genuinely on disk and
+// still commits.
+func TestFailedCloseCommitsNothing(t *testing.T) {
+	ctx := context.Background()
+	f := newPreStageFixture(t)
+	sess := f.newSession()
+	// A path the plan promised and the transfer never delivered.
+	f.awaitContent(sess, "never-arrived.txt", []byte("bytes that never made it"))
+
+	committed, err := f.router.closeSession(ctx, sess, store.RunStatusFailed, nil)
+	if err != nil {
+		t.Fatalf("closeSession: %v", err)
+	}
+	if committed != 0 {
+		t.Errorf("committed = %d, want 0 for a failed close", committed)
+	}
+	if _, err := f.store.GetByPath(ctx, f.volID, "never-arrived.txt"); err == nil {
+		t.Error("a row exists for a path whose bytes never arrived")
+	}
+}
+
+// TestPartialCloseCommitsTheRest is the other side of the same contract:
+// an initiator that named its failures has verified everything else, so
+// those paths commit.
+func TestPartialCloseCommitsTheRest(t *testing.T) {
+	ctx := context.Background()
+	f := newPreStageFixture(t)
+	sess := f.newSession()
+	landed := []byte("this one arrived")
+	f.awaitContent(sess, "landed.txt", landed)
+	f.awaitContent(sess, "failed.txt", []byte("this one did not"))
+	if err := os.WriteFile(filepath.Join(f.vol.Path, "landed.txt"), landed, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	committed, err := f.router.closeSession(ctx, sess, store.RunStatusPartial, []string{"failed.txt"})
+	if err != nil {
+		t.Fatalf("closeSession: %v", err)
+	}
+	if committed != 1 {
+		t.Errorf("committed = %d, want 1", committed)
+	}
+	if _, err := f.store.GetByPath(ctx, f.volID, "landed.txt"); err != nil {
+		t.Errorf("landed.txt has no row: %v", err)
+	}
+	if _, err := f.store.GetByPath(ctx, f.volID, "failed.txt"); err == nil {
+		t.Error("failed.txt committed a row despite being named as failed")
+	}
+}
+
+// TestPutContentRepairsCopyFromExisting covers the retry path for a dedup
+// copy that did not survive. The initiator never offers copy-from-existing
+// content up front — the receiver materialised it locally during
+// pre-stage — but /verify checks those paths, so one that is missing or
+// mismatched comes back as a failing path and is re-sent. Refusing it
+// would leave exactly those paths unrepairable for the rest of the run.
+func TestPutContentRepairsCopyFromExisting(t *testing.T) {
+	f := newPreStageFixture(t)
+	sess := f.newSession()
+	content := []byte("deduped bytes")
+	f.awaitContent(sess, "copy.txt", content)
+	sess.dispositions["copy.txt"].disposition = syncproto.DispositionCopyFromExisting
+	f.router.storeSession(sess)
+
+	code, body := putContent(t, f.srv, f.recvRun, blakeHex(content), content)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d (%s), want 200 — a vanished dedup copy must be repairable", code, body)
+	}
+	got, err := os.ReadFile(filepath.Join(f.vol.Path, "copy.txt"))
+	if err != nil {
+		t.Fatalf("read repaired file: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("repaired %q, want %q", got, content)
 	}
 }

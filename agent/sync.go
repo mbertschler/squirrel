@@ -1592,6 +1592,17 @@ func (r *peerSyncRouter) closeSession(ctx context.Context, sess *peerSession, st
 	}
 	origins := newOriginResolver(r.srv.store, sess)
 	committed := 0
+	// A failed close commits no path at all. `failed` reaches here from
+	// the initiator's abort, which carries no FailedPaths — it gave up
+	// mid-flight and cannot say which uploads landed. Committing the
+	// unlisted paths would record `present` rows for bytes that never
+	// arrived, which is worse than losing the run: the index would claim
+	// content the volume does not hold. A `partial` close is different —
+	// the initiator enumerated exactly what failed — so it still commits
+	// the rest.
+	if status == store.RunStatusFailed {
+		sess.dispositions = nil
+	}
 	for path, entry := range sess.dispositions {
 		if !materializesAtPath(entry.disposition) {
 			continue

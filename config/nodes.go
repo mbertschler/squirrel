@@ -21,7 +21,8 @@ import (
 // receiver's TLS certificate — when set, the initiator verifies the
 // presented cert's SHA-256 fingerprint against this value before
 // trusting the connection (self-signed certs are normal for LAN
-// agents; pinning is the trust anchor in lieu of a CA chain). Path
+// agents; pinning is the trust anchor in lieu of a CA chain).
+//
 // Bytes travel over this same endpoint: the initiator PUTs each content
 // object to the peer-sync API, so a peer is reached by exactly one
 // address with exactly one trust anchor.
@@ -57,8 +58,10 @@ type rawNode struct {
 	// Path is accepted only so an obsolete `path` can be rejected by
 	// name. Bytes travel over the endpoint now; leaving the key to the
 	// decoder's strict mode would report it as an unrecognised field and
-	// leave the operator guessing whether they had typoed it.
-	Path                string       `toml:"path"`
+	// leave the operator guessing whether they had typoed it. A pointer
+	// so presence is what triggers the rejection — `path = ""` is a line
+	// to delete just as much as one naming a mount.
+	Path                *string      `toml:"path"`
 	DedupStrategy       string       `toml:"dedup_strategy"`
 	PullDurabilityEvery string       `toml:"pull_durability_every"`
 	Auth                *rawNodeAuth `toml:"auth"`
@@ -99,7 +102,7 @@ func resolveNode(name string, r *rawNode) (*Node, error) {
 	if !nameRE.MatchString(name) {
 		return nil, fmt.Errorf("invalid node name (must match %s)", nameRE)
 	}
-	if r.Path != "" {
+	if r.Path != nil {
 		return nil, errors.New("path is obsolete: peer syncs now stream bytes over the node's endpoint, so there is no separate byte-path to configure — delete the line")
 	}
 	if r.Endpoint == "" {
@@ -115,9 +118,6 @@ func resolveNode(name string, r *rawNode) (*Node, error) {
 	if u.Host == "" {
 		return nil, errors.New("endpoint: host is required")
 	}
-	// Path is deliberately not required here: whether this node ever
-	// receives bytes is a property of the volumes, not of the node block,
-	// so the check belongs to resolve() once sync_to is known.
 	if r.Auth == nil || r.Auth.Bearer == nil {
 		return nil, errors.New("auth.bearer is required")
 	}

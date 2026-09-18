@@ -50,14 +50,14 @@ func (r *peerSyncRouter) handlePutContent(w http.ResponseWriter, req *http.Reque
 		writeError(w, http.StatusNotFound, "no session for receiver_run_id")
 		return
 	}
-	targets, size, mtimeNs := pathsAwaitingContent(sess, digest)
+	targets, size := pathsAwaitingContent(sess, digest)
 	if len(targets) == 0 {
 		writeError(w, http.StatusConflict,
 			fmt.Sprintf("no path in this session awaits content %s", hex.EncodeToString(digest)))
 		return
 	}
 	body := http.MaxBytesReader(w, req.Body, size)
-	if err := r.materializeContent(sess, digest, targets, size, mtimeNs, body); err != nil {
+	if err := r.materializeContent(sess, digest, targets, size, body); err != nil {
 		writeError(w, contentErrorStatus(err), err.Error())
 		return
 	}
@@ -98,7 +98,7 @@ func parseContentRoute(req *http.Request) (runID int64, digest []byte, err error
 // Size and mtime are read from the matched entries, which all describe
 // the same content and therefore agree on size; the mtime of the first
 // sorted path is applied to every copy.
-func pathsAwaitingContent(sess *peerSession, digest []byte) (paths []string, size, mtimeNs int64) {
+func pathsAwaitingContent(sess *peerSession, digest []byte) (paths []string, size int64) {
 	for path, entry := range sess.dispositions {
 		if awaitsTransfer(entry.disposition) && bytesEqual(entry.blake3, digest) {
 			paths = append(paths, path)
@@ -106,22 +106,33 @@ func pathsAwaitingContent(sess *peerSession, digest []byte) (paths []string, siz
 	}
 	slices.Sort(paths)
 	if len(paths) == 0 {
-		return nil, 0, 0
+		return nil, 0
 	}
-	first := sess.dispositions[paths[0]]
-	return paths, first.size, first.mtimeNs
+	// Equal digests mean equal bytes and therefore equal size, but not
+	// equal mtime: two paths holding the same content were observed at
+	// their own times, and /close records each one's. Size comes from the
+	// set; mtime is read per path as each is materialised.
+	return paths, sess.dispositions[paths[0]].size
 }
 
-// awaitsTransfer reports whether a disposition leaves the receiver
-// waiting for the initiator's bytes. It is the receiver-side mirror of
-// sync.pathsInScope: copy-from-existing is excluded because the receiver
-// already materialised those paths itself during pre-stage, and
-// already-correct because nothing needs to move.
+// awaitsTransfer reports whether a disposition may be satisfied by the
+// initiator's bytes. Transfer, supersede, and conflict are what
+// sync.pathsInScope uploads on the normal path.
+//
+// Copy-from-existing is accepted too, though the initiator never offers
+// it up front — the receiver materialised those paths itself during
+// pre-stage. It matters on retry: /verify checks copy-from-existing
+// paths, so a dedup copy that failed or vanished comes back as a failing
+// path, and the initiator re-sends it. Refusing the upload would leave
+// exactly those paths unrepairable for the rest of the run.
+//
+// Already-correct is the one verdict that needs nothing.
 func awaitsTransfer(disposition string) bool {
 	switch disposition {
 	case syncproto.DispositionTransfer,
 		syncproto.DispositionSupersede,
-		syncproto.DispositionConflict:
+		syncproto.DispositionConflict,
+		syncproto.DispositionCopyFromExisting:
 		return true
 	}
 	return false
@@ -148,13 +159,14 @@ func contentErrorStatus(err error) int {
 // copies it to any remaining ones. The stream is written once and hashed
 // in the same pass, so the digest covers exactly the bytes that reached
 // the disk rather than a later re-read of them.
-func (r *peerSyncRouter) materializeContent(sess *peerSession, digest []byte, targets []string, size, mtimeNs int64, body io.Reader) error {
+func (r *peerSyncRouter) materializeContent(sess *peerSession, digest []byte, targets []string, size int64, body io.Reader) error {
 	primary := filepath.Join(sess.volume.Path, targets[0])
-	if err := streamToPath(primary, body, digest, size, mtimeNs); err != nil {
+	if err := streamToPath(primary, body, digest, size, sess.dispositions[targets[0]].mtimeNs); err != nil {
 		return fmt.Errorf("receive %s: %w", targets[0], err)
 	}
 	for _, rel := range targets[1:] {
-		if err := copyFileToPath(primary, filepath.Join(sess.volume.Path, rel), mtimeNs); err != nil {
+		dst := filepath.Join(sess.volume.Path, rel)
+		if err := copyFileToPath(primary, dst, sess.dispositions[rel].mtimeNs); err != nil {
 			return fmt.Errorf("materialise %s from %s: %w", rel, targets[0], err)
 		}
 	}
