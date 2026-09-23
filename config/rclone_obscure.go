@@ -67,16 +67,9 @@ func rcloneObscure(plaintext string) string {
 	return base64.RawURLEncoding.EncodeToString(buf)
 }
 
-// rcloneReveal is the inverse of rcloneObscure, reproducing rclone's
-// obscure.Reveal: base64 raw-URL decode, read the leading block as the
-// AES-CTR IV, and XOR the remainder back to plaintext.
-//
-// It reads the IV from the value rather than assuming rcloneObscure's fixed
-// zero one, so a credential obscured by `rclone obscure` (which draws a
-// random IV) reveals identically to one squirrel rendered. That is what
-// lets DeriveNamingKey run on the revealed plaintext and derive the same
-// key from both config forms — a config that supplies a pre-obscured
-// password and one that supplies the plaintext name their artifacts alike.
+// rcloneReveal reproduces rclone's obscure.Reveal, the inverse of
+// rcloneObscure. It reads the initialisation vector from the value's
+// leading block, so it also reveals the random one `rclone obscure` draws.
 func rcloneReveal(obscured string) (string, error) {
 	buf, err := base64.RawURLEncoding.DecodeString(obscured)
 	if err != nil {

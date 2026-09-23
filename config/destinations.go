@@ -134,38 +134,17 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 	if !nameRE.MatchString(name) {
 		return nil, fmt.Errorf("invalid destination name (must match %s)", nameRE)
 	}
-	typ, ok := raw["type"].(string)
-	if !ok || typ == "" {
-		return nil, errors.New("type is required")
-	}
-	schema, ok := destSchemas[typ]
-	if !ok {
-		return nil, fmt.Errorf("unsupported destination type %q (supported: %v)", typ, SupportedTypes())
-	}
-	rootAny, ok := raw["root"]
-	if !ok {
-		return nil, errors.New("root is required")
-	}
-	root, ok := rootAny.(string)
-	if !ok || root == "" {
-		return nil, errors.New("root must be a non-empty string")
-	}
-	crypt, err := resolveCrypt(raw, typ)
+	typ, schema, err := resolveDestinationType(raw)
 	if err != nil {
 		return nil, err
 	}
-	layout, err := resolveLayout(raw, typ)
+	root, err := resolveRoot(raw)
 	if err != nil {
 		return nil, err
 	}
-	// Only the append-only layouts derive artifact names from the crypt
-	// secrets, so only they need the key — and only they are held to a
-	// password squirrel can reveal. A crypt mirror keeps passing whatever
-	// pre-obscured value it always did straight through to rclone.
-	if crypt != nil && layoutHidesArtifactNames(layout) {
-		if err := crypt.deriveNamingKey(); err != nil {
-			return nil, err
-		}
+	crypt, layout, err := resolveCryptAndLayout(raw, typ)
+	if err != nil {
+		return nil, err
 	}
 	hashAlgo, err := resolveHashAlgo(raw, typ, layout)
 	if err != nil {
@@ -197,6 +176,54 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 		PackThreshold: pack.threshold, PackSize: pack.size, ZstdLevel: pack.zstdLevel,
 		VerifyEvery: verifyEvery,
 	}, nil
+}
+
+// resolveDestinationType reads the required `type` key and the schema it
+// selects.
+func resolveDestinationType(raw map[string]any) (string, destSchema, error) {
+	typ, ok := raw["type"].(string)
+	if !ok || typ == "" {
+		return "", destSchema{}, errors.New("type is required")
+	}
+	schema, ok := destSchemas[typ]
+	if !ok {
+		return "", destSchema{}, fmt.Errorf("unsupported destination type %q (supported: %v)", typ, SupportedTypes())
+	}
+	return typ, schema, nil
+}
+
+// resolveRoot reads the required, non-empty `root` key.
+func resolveRoot(raw map[string]any) (string, error) {
+	rootAny, ok := raw["root"]
+	if !ok {
+		return "", errors.New("root is required")
+	}
+	root, ok := rootAny.(string)
+	if !ok || root == "" {
+		return "", errors.New("root must be a non-empty string")
+	}
+	return root, nil
+}
+
+// resolveCryptAndLayout resolves the crypt block and the layout together,
+// because the layout decides whether the crypt passwords must also yield an
+// artifact-naming key. A crypt mirror passes its passwords to rclone
+// verbatim and derives none.
+func resolveCryptAndLayout(raw map[string]any, typ string) (*Crypt, string, error) {
+	crypt, err := resolveCrypt(raw, typ)
+	if err != nil {
+		return nil, "", err
+	}
+	layout, err := resolveLayout(raw, typ)
+	if err != nil {
+		return nil, "", err
+	}
+	if crypt != nil && layoutHidesArtifactNames(layout) {
+		if err := crypt.deriveNamingKey(); err != nil {
+			return nil, "", err
+		}
+	}
+	return crypt, layout, nil
 }
 
 // resolveVerifyEvery validates the optional per-destination `verify_every`
@@ -475,15 +502,9 @@ func resolveCrypt(raw map[string]any, typ string) (*Crypt, error) {
 	return &Crypt{Password: password, Password2: password2}, nil
 }
 
-// deriveNamingKey fills NamingKey from the plaintext behind the two stored
-// passwords. Both are held obscured, so both are revealed first: that
-// normalisation is what makes the key — and every artifact name derived
-// from it — identical whether the config supplied plaintext or a
-// pre-obscured value, whose initialisation vectors differ.
-//
-// A value that cannot be revealed is a malformed `obscured = true` entry,
-// which rclone would reject too; failing here names the field instead of
-// leaving it to a later transfer.
+// deriveNamingKey fills NamingKey from the plaintext behind the two stored,
+// obscured passwords, so a plaintext config and a pre-obscured one derive
+// the same key.
 func (c *Crypt) deriveNamingKey() error {
 	password, err := rcloneReveal(c.Password)
 	if err != nil {
@@ -792,24 +813,17 @@ func sortedSubset(in []string) []string {
 	return out
 }
 
-// HidesArtifactNames reports whether this destination names the artifacts
-// it stores by a key derived from its crypt passwords instead of by content
-// hash. Content objects, packs, and per-volume directories then carry a
-// keyed BLAKE3 hex name, so the remote discloses neither a path nor a
-// content hash — without the passwords, a candidate file cannot be tested
-// against the archive.
-//
-// It holds for an encrypted destination on the append-only layouts, whose
-// names squirrel owns outright. A mirror replicates the volume's own tree,
-// so its names are the operator's paths and belong to them; an unencrypted
-// destination has no key to derive from.
+// HidesArtifactNames reports whether this destination names its content
+// objects, packs, and per-volume directories by a keyed BLAKE3 hash derived
+// from its crypt passwords, so the remote discloses neither a path nor a
+// content hash. It holds for an encrypted destination on the append-only
+// layouts; a mirror's names are the volume's own paths.
 func (d *Destination) HidesArtifactNames() bool {
 	return d.Crypt != nil && layoutHidesArtifactNames(d.Layout)
 }
 
-// layoutHidesArtifactNames reports whether layout names artifacts squirrel
-// chose rather than paths the operator chose, which is what makes keying
-// them possible at all.
+// layoutHidesArtifactNames reports whether layout stores its artifacts
+// under names squirrel chooses, which it can key.
 func layoutHidesArtifactNames(layout string) bool {
 	return layout == LayoutContentAddressed || layout == LayoutPacked
 }

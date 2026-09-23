@@ -43,12 +43,12 @@ func TestDeriveNamingKeySeparatesFields(t *testing.T) {
 	}
 }
 
-// TestNamingKeyIdenticalAcrossConfigForms is the migration guarantee: the
-// same password reaches the same key whether the config supplied plaintext
-// or a pre-obscured value. Squirrel obscures with a fixed zero
-// initialisation vector while `rclone obscure` draws a random one, so the
-// two stored forms differ byte-for-byte; deriving from the revealed
-// plaintext is what keeps them naming one archive.
+// TestNamingKeyIdenticalAcrossConfigForms: the same password reaches the
+// same key whether the config supplied plaintext or a pre-obscured value.
+// Squirrel obscures with a fixed zero initialisation vector while `rclone
+// obscure` draws a random one, so the two stored forms differ
+// byte-for-byte; deriving from the revealed plaintext is what keeps them
+// naming one archive.
 func TestNamingKeyIdenticalAcrossConfigForms(t *testing.T) {
 	const password = "hunter2"
 	plain, err := Load(writeConfig(t, `
@@ -91,9 +91,8 @@ password = "`+obscureWithRandomIV(t, password)+`"
 }
 
 // TestNamingKeyDerivedOnlyWhereNeeded: the append-only layouts get a key
-// and are held to a revealable password; a crypt mirror never derives one,
-// so it keeps passing whatever pre-obscured value it always did straight
-// through to rclone.
+// and are held to a revealable password; a crypt mirror derives none and
+// passes its pre-obscured value straight through to rclone.
 func TestNamingKeyDerivedOnlyWhereNeeded(t *testing.T) {
 	for _, tc := range []struct {
 		layout    string
@@ -132,8 +131,7 @@ password = "hunter2"
 
 // TestUnrevealablePasswordRefusedForKeyedLayouts: an `obscured = true`
 // value squirrel cannot reveal cannot name artifacts either, so an archive
-// layout refuses it at load — naming the field — rather than deriving from
-// a value rclone would reject later anyway. A mirror is unaffected.
+// layout refuses it at load, naming the field. A mirror is unaffected.
 func TestUnrevealablePasswordRefusedForKeyedLayouts(t *testing.T) {
 	body := func(layout string) string {
 		return `
@@ -191,7 +189,7 @@ func TestRcloneRevealMatchesIndependentReveal(t *testing.T) {
 }
 
 // TestRcloneRevealRejectsMalformed: a value that is not obscured at all
-// surfaces as an error rather than decoding to noise.
+// surfaces as an error.
 func TestRcloneRevealRejectsMalformed(t *testing.T) {
 	for _, in := range []string{"not base64 !!", "c2hvcnQ"} {
 		if _, err := rcloneReveal(in); err == nil {
