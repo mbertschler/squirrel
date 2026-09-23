@@ -49,17 +49,9 @@ func (s IndexSnapshot) Age(now time.Time) (time.Duration, bool) {
 // error — a destination that has simply never carried a given volume is a
 // normal answer to "what do you have", not a failure.
 func DiscoverIndexSnapshots(ctx context.Context, rcl *Rclone, dest *config.Destination, volumes []string) ([]IndexSnapshot, error) {
-	// Resolve the naming scheme from the root, not from the config: an
-	// encrypted archive written before keyed naming keeps its snapshots
-	// under the volume name in clear, and reporting an empty recovery plan
-	// as fact is the one answer this flow must never give.
-	dirs, err := resolveNamer(ctx, rcl, dest)
-	if err != nil {
-		return nil, err
-	}
 	var out []IndexSnapshot
 	for _, vol := range volumes {
-		names, err := listSnapshotsStrict(ctx, rcl, indexDirURI(dirs, vol))
+		names, err := listSnapshotsStrict(ctx, rcl, indexDirURI(dest, vol))
 		if err != nil {
 			return nil, fmt.Errorf("list index snapshots for %s/%s: %w", dest.Name, vol, err)
 		}
@@ -142,11 +134,7 @@ func parseSnapshotName(volume, name string) IndexSnapshot {
 // schema version is store.PreflightCheckSnapshot's job, and the caller runs
 // it before letting the file near the live database.
 func FetchIndexSnapshot(ctx context.Context, rcl *Rclone, dest *config.Destination, snap IndexSnapshot, localPath string) error {
-	dirs, err := resolveNamer(ctx, rcl, dest)
-	if err != nil {
-		return err
-	}
-	uri := indexDirURI(dirs, snap.Volume) + "/" + snap.Name
+	uri := indexDirURI(dest, snap.Volume) + "/" + snap.Name
 	if err := rcl.copyTo(ctx, uri, localPath); err != nil {
 		return fmt.Errorf("fetch index snapshot %s from %s: %w", snap.Name, dest.Name, err)
 	}

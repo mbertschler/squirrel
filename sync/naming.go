@@ -45,16 +45,7 @@ type namingMarker struct {
 	CreatedAt string `json:"created_at,omitempty"`
 }
 
-// namer resolves the basenames of one destination's artifacts under the
-// naming scheme its root is actually written in. A destination's *own*
-// configuration says what this binary would write (namerFor); what is
-// already at a given root can differ, so the read paths resolve it against
-// the root instead (resolveNamer) and address what is there.
-//
-// Keeping the scheme in a value rather than re-deriving it from the
-// destination at each call site is what makes that distinction impossible
-// to get wrong by accident: a caller cannot name an artifact without having
-// said which scheme it means.
+// namer resolves the basenames of one destination's artifacts.
 type namer struct {
 	dest  *config.Destination
 	keyed bool
@@ -64,12 +55,6 @@ type namer struct {
 // append-only destination, content-hash names otherwise.
 func namerFor(dest *config.Destination) namer {
 	return namer{dest: dest, keyed: dest.HidesArtifactNames()}
-}
-
-// legacyNamerFor is the content-hash scheme every destination used before
-// keyed naming existed, for addressing a root written back then.
-func legacyNamerFor(dest *config.Destination) namer {
-	return namer{dest: dest, keyed: false}
 }
 
 // object is the basename of one content object: a keyed name under the
@@ -154,7 +139,7 @@ const (
 // answers rootKeyed and the callers' own naming (content-hash) applies
 // unchanged.
 //
-// Read-only, so the read paths and a dry run can all ask it.
+// Read-only, so a dry run can ask it.
 func probeRootNaming(ctx context.Context, rcl *Rclone, dest *config.Destination) (rootNaming, error) {
 	if !dest.HidesArtifactNames() {
 		return rootKeyed, nil
@@ -173,27 +158,6 @@ func probeRootNaming(ctx context.Context, rcl *Rclone, dest *config.Destination)
 	return rootLegacy, nil
 }
 
-// resolveNamer is how every read path names an artifact: under the scheme
-// the root is written in, not the one this binary would write.
-//
-// An encrypted archive uploaded before keyed naming exists stays fully
-// readable — restore, verify, and snapshot discovery address its
-// content-hash names — because a hash ever observed must stay retrievable,
-// and a squirrel upgrade must not be the thing that strands an archive.
-// Writing is where the two schemes are kept apart (ensureNamingScheme
-// refuses to add keyed names to such a root), so a root only ever holds
-// one scheme and reading it is unambiguous.
-func resolveNamer(ctx context.Context, rcl *Rclone, dest *config.Destination) (namer, error) {
-	root, err := probeRootNaming(ctx, rcl, dest)
-	if err != nil {
-		return namer{}, err
-	}
-	if root == rootLegacy {
-		return legacyNamerFor(dest), nil
-	}
-	return namerFor(dest), nil
-}
-
 // ensureNamingScheme gates a push on the destination root's recorded naming
 // scheme and bootstraps the marker on a fresh root.
 func (h *contentPusher) ensureNamingScheme(ctx context.Context) error {
@@ -207,8 +171,7 @@ func (h *contentPusher) ensureNamingScheme(ctx context.Context) error {
 // checkNamingScheme classifies the root and refuses a push to one written
 // under another scheme. Mixing the two would leave the pre-existing
 // artifacts named as they already are while squirrel treated the root as
-// private, so the refusal is the honest answer — and it is what keeps a
-// root single-scheme, which is what lets the read paths resolve one.
+// private, so the refusal is the honest answer.
 //
 // Read-only, so a dry run can ask the same question.
 func (h *contentPusher) checkNamingScheme(ctx context.Context) (rootNaming, error) {
@@ -216,7 +179,7 @@ func (h *contentPusher) checkNamingScheme(ctx context.Context) (rootNaming, erro
 	if err != nil || root != rootLegacy {
 		return root, err
 	}
-	return root, fmt.Errorf("destination %q holds files at %s but no %s, so whatever is there was written under other names than the keyed ones this destination now derives — mixing the two would leave the existing artifacts named as they are while squirrel treated the root as private; restore and verify still read it as it stands, but to keep adding to it point the destination at a fresh root, or (after wiping the remote root) run `squirrel destination reset %s`: %w",
+	return root, fmt.Errorf("destination %q holds files at %s but no %s, so whatever is there was written under other names than the keyed ones this destination derives — point the destination at a fresh root, or (after wiping the remote root) run `squirrel destination reset %s`: %w",
 		h.dest.Name, remoteSubpathURI(h.dest, ""), NamingMarkerName, h.dest.Name, ErrRefused)
 }
 
