@@ -283,15 +283,25 @@ type transport interface {
 ### sftp implementation
 
 - Built on `golang.org/x/crypto/ssh`, already a dependency, and
-  `github.com/pkg/sftp`, which is new.
+  `github.com/pkg/sftp`, which is new (`sync/transport_sftp.go`).
 - `Put` opens with `SSH_FXF_CREAT|SSH_FXF_EXCL` and uses concurrent writes, so
   high latency doesn't cap throughput. It syncs through `fsync@openssh.com`
   when the server offers it.
 - **mtime is whole seconds.** Protocol version 3 carries only seconds, so the
   records store the mtime the server reports.
-- **`Rename` checks first.** The protocol's rename fails when the target
-  exists. Servers don't all honour that, so the transport also runs `Lstat`
-  first. The contract suite pins the behaviour against the testbed's server.
+- **`Put` and `Rename` check first.** The protocol's rename fails when the
+  target exists, but servers don't all honour that: `pkg/sftp`'s own server
+  replaces it (`TestSFTPServerRenameReplaces`). Version 3 also has no
+  "already exists" status, so an exclusive create that fails can't say why. So
+  both calls run `Lstat` on their target first and fail with `fs.ErrExist`,
+  and every call checks its name's parent chain for symlinks, as the local
+  transport does. The contract suite passes against an in-process `pkg/sftp`
+  server and against `rclone serve sftp`, the testbed's server. That server
+  hides symlinks, so the symlink cases skip there.
+- **Host keys follow known_hosts.** The handshake asks the server for the key
+  types known_hosts pins for it (or `host_key_algorithms` when set), so a
+  server that also offers another key type is still checked against the
+  pinned one (`sync/transport_sftp_hostkey.go`).
 - **One optional server-side command: a hash.** Content-addressed and packed
   artifacts get their fingerprint confirmed, and re-confirmed, by a hash
   command run on the server. That is `sha256sum` by default, chosen by

@@ -49,7 +49,7 @@ func (t *localTransport) List(_ context.Context, dir string) ([]entry, error) {
 		if err := t.checkName(dir); err != nil {
 			return nil, err
 		}
-		if err := t.requireKind(dir, kindDir); err != nil {
+		if err := requireKind(dir, kindDir, t.lstat); err != nil {
 			return nil, err
 		}
 	}
@@ -77,7 +77,7 @@ func (t *localTransport) Get(_ context.Context, name string) (io.ReadCloser, err
 	if err := t.checkName(name); err != nil {
 		return nil, err
 	}
-	if err := t.requireKind(name, kindFile); err != nil {
+	if err := requireKind(name, kindFile, t.lstat); err != nil {
 		return nil, err
 	}
 	return t.root.Open(filepath.FromSlash(name))
@@ -150,44 +150,14 @@ func (t *localTransport) Remove(_ context.Context, name string) error {
 // checkName refuses a name that is not a clean path below the root, or
 // whose parent chain crosses a symlink or a non-directory.
 func (t *localTransport) checkName(name string) error {
-	if !fs.ValidPath(name) || name == "." || (runtime.GOOS == "windows" && strings.ContainsRune(name, '\\')) {
+	if !validName(name) || (runtime.GOOS == "windows" && strings.ContainsRune(name, '\\')) {
 		return fmt.Errorf("%w: %q", errInvalidName, name)
 	}
-	dir := path.Dir(name)
-	if dir == "." {
-		return nil
-	}
-	parts := strings.Split(dir, "/")
-	for i := range parts {
-		p := strings.Join(parts[:i+1], "/")
-		fi, err := t.root.Lstat(filepath.FromSlash(p))
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		switch kindOf(fi.Mode()) {
-		case kindDir:
-		case kindSymlink:
-			return fmt.Errorf("%s: %w", p, errSymlinkInPath)
-		default:
-			return fmt.Errorf("%s: %w", p, errParentNotDir)
-		}
-	}
-	return nil
+	return checkParents(name, t.lstat)
 }
 
-// requireKind refuses name unless it exists and is of kind want.
-func (t *localTransport) requireKind(name string, want entryKind) error {
-	fi, err := t.root.Lstat(filepath.FromSlash(name))
-	if err != nil {
-		return err
-	}
-	if kindOf(fi.Mode()) != want {
-		return fmt.Errorf("%s: %w", name, errUnexpectedKind)
-	}
-	return nil
+func (t *localTransport) lstat(name string) (fs.FileInfo, error) {
+	return t.root.Lstat(filepath.FromSlash(name))
 }
 
 func (t *localTransport) mkdirParents(name string) error {
@@ -213,14 +183,6 @@ func (t *localTransport) syncDir(dir string) error {
 		return fmt.Errorf("sync %s: %w", dir, err)
 	}
 	return nil
-}
-
-// errUnexpectedKind refuses an operation on a name that is not the kind of
-// entry the operation reads.
-var errUnexpectedKind = errors.New("unexpected kind of entry")
-
-func entryOf(fi fs.FileInfo) entry {
-	return entry{name: fi.Name(), kind: kindOf(fi.Mode()), size: fi.Size(), mtime: fi.ModTime()}
 }
 
 // renameCheckThenMove is the rename for a filesystem without a no-replace

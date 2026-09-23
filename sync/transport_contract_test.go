@@ -29,6 +29,7 @@ func runTransportContract(t *testing.T, open transportHarness) {
 		run  func(t *testing.T, tr transport, plant func(target, name string))
 	}{
 		{"PutThenStatListGet", contractPutThenStatListGet},
+		{"PutLandsALargeBodyIntact", contractPutLarge},
 		{"PutNeverReplaces", contractPutNeverReplaces},
 		{"StatAbsent", contractStatAbsent},
 		{"RenameMovesAndCreatesParents", contractRenameMoves},
@@ -115,6 +116,21 @@ func contractPutThenStatListGet(t *testing.T, tr transport, _ func(string, strin
 	}
 	if got := mustRead(t, tr, "a/b/c.txt"); got != "hello" {
 		t.Fatalf("Get = %q, want hello", got)
+	}
+}
+
+// contractPutLarge lands a body spanning many write requests, which an
+// sftp transport sends concurrently and a server may apply out of order.
+func contractPutLarge(t *testing.T, tr transport, _ func(string, string)) {
+	body := make([]byte, 5<<20+123)
+	for i := range body {
+		body[i] = byte(i * 7 % 251)
+	}
+	if err := tr.Put(context.Background(), "big", bytes.NewReader(body), contractMtime); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if got := mustRead(t, tr, "big"); got != string(body) {
+		t.Fatalf("read back %d bytes, want the %d written", len(got), len(body))
 	}
 }
 

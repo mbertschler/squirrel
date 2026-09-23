@@ -3,8 +3,11 @@ package sync
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
+	"path"
+	"strings"
 	"time"
 )
 
@@ -74,6 +77,62 @@ var errParentNotDir = errors.New("a parent along the path is not a directory")
 // errInvalidName refuses a name that is not a clean slash-separated path
 // inside the root.
 var errInvalidName = errors.New("invalid destination name")
+
+// errUnexpectedKind refuses an operation on a name that is not the kind of
+// entry the operation reads.
+var errUnexpectedKind = errors.New("unexpected kind of entry")
+
+// validName reports whether name is a clean slash-separated path strictly
+// below a root.
+func validName(name string) bool {
+	return fs.ValidPath(name) && name != "."
+}
+
+// checkParents refuses a name whose parent chain crosses a symlink or
+// something that is not a directory. lstat describes one root-relative
+// name without following it. A parent that does not exist ends the check:
+// nothing below it exists either.
+func checkParents(name string, lstat func(string) (fs.FileInfo, error)) error {
+	dir := path.Dir(name)
+	if dir == "." {
+		return nil
+	}
+	parts := strings.Split(dir, "/")
+	for i := range parts {
+		p := strings.Join(parts[:i+1], "/")
+		fi, err := lstat(p)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		switch kindOf(fi.Mode()) {
+		case kindDir:
+		case kindSymlink:
+			return fmt.Errorf("%s: %w", p, errSymlinkInPath)
+		default:
+			return fmt.Errorf("%s: %w", p, errParentNotDir)
+		}
+	}
+	return nil
+}
+
+// requireKind refuses name unless it exists and is of kind want.
+func requireKind(name string, want entryKind, lstat func(string) (fs.FileInfo, error)) error {
+	fi, err := lstat(name)
+	if err != nil {
+		return err
+	}
+	if kindOf(fi.Mode()) != want {
+		return fmt.Errorf("%s: %w", name, errUnexpectedKind)
+	}
+	return nil
+}
+
+func entryOf(fi fs.FileInfo) entry {
+	return entry{name: fi.Name(), kind: kindOf(fi.Mode()), size: fi.Size(), mtime: fi.ModTime()}
+}
 
 // ctxReader stops a streaming copy once its context is done.
 type ctxReader struct {
