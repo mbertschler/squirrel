@@ -70,7 +70,8 @@ In the [reference setup](reference-setup.md), `usb` moves with this work.
   squirrel's records, confirms each planned path's size and mtime, and moves
   whatever is there aside before writing. Its safety comes from that move, not
   from a content comparison. Content is checked by hashing the source as it
-  streams, by the read-back in the evidence step, and by the verify pass.
+  streams, by the read-back on local disks, and by the verify pass (both from the
+  evidence step).
   None of those is optional, so the flag has nothing to switch off.
 
 ## 1. The planner
@@ -263,7 +264,16 @@ type transport interface {
 - **`Rename` checks first.** The protocol's rename fails when the target
   exists. Servers don't all honour that, so the transport also runs `Lstat`
   first. The contract suite pins the behaviour against the testbed's server.
-- **Nothing runs a program on the server.** The cloudbox shape allows none.
+- **One optional server-side command: a hash.** Content-addressed and packed
+  artifacts get their fingerprint confirmed, and re-confirmed, by a hash
+  command run on the server. That is `sha256sum` by default, chosen by
+  `hash_algo`, as rclone runs today.
+  - The command line is built only from the configured root and hex artifact
+    names. A root holding anything beyond letters, digits, `.`, `_`, `-` and
+    `/` is never hashed on the server.
+  - The transport probes for the command once per push. On a server that runs
+    no programs, like the cloudbox shape, fingerprints stay pending, as today.
+  - Mirror paths are user filenames, so they never go on a command line.
 
 ## 4. The mirror layout
 
@@ -445,28 +455,31 @@ wrapped in the fault injector.
 
 Until this step, a native mirror push advances its vector as `presence+size`.
 Every fingerprint stays pending, so the mirror still can't gate offload.
-That's the same as today, only the method name changes. This step changes it.
+That's the same as today, only the method name changes. This step changes it
+for local mirrors.
 
-- **Read-back at write time.** After staging and syncing, squirrel re-reads
-  the staged file and hashes it with BLAKE3 before committing:
-  - **Local:** a cache-bypassing read (`POSIX_FADV_DONTNEED` on Linux,
-    `F_NOCACHE` on macOS). It is best effort: a USB bridge's own cache is out
-    of reach.
-  - **sftp:** a download over the same session.
+- **Read-back at write time, on local disks.** After staging and syncing,
+  squirrel re-reads the staged file and hashes it with BLAKE3 before
+  committing. The read bypasses the cache (`POSIX_FADV_DONTNEED` on Linux,
+  `F_NOCACHE` on macOS). It is best effort: a USB bridge's own cache is out of
+  reach.
 
   A match records `checksum_algo = blake3` and `verified_at_ns` on the row.
   `CountVolumeContentsPendingFingerprint` and `ContentFingerprintVerified`
   consult `remote_paths`. So a push can advance as `fingerprint-verified`
   through the existing gate path, which requires a verify cadence.
-- **Cost.** Read-back is a safety property, so it's always on. On a USB disk,
-  every written byte is read once more, roughly 1.5 to 2 times the push time.
-  On sftp, every uploaded byte is downloaded once.
+- **sftp mirrors stay non-gating.** An sftp push skips read-back, and mirror
+  paths never go on a server command line, so their fingerprints stay
+  pending.
+- **Cost.** Read-back is a safety property, so it's always on for local
+  disks. Every written byte is read once more, roughly 1.5 to 2 times the push
+  time on a USB disk.
 - **Verify pass for mirrors.** `verify_every` becomes valid on native mirrors.
   Each pass does two things:
   - It checks the size and mtime of every `live` and `displaced` row with
     `Lstat`. Both states count as stored content, so both are checked. This is
     cheap and catches deletion, truncation and replacement.
-  - It re-hashes a slice of rows, oldest `verified_at_ns` first, within a
+  - On local mirrors, it re-hashes a slice of rows, oldest `verified_at_ns` first, within a
     budget per pass. So every byte is re-read within a known period. Kopia's
     `verify_files_percent` is the precedent for sampled read-back.
 
@@ -474,8 +487,9 @@ That's the same as today, only the method name changes. This step changes it.
   `lost`. `lost` live rows whose content is still the index's current content
   become the planner's repairs.
 - **Documents amended in the same PR:**
-  - `CanEverGateOffload` becomes true for native mirrors, and
-    `offload_requires` accepts them;
+  - `CanEverGateOffload` becomes true for native local mirrors, and
+    `offload_requires` accepts them. sftp mirrors keep refusing, and the
+    refusal names the reason;
   - reference-setup.md's "Offload gate" paragraph;
   - guides/offloading.md and layouts/mirror.md;
   - the F21 entry in friction-log.md;
@@ -513,8 +527,10 @@ That's the same as today, only the method name changes. This step changes it.
   message gives the presented fingerprint and how to trust it.
   - **Migration cost:** a config that relied on rclone accepting any host key
     stops connecting until the key is pinned.
-- **Rclone-only keys are rejected** on native destinations: `checkers`, and
-  `hash_algo` (the key for rclone's server-side hash). No key is added.
+- **Rclone-only keys are rejected** on native destinations: `checkers`
+  everywhere, and `hash_algo` on sftp mirrors. On content-addressed and packed
+  sftp destinations, `hash_algo` still chooses the hash, which now names the
+  command the transport runs on the server. No key is added.
   Concurrency is fixed: a few parallel writes on sftp, and one or two on a
   local disk.
 
@@ -527,7 +543,7 @@ That's the same as today, only the method name changes. This step changes it.
     walker. With a native mirror that becomes literally true. The
     kopia-leg section gets amended in the mirror PR to say what the mirrors
     no longer cover.
-  - Open question 5 proposes a cheap mitigation.
+  - Decision 7 keeps a cheap mitigation as a candidate.
 - **Rclone's tuning and backend know-how.** Rclone brings parallel transfers,
   multi-threaded streams, and years of workarounds for sftp servers. The
   switch should wait for a benchmark on the testbed against rclone.
@@ -552,7 +568,7 @@ checklist splits them into sections for separate sessions:
    mirrors.
 4. **Restore, ride-along and recover** on the transport. Once this lands,
    `local` and plain `sftp` mirrors are free of rclone.
-5. **Evidence.** Read-back fingerprints, the mirror verify pass, and repairs
+5. **Evidence.** Read-back fingerprints on local mirrors, the mirror verify pass, and repairs
    in the planner. This reverses #216 and amends the design and docs listed in
    section 5.
 6. **Content-addressed and packed on `local` and `sftp`** move to the
@@ -562,25 +578,31 @@ checklist splits them into sections for separate sessions:
 The crypt decision is independent of this order. Once made, it becomes a
 crypt transport wrapper, and then cloudbox moves.
 
-## 10. Open questions
+## 10. Decisions and open questions
 
-1. **Crypt byte-compatibility with rclone.** This blocks cloudbox only.
-   Undecided, and to be discussed separately.
-2. **sftp and the offload gate.** Is a stat on every row, plus a rotating
-   read-back, enough for an sftp mirror to gate offload? Or should an sftp
-   mirror stay non-gating?
-3. **Adopting an existing mirror tree.** Unrecorded entries are displaced
-   into history, so pointing a native mirror at an rclone-era tree re-uploads
-   everything. The alternative is an adopt pass that hashes existing files and
-   records the ones that match. Recommendation: use fresh roots (nothing is in
-   production), and build adoption only if the testbed shows the re-upload
-   hurts.
-4. **Receipt location.** Keep mirror receipts in `.squirrel-index/`. Or move
-   every layout's segments there, which gives one landing-evidence location
-   for all three.
-5. **Regaining some independence.** A periodic source-completeness audit
-   would compare a plain directory walk of each volume with the index's
-   present set. It would catch indexer skips for every layout, not only
-   mirrors.
-6. **Case-folding collisions.** Refuse only the colliding path (as proposed),
-   or refuse the whole destination for that volume?
+Decided on 2026-09-23:
+
+1. **Offload gating on sftp.** Content-addressed and packed sftp destinations
+   gate through the optional server hash command (section 3), as they do
+   through rclone today. sftp mirrors stay non-gating, and so does any server
+   that runs no programs.
+2. **Host keys.** They are always verified against `known_hosts_file`, or
+   against `~/.ssh/known_hosts` when that's unset. Unknown hosts are refused.
+   Configs that relied on rclone accepting any key must pin it first.
+3. **Read-back** runs on local disks only (section 5).
+4. **Existing mirror trees aren't adopted.** The watermark rule refuses an
+   rclone-era mirror: the tree isn't empty, and its runs left no receipts. A
+   native mirror needs a fresh or emptied root. Adoption gets built only if the
+   testbed shows that hurts.
+5. **Receipts** for mirrors live in `.squirrel-index/`. The content layouts
+   keep their segments where they are.
+6. **Case-folding and normalization collisions** refuse only the colliding
+   path.
+7. **No source-completeness audit in this branch.** It stays a candidate. A
+   periodic check would compare a plain directory walk with the index's
+   present set, which would restore some independence for every layout.
+
+Open:
+
+1. **Crypt byte-compatibility with rclone.** This blocks cloudbox only, and is
+   to be discussed separately.
