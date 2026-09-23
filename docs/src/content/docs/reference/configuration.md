@@ -25,7 +25,7 @@ table resolved at load time.
 | `sync_to` | no | List of destination names to push to. |
 | `sync_every` | no | Duration; the [agent](/squirrel/guides/agent/) syncs this volume to every target in `sync_to` on this cadence. Absent = no scheduled sync. |
 | `index_every` | no | Duration; cadence for *standalone* index passes between syncs (a sync indexes first anyway). Absent = no extra indexing. |
-| `offload_requires` | no | List of targets whose durability must cover a file before its local bytes may be [offloaded](/squirrel/guides/offloading/). A volume without this key refuses to offload. |
+| `offload_requires` | no | List of targets whose durability must cover a file before its local bytes may be [offloaded](/squirrel/guides/offloading/). A volume without this key refuses to offload. Naming a mirror destination is a config error: a mirror can never produce evidence the gate accepts. |
 | `offload_max_evidence_age` | no | Duration; a target whose durability evidence was last re-verified longer ago than this refuses the offload. Default disabled. |
 
 ### `[volumes.<name>.hook]`

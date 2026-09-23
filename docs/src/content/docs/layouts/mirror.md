@@ -35,9 +35,15 @@ at the destination.
 
 ## Verification
 
-Sync verifies each uploaded file's BLAKE3 against the destination using rclone's
-`--checksum --hash blake3`. A mismatch aborts that file before the run is marked
-success. See [Syncing & first use](/squirrel/guides/syncing/).
+Sync compares every file with its copy by checksum (rclone's `--checksum`),
+under the first hash both ends support — MD5 on local disks and S3, independent
+of the BLAKE3 in the index. A copy that fails the check after transfer is an
+error, so the run is not marked success. The run advances the destination's
+durability evidence under the `checksum` method, which
+[`squirrel status`](/squirrel/reference/cli/) shows but the offload gate does not
+accept: a mirror cannot be named in
+[`offload_requires`](/squirrel/guides/offloading/). See
+[Syncing & first use](/squirrel/guides/syncing/).
 
 ## Index snapshots
 

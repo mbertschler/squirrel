@@ -53,9 +53,10 @@ what's missing.
 
 ## Properties that differ from mirrored destinations
 
-- **Verification is presence+size**, recorded as such: per-object transfers
-  can't carry the end-to-end BLAKE3 check (and `crypt` remotes expose no hashes
-  at all), so the runs row is recorded shallow and the push never claims content
+- **Verification is presence+size**, recorded as such: each object is
+  re-hashed with BLAKE3 before upload and confirmed present at the expected size
+  after it, but its stored bytes are not compared at transfer time (and `crypt`
+  remotes expose no hashes at all), so the runs row is recorded shallow and the push never claims content
   verification. On top of that, each upload's provider-side ciphertext
   fingerprint is recorded and re-checked by
   [`squirrel verify`](/squirrel/guides/verification/).

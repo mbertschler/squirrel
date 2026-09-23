@@ -163,9 +163,11 @@ missing findings. There have always been exactly 22.)
 ### Medium
 
 12. ✅ [#M1](#m1-shallow-mode-on-bucket-sync-can-skip-a-divergent-destination)
-    — `--shallow` drops `--checksum --hash blake3`; a destination that
-    drifted out-of-band but kept the same (size, mtime) silently stays
-    divergent.
+    — `--shallow` drops `--checksum` (the finding said `--checksum --hash
+    blake3`; `--hash` never picked the comparison hash, see
+    [#211](https://github.com/mbertschler/squirrel/issues/211)); a
+    destination that drifted out-of-band but kept the same (size, mtime)
+    silently stays divergent.
     → tracked in [#79](https://github.com/mbertschler/squirrel/issues/79),
     fixed in [#82](https://github.com/mbertschler/squirrel/pull/82)
 13. ✅ [#M2](#m2-folder-merkle-hashes-have-no-self-check) — there is no
@@ -1008,6 +1010,16 @@ The third bullet — periodic full verification — was not built here but has
 since been answered better than proposed: `squirrel verify` plus the
 agent's `verify_every` cadence re-check offsite fingerprints on a schedule
 (F32), rather than opportunistically re-verifying the last sync's subset.
+
+The finding's premise overstated what a non-shallow run checks. The
+`--hash blake3` beside `--checksum` only picks the hash a listing prints,
+so the comparison ran under the first hash both backends support — MD5 on
+local and s3 — and runs were recorded as `blake3` all the same.
+[#211](https://github.com/mbertschler/squirrel/issues/211) dropped the flag,
+records such a run as `checksum`, relabels the components already stored,
+and stops the offload gate from accepting it, so a mirror can no longer be
+named in `offload_requires`. The shallow warning now says "skipping the
+checksum comparison".
 
 **Issue:** `sync: surface --shallow trade-off in logs and persist it on the runs row`
 → tracked in [#79](https://github.com/mbertschler/squirrel/issues/79),

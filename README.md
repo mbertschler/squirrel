@@ -16,7 +16,7 @@ Squirrel works the same at any size: one machine backing up to one destination, 
 
 ## Under the hood
 
-Squirrel indexes a local file tree by BLAKE3 content hash and syncs it to one or more remote destinations (NAS, S3, B2, GCS, SFTP, …) via rclone. Every upload is BLAKE3-verified end-to-end. Destinations are append-only: an overwrite at the destination moves the prior bytes into `.squirrel-history/run-<id>/`, never deletes them.
+Squirrel indexes a local file tree by BLAKE3 content hash and syncs it to one or more remote destinations (NAS, S3, B2, GCS, SFTP, …) via rclone. Peer syncs are BLAKE3-verified end-to-end; every other destination is checked by the strongest comparison it supports, and the index records which one ran. Destinations are append-only: an overwrite at the destination moves the prior bytes into `.squirrel-history/run-<id>/`, never deletes them.
 
 ## Principle
 
@@ -49,7 +49,7 @@ go install github.com/mbertschler/squirrel/cmd/squirrel@latest
 
 A source build reports its version as `0.0.0-dev` — the version is only stamped into the released binaries at build time.
 
-You will also need [rclone](https://rclone.org) ≥ 1.66 on `PATH` to sync or restore against a **bucket destination** (BLAKE3 hash support landed in rclone 1.66). Syncing to a **peer node** does not use it — those bytes stream over the peer's own sync API — so a machine whose only targets are peers needs no rclone at all:
+You will also need [rclone](https://rclone.org) ≥ 1.71 on `PATH` to sync or restore against a **bucket destination** (1.71 added the sftp `hashes` option that [`hash_algo`](#offsite-verification-squirrel-verify) sets). Syncing to a **peer node** does not use it — those bytes stream over the peer's own sync API — so a machine whose only targets are peers needs no rclone at all:
 
 ```
 brew install rclone     # macOS
@@ -131,7 +131,7 @@ password2 = { env = "OFFSITE_CRYPT_SALT" }    # salt — optional but recommende
 Two properties to be aware of:
 
 - **What the destination discloses depends on the layout.** rclone's own filename encryption stays off (`filename_encryption = off`, fixed by design). On the content-addressed and packed layouts squirrel names every artifact — objects, packs, and the per-volume directory — by a keyed BLAKE3 hash derived from the crypt passwords, so the remote discloses neither a path nor a content hash, and nobody holding a candidate file can test whether the archive stores it without first finding the passwords — the naming key is stretched from them by rclone crypt's own scrypt derivation. On a mirror the names *are* your tree, replicated path for path, and stay in clear; if the names themselves are sensitive, use an append-only layout rather than a mirror.
-- **Verification falls back to size+mtime.** rclone crypt remotes cannot expose content hashes, so the end-to-end BLAKE3 check (`--checksum --hash blake3`) cannot pass through the overlay. Transfers to and from an encrypted destination compare by size+mtime instead — the same comparison `--shallow` uses — and say so in the run output; the runs row records the transfer as shallow. Content-addressed destinations regain deeper verification through provider-side ciphertext fingerprints — see [Offsite verification](#offsite-verification-squirrel-verify).
+- **Verification falls back to size+mtime.** rclone crypt remotes cannot expose content hashes, so the checksum comparison (`--checksum`) cannot pass through the overlay. Transfers to and from an encrypted destination compare by size+mtime instead — the same comparison `--shallow` uses — and say so in the run output; the runs row records the transfer as shallow. Content-addressed destinations regain deeper verification through provider-side ciphertext fingerprints — see [Offsite verification](#offsite-verification-squirrel-verify).
 
 ### Kopia destinations
 
@@ -180,7 +180,7 @@ Durability is **transactional per run**: the run only counts as successful — a
 
 Properties that differ from mirrored destinations:
 
-- **Verification is presence+size**, recorded as such: per-object transfers can't carry the end-to-end BLAKE3 check (and `crypt` remotes expose no hashes at all), so the runs row is recorded shallow and the push never claims content verification. On top of that, each upload's provider-side ciphertext fingerprint is recorded in the index and re-checked by [`squirrel verify`](#offsite-verification-squirrel-verify).
+- **Verification is presence+size**, recorded as such: each object is re-hashed with BLAKE3 before upload and confirmed present at the expected size after it, but its stored bytes are not compared at transfer time (and `crypt` remotes expose no hashes at all), so the runs row is recorded shallow and the push never claims content verification. On top of that, each upload's provider-side ciphertext fingerprint is recorded in the index and re-checked by [`squirrel verify`](#offsite-verification-squirrel-verify).
 - **Pick the layout when the destination is first used.** Switching an existing mirrored destination to `content-addressed` (or back) is not supported — point the new layout at a fresh destination or root. The push detects a mirrored history (a recorded successful sync without its manifest segment) and refuses.
 - **`squirrel restore` restores the layout**: it resolves each present path to its content hash from the local index, fetches the per-hash object through the same rclone (`crypt`) read path the push uses, and re-hashes every fetched object before writing. When the *local index itself* is lost, the format is deliberately simple enough to recover without squirrel — see below.
 - `--dry-run` is not supported yet on the push (it previews restore).
@@ -384,7 +384,7 @@ squirrel sync pictures --to nas     # just one
 squirrel sync                       # every (volume, destination) pair in config
 ```
 
-Sync verifies each uploaded file's BLAKE3 against the destination (using rclone's `--checksum --hash blake3`). Mismatches abort that file before the runs row is marked success. Use `--shallow` to fall back to rclone's default size+mtime comparison if you want speed over integrity for a big initial push. Encrypted (`crypt`) destinations always use the size+mtime comparison (see [Encrypted destinations](#encrypted-destinations)).
+Sync compares every file with its copy on a mirror destination by checksum (rclone's `--checksum`), under the first hash both ends support — MD5 on local disks and S3, independent of the BLAKE3 in the index. A copy that fails the check after transfer is an error, so the runs row is not marked success. The run records the `checksum` method, which the offload gate does not accept: a mirror can never be named in `offload_requires`. Use `--shallow` to fall back to rclone's default size+mtime comparison if you want speed over integrity for a big initial push. Encrypted (`crypt`) destinations always use the size+mtime comparison (see [Encrypted destinations](#encrypted-destinations)).
 
 ### First use and the `.squirrel-volume` marker
 
@@ -455,7 +455,7 @@ squirrel tui
 | ----------- | ----------------------------- | ---------------------------------------------------------------- |
 | `--config`  | `~/.squirrel/config.toml`     | TOML configuration file (env: `SQUIRREL_CONFIG`)                 |
 | `--db`      | from config, else default     | SQLite database path; overrides `db` in config                   |
-| `--shallow` | off                           | Skip BLAKE3 verification; use rclone's default size+mtime check  |
+| `--shallow` | off                           | Skip the checksum comparison; use rclone's default size+mtime check |
 | `--dry-run` | off                           | Report what would change without writing                         |
 | `--init`    | off                           | Authorise first-use destination bootstrap (sync only; see above) |
 | `--workers` | `NumCPU()`                    | Number of hashing workers (index only)                           |

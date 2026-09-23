@@ -36,9 +36,11 @@ destination/node namespace that `sync_to` uses; they may also name targets only 
 has not arrived yet simply keeps the gate closed.
 
 :::caution[An unsatisfiable requirement is a config error, not a closed gate]
-A target whose layout can *never* produce durability evidence — a plain crypt
-mirror, say — is rejected when the config loads, rather than leaving a gate that
-silently never opens. The check covers targets only a peer pushes to as well,
+A target whose layout can *never* produce evidence the gate accepts — any
+[mirror](/squirrel/layouts/mirror/) destination, plain or encrypted — is rejected
+when the config loads, rather than leaving a gate that silently never opens. A
+mirror sync compares each copy by checksum or by size+mtime, never against the
+BLAKE3 in the index, and keeps no fingerprint a verify pass could upgrade. The check covers targets only a peer pushes to as well,
 using the capabilities that peer reports. This distinction is the whole point:
 a refusal you see always means **not yet**, never **never**.
 :::
@@ -53,7 +55,9 @@ three of these hold, for **every** required target:
    vector component for that node to be ≥ `run`.
 2. **Verification method** — the component must be *content-verified*. A
    component recorded as `presence+size` (the object is there and the right
-   size) is refused: presence is not proof of bytes.
+   size) is refused: presence is not proof of bytes. So is a mirror's
+   `checksum` (compared under a hash the transfer picked, not the index's
+   BLAKE3).
 3. **Freshness** — if [`offload_max_evidence_age`](#evidence-staleness-opt-in)
    is set, the evidence must have been re-verified within it.
 
@@ -133,7 +137,7 @@ The causes, in the order the gate applies them:
 | **evidence is behind** | The target's coverage of that origin stops at an earlier run than this file's. |
 | **evidence is too old** | Coverage is sound but was last re-verified outside [`offload_max_evidence_age`](#evidence-staleness-opt-in). |
 | **not pushed since this file appeared** | No completed whole-volume sync covers the run in which the path became present (re-acquisition). |
-| **stored but not content-verified** | The component rests on presence, not on proof of the bytes; a verify pass upgrades it. |
+| **stored but not content-verified** | The component rests on presence or on a mirror's checksum comparison, not on proof of the bytes; a verify pass upgrades a `presence+size` component. |
 
 ## Evidence staleness (opt-in)
 

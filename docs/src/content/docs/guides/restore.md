@@ -1,6 +1,6 @@
 ---
 title: Restoring
-description: Pull a volume back from one of its rclone destinations, with content verification on the way down (BLAKE3 where the destination exposes hashes).
+description: Pull a volume back from one of its rclone destinations, with content verification on the way down (BLAKE3 for archive layouts, a checksum comparison for mirrors).
 ---
 
 `squirrel restore` pulls a volume back from one of its rclone destinations.
@@ -18,15 +18,16 @@ It takes exactly one positional argument — the **volume name**.
 |---|---|---|
 | `--from <name>` | — | Destination name to pull from, **or** peer node name to filter by content origin (names are unique across both kinds). |
 | `--to <path>` | volume's declared path | Local target path. |
-| `--shallow` | off | Skip BLAKE3 verification on the way down. |
+| `--shallow` | off | Skip the checksum comparison on the way down (mirror destinations). |
 | `--dry-run` | off | Preview rclone actions without transferring. |
 | `--in-place` | off | Permit restore against a non-empty live `vol.Path`; overwritten files are moved to `.squirrel-restore-history/run-<id>/`. |
 
 ## Verification on the way down
 
-By default, restore verifies each file's BLAKE3 as it arrives, the same
-end-to-end check [`sync`](/squirrel/guides/syncing/) uses on the way up. Pass
-`--shallow` to skip it.
+By default, a mirror restore compares each file with its copy by checksum as it
+arrives, the same comparison [`sync`](/squirrel/guides/syncing/) uses on the way
+up. Pass `--shallow` to skip it. Content-addressed and packed restores re-hash
+everything they extract to BLAKE3 regardless (see below).
 
 :::note[Encrypted destinations are always size+mtime]
 [Encrypted (`crypt`)](/squirrel/layouts/encrypted/) destinations cannot expose

@@ -289,6 +289,13 @@ amendment and the reasoning (#171). #173 extended the same fail-fast to
 peer-relayed targets, where the unsatisfiable destination is only visible
 through another node's capability report.
 
+*Revised in #211.* The plain-mirror half rested on a false premise: the
+`--hash blake3` beside `--checksum` never picked the comparison hash, so the
+"blake3" advances were MD5 compares on local and s3. Plain mirrors still
+advance the vector, now as `checksum`, but the gate refuses that method and
+config load rejects every mirror in `offload_requires`, plain or crypt. The
+fail-fast half stands and now covers both.
+
 ## Checkpoints 4–5 — trip return + offload day
 
 **F22 · S2 — ~~gate refusals are per-file walls of jargon that can't

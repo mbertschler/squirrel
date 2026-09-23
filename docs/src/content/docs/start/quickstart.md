@@ -49,10 +49,10 @@ squirrel sync pictures --to nas     # just one
 squirrel sync                       # every (volume, destination) pair in config
 ```
 
-Sync verifies each uploaded file's BLAKE3 against the destination (using
-rclone's `--checksum --hash blake3`). Mismatches abort that file before the run
-is marked success. Use `--shallow` to fall back to a size+mtime comparison for a
-big initial push.
+Sync compares every file with its copy on the destination by checksum, and a
+copy that fails the check after transfer keeps the run from being marked
+success. Use `--shallow` to fall back to a size+mtime comparison for a big
+initial push.
 
 :::caution[First use needs `--init`]
 Destinations that need first-use setup (a `local` marker, a new kopia

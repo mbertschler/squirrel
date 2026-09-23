@@ -108,7 +108,7 @@ Optional single positional. No arg = every `(volume, destination)` pair; one arg
 | Flag | Default | Meaning |
 |---|---|---|
 | `--to` | all | Limit to this destination name. |
-| `--shallow` | `false` | Skip BLAKE3 verification on bucket destinations; trust rclone's size+mtime comparison. A peer sync hashes every byte on both ends regardless. |
+| `--shallow` | `false` | Skip the checksum comparison on mirror destinations; trust rclone's size+mtime comparison. A peer sync hashes every byte on both ends regardless. |
 | `--dry-run` | `false` | Preview rclone actions without transferring; no runs row is written. |
 | `--init` | `false` | Authorise first-use destination bootstrap. |
 | `--progress`, `-P` | auto on a TTY | Show live transfer progress (files, bytes, rate, ETA). |
@@ -414,7 +414,7 @@ Exactly one positional — the volume name. See [Restoring](/squirrel/guides/res
 |---|---|---|
 | `--from` | — | Destination name to pull from, or peer node name to filter by content origin. |
 | `--to` | volume's declared path | Local target path. |
-| `--shallow` | `false` | Skip BLAKE3 verification on the way down. |
+| `--shallow` | `false` | Skip the checksum comparison on the way down (mirror destinations). |
 | `--dry-run` | `false` | Preview rclone actions without transferring. |
 | `--in-place` | `false` | Permit restore against a non-empty live path; overwritten files move to `.squirrel-restore-history/run-<id>/`. |
 

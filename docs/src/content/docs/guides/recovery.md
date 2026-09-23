@@ -160,7 +160,7 @@ destination carries bytes but no catalog to recover the index from.
 
 For a [mirror](/squirrel/layouts/mirror/) destination (including an encrypted
 one), [`squirrel restore`](/squirrel/guides/restore/) pulls the volume back
-byte-for-byte, decrypting on the way down and verifying BLAKE3 where the
+byte-for-byte, decrypting on the way down and comparing checksums where the
 destination exposes hashes.
 
 ### Recovering the index too
