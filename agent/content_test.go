@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zeebo/blake3"
 
@@ -275,33 +277,106 @@ func TestPutContentRequiresBearer(t *testing.T) {
 	}
 }
 
-// TestFailedCloseCommitsNothing is the invariant that keeps a broken
-// transfer from poisoning the receiver's index. `failed` reaches
-// closeSession from the initiator's abort, which carries no FailedPaths
-// because it gave up mid-flight and cannot say which uploads landed.
-// Committing the unlisted paths would write `present` rows for bytes that
-// never arrived — the index claiming content the volume does not hold,
-// which is worse than losing the run.
-//
-// A `partial` close is the contrasting case: there the initiator
-// enumerated exactly what failed, so the rest is genuinely on disk and
-// still commits.
-func TestFailedCloseCommitsNothing(t *testing.T) {
+// TestFailedCloseCommitsOnlyLandedUploads pins what a failed close
+// records. The initiator gave up mid-flight and sends no failed paths, so
+// the receiver commits exactly the uploads it verified on the way in: a
+// row for bytes that never arrived would have the index claim content the
+// volume does not hold, and dropping the ones that did arrive would make
+// the next run preserve and re-send them instead of resuming.
+func TestFailedCloseCommitsOnlyLandedUploads(t *testing.T) {
 	ctx := context.Background()
 	f := newPreStageFixture(t)
 	sess := f.newSession()
-	// A path the plan promised and the transfer never delivered.
+	landed := []byte("bytes that arrived")
+	f.awaitContent(sess, "landed.txt", landed)
 	f.awaitContent(sess, "never-arrived.txt", []byte("bytes that never made it"))
+	f.router.storeSession(sess)
+	if code, body := putContent(t, f.srv, f.recvRun, blakeHex(landed), landed); code != http.StatusOK {
+		t.Fatalf("upload status = %d (%s)", code, body)
+	}
 
 	committed, err := f.router.closeSession(ctx, sess, store.RunStatusFailed, nil)
 	if err != nil {
 		t.Fatalf("closeSession: %v", err)
 	}
-	if committed != 0 {
-		t.Errorf("committed = %d, want 0 for a failed close", committed)
+	if committed != 1 {
+		t.Errorf("committed = %d, want 1", committed)
+	}
+	if _, err := f.store.GetByPath(ctx, f.volID, "landed.txt"); err != nil {
+		t.Errorf("landed.txt has no row: %v", err)
 	}
 	if _, err := f.store.GetByPath(ctx, f.volID, "never-arrived.txt"); err == nil {
 		t.Error("a row exists for a path whose bytes never arrived")
+	}
+}
+
+// TestCloseWaitsForInFlightUpload pins that /close commits only once every
+// upload it could race with has finished, so no bytes land in a volume
+// after its session committed and released the lock.
+func TestCloseWaitsForInFlightUpload(t *testing.T) {
+	ctx := context.Background()
+	f := newPreStageFixture(t)
+	sess := f.newSession()
+	content := []byte("streamed in two halves")
+	f.awaitContent(sess, "slow.txt", content)
+	f.router.storeSession(sess)
+
+	bodyReader, bodyWriter := io.Pipe()
+	uploaded := make(chan int, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodPut, syncproto.ContentPath(f.recvRun, blakeHex(content)), bodyReader)
+		req.Header.Set("Authorization", "Bearer test-token")
+		rec := httptest.NewRecorder()
+		f.srv.Handler().ServeHTTP(rec, req)
+		uploaded <- rec.Code
+	}()
+	if _, err := bodyWriter.Write(content[:5]); err != nil {
+		t.Fatal(err)
+	}
+
+	closed := make(chan int, 1)
+	go func() {
+		closeBody, _ := json.Marshal(syncproto.CloseRequest{ReceiverRunID: f.recvRun, Status: store.RunStatusFailed})
+		req := httptest.NewRequest(http.MethodPost, "/v1/sync/close", bytes.NewReader(closeBody))
+		req.Header.Set("Authorization", "Bearer test-token")
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		f.srv.Handler().ServeHTTP(rec, req)
+		closed <- rec.Code
+	}()
+	select {
+	case code := <-closed:
+		t.Fatalf("close returned %d while an upload was still streaming", code)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if _, err := bodyWriter.Write(content[5:]); err != nil {
+		t.Fatal(err)
+	}
+	_ = bodyWriter.Close()
+	if code := <-uploaded; code != http.StatusOK {
+		t.Fatalf("upload status = %d", code)
+	}
+	if code := <-closed; code != http.StatusOK {
+		t.Fatalf("close status = %d", code)
+	}
+	if _, err := f.store.GetByPath(ctx, f.volID, "slow.txt"); err != nil {
+		t.Errorf("slow.txt landed before close committed but has no row: %v", err)
+	}
+}
+
+func TestPlanRefusesDigestDeclaredAtTwoSizes(t *testing.T) {
+	digest := blakeHex([]byte("same bytes"))
+	same := []syncproto.IndexEntry{
+		{Path: "a.txt", Blake3Hex: digest, SizeBytes: 10},
+		{Path: "b.txt", Blake3Hex: strings.ToUpper(digest), SizeBytes: 10},
+	}
+	if err := validateContentSizes(same); err != nil {
+		t.Fatalf("validateContentSizes(one size) = %v", err)
+	}
+	same[1].SizeBytes = 11
+	if err := validateContentSizes(same); err == nil {
+		t.Fatal("validateContentSizes accepted one digest at two sizes")
 	}
 }
 

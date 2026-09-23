@@ -14,6 +14,7 @@ import (
 
 	"github.com/zeebo/blake3"
 
+	"github.com/mbertschler/squirrel/store"
 	"github.com/mbertschler/squirrel/syncproto"
 )
 
@@ -30,18 +31,17 @@ const receivedFileMode = 0o644
 // only then materialises it at every path in the session that wants that
 // content.
 //
-// Addressing by digest rather than by path is what keeps the endpoint
-// safe: {blake3} is validated against a fixed 64-character hex alphabet
-// before anything touches the filesystem, and the destination paths come
-// from the session's own /plan verdicts, so no peer-supplied path is ever
-// joined onto the volume root here.
+// The URL carries a digest and no path: {blake3} is validated against a
+// fixed 64-character hex alphabet before anything touches the filesystem,
+// and the destination paths are the session's own /plan verdicts, each
+// checked by validateRelPath when /plan accepted it.
 func (r *peerSyncRouter) handlePutContent(w http.ResponseWriter, req *http.Request) {
 	runID, digest, err := parseContentRoute(req)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	sess, ok, err := r.lookupSession(runID, callerNodeName(req))
+	sess, ok, err := r.enterUpload(runID, callerNodeName(req))
 	if err != nil {
 		writeError(w, http.StatusForbidden, err.Error())
 		return
@@ -50,6 +50,7 @@ func (r *peerSyncRouter) handlePutContent(w http.ResponseWriter, req *http.Reque
 		writeError(w, http.StatusNotFound, "no session for receiver_run_id")
 		return
 	}
+	defer sess.uploads.Done()
 	targets, size := pathsAwaitingContent(sess, digest)
 	if len(targets) == 0 {
 		writeError(w, http.StatusConflict,
@@ -90,52 +91,65 @@ func parseContentRoute(req *http.Request) (runID int64, digest []byte, err error
 }
 
 // pathsAwaitingContent returns every volume-relative path in the session
-// whose /plan verdict expects the initiator to deliver these exact bytes,
-// along with the size and mtime the initiator declared for them. Paths
-// come back sorted so a multi-path upload materialises in a deterministic
-// order and the response body is stable.
-//
-// Size and mtime are read from the matched entries, which all describe
-// the same content and therefore agree on size; the mtime of the first
-// sorted path is applied to every copy.
+// whose /plan verdict expects these exact bytes, sorted so a multi-path
+// upload materialises in a deterministic order, along with their size —
+// one size, since /plan refuses a digest declared at two sizes.
 func pathsAwaitingContent(sess *peerSession, digest []byte) (paths []string, size int64) {
 	for path, entry := range sess.dispositions {
-		if awaitsTransfer(entry.disposition) && bytesEqual(entry.blake3, digest) {
+		if materializesAtPath(entry.disposition) && bytesEqual(entry.blake3, digest) {
 			paths = append(paths, path)
 		}
 	}
-	slices.Sort(paths)
 	if len(paths) == 0 {
 		return nil, 0
 	}
-	// Equal digests mean equal bytes and therefore equal size, but not
-	// equal mtime: two paths holding the same content were observed at
-	// their own times, and /close records each one's. Size comes from the
-	// set; mtime is read per path as each is materialised.
+	slices.Sort(paths)
 	return paths, sess.dispositions[paths[0]].size
 }
 
-// awaitsTransfer reports whether a disposition may be satisfied by the
-// initiator's bytes. Transfer, supersede, and conflict are what
-// sync.pathsInScope uploads on the normal path.
-//
-// Copy-from-existing is accepted too, though the initiator never offers
-// it up front — the receiver materialised those paths itself during
-// pre-stage. It matters on retry: /verify checks copy-from-existing
-// paths, so a dedup copy that failed or vanished comes back as a failing
-// path, and the initiator re-sends it. Refusing the upload would leave
-// exactly those paths unrepairable for the rest of the run.
-//
-// Already-correct is the one verdict that needs nothing.
-func awaitsTransfer(disposition string) bool {
-	switch disposition {
-	case syncproto.DispositionTransfer,
-		syncproto.DispositionSupersede,
-		syncproto.DispositionConflict,
-		syncproto.DispositionCopyFromExisting:
+// enterUpload resolves the session for an upload and counts the upload
+// in flight under the same lock takeSession removes the session with, so
+// /close either sees the upload and waits for it, or the upload finds no
+// session. The caller must call sess.uploads.Done.
+func (r *peerSyncRouter) enterUpload(receiverRunID int64, callerNode string) (sess *peerSession, ok bool, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	sess, ok = r.sessions[receiverRunID]
+	if !ok {
+		return nil, false, nil
+	}
+	if callerNode != "" && callerNode != sess.initiatorNodeName {
+		return nil, true, errSessionCallerMismatch
+	}
+	sess.uploads.Add(1)
+	return sess, true, nil
+}
+
+func (sess *peerSession) markLanded(rel string) {
+	sess.landedMu.Lock()
+	defer sess.landedMu.Unlock()
+	if sess.landed == nil {
+		sess.landed = make(map[string]struct{})
+	}
+	sess.landed[rel] = struct{}{}
+}
+
+// commits reports whether /close records a live row for path. A failed
+// close comes from an initiator that gave up mid-flight and cannot say
+// what landed, so it commits only the paths an upload materialised with
+// verified bytes; any other close commits every path expecting bytes and
+// relies on failedPaths for the ones that did not verify.
+func (sess *peerSession) commits(path string, entry *sessionEntry, status string) bool {
+	if !materializesAtPath(entry.disposition) {
+		return false
+	}
+	if status != store.RunStatusFailed {
 		return true
 	}
-	return false
+	sess.landedMu.Lock()
+	defer sess.landedMu.Unlock()
+	_, ok := sess.landed[path]
+	return ok
 }
 
 // errRejected marks a failure the *caller's bytes* caused — a body that is
@@ -164,11 +178,13 @@ func (r *peerSyncRouter) materializeContent(sess *peerSession, digest []byte, ta
 	if err := streamToPath(primary, body, digest, size, sess.dispositions[targets[0]].mtimeNs); err != nil {
 		return fmt.Errorf("receive %s: %w", targets[0], err)
 	}
+	sess.markLanded(targets[0])
 	for _, rel := range targets[1:] {
 		dst := filepath.Join(sess.volume.Path, rel)
 		if err := copyFileToPath(primary, dst, sess.dispositions[rel].mtimeNs); err != nil {
 			return fmt.Errorf("materialise %s from %s: %w", rel, targets[0], err)
 		}
+		sess.markLanded(rel)
 	}
 	return nil
 }
@@ -197,9 +213,6 @@ func streamToPath(dstAbs string, body io.Reader, want []byte, size, mtimeNs int6
 	if err != nil {
 		_ = tmp.Close()
 		cleanup()
-		// Overrunning the declared size is the caller's doing; any other
-		// copy failure is this machine's disk or a dropped connection, and
-		// must not be reported to the peer as a bad request.
 		var overrun *http.MaxBytesError
 		if errors.As(err, &overrun) {
 			return fmt.Errorf("%w: body exceeds the %d bytes plan declared", errRejected, size)
