@@ -125,6 +125,9 @@ type layout[O operations] interface {
 	// advanceMethod names the evidence the confirmed landing earns; an
 	// empty method holds the vector (packed, while a fingerprint is pending).
 	advanceMethod(ctx context.Context, rep *Report, p pushPlan) (string, error)
+	// shelf opens <volume>/.squirrel-index/ for the ride-along: through
+	// rclone for the content layouts, through the transport for a mirror.
+	shelf(ctx context.Context, runID int64) (snapshotShelf, error)
 }
 ```
 

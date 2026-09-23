@@ -50,9 +50,9 @@ func SyncNode(ctx context.Context, s *store.Store, vol *config.Volume, node *con
 	// runNodeSession's deferred finishRun has committed the run's
 	// terminal state by now, so the snapshot reflects this run's own row.
 	// Peer-sync takes the local snapshot only — there is no ride-along to
-	// peer nodes (dest=nil), and the Snapshotter no-ops on non-terminal
+	// peer nodes (no shelf), and the Snapshotter no-ops on non-terminal
 	// states and dry-run.
-	opts.Snapshot.afterSync(ctx, &rep, vol, nil)
+	opts.Snapshot.afterSync(ctx, &rep, nil)
 	return rep, err
 }
 

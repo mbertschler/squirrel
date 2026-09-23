@@ -369,7 +369,7 @@ func TestKeyedVolumeDirFoundByRecovery(t *testing.T) {
 	f := setupContentAddressedFixture(t)
 	f.write(t, "a.txt", "alpha")
 	f.index(t)
-	sn := NewSnapshotter(f.store, f.rcl, SnapshotConfig{Dir: t.TempDir(), Keep: 7, Cloud: true, CloudKeep: 7})
+	sn := NewSnapshotter(f.store, SnapshotConfig{Dir: t.TempDir(), Keep: 7, Cloud: true, CloudKeep: 7})
 	rep, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, f.pair, Options{Snapshot: sn})
 	if err != nil {
 		t.Fatalf("sync: %v", err)

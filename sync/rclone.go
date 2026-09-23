@@ -650,8 +650,7 @@ func (r *Rclone) listSnapshots(ctx context.Context, dirURI string) ([]string, er
 	}
 	var names []string
 	for _, line := range strings.Split(string(out), "\n") {
-		name := strings.TrimSpace(line)
-		if strings.HasPrefix(name, snapshotPrefix) && strings.HasSuffix(name, ".db") {
+		if name := strings.TrimSpace(line); isSnapshotName(name) {
 			names = append(names, name)
 		}
 	}

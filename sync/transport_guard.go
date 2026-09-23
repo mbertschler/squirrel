@@ -62,7 +62,7 @@ func (g nameGuard) permit(op guardOp, name, to string) error {
 
 func (g nameGuard) removable(name string) bool {
 	if rel, ok := strings.CutPrefix(name, g.volumeDir+"/"+IndexDirName+"/"); ok {
-		return !strings.Contains(rel, "/") && strings.HasPrefix(rel, snapshotPrefix) && strings.HasSuffix(rel, ".db")
+		return !strings.Contains(rel, "/") && isSnapshotName(rel)
 	}
 	runID, key, ok := g.stagingParts(name)
 	if !ok || runID == g.runID || !g.finished(runID) {

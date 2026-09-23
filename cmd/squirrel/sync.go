@@ -91,7 +91,7 @@ func runSync(cmd *cobra.Command, volumeName, destinationName string, progress bo
 	// for dry-run (no run rows to snapshot against) and when [backups] is
 	// turned off.
 	if !opts.DryRun && cfg.Backups.Enabled {
-		opts.Snapshot = sync.NewSnapshotter(s, rcl, snapshotConfig(cfg, s.Path()))
+		opts.Snapshot = sync.NewSnapshotter(s, snapshotConfig(cfg, s.Path()))
 	}
 
 	// Progress renders to stderr (leaving stdout for the summary lines). A

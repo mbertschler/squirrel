@@ -362,7 +362,7 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 	// terminal state by now, so the snapshot reflects this run's own row.
 	// Destination syncs are eligible for the cloud ride-along; the
 	// Snapshotter no-ops on dry-run and on non-terminal-success states.
-	opts.Snapshot.afterSync(ctx, &rep, vol, dest)
+	opts.Snapshot.afterSync(ctx, &rep, rcloneShelfOf(rcl, dest, vol.Name))
 	return rep, err
 }
 
@@ -935,10 +935,11 @@ func (p Pair) TargetName() string {
 func (p Pair) IsNode() bool { return p.Node != nil }
 
 // DrivesRclone reports whether syncing this pair invokes rclone. Every
-// destination does except kopia, which drives its own binary; a peer node
-// streams its bytes over the sync API.
+// destination does except kopia, which drives its own binary, and a
+// native mirror, which squirrel writes itself; a peer node streams its
+// bytes over the sync API.
 func (p Pair) DrivesRclone() bool {
-	return p.Destination != nil && p.Destination.Type != "kopia"
+	return p.Destination != nil && p.Destination.Type != "kopia" && !p.Destination.NativeMirror()
 }
 
 // RestoreOptions shape one Restore invocation. ToPath overrides the local

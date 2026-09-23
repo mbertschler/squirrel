@@ -109,3 +109,23 @@ func TestSchedulerToolsRebuildKeepsRclone(t *testing.T) {
 		t.Fatalf("rclone() = %p after a reload that needs none, want the located wrapper %p", got, located)
 	}
 }
+
+// TestScheduledSyncToANativeMirrorNeedsNoRclone: squirrel writes a local
+// mirror and a plain sftp mirror itself, so a cadence naming only those
+// runs on a host without rclone; an encrypted sftp mirror still needs it.
+func TestScheduledSyncToANativeMirrorNeedsNoRclone(t *testing.T) {
+	cfg := &config.Config{
+		Volumes: map[string]*config.Volume{"pics": {Name: "pics", SyncEvery: time.Hour, SyncTo: []string{"usb", "box"}}},
+		Destinations: map[string]*config.Destination{
+			"usb": {Name: "usb", Type: "local", Layout: config.LayoutMirror},
+			"box": {Name: "box", Type: "sftp", Layout: config.LayoutMirror},
+		},
+	}
+	if anyVolumeNeedsScheduledSync(cfg) {
+		t.Fatal("a cadence onto native mirrors only must not need rclone")
+	}
+	cfg.Destinations["box"].Crypt = &config.Crypt{Password: "pw"}
+	if !anyVolumeNeedsScheduledSync(cfg) {
+		t.Fatal("an encrypted sftp mirror is written by rclone")
+	}
+}

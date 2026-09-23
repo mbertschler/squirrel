@@ -20,7 +20,7 @@ func (f *syncFixture) snapshotterFor(t *testing.T, cfg SnapshotConfig) *Snapshot
 	if cfg.Dir == "" {
 		cfg.Dir = t.TempDir()
 	}
-	return NewSnapshotter(f.store, f.rcl, cfg)
+	return NewSnapshotter(f.store, cfg)
 }
 
 func globOne(t *testing.T, pattern string) string {
@@ -174,7 +174,7 @@ func TestSnapshotErrorDoesNotFailSync(t *testing.T) {
 	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	sn := NewSnapshotter(f.store, f.rcl, SnapshotConfig{Dir: filepath.Join(blocker, "backups"), Keep: 7, Cloud: true, CloudKeep: 7})
+	sn := NewSnapshotter(f.store, SnapshotConfig{Dir: filepath.Join(blocker, "backups"), Keep: 7, Cloud: true, CloudKeep: 7})
 
 	rep, err := Sync(context.Background(), f.store, f.rcl, f.vol, f.dest, Options{Snapshot: sn})
 	if err != nil {
@@ -397,23 +397,17 @@ func argsHaveFilter(args []string, want string) bool {
 
 // TestSnapshotterWithoutRcloneServesPeerPairs pins the coupling that lets
 // a peer-only or kopia-only sync run on a host with no rclone installed:
-// `runSync` now leaves the wrapper nil for such a batch, and the
-// Snapshotter is still constructed and still takes its local snapshot.
-// Only the destination ride-along needs rclone, and both handlers that
-// never have one (peer sync, kopia) pass a nil destination, which
-// afterSync returns on before reaching it.
-//
-// A test rather than a comment because the safety of the nil is a
-// cross-package invariant: it holds only as long as every caller reaching
-// rideAlong is an rclone-driven handler.
+// the Snapshotter holds no rclone wrapper, and the handlers that have no
+// ride-along (peer sync, kopia) pass no shelf, so it still takes its local
+// snapshot.
 func TestSnapshotterWithoutRcloneServesPeerPairs(t *testing.T) {
 	f := setupFixture(t)
-	sn := NewSnapshotter(f.store, nil, SnapshotConfig{
+	sn := NewSnapshotter(f.store, SnapshotConfig{
 		Dir: filepath.Join(t.TempDir(), "backups"), Keep: 7, Cloud: true, CloudKeep: 7,
 	})
 
 	rep := &Report{RunID: 1, Status: store.RunStatusSuccess}
-	sn.afterSync(context.Background(), rep, f.vol, nil)
+	sn.afterSync(context.Background(), rep, nil)
 
 	if rep.SnapshotErr != nil {
 		t.Fatalf("SnapshotErr = %v, want the local snapshot to succeed without rclone", rep.SnapshotErr)

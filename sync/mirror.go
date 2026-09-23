@@ -188,6 +188,16 @@ func (h *mirrorHandler) advanceMethod(context.Context, *Report, pushPlan) (strin
 	return store.VerifyMethodPresenceSize, nil
 }
 
+// shelf is the mirror's <volume>/.squirrel-index/, reached through runID's
+// guarded transport.
+func (h *mirrorHandler) shelf(ctx context.Context, runID int64) (snapshotShelf, error) {
+	tr, err := h.root(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	return transportShelf{tr: tr, dir: path.Join(h.vol.Name, IndexDirName)}, nil
+}
+
 func (h *mirrorHandler) receiptName(runID int64) string {
 	return path.Join(h.vol.Name, IndexDirName, "run-"+strconv.FormatInt(runID, 10))
 }

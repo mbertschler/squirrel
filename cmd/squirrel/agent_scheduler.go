@@ -82,9 +82,9 @@ func (t *schedulerTools) rebuild(ctx context.Context, cfg *config.Config) error 
 
 // anyVolumeNeedsScheduledSync reports whether a scheduled sync will
 // invoke rclone. Only rclone-backed destinations count: a peer node
-// streams its bytes over the sync API and a kopia destination drives its
-// own binary, so a cadence naming only those runs its whole schedule on a
-// host with no rclone installed.
+// streams its bytes over the sync API, a kopia destination drives its own
+// binary, and squirrel writes a native mirror itself, so a cadence naming
+// only those runs its whole schedule on a host with no rclone installed.
 func anyVolumeNeedsScheduledSync(cfg *config.Config) bool {
 	for _, v := range cfg.Volumes {
 		if v.SyncEvery <= 0 {
@@ -108,8 +108,8 @@ func targetNeedsRclone(cfg *config.Config, target string) bool {
 	if _, isNode := cfg.Nodes[target]; isNode {
 		return false
 	}
-	if dest, ok := cfg.Destinations[target]; ok && dest.Type == "kopia" {
-		return false
+	if dest, ok := cfg.Destinations[target]; ok {
+		return sync.Pair{Destination: dest}.DrivesRclone()
 	}
 	return true
 }
@@ -159,7 +159,7 @@ func buildSchedulerSyncRunner(live *config.Live, s *store.Store, tools *schedule
 			return agent.SyncRunReport{Err: err}
 		}
 		rcl := tools.rclone()
-		if rcl == nil && !pair.IsNode() {
+		if rcl == nil && pair.DrivesRclone() {
 			return agent.SyncRunReport{Err: errors.New("scheduled sync needs rclone, which the configuration in force did not call for")}
 		}
 		// Per-kick because the kopia lookup belongs to the kicks that
@@ -174,7 +174,7 @@ func buildSchedulerSyncRunner(live *config.Live, s *store.Store, tools *schedule
 		// a single pair, so a fresh Snapshotter per kick is the right unit.
 		opts := sync.Options{}
 		if cfg.Backups.Enabled {
-			opts.Snapshot = sync.NewSnapshotter(s, rcl, snapshotConfig(cfg, s.Path()))
+			opts.Snapshot = sync.NewSnapshotter(s, snapshotConfig(cfg, s.Path()))
 		}
 		rep, runErr := sync.RunPair(ctx, s, syncTools, pair, opts)
 		return agent.SyncRunReport{

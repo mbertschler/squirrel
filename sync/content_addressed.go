@@ -125,6 +125,12 @@ func (h *contentPusher) ensureMarkers(ctx context.Context, init bool) error {
 	return ensureRemoteDestinationMarker(ctx, h.store, h.rcl, h.dest, h.vol.Name, init)
 }
 
+// shelf is the destination's .squirrel-index/ directory, reached through
+// rclone like the rest of the push.
+func (h *contentPusher) shelf(context.Context, int64) (snapshotShelf, error) {
+	return rcloneShelfOf(h.rcl, h.dest, h.vol.Name)()
+}
+
 // markers is the content layouts' marker gate. A dry run checks the naming
 // scheme read-only and writes nothing.
 func (h *contentPusher) markers(ctx context.Context, _ *Report, _ int64, opts Options) error {
