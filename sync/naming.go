@@ -45,58 +45,50 @@ type namingMarker struct {
 	CreatedAt string `json:"created_at,omitempty"`
 }
 
-// namer resolves the basenames of one destination's artifacts.
+// namer names one destination's artifacts: by a keyed BLAKE3 hash when it
+// holds a naming key, by content hash otherwise.
 type namer struct {
-	dest  *config.Destination
-	keyed bool
+	key *[32]byte
 }
 
-// namerFor is the naming scheme dest writes under: keyed for an encrypted
-// append-only destination, content-hash names otherwise.
+// namerFor is the naming dest's artifacts are written and read under.
 func namerFor(dest *config.Destination) namer {
-	return namer{dest: dest, keyed: dest.HidesArtifactNames()}
+	if !dest.HidesArtifactNames() {
+		return namer{}
+	}
+	return namer{key: &dest.Crypt.NamingKey}
 }
 
-// object is the basename of one content object: a keyed name under the
-// keyed scheme, the content's own BLAKE3 hex otherwise.
+// object is the basename of one content object.
 func (n namer) object(contentHash []byte) string {
-	if !n.keyed {
+	if n.key == nil {
 		return hex.EncodeToString(contentHash)
 	}
 	return n.keyedName(nameDomainObject, contentHash)
 }
 
-// pack is the basename of one pack, named the same way as object. A pack
-// key already discloses no single file, but naming it keyed keeps one rule
-// for the whole root.
+// pack is the basename of one pack.
 func (n namer) pack(packKey []byte) string {
-	if !n.keyed {
+	if n.key == nil {
 		return hex.EncodeToString(packKey)
 	}
 	return n.keyedName(nameDomainPack, packKey)
 }
 
 // volumeDir is the per-volume directory holding that volume's manifest
-// segments and ride-along index snapshots. Keying it is what stops the
-// remote from disclosing the volume names themselves.
+// segments, volume marker, and ride-along index snapshots.
 func (n namer) volumeDir(volumeName string) string {
-	if !n.keyed {
+	if n.key == nil {
 		return volumeName
 	}
 	return n.keyedName(nameDomainVolume, []byte(volumeName))
 }
 
-// keyedName derives one artifact name: the keyed BLAKE3 of domain, a NUL
-// separator, and input, under the destination's naming key, as lowercase
-// hex. Deterministic, so identical content still derives one name and
-// uploads once; unforgeable without the key, so the name discloses nothing
-// about what it stands for.
+// keyedName is the lowercase hex keyed BLAKE3 of domain, a NUL separator,
+// and input.
 func (n namer) keyedName(domain string, input []byte) string {
-	h, err := blake3.NewKeyed(n.dest.Crypt.NamingKey[:])
+	h, err := blake3.NewKeyed(n.key[:])
 	if err != nil {
-		// NewKeyed rejects only a key that is not 32 bytes, and NamingKey
-		// is a [32]byte, so reaching this is a programming error rather
-		// than a runtime condition callers could handle.
 		panic("sync: invalid artifact naming key: " + err.Error())
 	}
 	material := make([]byte, 0, len(domain)+1+len(input))

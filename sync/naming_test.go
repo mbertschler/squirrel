@@ -65,6 +65,27 @@ func TestPlainDestinationKeepsContentHashNames(t *testing.T) {
 	}
 }
 
+// TestKeyedNamesGolden pins the names derived under a fixed key, as the
+// blake3 Python package computes them too. They are the on-remote format:
+// changing a domain tag or the separator renames every stored artifact.
+func TestKeyedNamesGolden(t *testing.T) {
+	var key [32]byte
+	for i := range key {
+		key[i] = byte(i)
+	}
+	n := namer{key: &key}
+	content := mustHex(t, blake3Hex("alpha"))
+	for _, tc := range []struct{ artifact, got, want string }{
+		{"object", n.object(content), "21d232103b50905cffe724c56064f08f6459c275ad7e50b64b7a428f932995ed"},
+		{"pack", n.pack(content), "6f0814ea8c8ab2e91052b2e493875dfa85e3103368f62e4750386bbbb051835f"},
+		{"volume directory", n.volumeDir("pics"), "27a9dea6c0b5fa0dbcecea454025d2d870393d8810b7ccde84581c63ef05ca3d"},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s name = %s, want %s", tc.artifact, tc.got, tc.want)
+		}
+	}
+}
+
 // TestKeyedNameDomainsSeparate: the same bytes under two roles derive two
 // names, so the objects/, packs/, and per-volume namespaces stay
 // independent even where a content hash and a pack key coincide.
