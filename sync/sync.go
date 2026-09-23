@@ -973,90 +973,50 @@ type RestoreOptions struct {
 }
 
 // Restore reverses Sync back to the local filesystem, recording a
-// kind='restore' runs row. The mirror layout copies the destination's
-// per-volume tree down with rclone; the content-addressed and packed
-// layouts (which have no mirrored tree) resolve each present path to its
-// content hash in the local index, fetch the per-hash object or pack
-// member, and re-hash it before writing. Restore is read-only against both
-// the index and the destination — it never uploads, never mutates content
-// rows — but the rclone mirror path will overwrite whatever exists at the
-// target on a hash mismatch, so callers point ToPath at an empty / scratch
-// directory unless they explicitly intend to restore in place.
+// kind='restore' runs row. A native mirror (local, or sftp without crypt)
+// is read through squirrel's own transport and every file is placed
+// through a temporary file beside its path, checked against the index —
+// or, on a fresh machine, against the mirror's receipts; rcl may be nil
+// for one. An rclone mirror is copied down with rclone. The
+// content-addressed and packed layouts (which have no mirrored tree)
+// resolve each present path to its content hash in the local index, fetch
+// the per-hash object or pack member, and re-hash it before writing.
+// Restore is read-only against both the index and the destination — it
+// never uploads, never mutates content rows. An in-place restore without
+// InPlace is refused on a non-empty volume, and with it every file it
+// replaces moves into .squirrel-restore-history/run-<id>/.
 func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, dest *config.Destination, opts RestoreOptions) (rep Report, err error) {
 	rep = Report{Volume: vol.Name, Destination: dest.Name}
 	if dest.Type == "kopia" {
 		return rep, fmt.Errorf("destination %q is a kopia repository — restore from it with the kopia CLI (`kopia snapshot restore`)", dest.Name)
 	}
-	archive := dest.Layout == config.LayoutContentAddressed || dest.Layout == config.LayoutPacked
-
-	// "In-place" is the dangerous direction: writing into the live
-	// volume path. Unsetting ToPath is the canonical request, but a
-	// caller who explicitly passes ToPath == vol.Path is asking for
-	// the same thing and must go through the same gates — otherwise
-	// `--to <vol.Path>` would silently bypass the marker check, the
-	// non-empty refusal, AND the overwrite backup, reintroducing exactly
-	// the data-loss path this guard is trying to close.
-	targetInPlace, err := isInPlaceRestore(vol, opts.ToPath)
+	targetInPlace, err := checkRestoreTarget(vol, opts)
 	if err != nil {
 		return rep, err
 	}
-
-	// Local target marker check: when restoring into the live volume
-	// path, insist on a marker that names this volume. A missing or
-	// mismatched marker is the strongest signal we have that vol.Path
-	// is a typo or unrelated tree, and overwriting it would be
-	// irreversible. A genuine scratch --to bypasses the check because
-	// the operator is explicitly redirecting to an unrelated directory.
-	if !opts.DryRun && targetInPlace {
-		if err := validateLocalVolumeMarker(vol); err != nil {
-			return rep, err
-		}
-	}
-
-	// In-place overwrite gate: a non-empty live vol.Path is the
-	// most likely realistic data-loss path in squirrel today (user
-	// runs `restore` to recover what they think is missing, and the
-	// destination's view replaces local edits). When InPlace is unset
-	// and the directory carries anything beyond the marker/history
-	// subtree, refuse with the --in-place hint.
-	if !opts.DryRun && targetInPlace && !opts.InPlace {
-		hasContent, err := localVolumeHasContent(vol.Path)
-		if err != nil {
-			return rep, err
-		}
-		if hasContent {
-			return rep, fmt.Errorf("volume %q at %s is not empty — pass --in-place to overwrite (a per-run history of replaced files lands under %s/run-<id>/) or --to <scratch-path> to restore into a different directory", vol.Name, vol.Path, RestoreHistoryDirName)
-		}
-	}
-
-	// We deliberately don't require an existing index for the mirror
-	// pull: the destination is the source of truth there, and a fresh
-	// laptop may have no DB rows yet. We still create a volumes row so
-	// the runs row's FK resolves. (The archive pull does need the index
-	// — that is where path→hash lives — but a fresh volume simply
-	// resolves to zero present rows and restores nothing.)
+	// We deliberately don't require an existing index: a fresh machine
+	// may have no DB rows yet, and a mirror restores from its own tree
+	// then. We still create a volumes row so the runs row's FK resolves.
 	v, err := getOrCreateVolumeForRestore(ctx, s, vol)
 	if err != nil {
 		return rep, err
 	}
-
-	// The archive layouts re-hash every extracted content locally, so the
-	// pull is content-verified regardless of --shallow or a crypt overlay;
-	// the mirror pull records rclone's effective comparison instead.
-	shallow := EffectiveShallow(dest, opts.Shallow)
-	if archive {
-		shallow = false
-	}
+	// Squirrel re-hashes every file it restores from a native mirror or an
+	// archive layout, so those pulls are content-verified regardless of
+	// --shallow or a crypt overlay; an rclone mirror pull records rclone's
+	// effective comparison instead.
+	archive := dest.Layout == config.LayoutContentAddressed || dest.Layout == config.LayoutPacked
+	shallow := EffectiveShallow(dest, opts.Shallow) && !archive && !dest.NativeMirror()
 	runID, err := beginRestoreRun(ctx, s, opts.DryRun, v.ID, dest.Name, shallow)
 	if err != nil {
 		return rep, err
 	}
-
-	if archive {
-		err = restoreArchive(ctx, s, rcl, vol, dest, v.ID, runID, targetInPlace, opts, &rep)
-		return rep, err
+	switch {
+	case archive:
+		return rep, restoreArchive(ctx, s, rcl, vol, dest, v.ID, runID, targetInPlace, opts, &rep)
+	case dest.NativeMirror():
+		return rep, restoreMirror(ctx, s, vol, dest, v.ID, runID, targetInPlace, opts, &rep)
 	}
-
 	if w := cryptVerificationWarning(dest, opts.Shallow); w != "" {
 		rep.Warnings = append(rep.Warnings, w)
 	}
@@ -1065,6 +1025,41 @@ func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volum
 			return buildRestoreArgs(vol, dest, runID, opts), nil
 		})
 	return rep, err
+}
+
+// checkRestoreTarget applies the in-place gates and reports whether the
+// restore writes into the live volume path. "In-place" is the dangerous
+// direction: an unset ToPath is the canonical request, but a caller who
+// explicitly passes ToPath == vol.Path is asking for the same thing and
+// must go through the same gates — otherwise `--to <vol.Path>` would
+// silently bypass the marker check, the non-empty refusal, AND the
+// overwrite backup.
+//
+// Into the live path, a marker naming this volume is required: a missing
+// or mismatched one is the strongest signal that vol.Path is a typo or an
+// unrelated tree. And a non-empty live path — the most realistic data-loss
+// path, where the destination's view replaces local edits — is refused
+// unless InPlace. A genuine scratch --to bypasses both, because the
+// operator explicitly redirected to an unrelated directory.
+func checkRestoreTarget(vol *config.Volume, opts RestoreOptions) (bool, error) {
+	targetInPlace, err := isInPlaceRestore(vol, opts.ToPath)
+	if err != nil || opts.DryRun || !targetInPlace {
+		return targetInPlace, err
+	}
+	if err := validateLocalVolumeMarker(vol); err != nil {
+		return true, err
+	}
+	if opts.InPlace {
+		return true, nil
+	}
+	hasContent, err := localVolumeHasContent(vol.Path)
+	if err != nil {
+		return true, err
+	}
+	if hasContent {
+		return true, fmt.Errorf("volume %q at %s is not empty — pass --in-place to overwrite (a per-run history of replaced files lands under %s/run-<id>/) or --to <scratch-path> to restore into a different directory", vol.Name, vol.Path, RestoreHistoryDirName)
+	}
+	return true, nil
 }
 
 // isInPlaceRestore reports whether the restore target equals

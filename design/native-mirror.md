@@ -559,18 +559,29 @@ for local mirrors.
 
 ## 6. Restore, ride-along, recover
 
-- **Mirror restore with an index** uses the archive restore pipeline:
+- **Mirror restore with an index** uses the archive restore pipeline
+  (`sync/restore_mirror.go`):
   1. resolve the present paths;
   2. `Get` each one by path;
   3. BLAKE3 while streaming;
   4. place it.
 
   Placing goes through a temporary file in the target directory, a sync and a
-  rename. Today's archive restore writes with `O_TRUNC` in place. Both get
-  fixed together.
+  rename (`sync/restore_place.go`). Archive restore wrote with `O_TRUNC` in
+  place; both now place the same way. Bytes that fail their hash never reach
+  the path. A path that already holds its indexed bytes is left alone and
+  counted as already correct, so an in-place restore moves into
+  `.squirrel-restore-history/` only what it actually replaces.
 - **Mirror restore without an index** (a fresh machine) walks the mirror with
-  `List` and skips the reserved directories. When receipts are present, each
-  file is checked against them, and files that can't be checked are counted.
+  `List` and skips the reserved directories. "Without an index" means the index
+  holds no present file for the volume: a fresh database, or one whose rows for
+  the volume are all missing after a rescan of an emptied disk. The receipts,
+  folded oldest run first, give each path the content its newest present entry
+  recorded. A file with such an entry is checked against it and refused when it
+  differs; a file no receipt names can't be checked, so it is restored and
+  counted in a warning. A receipt that doesn't parse is reported and skipped.
+- **`--shallow` changes nothing** on a native mirror restore, as on an archive
+  restore: every byte is hashed anyway.
 - **The marker gate, the snapshot ride-along and its rotation, and `recover
   --from` discovery** become transport calls. That removes the rclone-specific
   helpers `statRemoteExists`, `catRemote`, `copyTo`, `listSnapshots`,

@@ -48,6 +48,18 @@ func (pl restorePlacer) place(rel string, r io.Reader, want []byte, mtime time.T
 	return n, nil
 }
 
+// holds reports whether rel already holds size bytes hashing to want, so
+// a restore can leave it as it is.
+func (pl restorePlacer) holds(rel string, size int64, want []byte) bool {
+	dst := pl.path(rel)
+	fi, err := os.Lstat(dst)
+	if err != nil || !fi.Mode().IsRegular() || fi.Size() != size {
+		return false
+	}
+	digest, err := hashLocalFile(dst)
+	return err == nil && bytes.Equal(digest, want)
+}
+
 func (pl restorePlacer) path(rel string) string {
 	return filepath.Join(pl.target, filepath.FromSlash(rel))
 }

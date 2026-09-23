@@ -402,7 +402,7 @@ winner live. Adopting the preserved version instead is a deliberate
 
 ## squirrel restore
 
-**Pull a volume back from one of its rclone destinations.**
+**Pull a volume back from one of its destinations.**
 
 ```
 squirrel restore <volume>
@@ -414,9 +414,13 @@ Exactly one positional — the volume name. See [Restoring](/squirrel/guides/res
 |---|---|---|
 | `--from` | — | Destination name to pull from, or peer node name to filter by content origin. |
 | `--to` | volume's declared path | Local target path. |
-| `--shallow` | `false` | Skip the checksum comparison on the way down (mirror destinations). |
-| `--dry-run` | `false` | Preview rclone actions without transferring. |
+| `--shallow` | `false` | Skip the checksum comparison on the way down from an rclone mirror. Native mirrors and the content-addressed and packed layouts are always re-hashed to BLAKE3. |
+| `--dry-run` | `false` | Preview what the restore would fetch without transferring. |
 | `--in-place` | `false` | Permit restore against a non-empty live path; overwritten files move to `.squirrel-restore-history/run-<id>/`. |
+
+A [native mirror](/squirrel/guides/restore/#native-mirrors) restore needs no rclone:
+with an index it checks each path against it, and without one it walks the mirror
+and checks each file against the mirror's receipts.
 
 Restore from an [encrypted (`crypt`)](/squirrel/layouts/encrypted/) destination
 is always a size+mtime comparison (recorded shallow) even without `--shallow`,

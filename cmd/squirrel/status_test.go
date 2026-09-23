@@ -77,7 +77,7 @@ func TestCLIStatusNeverSyncedIsAmber(t *testing.T) {
 // TestCLIStatusAfterSyncIsGreen: once a fresh sync lands, the pair is
 // caught up within cadence and the command exits 0.
 func TestCLIStatusAfterSyncIsGreen(t *testing.T) {
-	requireRcloneCLI(t)
+	withoutRclone(t)
 	cfg := writeStatusConfig(t)
 	runCLI(t, "--config", cfg, "index", "pics")
 	runCLI(t, "--config", cfg, "sync", "pics", "--init")

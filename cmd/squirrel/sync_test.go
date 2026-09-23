@@ -9,7 +9,7 @@ import (
 )
 
 func TestCLISyncErrorsWhenVolumeNotIndexed(t *testing.T) {
-	requireRcloneCLI(t)
+	withoutRclone(t)
 	f := writeSyncFixture(t)
 	writeTestFile(t, filepath.Join(f.volumeDir, "a.txt"), "alpha")
 
@@ -21,7 +21,7 @@ func TestCLISyncErrorsWhenVolumeNotIndexed(t *testing.T) {
 }
 
 func TestCLISyncHappyPath(t *testing.T) {
-	requireRcloneCLI(t)
+	withoutRclone(t)
 	f := writeSyncFixture(t)
 	writeTestFile(t, filepath.Join(f.volumeDir, "a.txt"), "alpha")
 	writeTestFile(t, filepath.Join(f.volumeDir, "b.txt"), "beta")
@@ -46,7 +46,7 @@ func TestCLISyncHappyPath(t *testing.T) {
 // volume reports already_correct so an in-sync no-op is distinguishable
 // from an empty one (transferred=0 alone is ambiguous).
 func TestCLISyncAlreadyCorrect(t *testing.T) {
-	requireRcloneCLI(t)
+	withoutRclone(t)
 	f := writeSyncFixture(t)
 	writeTestFile(t, filepath.Join(f.volumeDir, "a.txt"), "alpha")
 	writeTestFile(t, filepath.Join(f.volumeDir, "b.txt"), "beta")
@@ -143,7 +143,7 @@ func TestCLISyncRequiresConfig(t *testing.T) {
 // sync/. We verify (a) the command succeeds and prints a report, (b)
 // nothing lands at the destination, and (c) no new runs row is recorded.
 func TestCLISyncDryRun(t *testing.T) {
-	requireRcloneCLI(t)
+	withoutRclone(t)
 	f := writeSyncFixture(t)
 	writeTestFile(t, filepath.Join(f.volumeDir, "a.txt"), "alpha")
 	runCLI(t, "--config", f.configPath, "index", f.volumeName)
@@ -175,7 +175,7 @@ func TestCLISyncMissingExplicitConfigErrors(t *testing.T) {
 }
 
 func TestCLISyncRunsRowVisibleViaRunsCommand(t *testing.T) {
-	requireRcloneCLI(t)
+	withoutRclone(t)
 	f := writeSyncFixture(t)
 	writeTestFile(t, filepath.Join(f.volumeDir, "a.txt"), "alpha")
 
