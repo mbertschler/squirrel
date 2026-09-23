@@ -6,14 +6,11 @@ import (
 	"cmp"
 	"context"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path"
-	"path/filepath"
 	"slices"
-	"strconv"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
@@ -33,15 +30,13 @@ import (
 // offset/length pack slicing needs. Packs are fetched once per pack and
 // every requested member is extracted from that single stream.
 type archiveRestore struct {
-	store    *store.Store
-	rcl      *Rclone
-	vol      *config.Volume
-	dest     *config.Destination
-	volID    int64
-	runID    int64
-	target   string // resolved local directory (vol.Path or --to)
-	preserve bool   // move overwritten files to .squirrel-restore-history/
-	dryRun   bool
+	store  *store.Store
+	rcl    *Rclone
+	vol    *config.Volume
+	dest   *config.Destination
+	volID  int64
+	placer restorePlacer
+	dryRun bool
 }
 
 // restoreArchive orchestrates one content-addressed or packed restore: it
@@ -51,28 +46,35 @@ type archiveRestore struct {
 // reason. Read-only against the index and destination throughout.
 func restoreArchive(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, dest *config.Destination, volID, runID int64, targetInPlace bool, opts RestoreOptions, rep *Report) error {
 	rep.RunID = runID
+	ar := &archiveRestore{
+		store: s, rcl: rcl, vol: vol, dest: dest, volID: volID,
+		placer: newRestorePlacer(vol, runID, targetInPlace, opts), dryRun: opts.DryRun,
+	}
+	runErr := ar.run(ctx, rep, opts.IncludeFromFile)
+	finishRestore(ctx, s, opts.DryRun, runID, rep, runErr)
+	return runErr
+}
+
+// newRestorePlacer targets the volume's path, or --to. It preserves what
+// it replaces only for an in-place restore that asked to (--in-place),
+// mirroring the mirror layout's history contract.
+func newRestorePlacer(vol *config.Volume, runID int64, targetInPlace bool, opts RestoreOptions) restorePlacer {
 	target := vol.Path
 	if opts.ToPath != "" {
 		target = opts.ToPath
 	}
-	ar := newArchiveRestore(s, rcl, vol, dest, volID, runID, target, targetInPlace && opts.InPlace, opts.DryRun)
-	runErr := ar.run(ctx, rep, opts.IncludeFromFile)
+	return restorePlacer{target: target, runID: runID, preserve: targetInPlace && opts.InPlace}
+}
+
+// finishRestore writes a restore run's terminal state. A fatal error
+// (nothing counted as an individual failure) is turned into a synthesised
+// failed-file so the runs row carries the reason.
+func finishRestore(ctx context.Context, s *store.Store, dryRun bool, runID int64, rep *Report, runErr error) {
 	if runErr != nil && rep.RcloneResult.Errors == 0 {
 		rep.RcloneResult.FatalError = true
 		rep.RcloneResult.FailedFiles = append(rep.RcloneResult.FailedFiles, FailedFile{Message: runErr.Error()})
 	}
-	finishRun(ctx, s, opts.DryRun, runID, rep)
-	return runErr
-}
-
-// newArchiveRestore builds the restorer. preserve is set only for an
-// in-place restore that must keep any overwritten bytes, mirroring the
-// mirror layout's --backup-dir contract.
-func newArchiveRestore(s *store.Store, rcl *Rclone, vol *config.Volume, dest *config.Destination, volID, runID int64, target string, preserve, dryRun bool) *archiveRestore {
-	return &archiveRestore{
-		store: s, rcl: rcl, vol: vol, dest: dest,
-		volID: volID, runID: runID, target: target, preserve: preserve, dryRun: dryRun,
-	}
+	finishRun(ctx, s, dryRun, runID, rep)
 }
 
 // restoreContent is one content to restore and the volume-relative paths it
@@ -224,17 +226,17 @@ func (ar *archiveRestore) restoreObject(ctx context.Context, rep *Report, c rest
 	}
 	tmp, err := ar.fetch(ctx, path.Join(ObjectsDirName, namerFor(ar.dest).object(c.blake3)))
 	if err != nil {
-		ar.recordFailure(rep, c.firstPath(), err)
+		recordRestoreFailure(rep, c.firstPath(), err)
 		return
 	}
 	defer func() { _ = os.Remove(tmp) }()
 	digest, err := hashLocalFile(tmp)
 	if err != nil {
-		ar.recordFailure(rep, c.firstPath(), fmt.Errorf("re-hash object: %w", err))
+		recordRestoreFailure(rep, c.firstPath(), fmt.Errorf("re-hash object: %w", err))
 		return
 	}
 	if !bytes.Equal(digest, c.blake3) {
-		ar.recordFailure(rep, c.firstPath(), fmt.Errorf("object hashes to %s, want %s", hex.EncodeToString(digest), hex.EncodeToString(c.blake3)))
+		recordRestoreFailure(rep, c.firstPath(), fmt.Errorf("object hashes to %s, want %s", hex.EncodeToString(digest), hex.EncodeToString(c.blake3)))
 		return
 	}
 	ar.place(rep, tmp, c)
@@ -296,7 +298,7 @@ func (ar *archiveRestore) extractMembers(rep *Report, packTmp string, members []
 		}
 		if !bytes.Equal(digest, m.content.blake3) {
 			_ = os.Remove(memberTmp)
-			ar.recordFailure(rep, m.content.firstPath(), fmt.Errorf("pack member hashes to %s, want %s", hex.EncodeToString(digest), hex.EncodeToString(m.content.blake3)))
+			recordRestoreFailure(rep, m.content.firstPath(), fmt.Errorf("pack member hashes to %s, want %s", hex.EncodeToString(digest), hex.EncodeToString(m.content.blake3)))
 			continue
 		}
 		ar.place(rep, memberTmp, m.content)
@@ -353,8 +355,8 @@ func (ar *archiveRestore) fetch(ctx context.Context, subpath string) (string, er
 // failure is recorded and does not stop the others.
 func (ar *archiveRestore) place(rep *Report, srcTmp string, c restoreContent) {
 	for _, p := range c.paths {
-		if err := ar.writeOne(p, srcTmp); err != nil {
-			ar.recordFailure(rep, p.rel, err)
+		if err := ar.writeOne(p, srcTmp, c.blake3); err != nil {
+			recordRestoreFailure(rep, p.rel, err)
 			continue
 		}
 		rep.RcloneResult.Transferred++
@@ -362,72 +364,16 @@ func (ar *archiveRestore) place(rep *Report, srcTmp string, c restoreContent) {
 	}
 }
 
-// writeOne copies the verified bytes to <target>/<rel>, creating parent
-// directories, refusing to write over a non-regular file (symlink, device,
-// directory, …), preserving any overwritten regular file for an in-place
-// restore, and stamping the index-recorded mtime.
-func (ar *archiveRestore) writeOne(p restorePath, srcTmp string) error {
-	dst := filepath.Join(ar.target, filepath.FromSlash(p.rel))
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return fmt.Errorf("create target dir: %w", err)
-	}
-	if err := refuseNonRegularTarget(p.rel, dst); err != nil {
-		return err
-	}
-	if ar.preserve {
-		if err := ar.backupExisting(p.rel, dst); err != nil {
-			return err
-		}
-	}
-	if err := copyFileContents(srcTmp, dst); err != nil {
-		return err
-	}
-	t := time.Unix(0, p.mtimeNs)
-	if err := os.Chtimes(dst, t, t); err != nil {
-		return fmt.Errorf("set mtime on %s: %w", p.rel, err)
-	}
-	return nil
-}
-
-// refuseNonRegularTarget refuses to write when the destination already
-// exists as anything other than a regular file. Writing through a symlink
-// with os.OpenFile would follow it and could clobber a path *outside* the
-// restore target — a data-loss path squirrel must never take — so an
-// existing symlink, device, fifo, socket, or directory is a hard refusal,
-// not a silent skip. An absent path or a plain regular file is allowed.
-func refuseNonRegularTarget(rel, dst string) error {
-	info, err := os.Lstat(dst)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
+// writeOne places the bytes at srcTmp at p, re-checked against want and
+// stamped with the index-recorded mtime.
+func (ar *archiveRestore) writeOne(p restorePath, srcTmp string, want []byte) error {
+	f, err := os.Open(srcTmp)
 	if err != nil {
-		return fmt.Errorf("stat target %s: %w", rel, err)
+		return fmt.Errorf("open restored bytes: %w", err)
 	}
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("refusing to write %s: destination already exists as a non-regular file (%s) — squirrel will not follow or replace it", rel, info.Mode().Type())
-	}
-	return nil
-}
-
-// backupExisting moves an existing regular file at dst under the per-run
-// restore-history subtree so an in-place overwrite never destroys prior
-// bytes — the local-side counterpart of sync's --backup-dir. The caller
-// has already refused any non-regular destination, so dst is absent or a
-// regular file here.
-func (ar *archiveRestore) backupExisting(rel, dst string) error {
-	if _, err := os.Lstat(dst); errors.Is(err, os.ErrNotExist) {
-		return nil
-	} else if err != nil {
-		return fmt.Errorf("stat existing %s: %w", rel, err)
-	}
-	backup := filepath.Join(ar.target, RestoreHistoryDirName, "run-"+strconv.FormatInt(ar.runID, 10), filepath.FromSlash(rel))
-	if err := os.MkdirAll(filepath.Dir(backup), 0o755); err != nil {
-		return fmt.Errorf("create restore-history dir: %w", err)
-	}
-	if err := os.Rename(dst, backup); err != nil {
-		return fmt.Errorf("preserve overwritten %s: %w", rel, err)
-	}
-	return nil
+	defer func() { _ = f.Close() }()
+	_, err = ar.placer.place(p.rel, f, want, time.Unix(0, p.mtimeNs))
+	return err
 }
 
 // countContent tallies the files (and bytes) a content would restore,
@@ -437,8 +383,9 @@ func (ar *archiveRestore) countContent(rep *Report, c restoreContent) {
 	rep.RcloneResult.Bytes += c.size * int64(len(c.paths))
 }
 
-// recordFailure counts one failed content and captures its message (capped).
-func (ar *archiveRestore) recordFailure(rep *Report, object string, err error) {
+// recordRestoreFailure counts one failed restore item and captures its
+// message (capped).
+func recordRestoreFailure(rep *Report, object string, err error) {
 	rep.RcloneResult.Errors++
 	if int64(len(rep.RcloneResult.FailedFiles)) < maxFailedFiles {
 		rep.RcloneResult.FailedFiles = append(rep.RcloneResult.FailedFiles, FailedFile{Object: object, Message: err.Error()})
@@ -449,7 +396,7 @@ func (ar *archiveRestore) recordFailure(rep *Report, object string, err error) {
 // used when a whole pack could not be fetched or its stream broke.
 func (ar *archiveRestore) failMembers(rep *Report, members []packMemberRestore, err error) {
 	for _, m := range members {
-		ar.recordFailure(rep, m.content.firstPath(), err)
+		recordRestoreFailure(rep, m.content.firstPath(), err)
 	}
 }
 
@@ -474,27 +421,4 @@ func loadIncludeSet(pathname string) (map[string]bool, error) {
 		return nil, fmt.Errorf("read include list: %w", err)
 	}
 	return set, nil
-}
-
-// copyFileContents writes src's bytes to dst, truncating an existing file.
-// The bytes are already BLAKE3-verified by the caller, so a plain copy is
-// safe.
-func copyFileContents(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return fmt.Errorf("open restored bytes: %w", err)
-	}
-	defer func() { _ = in.Close() }()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		return fmt.Errorf("create %s: %w", dst, err)
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close()
-		return fmt.Errorf("write %s: %w", dst, err)
-	}
-	if err := out.Close(); err != nil {
-		return fmt.Errorf("close %s: %w", dst, err)
-	}
-	return nil
 }
