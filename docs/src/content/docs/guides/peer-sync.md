@@ -37,6 +37,14 @@ by path:
   rather than stored under the wrong hash. The verify phase then re-reads
   what is on disk, and only a clean verify advances durability.
 
+A problem with one file costs only that file. If it was deleted or rewritten
+since it was indexed, or the receiver refuses its bytes, the run retries it,
+then ends **partial**: it names the path and why, and commits everything
+else. A peer that takes no bytes for ten minutes — a hung disk behind a live
+agent — fails the run instead of holding it open. Either way the receiver
+keeps every upload it verified on the way in, so the next run picks up where
+this one stopped rather than starting over.
+
 Peer sync uses no external binary — [rclone](/squirrel/start/install/) is for
 bucket destinations. A machine whose only targets are peers needs none
 installed.

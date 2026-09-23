@@ -19,8 +19,8 @@ rclone 1.66.
 
 Syncing to a **[peer node](/squirrel/guides/peer-sync/)** does not use rclone:
 those bytes stream over the peer's own sync API. A machine whose only targets
-are peers — a roaming laptop that pushes to the household hub and nowhere
-else — needs no rclone installed, and its agent will not look for one.
+are peers — a laptop that only ever syncs to your other devices — needs no
+rclone installed, and its agent will not look for one.
 
 ```sh
 brew install rclone     # macOS
