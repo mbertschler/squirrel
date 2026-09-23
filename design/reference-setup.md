@@ -30,9 +30,11 @@ storage box — that is the price of a copy you can restore with nothing but an
 SFTP client. `s3archive` is packed, so every name under it is one squirrel
 chose, and squirrel keys those names from the crypt passwords: the bucket
 discloses no path, no volume name, and no content hash, so nobody holding a
-candidate file can test whether the household stores it. A household that
-considers its filenames sensitive should read `cloudbox` as the weaker leg and
-lean on `s3archive` (or `kopia-mirror`) for that property.
+candidate file can test whether the household stores it without first finding
+the crypt passwords, at the same scrypt cost as attacking the encrypted data
+itself. A household that considers its filenames sensitive should read
+`cloudbox` as the weaker leg and lean on `s3archive` (or `kopia-mirror`) for
+that property.
 
 The Synology-vs-QNAP question dissolves at this level: both run the
 agent as a container with the volumes bind-mounted; every difference

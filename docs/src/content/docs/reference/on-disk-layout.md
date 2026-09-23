@@ -65,10 +65,10 @@ the crypt passwords, so no content hash or volume name appears at the remote:
 ```
 <dest.root>/
   .squirrel-naming                 # records the naming scheme (carries no key material)
-  objects/6f4f9d…cae3              # keyed, not the content hash
-  packs/8b0b26…e1e9                # keyed, not the pack key
+  objects/<name("object", blake3)> # keyed name of the content hash
+  packs/<name("pack", pack)>       # keyed name of the pack key
   packs/map-13                     # run id in clear
-  a1c9f2…7b04/                     # keyed volume directory
+  <name("volume", volume)>/        # keyed volume directory
     index/run-13                   # run id in clear
     .squirrel-index/index-…-run-13.db
 ```
@@ -93,7 +93,7 @@ for user content:
 One reserved **file** sits at the destination root rather than in a volume tree:
 `.squirrel-naming`, which records the artifact-naming scheme of an
 [encrypted](/squirrel/layouts/encrypted/) content-addressed or packed root. It is
-the gate that stops two naming generations from being mixed into one root, and it
+the gate that stops two naming schemes from being mixed into one root, and it
 never carries key material.
 
 A directory literally called `.squirrel-history` in your **source** volume is

@@ -44,9 +44,11 @@ On the [content-addressed](/squirrel/layouts/content-addressed/) and
 [packed](/squirrel/layouts/packed/) layouts, every name at the destination is
 one squirrel chose, and squirrel **keys** them: objects, packs, and the
 per-volume directory are named by a keyed BLAKE3 hash derived from your crypt
-passwords. The remote therefore discloses neither a path nor a content hash,
-and — because the naming key is unguessable without the passwords — nobody
-holding a candidate file can hash it and test whether your archive stores it.
+passwords. The remote therefore discloses neither a path nor a content hash, and
+nobody holding a candidate file can hash it and test whether your archive stores
+it without first finding your passwords. The naming key is stretched from the
+passwords by the same scrypt derivation rclone crypt uses, so guessing a password
+through the names costs the same work as guessing it through the encrypted data.
 Your paths live inside the manifest segments, which ride the overlay encrypted
 like everything else.
 
@@ -65,11 +67,11 @@ that two paths share content, without disclosing which content.
 
 ```
 <dest.root>/
-  .squirrel-naming                     # records the naming scheme (no key material)
-  objects/6f4f9d…cae3                  # keyed name, not the content hash
-  packs/8b0b26…e1e9                    # keyed name, not the pack key
-  packs/map-13                         # run id in clear
-  a1c9f2…7b04/index/run-13             # keyed volume directory, run id in clear
+  .squirrel-naming                        # records the naming scheme (no key material)
+  objects/<name("object", blake3)>        # keyed name of the content hash
+  packs/<name("pack", pack)>              # keyed name of the pack key
+  packs/map-13                            # run id in clear
+  <name("volume", volume)>/index/run-13   # keyed volume directory, run id in clear
 ```
 
 Run identifiers stay in clear deliberately: replaying segments in run order is
@@ -77,36 +79,22 @@ what lets you [recover from the destination without
 squirrel](/squirrel/reference/formats/#disaster-recovery-without-squirrel), and
 that ordering has to survive without the key.
 
-The `.squirrel-naming` marker records *which* scheme a root was written under so
-two naming generations are never mixed into one root.
+The `.squirrel-naming` marker records *which* scheme a root was written under, so
+two naming schemes are never mixed into one root. The first `--init` push to an
+empty root writes it. A push refuses a root that holds files but no marker, or a
+marker recording a scheme it does not write, and names the remedy: point the
+destination at a fresh root, or wipe the remote root and run
+`squirrel destination reset <name>`.
 
-### An archive written before keyed naming
-
-Encrypted archives uploaded by an earlier squirrel store their objects under the
-content hash and their segments under the volume name. Such a root keeps working,
-with one restriction:
-
-- **Reading it is unaffected.** `squirrel restore`, `squirrel verify`, and
-  snapshot discovery resolve the naming scheme from the root itself and address
-  it as it stands. A hash ever observed stays retrievable, so upgrading squirrel
-  never strands an archive.
-- **Adding to it is refused.** A push to a root holding files without a marker
-  stops with an error naming the remedy: point the destination at a fresh root,
-  or wipe the remote root and run `squirrel destination reset <name>`. Writing
-  keyed names alongside the existing ones would leave those disclosing exactly
-  what they always did while squirrel treated the root as private.
-
-So an existing archive stays readable for as long as you keep it, and the names
-become private from the first push to a fresh root onward.
-
-:::note[The key is derived from your passwords, not stored]
-The naming key comes from `password` and `password2` through a key-derivation
-step, so there is no new secret to keep and no key file to lose — and the names
-stay reproducible from the config alone. The exact derivation is documented for
-recovery tooling in [Manifest & pack
-formats](/squirrel/reference/formats/#deriving-the-stored-names-on-an-encrypted-destination).
-Losing the passwords now costs you the ability to *locate* an artifact as well
-as to decrypt it.
+:::note[The key is derived from your passwords, never stored]
+The naming key comes from `password` and `password2` through rclone crypt's
+scrypt key derivation and a BLAKE3 key-derivation step, so there is no new secret
+to keep and no key file to lose — and the names stay reproducible from the config
+alone. The exact derivation, including the `name(…)` shown above, is documented
+for recovery tooling in
+[Manifest & pack formats](/squirrel/reference/formats/#deriving-the-stored-names-on-an-encrypted-destination).
+Losing the passwords costs you the ability to *locate* an artifact as well as to
+decrypt it.
 :::
 
 ### Verification falls back to size+mtime
