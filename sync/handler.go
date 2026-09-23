@@ -134,12 +134,19 @@ func HandlerFor(s *store.Store, tools Tools, p Pair) (Handler, error) {
 			return nil, fmt.Errorf("destination %q: rclone wrapper is required", p.Destination.Name)
 		}
 		return &contentAddressedHandler{contentPusher{store: s, rcl: tools.Rclone, vol: p.Volume, dest: p.Destination}}, nil
+	case p.Destination.Type == "local":
+		return &mirrorHandler{store: s, vol: p.Volume, dest: p.Destination, openTransport: openLocalDestination, stallTimeout: DefaultStallTimeout}, nil
 	default:
 		if tools.Rclone == nil {
 			return nil, fmt.Errorf("destination %q: rclone wrapper is required", p.Destination.Name)
 		}
 		return &rcloneHandler{store: s, rcl: tools.Rclone, vol: p.Volume, dest: p.Destination}, nil
 	}
+}
+
+// openLocalDestination opens a local destination's root directory.
+func openLocalDestination(dest *config.Destination) (transport, error) {
+	return openLocalTransport(dest.Root)
 }
 
 // rcloneHandler pushes to an rclone-backed bucket destination via Sync.

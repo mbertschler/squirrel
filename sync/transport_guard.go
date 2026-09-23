@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -49,7 +50,7 @@ func (g nameGuard) permit(op guardOp, name, to string) error {
 			return nil
 		}
 	case op == opRename:
-		if rel, ok := g.liveRel(name); ok && to == g.historyName(g.runID, rel) {
+		if rel, ok := g.liveRel(name); ok && to == historyName(g.volumeDir, g.runID, rel) {
 			return nil
 		}
 		if _, ok := g.liveRel(to); ok && g.stagedByThisRun(name) {
@@ -104,8 +105,16 @@ func (g nameGuard) liveRel(name string) (string, bool) {
 	return rel, true
 }
 
-func (g nameGuard) historyName(runID int64, rel string) string {
-	return path.Join(g.volumeDir, HistoryDirName, "run-"+strconv.FormatInt(runID, 10), rel)
+// historyName is where a displacement by runID moves the volume-relative
+// path rel: <volume>/.squirrel-history/run-<runID>/<rel>.
+func historyName(volumeDir string, runID int64, rel string) string {
+	return path.Join(volumeDir, HistoryDirName, "run-"+strconv.FormatInt(runID, 10), rel)
+}
+
+// stagingName is where runID stages the path whose key is key:
+// <volume>/.squirrel-staging/run-<runID>/<key>.
+func stagingName(volumeDir string, runID int64, key string) string {
+	return path.Join(volumeDir, StagingDirName, "run-"+strconv.FormatInt(runID, 10), key)
 }
 
 // isStagingKey reports whether key is the staging name of one path: the
@@ -121,4 +130,25 @@ func isStagingKey(key string) bool {
 		}
 	}
 	return true
+}
+
+// guardedTransport is the transport a layout holds: every Rename and
+// Remove passes the name guard first.
+type guardedTransport struct {
+	transport
+	guard nameGuard
+}
+
+func (t guardedTransport) Rename(ctx context.Context, from, to string) error {
+	if err := t.guard.permit(opRename, from, to); err != nil {
+		return err
+	}
+	return t.transport.Rename(ctx, from, to)
+}
+
+func (t guardedTransport) Remove(ctx context.Context, name string) error {
+	if err := t.guard.permit(opRemove, name, ""); err != nil {
+		return err
+	}
+	return t.transport.Remove(ctx, name)
 }

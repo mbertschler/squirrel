@@ -264,8 +264,8 @@ func printSyncReport(w io.Writer, rep sync.Report, runErr error, reverse bool) {
 // an empty one — transferred=0 alone is ambiguous (friction F7).
 func printSyncSummaryLine(w io.Writer, rep sync.Report, src, dst string) {
 	r := rep.RcloneResult
-	switch rep.Verification.Method {
-	case sync.VerifyMethodKopia:
+	switch {
+	case rep.Verification.Method == sync.VerifyMethodKopia:
 		// Kopia pushes have no rclone counters; render the snapshot's
 		// own numbers instead.
 		fmt.Fprintf(w, "%s → %s  status=%s files=%d bytes=%d snapshot=%s verified=%t run=%d\n",
@@ -273,7 +273,7 @@ func printSyncSummaryLine(w io.Writer, rep sync.Report, src, dst string) {
 			rep.Verification.Files, rep.Verification.Bytes,
 			rep.Verification.SnapshotID, rep.Verification.Verified(), rep.RunID,
 		)
-	case sync.VerifyMethodPresenceSize:
+	case rep.Layout == config.LayoutContentAddressed || rep.Layout == config.LayoutPacked:
 		// Content-addressed pushes count objects, with skipped = hashes
 		// the destination already recorded, entries = manifest segment
 		// lines, and fingerprints = provider checksums captured for the

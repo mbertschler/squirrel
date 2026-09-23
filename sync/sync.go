@@ -122,8 +122,12 @@ type Options struct {
 // was inserted; zero in dry-run mode. RcloneResult is the parsed rclone
 // summary, surfaced verbatim so callers can render whatever they need.
 type Report struct {
-	Volume       string
-	Destination  string
+	Volume      string
+	Destination string
+	// Layout is the destination's layout for a push through the shared
+	// planner (config.Layout*), so output renderers can tell a native
+	// mirror from a content layout; empty for every other push.
+	Layout       string
 	RunID        int64
 	RcloneResult RunResult
 	Status       string // success / partial / failed

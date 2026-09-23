@@ -9,7 +9,8 @@ import (
 
 func TestHandlerForDispatch(t *testing.T) {
 	vol := &config.Volume{Name: "pics", Path: "/tmp/pics"}
-	bucket := &config.Destination{Name: "scratch", Type: "local", Root: "/tmp/dst"}
+	bucket := &config.Destination{Name: "offsite", Type: "sftp", Root: "/data"}
+	usb := &config.Destination{Name: "usb", Type: "local", Root: "/tmp/dst"}
 	node := &config.Node{Name: "nas"}
 	tools := Tools{Rclone: &Rclone{Binary: "rclone"}}
 
@@ -17,8 +18,17 @@ func TestHandlerForDispatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bucket pair: %v", err)
 	}
-	if _, ok := h.(*rcloneHandler); !ok || h.TargetName() != "scratch" {
-		t.Fatalf("bucket pair resolved to %T (%q), want *rcloneHandler scratch", h, h.TargetName())
+	if _, ok := h.(*rcloneHandler); !ok || h.TargetName() != "offsite" {
+		t.Fatalf("bucket pair resolved to %T (%q), want *rcloneHandler offsite", h, h.TargetName())
+	}
+
+	// A local mirror is native, and needs no rclone wrapper.
+	h, err = HandlerFor(nil, Tools{}, Pair{Volume: vol, Destination: usb})
+	if err != nil {
+		t.Fatalf("local mirror pair: %v", err)
+	}
+	if _, ok := h.(*mirrorHandler); !ok || h.TargetName() != "usb" {
+		t.Fatalf("local mirror pair resolved to %T (%q), want *mirrorHandler usb", h, h.TargetName())
 	}
 
 	h, err = HandlerFor(nil, tools, Pair{Volume: vol, Node: node})

@@ -113,6 +113,8 @@ type layout[O operations] interface {
 	// rootEmpty and foreignHistory complete the watermark rule below.
 	rootEmpty(ctx context.Context) (bool, error)
 	foreignHistory(runID int64) error
+	// reconcile settles what an earlier push left in flight (mirror only).
+	reconcile(ctx context.Context, rep *Report, volumeID, runID int64) error
 	// translate turns the plan into this layout's operations. It reads
 	// squirrel's records and writes nothing: a dry run is translate alone.
 	translate(ctx context.Context, p pushPlan) (O, error)
@@ -128,7 +130,7 @@ type layout[O operations] interface {
 
 One driver runs every layout:
 
-    requireIndexedVolume → markers → begin run → plan → translate → execute → seal → advance → finish → ride-along
+    requireIndexedVolume → markers → begin run → reconcile → plan → translate → execute → seal → advance → finish → ride-along
 
 A dry run stops after translate and reports the operations' preview. The
 separate `previewDryRun` each handler carried became that preview

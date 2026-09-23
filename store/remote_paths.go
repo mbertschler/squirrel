@@ -186,3 +186,22 @@ func (s *Store) ListRemotePaths(ctx context.Context, destination string, volumeI
 		ORDER BY rp.id
 	`, scanRemotePath, destination, volumeID)
 }
+
+// CountInSyncRemotePaths counts the volume's live rows on the destination
+// whose files row is still present: paths the destination holds with
+// their current content by squirrel's records, the mirror's "already
+// correct".
+func (s *Store) CountInSyncRemotePaths(ctx context.Context, destination string, volumeID int64) (int64, error) {
+	var n int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM remote_paths rp
+		JOIN folders fo ON fo.id = rp.folder_id
+		JOIN files f ON f.folder_id = rp.folder_id AND f.name = rp.name AND f.content_id = rp.content_id
+		WHERE rp.destination = ? AND fo.volume_id = ? AND rp.state = 'live' AND f.status = 'present'
+	`, destination, volumeID).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count in-sync mirror paths on %q: %w", destination, err)
+	}
+	return n, nil
+}

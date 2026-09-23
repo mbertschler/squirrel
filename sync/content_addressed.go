@@ -142,6 +142,10 @@ func (h *contentPusher) rootEmpty(ctx context.Context) (bool, error) {
 	return h.rcl.remoteRootEmpty(ctx, remoteSubpathURI(h.dest, ""), rootMarkerNames(h.dest), checkersArgs(h.dest)...)
 }
 
+// reconcile has nothing to settle: every content-layout artifact is
+// written once under its own name and recorded only after it landed.
+func (h *contentPusher) reconcile(context.Context, *Report, int64, int64) error { return nil }
+
 func (h *contentPusher) target() pushTarget {
 	return pushTarget{store: h.store, vol: h.vol, dest: h.dest}
 }

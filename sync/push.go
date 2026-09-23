@@ -40,6 +40,9 @@ type layout[O operations] interface {
 	// foreignHistory is the refusal for a last success at runID that left
 	// no landing evidence on a destination that is no fresh start.
 	foreignHistory(runID int64) error
+	// reconcile settles, once at push start, whatever an earlier push left
+	// in flight on the destination, so translate reads settled records.
+	reconcile(ctx context.Context, rep *Report, volumeID, runID int64) error
 	// translate turns the plan into this layout's operations. It reads
 	// squirrel's records and writes nothing: a dry run is translate alone.
 	translate(ctx context.Context, p pushPlan) (O, error)
@@ -62,13 +65,13 @@ type pushTarget struct {
 
 // pushThrough is the single push driver every layout shares:
 //
-//	requireIndexedVolume → markers → begin run → plan → translate → execute → seal → advance → finish → ride-along
+//	requireIndexedVolume → markers → begin run → reconcile → plan → translate → execute → seal → advance → finish → ride-along
 //
 // A dry run stops after translate and reports the operations' preview; it
 // writes no runs row. The runs row records shallow=true: no layout reads
 // the landed bytes back through BLAKE3, and the audit trail says so.
 func pushThrough[O operations](ctx context.Context, t pushTarget, l layout[O], opts Options) (Report, error) {
-	rep := Report{Volume: t.vol.Name, Destination: t.dest.Name}
+	rep := Report{Volume: t.vol.Name, Destination: t.dest.Name, Layout: t.dest.Layout}
 	// Stamped up front so output renderers key their formatting off the
 	// method even when the push fails early.
 	rep.Verification.Method = VerifyMethodPresenceSize
@@ -124,6 +127,9 @@ func previewPush[O operations](ctx context.Context, t pushTarget, l layout[O], r
 // present as success, or the next watermark would skip past it.
 func landPush[O operations](ctx context.Context, t pushTarget, l layout[O], rep *Report, volID, runID int64) error {
 	rep.Status = store.RunStatusFailed
+	if err := l.reconcile(ctx, rep, volID, runID); err != nil {
+		return err
+	}
 	p, err := planPush(ctx, t, l, volID, true)
 	if err != nil {
 		return err
