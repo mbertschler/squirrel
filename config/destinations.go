@@ -146,11 +146,12 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 	if err != nil {
 		return nil, err
 	}
-	hashAlgo, err := resolveHashAlgo(raw, typ, layout)
+	native := nativeMirror(typ, layout, crypt != nil)
+	hashAlgo, err := resolveHashAlgo(raw, typ, layout, native)
 	if err != nil {
 		return nil, err
 	}
-	checkers, err := resolveCheckers(raw, typ)
+	checkers, err := resolveCheckers(raw, typ, native)
 	if err != nil {
 		return nil, err
 	}
@@ -262,10 +263,11 @@ var sftpHashAlgos = map[string]bool{
 // resolveHashAlgo validates the optional `hash_algo` key. sftp is the
 // one backend where rclone must be told which server-side hash command
 // to run; every other type exposes a fixed checksum, so the key is
-// rejected there. Content-addressed sftp destinations default to
+// rejected there, and so is it on a native sftp mirror, which runs no
+// command on the server. Content-addressed sftp destinations default to
 // "sha256" so scan-back fingerprints get a strong checksum without
 // relying on rclone's md5/sha1 preference.
-func resolveHashAlgo(raw map[string]any, typ, layout string) (string, error) {
+func resolveHashAlgo(raw map[string]any, typ, layout string, native bool) (string, error) {
 	v, err := optionalString(raw, "hash_algo")
 	if err != nil {
 		return "", err
@@ -279,6 +281,9 @@ func resolveHashAlgo(raw map[string]any, typ, layout string) (string, error) {
 	if typ != "sftp" {
 		return "", fmt.Errorf(`hash_algo is only supported on type "sftp" destinations; type %q exposes a fixed checksum`, typ)
 	}
+	if native {
+		return "", errors.New("hash_algo names the hash command run on the sftp server, and a mirror without crypt runs none: squirrel writes it itself and hashes every file as it sends it")
+	}
 	if !sftpHashAlgos[v] {
 		return "", fmt.Errorf("unknown hash_algo %q (supported: %v)", v, sortedKeys(sftpHashAlgos))
 	}
@@ -286,14 +291,17 @@ func resolveHashAlgo(raw map[string]any, typ, layout string) (string, error) {
 }
 
 // resolveCheckers validates the optional `checkers` key: a positive
-// integer cap on rclone's concurrent checkers for this destination.
-func resolveCheckers(raw map[string]any, typ string) (int, error) {
+// integer cap on rclone's concurrent checkers for this destination. A
+// native mirror runs no rclone, so the key is rejected there.
+func resolveCheckers(raw map[string]any, typ string, native bool) (int, error) {
 	v, ok := raw["checkers"]
 	if !ok {
 		return 0, nil
 	}
-	switch typ {
-	case "local", "kopia":
+	switch {
+	case native:
+		return 0, fmt.Errorf("checkers caps rclone's checkers, and a type %q mirror without crypt is written by squirrel itself, without rclone", typ)
+	case typ == "kopia":
 		return 0, fmt.Errorf("checkers requires an rclone-remote destination type, not %q", typ)
 	}
 	n, isInt := v.(int64)
@@ -823,6 +831,17 @@ func sortedSubset(in []string) []string {
 	out := append([]string(nil), in...)
 	sort.Strings(out)
 	return out
+}
+
+// NativeMirror reports whether squirrel writes this destination itself,
+// through its own transport, instead of driving rclone: a mirror on a
+// local disk, or on an sftp server without crypt.
+func (d *Destination) NativeMirror() bool {
+	return nativeMirror(d.Type, d.Layout, d.Crypt != nil)
+}
+
+func nativeMirror(typ, layout string, crypt bool) bool {
+	return layout == LayoutMirror && !crypt && (typ == "local" || typ == "sftp")
 }
 
 // HidesArtifactNames reports whether this destination names its content

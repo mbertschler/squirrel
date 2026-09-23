@@ -134,8 +134,8 @@ For `layout = "content-addressed"` or `layout = "packed"` destinations. See
 
 | Key | Applies to | Default | Meaning |
 |---|---|---|---|
-| `hash_algo` | sftp | `sha256` | Which server-side hash the [scan-back fingerprint](/squirrel/guides/verification/) uses. |
-| `checkers` | rclone remotes | rclone default | Cap rclone's concurrent checkers (`--checkers`). |
+| `hash_algo` | sftp, except a mirror without crypt | `sha256` | Which server-side hash the [scan-back fingerprint](/squirrel/guides/verification/) uses. A plain sftp mirror runs no command on the server, so the key is rejected there. |
+| `checkers` | rclone remotes | rclone default | Cap rclone's concurrent checkers (`--checkers`). Rejected on a `local` mirror and on an `sftp` mirror without crypt: squirrel writes those itself, without rclone. |
 | `force_path_style` | s3 | `false` | Path-style bucket addressing for squirrel's own ETag reader (not the rclone transport). |
 | `pack_threshold` | packed | — | Files smaller than this are packed; at/above land as objects (e.g. `1MiB`). |
 | `pack_size` | packed | — | Target size of one pack before it is closed (e.g. `512MiB`). |

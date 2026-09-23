@@ -44,7 +44,7 @@ root = "/data"
 }
 
 // TestLoadHashAlgoExplicit: an explicit hash_algo overrides the default
-// and renders on mirrored sftp destinations too.
+// and renders on an encrypted sftp mirror, which rclone still writes.
 func TestLoadHashAlgoExplicit(t *testing.T) {
 	cfg, err := Load(writeConfig(t, `
 [destinations.archive]
@@ -61,6 +61,9 @@ host      = "host.example"
 user      = "u"
 root      = "/data"
 hash_algo = "sha256"
+
+[destinations.mirror.crypt]
+password = "pw"
 `))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -73,6 +76,24 @@ hash_algo = "sha256"
 	}
 	if !strings.Contains(cfg.Destinations["mirror"].RcloneSection(), "hashes = sha256\n") {
 		t.Fatalf("mirror section lacks hashes line:\n%s", cfg.Destinations["mirror"].RcloneSection())
+	}
+}
+
+// TestLoadRejectsRcloneKeysOnNativeMirrors: squirrel writes a plain sftp
+// mirror itself, so the keys that only tune rclone are refused there.
+func TestLoadRejectsRcloneKeysOnNativeMirrors(t *testing.T) {
+	for _, key := range []string{`hash_algo = "sha256"`, "checkers = 4"} {
+		_, err := Load(writeConfig(t, `
+[destinations.mirror]
+type = "sftp"
+host = "host.example"
+user = "u"
+root = "/data"
+`+key+"\n"))
+		name, _, _ := strings.Cut(key, " ")
+		if err == nil || !strings.Contains(err.Error(), name) || !strings.Contains(err.Error(), "squirrel") {
+			t.Fatalf("%s on a plain sftp mirror: err = %v, want a rejection naming the key", name, err)
+		}
 	}
 }
 
@@ -111,6 +132,7 @@ type     = "sftp"
 host     = "host.example"
 user     = "u"
 root     = "/data"
+layout   = "content-addressed"
 checkers = 4
 `))
 	if err != nil {
@@ -135,10 +157,11 @@ func TestLoadRejectsBadCheckers(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			_, err := Load(writeConfig(t, `
 [destinations.archive]
-type = "sftp"
-host = "host.example"
-user = "u"
-root = "/data"
+type   = "sftp"
+host   = "host.example"
+user   = "u"
+root   = "/data"
+layout = "content-addressed"
 `+c.body+"\n"))
 			if err == nil || !strings.Contains(err.Error(), "checkers") {
 				t.Fatalf("err = %v, want checkers rejection", err)
