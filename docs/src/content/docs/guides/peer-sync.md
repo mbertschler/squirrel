@@ -79,7 +79,7 @@ squirrel conflicts resolve <volume> <path>      # unfreeze it
 The freeze is not just the hub's business — each node mirrors it into its own
 index, so the losing edge machine sees a contested badge on its own dashboard
 instead of green 0-file syncs while its local file quietly differs from the
-household's copy. Conflict and contested counts also land on the initiators' run
+hub's copy. Conflict and contested counts also land on the initiators' run
 rows.
 
 Resolving **clears the latch; it does not pick a winner.** The version that is

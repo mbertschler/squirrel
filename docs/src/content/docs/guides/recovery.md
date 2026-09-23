@@ -61,7 +61,7 @@ recovery legible.
 
 ## Rebuilding a machine from its hub
 
-When an edge machine dies (the most likely household disaster), rebuild it from
+When an edge machine dies (the most likely disaster), rebuild it from
 the hub with a **reverse peer push** — the same peer-sync mechanism the hub uses
 to feed a receive-only node every day. There is no separate restore verb for
 this: `squirrel restore` pulls from bucket destinations, not from peer nodes,
