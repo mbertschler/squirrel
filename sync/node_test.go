@@ -551,7 +551,7 @@ func TestNodeSyncContestedFreezeEndToEnd(t *testing.T) {
 // file after indexing fails the transfer deterministically: /plan still
 // classifies the conflict from the index, and the upload phase then finds
 // nothing to send.
-func TestNodeSyncContestedMirroredOnTransferFailure(t *testing.T) {
+func TestNodeSyncContestedMirroredWhenUploadFails(t *testing.T) {
 	f := setupNodeFixture(t)
 	ctx := context.Background()
 
@@ -585,9 +585,12 @@ func TestNodeSyncContestedMirroredOnTransferFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = SyncNode(ctx, f.initStore, f.initVol, f.node, Options{Shallow: true})
-	if err == nil {
-		t.Fatal("SyncNode succeeded, want a transfer failure")
+	rep, err := SyncNode(ctx, f.initStore, f.initVol, f.node, Options{})
+	if err != nil {
+		t.Fatalf("SyncNode: %v", err)
+	}
+	if rep.Status != store.RunStatusPartial {
+		t.Fatalf("status = %q, want partial: doc.md could not be uploaded", rep.Status)
 	}
 
 	// Despite the failure, the initiator mirrored the freeze locally — the

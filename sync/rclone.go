@@ -36,7 +36,8 @@ import (
 var MinRcloneVersion = Version{Major: 1, Minor: 66}
 
 // DefaultStallTimeout is the no-progress bound the agent scheduler applies
-// to every automatic rclone transfer (see Rclone.StallTimeout). Ten
+// to every automatic rclone transfer (see Rclone.StallTimeout), and every
+// peer content upload applies to itself. Ten
 // minutes is comfortably longer than the longest legitimate gap between
 // progress reports — hashing one very large file for a --checksum
 // comparison surfaces no transfer/check advance until it completes — while

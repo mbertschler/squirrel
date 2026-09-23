@@ -10,20 +10,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"maps"
 	"net/http"
-	"os"
 	"path"
-	"path/filepath"
-	"slices"
-	"strconv"
 	"strings"
-
-	"github.com/zeebo/blake3"
+	"time"
 
 	"github.com/mbertschler/squirrel/config"
-	"github.com/mbertschler/squirrel/runevents"
 	"github.com/mbertschler/squirrel/store"
 	"github.com/mbertschler/squirrel/syncproto"
 )
@@ -140,11 +132,15 @@ type nodeSyncDriver struct {
 	// originNodeNames caches local node id → name lookups so a plan
 	// full of same-origin entries resolves each origin node once.
 	originNodeNames map[int64]string
-	// contentByPath maps each in-scope volume-relative path to the
-	// BLAKE3 hex the plan was built from. The transfer phase groups
-	// uploads by it, and the verify-retry path needs it to re-derive the
-	// hashes for a subset of paths without re-running /plan.
-	contentByPath map[string]string
+	// planned maps each volume-relative path sent to /plan to the content
+	// this node claimed for it. The transfer phase groups uploads by it,
+	// and the verify-retry path re-derives a failing subset from it
+	// without re-running /plan.
+	planned map[string]plannedContent
+	// uploadFailures carries the error behind each path whose upload
+	// failed, so the run's failed-file list says why a path the final
+	// /verify still reports failing never landed.
+	uploadFailures map[string]string
 	// durabilityAdvance is the present-set origin maxima captured before
 	// the transfer. phaseClose advances the peer's durability vector to
 	// exactly this snapshot, so a row committed between enumeration and
@@ -376,7 +372,6 @@ func (d *nodeSyncDriver) phaseBegin() error {
 		VolumeID:    d.volID,
 		Destination: d.node.Name,
 		PeerNodeID:  sql.NullInt64{Int64: peer.ID, Valid: true},
-		Shallow:     d.opts.Shallow,
 	})
 	if err != nil {
 		return fmt.Errorf("begin local run: %w", err)
@@ -435,6 +430,7 @@ func (d *nodeSyncDriver) phasePlan() (syncproto.PlanResponse, error) {
 	if err != nil {
 		return syncproto.PlanResponse{}, fmt.Errorf("collect index entries: %w", err)
 	}
+	d.planned = plannedContentByPath(entries)
 	return d.client.plan(d.ctx, syncproto.PlanRequest{
 		ReceiverRunID: d.receiverRunID,
 		Entries:       entries,
@@ -686,131 +682,7 @@ func isReservedFolderPath(p string) bool {
 // prior bytes aside during pre-stage, so the original path is empty and
 // the upload lands like a fresh transfer.
 func (d *nodeSyncDriver) phaseTransfer(plan syncproto.PlanResponse) error {
-	d.contentByPath = contentHashesByPath(plan)
 	return d.uploadPaths(pathsInScope(plan))
-}
-
-// uploadPaths delivers the content behind the given volume-relative
-// paths. Paths sharing a BLAKE3 collapse to one upload — the receiver
-// materialises every path in the session that wants those bytes — so a
-// volume with duplicate files transfers each distinct content once.
-//
-// Dry-run stops here: the plan already told the operator what would move,
-// and a dry-run that wrote bytes to a peer would not be one.
-func (d *nodeSyncDriver) uploadPaths(paths []string) error {
-	jobs, err := d.uploadJobs(paths)
-	if err != nil {
-		return err
-	}
-	if d.opts.DryRun {
-		for _, j := range jobs {
-			d.report.RcloneResult.Transferred++
-			d.report.RcloneResult.Bytes += j.size
-		}
-		return nil
-	}
-	for _, job := range jobs {
-		if err := d.uploadOne(job); err != nil {
-			d.report.RcloneResult.Errors++
-			if int64(len(d.report.RcloneResult.FailedFiles)) < maxFailedFiles {
-				d.report.RcloneResult.FailedFiles = append(d.report.RcloneResult.FailedFiles,
-					FailedFile{Object: job.rel, Message: err.Error()})
-			}
-			continue
-		}
-		d.report.RcloneResult.Transferred++
-		d.report.RcloneResult.Bytes += job.size
-		d.emitProgress(len(jobs))
-	}
-	if d.report.RcloneResult.Errors > 0 {
-		return fmt.Errorf("%d content object(s) failed to reach %q", d.report.RcloneResult.Errors, d.node.Name)
-	}
-	return nil
-}
-
-// uploadJob is one content object to send: the hex digest addressing it
-// and a local path holding those bytes.
-type uploadJob struct {
-	hashHex string
-	rel     string
-	size    int64
-}
-
-// uploadJobs groups paths by content and stats each chosen source. A
-// path whose local file has vanished or changed size since the index is
-// refused here rather than streamed: the receiver would reject the body
-// against the size /plan declared, and failing locally names the file.
-func (d *nodeSyncDriver) uploadJobs(paths []string) ([]uploadJob, error) {
-	byHash := make(map[string]string, len(paths))
-	for _, rel := range slices.Sorted(slices.Values(paths)) {
-		hashHex, ok := d.contentByPath[rel]
-		if !ok {
-			return nil, fmt.Errorf("no planned content hash for %q", rel)
-		}
-		if _, seen := byHash[hashHex]; !seen {
-			byHash[hashHex] = rel
-		}
-	}
-	jobs := make([]uploadJob, 0, len(byHash))
-	for _, hashHex := range slices.Sorted(maps.Keys(byHash)) {
-		rel := byHash[hashHex]
-		info, err := os.Stat(filepath.Join(d.vol.Path, rel))
-		if err != nil {
-			return nil, fmt.Errorf("stat %s before upload: %w", rel, err)
-		}
-		jobs = append(jobs, uploadJob{hashHex: hashHex, rel: rel, size: info.Size()})
-	}
-	return jobs, nil
-}
-
-// uploadOne streams a single content object's bytes to the receiver,
-// hashing them on the way out. The hash is of exactly the bytes sent —
-// there is no second read of the file to drift against — so a source
-// edited since the index is caught by this check rather than landing at
-// the peer under the wrong digest. The receiver applies the same check
-// independently and is the authority; this one exists to name the file
-// locally instead of surfacing the peer's rejection.
-func (d *nodeSyncDriver) uploadOne(job uploadJob) error {
-	f, err := os.Open(filepath.Join(d.vol.Path, job.rel))
-	if err != nil {
-		return err
-	}
-	defer func() { _ = f.Close() }()
-	hasher := blake3.New()
-	if err := d.client.putContent(d.ctx, d.receiverRunID, job.hashHex, io.TeeReader(f, hasher), job.size); err != nil {
-		return err
-	}
-	if sent := hex.EncodeToString(hasher.Sum(nil)); sent != job.hashHex {
-		return fmt.Errorf("%w: %s hashed to %s while sending, indexed as %s — run `squirrel index %s` and sync again",
-			errContentDrift, job.rel, sent, job.hashHex, d.vol.Name)
-	}
-	return nil
-}
-
-// emitProgress reports upload advance to the optional progress sink,
-// reusing the counters already folded into the report so the CLI and the
-// desktop see the same numbers the run row will carry.
-func (d *nodeSyncDriver) emitProgress(total int) {
-	if d.opts.Progress == nil {
-		return
-	}
-	d.opts.Progress(runevents.Progress{
-		Stage:     runevents.StageUploading,
-		Done:      d.report.RcloneResult.Transferred,
-		Total:     int64(total),
-		BytesDone: d.report.RcloneResult.Bytes,
-	})
-}
-
-// contentHashesByPath indexes the plan's dispositions by path. The digest
-// on each disposition is the initiator's own claim, echoed back by the
-// receiver, so this recovers what the plan was built from.
-func contentHashesByPath(plan syncproto.PlanResponse) map[string]string {
-	out := make(map[string]string, len(plan.Dispositions))
-	for _, disp := range plan.Dispositions {
-		out[disp.Path] = disp.Blake3Hex
-	}
-	return out
 }
 
 // phaseVerify drives the verify endpoint plus up to nodeSyncRetries
@@ -845,6 +717,7 @@ func (d *nodeSyncDriver) phaseVerify() error {
 		d.report.NodeVerify = resp
 	}
 	if verifyHasDelta(resp) {
+		d.recordFailedPaths(resp)
 		d.report.Status = store.RunStatusPartial
 		return nil
 	}
@@ -950,13 +823,22 @@ func (d *nodeSyncDriver) abortWithError(phase string, err error) error {
 // http.Client carries the optional TLS pin so the verifier sees the
 // node-specific fingerprint without leaking it into request paths.
 type nodeClient struct {
-	node   *config.Node
-	client *http.Client
+	node         *config.Node
+	client       *http.Client
+	stallTimeout time.Duration
 }
 
 func newNodeClient(n *config.Node) *nodeClient {
 	cli := &http.Client{Transport: buildTransport(n)}
-	return &nodeClient{node: n, client: cli}
+	return &nodeClient{node: n, client: cli, stallTimeout: peerUploadStallTimeout}
+}
+
+// url joins urlPath onto the node's configured endpoint path, so a node
+// reachable under a prefix (https://nas.local:8443/squirrel/) keeps it.
+func (c *nodeClient) url(urlPath string) string {
+	full := *c.node.Endpoint
+	full.Path = path.Join(c.node.Endpoint.Path, urlPath)
+	return full.String()
 }
 
 // buildTransport returns an http.Transport tuned for the node. When
@@ -1022,73 +904,20 @@ func (c *nodeClient) close(ctx context.Context, body syncproto.CloseRequest) err
 	return c.do(ctx, "/v1/sync/close", body, nil)
 }
 
-// putContent streams one content object's bytes to the receiver. Unlike
-// the JSON endpoints it sends a raw body, so it builds its own request
-// rather than going through do(): size is declared as Content-Length so
-// the receiver can bound the read before the first byte arrives, and the
-// body is streamed from the open file rather than buffered.
-func (c *nodeClient) putContent(ctx context.Context, receiverRunID int64, blake3Hex string, body io.Reader, size int64) error {
-	urlPath := syncproto.ContentPath(receiverRunID, blake3Hex)
-	full := *c.node.Endpoint
-	full.Path = path.Join(c.node.Endpoint.Path, urlPath)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, full.String(), body)
-	if err != nil {
-		return fmt.Errorf("new request %s: %w", urlPath, err)
-	}
-	req.Header.Set("Authorization", "Bearer "+c.node.Token)
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.ContentLength = size
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("put %s: %w", urlPath, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("%s: %s", urlPath, responseError(resp))
-	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return nil
-}
-
-// maxPeerErrorBody bounds how much of a non-2xx reply is read before
-// rendering it as a diagnostic. The receiver's error bodies are one JSON
-// object with a single message; the cap keeps a misbehaving peer from
-// streaming unbounded bytes into a run row.
-const maxPeerErrorBody = 4 << 10
-
-// responseError renders a non-2xx reply as a diagnostic, preferring the
-// receiver's structured `error` field over a bare status line.
-func responseError(resp *http.Response) string {
-	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxPeerErrorBody))
-	var errBody syncproto.ErrorResponse
-	_ = json.Unmarshal(bodyBytes, &errBody)
-	if errBody.Error != "" {
-		return fmt.Sprintf("%s (%d)", errBody.Error, resp.StatusCode)
-	}
-	return "status " + strconv.Itoa(resp.StatusCode)
-}
-
 func (c *nodeClient) durability(ctx context.Context, body syncproto.DurabilityRequest) (syncproto.DurabilityResponse, error) {
 	var resp syncproto.DurabilityResponse
 	return resp, c.do(ctx, "/v1/sync/durability", body, &resp)
 }
 
-// do is the shared "POST JSON, decode JSON" implementation. The URL
-// is built by joining the configured endpoint's path with urlPath
-// (rather than concatenating raw strings, per CLAUDE.md) — a node
-// reachable at https://nas.local:8443/squirrel/ would dispatch to
-// https://nas.local:8443/squirrel/v1/sync/begin without leaking
-// either the prefix or the action name into request bodies.
-// Non-2xx responses surface as errors carrying the receiver's
-// `error` field when present.
+// do is the shared "POST JSON, decode JSON" implementation. Non-2xx
+// responses surface as errors carrying the receiver's `error` field when
+// present.
 func (c *nodeClient) do(ctx context.Context, urlPath string, body, out any) error {
-	full := *c.node.Endpoint
-	full.Path = path.Join(c.node.Endpoint.Path, urlPath)
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("encode %s: %w", urlPath, err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, full.String(), bytes.NewReader(encoded))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(urlPath), bytes.NewReader(encoded))
 	if err != nil {
 		return fmt.Errorf("new request %s: %w", urlPath, err)
 	}
@@ -1100,13 +929,7 @@ func (c *nodeClient) do(ctx context.Context, urlPath string, body, out any) erro
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode/100 != 2 {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		var errBody syncproto.ErrorResponse
-		_ = json.Unmarshal(bodyBytes, &errBody)
-		if errBody.Error != "" {
-			return fmt.Errorf("%s: %s (%d)", urlPath, errBody.Error, resp.StatusCode)
-		}
-		return fmt.Errorf("%s: status %d", urlPath, resp.StatusCode)
+		return fmt.Errorf("%s: %s", urlPath, responseError(resp))
 	}
 	if out == nil {
 		return nil

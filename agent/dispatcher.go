@@ -13,7 +13,7 @@ import (
 // defaultMaxParallelSyncs bounds how many automatic syncs run at once
 // across all destinations. Per-destination serialisation already caps
 // parallelism at the number of configured destinations; this is the
-// overall ceiling so a host with many destinations can't spawn one rclone
+// overall ceiling so a host with many destinations can't run one transfer
 // per destination simultaneously and thrash its uplink and CPU. Four
 // covers the reference household — a NAS pushing photos/docs/media to
 // cloudbox + s3archive + kopia-mirror + htpc — without a LAN pair ever
@@ -159,8 +159,9 @@ func (d *syncDispatcher) next(destName, done string) *config.Volume {
 
 // runOne takes an overall parallelism slot (or bails on shutdown), runs the
 // sync, and emits the kicked/finished/error logs. A sync that stalls is
-// failed by the runner's transfer timeout (rclone is killed); its
-// diagnosable error lands here and in the run row.
+// failed by its transfer's no-progress bound (the rclone child is killed,
+// or the peer upload cancelled); its diagnosable error lands here and in
+// the run row.
 func (d *syncDispatcher) runOne(ctx context.Context, vol *config.Volume, destName string) {
 	select {
 	case d.sem <- struct{}{}:
@@ -206,7 +207,8 @@ func (d *syncDispatcher) runOne(ctx context.Context, vol *config.Volume, destNam
 
 // wait blocks until every destination worker has drained. The scheduler
 // calls it during shutdown, after the run context is cancelled (which kills
-// any in-flight rclone child), so it returns promptly.
+// any in-flight rclone child and cancels any peer upload), so it returns
+// promptly.
 func (d *syncDispatcher) wait() {
 	d.wg.Wait()
 }
