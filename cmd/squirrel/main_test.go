@@ -24,6 +24,13 @@ func requireRcloneCLI(t *testing.T) {
 	}
 }
 
+// withoutRclone hides rclone from the test: PATH names only an empty
+// directory, so a command that reached for rclone would fail to find it.
+func withoutRclone(t *testing.T) {
+	t.Helper()
+	t.Setenv("PATH", t.TempDir())
+}
+
 // syncFixturePaths bundles the paths writeSyncFixture lays down so callers
 // can pass them straight to the CLI via --config / --db.
 type syncFixturePaths struct {

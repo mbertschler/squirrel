@@ -76,7 +76,7 @@ func TestRecoverRejectsPeerNode(t *testing.T) {
 // catalog is a real state, and the message has to say what is still
 // possible rather than only what failed.
 func TestRecoverWithoutSnapshotsExplains(t *testing.T) {
-	requireRcloneCLI(t) // discovery lists the destination through rclone
+	withoutRclone(t) // a local mirror is read through squirrel's own transport
 	cfgPath, _ := recoverConfig(t)
 	out, err := runCLIExpectErr(t, "--config", cfgPath, "recover", "--from", "scratch")
 	joined := out + err.Error()
@@ -93,7 +93,7 @@ func TestRecoverWithoutSnapshotsExplains(t *testing.T) {
 // runs `squirrel recover --from X` to find out what is there must not
 // discover they have started a recovery.
 func TestRecoverDryRunTouchesNothing(t *testing.T) {
-	requireRcloneCLI(t) // discovery lists the destination through rclone
+	withoutRclone(t) // a local mirror is read through squirrel's own transport
 	cfgPath, destRoot := recoverConfig(t)
 	newest := "index-20260807T120000.000Z-run-42.db"
 	seedSnapshots(t, destRoot, "photos", "index-20260101T090000.000Z-run-7.db", newest)
@@ -119,7 +119,7 @@ func TestRecoverDryRunTouchesNothing(t *testing.T) {
 // TestRecoverRejectsUnknownSnapshot: naming a snapshot that is not there
 // stops before any fetch, and says how to see the real list.
 func TestRecoverRejectsUnknownSnapshot(t *testing.T) {
-	requireRcloneCLI(t) // discovery lists the destination through rclone
+	withoutRclone(t) // a local mirror is read through squirrel's own transport
 	cfgPath, destRoot := recoverConfig(t)
 	seedSnapshots(t, destRoot, "photos", "index-20260807T120000.000Z-run-42.db")
 
@@ -171,7 +171,7 @@ func TestSnapshotAgeUnknownIsSaid(t *testing.T) {
 // which is itself the property worth pinning: absence of an answer is not
 // consent.
 func TestRecoverDeclinedPhaseStopsTheSequence(t *testing.T) {
-	requireRcloneCLI(t) // discovery lists the destination through rclone
+	withoutRclone(t) // a local mirror is read through squirrel's own transport
 	cfgPath, destRoot := recoverConfig(t)
 	seedSnapshots(t, destRoot, "photos", "index-20260807T120000.000Z-run-42.db")
 

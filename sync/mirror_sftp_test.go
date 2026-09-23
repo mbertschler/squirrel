@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -114,6 +115,36 @@ func TestMirrorRideAlongThroughTheTransport(t *testing.T) {
 			}
 			if len(receipts) != 3 {
 				t.Fatalf("receipts = %v, want one per run", receipts)
+			}
+		})
+	}
+}
+
+// TestRecoverFindsAMirrorsSnapshots: recover's discovery lists a native
+// mirror's ride-along snapshots and fetches one through the transport,
+// with no rclone wrapper, on both backends.
+func TestRecoverFindsAMirrorsSnapshots(t *testing.T) {
+	for _, b := range mirrorBackends {
+		t.Run(b.name, func(t *testing.T) {
+			f := setupMirrorFixtureOn(t, b)
+			f.write(t, "a.txt", "alpha")
+			f.index(t)
+			sn := NewSnapshotter(f.store, SnapshotConfig{Dir: t.TempDir(), Keep: 7, Cloud: true, CloudKeep: 7})
+			rep, err := f.push(t, Options{Snapshot: sn})
+			if err != nil || rep.SnapshotErr != nil {
+				t.Fatalf("push: err=%v snapshot=%v", err, rep.SnapshotErr)
+			}
+			ctx := context.Background()
+			snaps, err := DiscoverIndexSnapshots(ctx, nil, f.pair.Destination, []string{"pics", "never-synced"})
+			if err != nil || len(snaps) != 1 || snaps[0].RunID != rep.RunID {
+				t.Fatalf("discovery = %+v, %v; want run %d's snapshot", snaps, err, rep.RunID)
+			}
+			local := filepath.Join(t.TempDir(), snaps[0].Name)
+			if err := FetchIndexSnapshot(ctx, nil, f.pair.Destination, snaps[0], local); err != nil {
+				t.Fatalf("fetch: %v", err)
+			}
+			if fileHash(t, local) != fileHash(t, f.dest(IndexDirName+"/"+snaps[0].Name)) {
+				t.Fatal("the fetched snapshot differs from the one on the destination")
 			}
 		})
 	}

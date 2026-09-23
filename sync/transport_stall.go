@@ -92,6 +92,18 @@ func (s stallTransport) List(ctx context.Context, dir string) ([]entry, error) {
 	})
 }
 
+// Get bounds the open, and every Read of the file it returns, by the same
+// allowance.
+func (s stallTransport) Get(ctx context.Context, name string) (io.ReadCloser, error) {
+	rc, err := bounded(ctx, s, "get "+name, func(ctx context.Context, _ func(time.Duration)) (io.ReadCloser, error) {
+		return s.transport.Get(ctx, name)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &stallReader{ctx: ctx, s: s, name: name, rc: rc}, nil
+}
+
 func (s stallTransport) Put(ctx context.Context, name string, r io.Reader, mtime time.Time) error {
 	_, err := bounded(ctx, s, "put "+name, func(ctx context.Context, progress func(time.Duration)) (struct{}, error) {
 		return struct{}{}, s.transport.Put(ctx, name, &progressingReader{r: r, timeout: s.timeout, progress: progress}, mtime)
@@ -111,6 +123,44 @@ func (s stallTransport) Remove(ctx context.Context, name string) error {
 		return struct{}{}, s.transport.Remove(ctx, name)
 	})
 	return err
+}
+
+// stallReader bounds each Read of a file Get opened. A Read runs into the
+// reader's own buffer, so one given up on can finish later without
+// touching the caller's; after that the reader only reports the stall.
+type stallReader struct {
+	ctx  context.Context
+	s    stallTransport
+	name string
+	rc   io.ReadCloser
+	buf  []byte
+	err  error // the stall, once one happened
+}
+
+func (r *stallReader) Read(p []byte) (int, error) {
+	if r.err != nil {
+		return 0, r.err
+	}
+	if cap(r.buf) < len(p) {
+		r.buf = make([]byte, len(p))
+	}
+	buf := r.buf[:len(p)]
+	n, err := bounded(r.ctx, r.s, "read "+r.name, func(context.Context, func(time.Duration)) (int, error) {
+		return r.rc.Read(buf)
+	})
+	if errors.Is(err, errTransportStalled) {
+		r.err = err
+		return 0, err
+	}
+	return copy(p, buf[:n]), err
+}
+
+func (r *stallReader) Close() error {
+	if r.err != nil {
+		go func() { _ = r.rc.Close() }()
+		return nil
+	}
+	return r.rc.Close()
 }
 
 // progressingReader reports each chunk it reads as progress, and at the

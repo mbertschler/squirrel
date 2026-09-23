@@ -3,6 +3,9 @@ package sync
 import (
 	"context"
 	"fmt"
+	"io"
+	"os"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,15 +46,25 @@ func (s IndexSnapshot) Age(now time.Time) (time.Duration, bool) {
 // DiscoverIndexSnapshots lists the ride-along index snapshots a destination
 // holds for each named volume, newest first, then by volume. It is
 // read-only: it lists, it does not fetch, so an operator can be told what
-// is recoverable before anything is touched.
+// is recoverable before anything is touched. A native mirror is listed
+// through squirrel's own transport, so rcl may be nil for one.
 //
 // A volume directory that does not exist yields no snapshots rather than an
 // error — a destination that has simply never carried a given volume is a
 // normal answer to "what do you have", not a failure.
 func DiscoverIndexSnapshots(ctx context.Context, rcl *Rclone, dest *config.Destination, volumes []string) ([]IndexSnapshot, error) {
+	list := func(vol string) ([]string, error) { return listSnapshotsStrict(ctx, rcl, indexDirURI(dest, vol)) }
+	if dest.NativeMirror() {
+		tr, err := openReadOnly(ctx, dest)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = tr.Close() }()
+		list = func(vol string) ([]string, error) { return mirrorShelf(tr, vol).snapshots(ctx) }
+	}
 	var out []IndexSnapshot
 	for _, vol := range volumes {
-		names, err := listSnapshotsStrict(ctx, rcl, indexDirURI(dest, vol))
+		names, err := list(vol)
 		if err != nil {
 			return nil, fmt.Errorf("list index snapshots for %s/%s: %w", dest.Name, vol, err)
 		}
@@ -128,14 +141,42 @@ func parseSnapshotName(volume, name string) IndexSnapshot {
 	return snap
 }
 
-// FetchIndexSnapshot downloads one snapshot to localPath. It only moves the
-// file; validating that the bytes are a usable index at this binary's
-// schema version is store.PreflightCheckSnapshot's job, and the caller runs
-// it before letting the file near the live database.
+// FetchIndexSnapshot downloads one snapshot to localPath, which must not
+// exist yet. It only moves the file; validating that the bytes are a
+// usable index at this binary's schema version is
+// store.PreflightCheckSnapshot's job, and the caller runs it before letting
+// the file near the live database. rcl may be nil for a native mirror.
 func FetchIndexSnapshot(ctx context.Context, rcl *Rclone, dest *config.Destination, snap IndexSnapshot, localPath string) error {
-	uri := indexDirURI(dest, snap.Volume) + "/" + snap.Name
-	if err := rcl.copyTo(ctx, uri, localPath); err != nil {
+	var err error
+	if dest.NativeMirror() {
+		err = fetchThroughTransport(ctx, dest, path.Join(snap.Volume, IndexDirName, snap.Name), localPath)
+	} else {
+		err = rcl.copyTo(ctx, indexDirURI(dest, snap.Volume)+"/"+snap.Name, localPath)
+	}
+	if err != nil {
 		return fmt.Errorf("fetch index snapshot %s from %s: %w", snap.Name, dest.Name, err)
 	}
 	return nil
+}
+
+func fetchThroughTransport(ctx context.Context, dest *config.Destination, name, localPath string) error {
+	tr, err := openReadOnly(ctx, dest)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tr.Close() }()
+	rc, err := tr.Get(ctx, name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rc.Close() }()
+	f, err := os.OpenFile(localPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(f, ctxReader{ctx: ctx, r: rc}); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }

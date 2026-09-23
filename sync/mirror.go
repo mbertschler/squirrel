@@ -195,7 +195,13 @@ func (h *mirrorHandler) shelf(ctx context.Context, runID int64) (snapshotShelf, 
 	if err != nil {
 		return nil, err
 	}
-	return transportShelf{tr: tr, dir: path.Join(h.vol.Name, IndexDirName)}, nil
+	return mirrorShelf(tr, h.vol.Name), nil
+}
+
+// mirrorShelf is volume's .squirrel-index/ on a native mirror reached
+// through tr.
+func mirrorShelf(tr transport, volume string) transportShelf {
+	return transportShelf{tr: tr, dir: path.Join(volume, IndexDirName)}
 }
 
 func (h *mirrorHandler) receiptName(runID int64) string {

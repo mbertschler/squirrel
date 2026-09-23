@@ -152,6 +152,23 @@ func rcloneConfigPathFor(cfg *config.Config) string {
 	return filepath.Join(filepath.Dir(cfg.Path), "rclone.conf")
 }
 
+// rcloneFor locates rclone and renders its config for reading dest. A
+// native mirror is read through squirrel's own transport, so it gets a nil
+// wrapper and no rclone preamble.
+func rcloneFor(cmd *cobra.Command, cfg *config.Config, dest *config.Destination) (*sync.Rclone, error) {
+	if dest.NativeMirror() {
+		return nil, nil
+	}
+	rcl, err := sync.Find(cmd.Context())
+	if err != nil {
+		return nil, err
+	}
+	if err := writeRcloneConfigLogged(cmd.OutOrStdout(), rcl, cfg); err != nil {
+		return nil, err
+	}
+	return rcl, nil
+}
+
 // writeRcloneConfigLogged renders the rclone.conf and logs a single line
 // when the file actually changed. An unexpected rewrite is worth
 // surfacing: the config is derived deterministically from squirrel's

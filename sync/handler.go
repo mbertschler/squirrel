@@ -153,6 +153,21 @@ func openDestinationTransport(ctx context.Context, dest *config.Destination) (tr
 	return openLocalTransport(dest.Root)
 }
 
+// openReadOnly opens a native mirror's root for reading alone: the name
+// guard, held by no run, refuses every move and removal, and every call is
+// bounded by progress.
+func openReadOnly(ctx context.Context, dest *config.Destination) (transport, error) {
+	raw, err := openDestinationTransport(ctx, dest)
+	if err != nil {
+		return nil, err
+	}
+	return stallTransport{
+		transport: guardedTransport{transport: raw},
+		timeout:   DefaultStallTimeout,
+		stalled:   stalledCounter(dest.Name),
+	}, nil
+}
+
 // rcloneHandler pushes to an rclone-backed bucket destination via Sync.
 type rcloneHandler struct {
 	store *store.Store
