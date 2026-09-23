@@ -477,8 +477,8 @@ On its own it prints help. See [Recovery & disaster runbooks](/squirrel/guides/r
 squirrel destination reset <destination>
 ```
 
-One positional — the destination name. Clears the `remote_objects`/`remote_packs`
-upload ledgers, the durability vector, and the push-freshness rows for the
+One positional — the destination name. Clears the
+`remote_objects`/`remote_packs`/`remote_paths` upload ledgers, the durability vector, and the push-freshness rows for the
 destination, so the next sync treats it as fresh and re-uploads. The runs table
 and the append-only durability advance log are preserved, and the reset is
 recorded as an audit run; the remote bytes are untouched.

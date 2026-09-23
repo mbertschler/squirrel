@@ -6,14 +6,16 @@ import (
 )
 
 // ContentPresentOnDestination reports whether the content is recorded as
-// uploaded to the destination by either offsite layout: a remote_objects
-// row (the content-addressed per-hash object) or a remote_packs row for a
-// pack this content belongs to (the packed layout bundles it). Fingerprint
-// state is ignored — this is the upload-once dedup gate, the two-source
-// generalisation of HasRemoteObject, so a push never re-uploads bytes
-// already offsite in either form. Both branches are per-destination: a pack
-// this content sits in counts only when that pack was uploaded to *this*
-// destination, so a pack landed elsewhere never suppresses a needed upload.
+// stored on the destination by any layout: a remote_objects row (the
+// content-addressed per-hash object), a remote_packs row for a pack this
+// content belongs to (the packed layout bundles it), or a mirror copy — a
+// remote_paths row that is live or displaced (a lost row stopped vouching
+// for its bytes). Fingerprint state is ignored — this is the upload-once
+// dedup gate, the generalisation of HasRemoteObject, so a push never
+// re-uploads bytes already offsite in any form. Every branch is
+// per-destination: a pack this content sits in counts only when that pack
+// was uploaded to *this* destination, so a pack landed elsewhere never
+// suppresses a needed upload.
 func (s *Store) ContentPresentOnDestination(ctx context.Context, contentID int64, destination string) (bool, error) {
 	var present int
 	err := s.db.QueryRowContext(ctx, `
@@ -24,7 +26,11 @@ func (s *Store) ContentPresentOnDestination(ctx context.Context, contentID int64
 				JOIN remote_packs rp ON rp.pack_id = pm.pack_id
 				WHERE pm.content_id = ? AND rp.destination = ?
 			)
-	`, contentID, destination, contentID, destination).Scan(&present)
+			OR EXISTS (
+				SELECT 1 FROM remote_paths
+				WHERE content_id = ? AND destination = ? AND state IN ('live', 'displaced')
+			)
+	`, contentID, destination, contentID, destination, contentID, destination).Scan(&present)
 	if err != nil {
 		return false, fmt.Errorf("lookup content presence on %q: %w", destination, err)
 	}
@@ -106,7 +112,8 @@ func (s *Store) ContentFingerprintVerified(ctx context.Context, contentID int64,
 }
 
 // DestinationHasUploadRecords reports whether the index records any upload
-// to the destination, in any volume: a per-hash object or a pack. The push
+// to the destination, in any volume: a per-hash object, a pack, or a
+// mirror path in any state. The push
 // watermark rule reads an empty root as a fresh start only when this is
 // false; otherwise the root was wiped behind squirrel's back, and a push
 // would skip content these records still claim is there.
@@ -116,7 +123,8 @@ func (s *Store) DestinationHasUploadRecords(ctx context.Context, destination str
 		SELECT
 			EXISTS (SELECT 1 FROM remote_objects WHERE destination = ?)
 			OR EXISTS (SELECT 1 FROM remote_packs WHERE destination = ?)
-	`, destination, destination).Scan(&has)
+			OR EXISTS (SELECT 1 FROM remote_paths WHERE destination = ?)
+	`, destination, destination, destination).Scan(&has)
 	if err != nil {
 		return false, fmt.Errorf("lookup upload records on %q: %w", destination, err)
 	}

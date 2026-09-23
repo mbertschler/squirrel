@@ -13,6 +13,7 @@ import (
 // bytes gone — unexpectedly or intentionally).
 type PathDelta struct {
 	Path      string
+	FolderID  int64 // with the path's last component, the files row key
 	ContentID int64
 	Blake3    []byte // raw 32-byte BLAKE3-256 digest
 	SizeBytes int64
@@ -39,7 +40,7 @@ const reservedSubtreeFilter = `fo.path != '.squirrel-history'         AND fo.pat
 // coordinate).
 func (s *Store) ListPathDeltaSince(ctx context.Context, volumeID, sinceRunID int64) ([]PathDelta, error) {
 	return queryRows(ctx, s.db, `
-		SELECT `+pathFromFolderAndName+`, f.content_id, c.blake3, c.size_bytes, f.mtime_ns, f.status
+		SELECT `+pathFromFolderAndName+`, f.folder_id, f.content_id, c.blake3, c.size_bytes, f.mtime_ns, f.status
 		FROM `+fileFromJoin+`
 		WHERE fo.volume_id = ?
 		  AND COALESCE(f.status_changed_run_id, f.first_seen_run_id) > ?
@@ -57,7 +58,7 @@ func (s *Store) ListPathDeltaSince(ctx context.Context, volumeID, sinceRunID int
 // content hash it must fetch from objects/ or a pack.
 func (s *Store) ListPresentContent(ctx context.Context, volumeID int64) ([]PathDelta, error) {
 	return queryRows(ctx, s.db, `
-		SELECT `+pathFromFolderAndName+`, f.content_id, c.blake3, c.size_bytes, f.mtime_ns, f.status
+		SELECT `+pathFromFolderAndName+`, f.folder_id, f.content_id, c.blake3, c.size_bytes, f.mtime_ns, f.status
 		FROM `+fileFromJoin+`
 		WHERE fo.volume_id = ?
 		  AND f.status = 'present'
@@ -68,6 +69,6 @@ func (s *Store) ListPresentContent(ctx context.Context, volumeID int64) ([]PathD
 
 func scanPathDelta(s rowScanner) (PathDelta, error) {
 	var d PathDelta
-	err := s.Scan(&d.Path, &d.ContentID, &d.Blake3, &d.SizeBytes, &d.MtimeNs, &d.Status)
+	err := s.Scan(&d.Path, &d.FolderID, &d.ContentID, &d.Blake3, &d.SizeBytes, &d.MtimeNs, &d.Status)
 	return d, err
 }

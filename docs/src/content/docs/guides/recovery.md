@@ -11,9 +11,9 @@ an opt-in operator command. This page collects the recovery paths.
 ## Resetting a wrecked destination
 
 `squirrel destination reset <name>` forgets everything the index records about
-a destination's remote state — its per-content and per-pack upload ledgers, its
-live durability vector, and its push-freshness maxima — so the next sync treats
-the destination as fresh and re-uploads.
+a destination's remote state — its per-content, per-pack and per-mirror-path
+upload ledgers, its live durability vector, and its push-freshness maxima — so
+the next sync treats the destination as fresh and re-uploads.
 
 Use it when a destination's recorded state no longer matches reality and a sync
 refuses to proceed. The classic case: after wiping a remote, or pointing an
@@ -21,7 +21,9 @@ existing destination name at a fresh `root`, the
 [content-addressed](/squirrel/layouts/content-addressed/) or
 [packed](/squirrel/layouts/packed/) layout guard refuses — its recorded history
 under that destination name expects a manifest segment or placement map that is
-no longer there. Before this verb, the only escape was hand-editing SQLite or
+no longer there. An emptied root is refused too while its upload records remain:
+a push would otherwise skip everything those records claim is still there.
+Before this verb, the only escape was hand-editing SQLite or
 renaming the destination across every machine's config.
 
 ```sh
@@ -36,7 +38,7 @@ clear, and refuses without `--yes` (or a `--dry-run` preview).
 
 Cleared (derived state only):
 
-- `remote_objects` and `remote_packs` — the upload ledgers.
+- `remote_objects`, `remote_packs` and `remote_paths` — the upload ledgers.
 - the destination's durability vector and push-freshness rows.
 
 Preserved (the audit trail):

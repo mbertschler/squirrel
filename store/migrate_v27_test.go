@@ -138,7 +138,10 @@ func TestMigrateV26ToV27PreservesEveryRow(t *testing.T) {
 	// by later migrations are legitimately present after the rebuild and
 	// absent from the v26 fixture. Naming them keeps the count assertion
 	// exact — a table the rebuild itself invented would still fail here.
-	addedAfterV27 := []string{"config_drift"} // v29 (#191)
+	addedAfterV27 := []string{
+		"config_drift", // v29 (#191)
+		"remote_paths", // v32
+	}
 	if got, want := len(countsAfter), len(countsBefore)+len(addedAfterV27); got != want {
 		t.Errorf("table count = %d after migration, want %d", got, want)
 	}
@@ -147,8 +150,11 @@ func TestMigrateV26ToV27PreservesEveryRow(t *testing.T) {
 			t.Errorf("table %s missing after migration to v%d", table, SchemaVersion)
 		}
 	}
-	if after := schemaObjectNames(t, s.db); !equalStrings(after, objectsBefore) {
-		t.Errorf("indexes/triggers after migration = %v, want %v", after, objectsBefore)
+	indexesAddedAfterV27 := []string{"idx_remote_paths_unsettled", "uniq_remote_paths_live"} // v32
+	wantObjects := append(append([]string{}, objectsBefore...), indexesAddedAfterV27...)
+	sort.Strings(wantObjects)
+	if after := schemaObjectNames(t, s.db); !equalStrings(after, wantObjects) {
+		t.Errorf("indexes/triggers after migration = %v, want %v", after, wantObjects)
 	}
 
 	assertContentRowIntact(t, s)
