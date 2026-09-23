@@ -841,7 +841,8 @@ func (d *Destination) NativeMirror() bool {
 }
 
 func nativeMirror(typ, layout string, crypt bool) bool {
-	return !layoutHidesArtifactNames(layout) && !crypt && (typ == "local" || typ == "sftp")
+	mirror := layout != LayoutContentAddressed && layout != LayoutPacked
+	return mirror && !crypt && (typ == "local" || typ == "sftp")
 }
 
 // HidesArtifactNames reports whether this destination names its content

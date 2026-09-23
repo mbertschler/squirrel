@@ -190,18 +190,11 @@ func (h *mirrorHandler) advanceMethod(context.Context, *Report, pushPlan) (strin
 
 // shelf is the mirror's <volume>/.squirrel-index/, reached through runID's
 // guarded transport.
-func (h *mirrorHandler) shelf(ctx context.Context, runID int64) (snapshotShelf, error) {
-	tr, err := h.root(ctx, runID)
-	if err != nil {
-		return nil, err
+func (h *mirrorHandler) shelf(runID int64) snapshotShelf {
+	return transportShelf{
+		open: func(ctx context.Context) (transport, error) { return h.root(ctx, runID) },
+		dir:  path.Join(h.vol.Name, IndexDirName),
 	}
-	return mirrorShelf(tr, h.vol.Name), nil
-}
-
-// mirrorShelf is volume's .squirrel-index/ on a native mirror reached
-// through tr.
-func mirrorShelf(tr transport, volume string) transportShelf {
-	return transportShelf{tr: tr, dir: path.Join(volume, IndexDirName)}
 }
 
 func (h *mirrorHandler) receiptName(runID int64) string {

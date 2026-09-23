@@ -54,9 +54,9 @@ type layout[O operations] interface {
 	// advanceMethod names the evidence the confirmed landing earns. An
 	// empty method holds the durability vector where it is.
 	advanceMethod(ctx context.Context, rep *Report, p pushPlan) (string, error)
-	// shelf opens the destination's .squirrel-index/ directory, where
+	// shelf is the destination's .squirrel-index/ directory, where
 	// runID's ride-along index snapshot lands.
-	shelf(ctx context.Context, runID int64) (snapshotShelf, error)
+	shelf(runID int64) snapshotShelf
 }
 
 // pushTarget is the (volume, destination) pair one layout push serves.
@@ -102,7 +102,7 @@ func pushThrough[O operations](ctx context.Context, t pushTarget, l layout[O], o
 	}
 	err = landPush(ctx, t, l, &rep, volID, runID)
 	finishHandlerRun(ctx, t.store, &rep, err)
-	opts.Snapshot.afterSync(ctx, &rep, func() (snapshotShelf, error) { return l.shelf(ctx, runID) })
+	opts.Snapshot.afterSync(ctx, &rep, l.shelf(runID))
 	return rep, err
 }
 

@@ -362,7 +362,7 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 	// terminal state by now, so the snapshot reflects this run's own row.
 	// Destination syncs are eligible for the cloud ride-along; the
 	// Snapshotter no-ops on dry-run and on non-terminal-success states.
-	opts.Snapshot.afterSync(ctx, &rep, rcloneShelfOf(rcl, dest, vol.Name))
+	opts.Snapshot.afterSync(ctx, &rep, rcloneShelf{rcl: rcl, dir: indexDirURI(dest, vol.Name)})
 	return rep, err
 }
 

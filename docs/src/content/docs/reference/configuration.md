@@ -64,7 +64,7 @@ See [Hooks](/squirrel/guides/hooks/).
 | `password` | Secret (literal or `{ env }`). |
 | `key_file` | Path to a private key file, as an alternative to `password` (optional; a leading `~/` is expanded). A passphrase-protected key goes through ssh-agent instead. |
 | `root` | Base path on the server. |
-| `known_hosts_file` | Path to a known_hosts file holding the server's host key. |
+| `known_hosts_file` | Path to a known_hosts file holding the server's host key (a leading `~/` is expanded). |
 | `host_key_algorithms` | Space-separated list pinning accepted host-key algorithms (optional). |
 
 With neither `password` nor `key_file` set, squirrel logs in with the keys of the

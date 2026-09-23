@@ -85,12 +85,12 @@ type snapshotShelf interface {
 
 // afterSync is the post-run hook every push calls once the run's terminal
 // state is committed. It takes (once) the local snapshot and, with cloud
-// enabled, rides a copy along to the shelf openShelf opens; a nil
-// openShelf (peer and kopia pushes) keeps the local snapshot only.
+// enabled, rides a copy along to shelf; a nil shelf (peer and kopia
+// pushes) keeps the local snapshot only.
 // Failures are surfaced on rep.SnapshotErr and never mutate rep.Status —
 // the snapshot is defense-in-depth, not part of the sync's success
 // contract. A nil receiver (feature disabled) is a no-op.
-func (sn *Snapshotter) afterSync(ctx context.Context, rep *Report, openShelf func() (snapshotShelf, error)) {
+func (sn *Snapshotter) afterSync(ctx context.Context, rep *Report, shelf snapshotShelf) {
 	if sn == nil {
 		return
 	}
@@ -112,10 +112,10 @@ func (sn *Snapshotter) afterSync(ctx context.Context, rep *Report, openShelf fun
 		// The VACUUM itself failed; there is nothing to ride along.
 		return
 	}
-	if openShelf == nil || !sn.cloud {
+	if shelf == nil || !sn.cloud {
 		return
 	}
-	if rideErr := sn.rideAlong(ctx, localPath, rep, openShelf); rideErr != nil {
+	if rideErr := sn.rideAlong(ctx, localPath, rep, shelf); rideErr != nil {
 		rep.SnapshotErr = rideErr
 	}
 }
@@ -153,11 +153,7 @@ func (sn *Snapshotter) ensureLocalSnapshot(ctx context.Context, runID int64) (st
 // <volume>/.squirrel-index/, then rotates that directory to at most
 // cloudKeep snapshots. The uploaded copy keeps the snapshot's filename so
 // the catalog is traceable to its producing run on the destination too.
-func (sn *Snapshotter) rideAlong(ctx context.Context, localPath string, rep *Report, openShelf func() (snapshotShelf, error)) error {
-	shelf, err := openShelf()
-	if err != nil {
-		return fmt.Errorf("ride-along to %s: %w", rep.Destination, err)
-	}
+func (sn *Snapshotter) rideAlong(ctx context.Context, localPath string, rep *Report, shelf snapshotShelf) error {
 	if err := shelf.upload(ctx, localPath, filepath.Base(localPath)); err != nil {
 		return fmt.Errorf("ride-along upload to %s: %w", rep.Destination, err)
 	}
@@ -216,22 +212,21 @@ func (s rcloneShelf) remove(ctx context.Context, name string) error {
 	return s.rcl.deleteFile(ctx, s.dir+"/"+name)
 }
 
-// rcloneShelfOf opens dest's shelf for volumeName through rcl.
-func rcloneShelfOf(rcl *Rclone, dest *config.Destination, volumeName string) func() (snapshotShelf, error) {
-	return func() (snapshotShelf, error) {
-		return rcloneShelf{rcl: rcl, dir: indexDirURI(dest, volumeName)}, nil
-	}
-}
-
 // transportShelf is a native mirror's .squirrel-index/ directory, reached
-// through the push's guarded transport, whose name guard permits removing
-// a snapshot there and nothing else.
+// through the transport open returns: for a push, its guarded transport,
+// whose name guard permits removing a snapshot there and nothing else.
 type transportShelf struct {
-	tr  transport
-	dir string
+	open func(context.Context) (transport, error)
+	dir  string
 }
 
+// upload removes what a failed Put left behind, so recovery never offers
+// a truncated snapshot as the newest.
 func (s transportShelf) upload(ctx context.Context, localPath, name string) error {
+	tr, err := s.open(ctx)
+	if err != nil {
+		return err
+	}
 	f, err := os.Open(localPath)
 	if err != nil {
 		return err
@@ -241,11 +236,26 @@ func (s transportShelf) upload(ctx context.Context, localPath, name string) erro
 	if err != nil {
 		return err
 	}
-	return s.tr.Put(ctx, path.Join(s.dir, name), f, fi.ModTime())
+	dst := path.Join(s.dir, name)
+	err = tr.Put(ctx, dst, f, fi.ModTime())
+	if err != nil && !errors.Is(err, fs.ErrExist) {
+		_ = tr.Remove(ctx, dst)
+	}
+	return err
 }
 
 func (s transportShelf) snapshots(ctx context.Context) ([]string, error) {
-	entries, err := s.tr.List(ctx, s.dir)
+	tr, err := s.open(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return listSnapshotNames(ctx, tr, s.dir)
+}
+
+// listSnapshotNames lists the snapshots in dir through tr; a dir that
+// does not exist holds none.
+func listSnapshotNames(ctx context.Context, tr transport, dir string) ([]string, error) {
+	entries, err := tr.List(ctx, dir)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
 	}
@@ -262,7 +272,11 @@ func (s transportShelf) snapshots(ctx context.Context) ([]string, error) {
 }
 
 func (s transportShelf) remove(ctx context.Context, name string) error {
-	return s.tr.Remove(ctx, path.Join(s.dir, name))
+	tr, err := s.open(ctx)
+	if err != nil {
+		return err
+	}
+	return tr.Remove(ctx, path.Join(s.dir, name))
 }
 
 // indexDirURI returns the rclone URI of the per-volume .squirrel-index/

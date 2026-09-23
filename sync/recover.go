@@ -60,7 +60,7 @@ func DiscoverIndexSnapshots(ctx context.Context, rcl *Rclone, dest *config.Desti
 			return nil, err
 		}
 		defer func() { _ = tr.Close() }()
-		list = func(vol string) ([]string, error) { return mirrorShelf(tr, vol).snapshots(ctx) }
+		list = func(vol string) ([]string, error) { return listSnapshotNames(ctx, tr, path.Join(vol, IndexDirName)) }
 	}
 	var out []IndexSnapshot
 	for _, vol := range volumes {
