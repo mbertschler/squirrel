@@ -310,6 +310,35 @@ func TestFailedCloseCommitsOnlyLandedUploads(t *testing.T) {
 	}
 }
 
+// TestFailedCloseSkipsLandedUploadVerifyContradicted pins that /verify has
+// the last word: an upload that landed and was then found changed on disk
+// is not committed by a failed close.
+func TestFailedCloseSkipsLandedUploadVerifyContradicted(t *testing.T) {
+	ctx := context.Background()
+	f := newPreStageFixture(t)
+	sess := f.newSession()
+	content := []byte("landed, then overwritten")
+	f.awaitContent(sess, "x.txt", content)
+	f.router.storeSession(sess)
+	if code, body := putContent(t, f.srv, f.recvRun, blakeHex(content), content); code != http.StatusOK {
+		t.Fatalf("upload status = %d (%s)", code, body)
+	}
+	if err := os.WriteFile(filepath.Join(f.vol.Path, "x.txt"), []byte("something else"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if resp, err := f.router.verifySession(sess, nil); err != nil || len(resp.Mismatched) != 1 {
+		t.Fatalf("verifySession = (%+v, %v), want one mismatch", resp, err)
+	}
+
+	committed, err := f.router.closeSession(ctx, sess, store.RunStatusFailed, nil)
+	if err != nil {
+		t.Fatalf("closeSession: %v", err)
+	}
+	if committed != 0 {
+		t.Errorf("committed = %d, want 0 once verify contradicted the upload", committed)
+	}
+}
+
 // TestCloseWaitsForInFlightUpload pins that /close commits only once every
 // upload it could race with has finished, so no bytes land in a volume
 // after its session committed and released the lock.
@@ -365,18 +394,19 @@ func TestCloseWaitsForInFlightUpload(t *testing.T) {
 	}
 }
 
+// TestPlanRefusesDigestDeclaredAtTwoSizes pins the invariant the content
+// endpoint bounds an upload by: one digest, one size — compared across
+// hex case, since the digest is what the upload is addressed by.
 func TestPlanRefusesDigestDeclaredAtTwoSizes(t *testing.T) {
+	f := newPreStageFixture(t)
 	digest := blakeHex([]byte("same bytes"))
-	same := []syncproto.IndexEntry{
-		{Path: "a.txt", Blake3Hex: digest, SizeBytes: 10},
-		{Path: "b.txt", Blake3Hex: strings.ToUpper(digest), SizeBytes: 10},
+	entries := []syncproto.IndexEntry{
+		{Path: "a.txt", Blake3Hex: digest, SizeBytes: 10, MtimeNs: plannedMtimeNs},
+		{Path: "b.txt", Blake3Hex: strings.ToUpper(digest), SizeBytes: 11, MtimeNs: plannedMtimeNs},
 	}
-	if err := validateContentSizes(same); err != nil {
-		t.Fatalf("validateContentSizes(one size) = %v", err)
-	}
-	same[1].SizeBytes = 11
-	if err := validateContentSizes(same); err == nil {
-		t.Fatal("validateContentSizes accepted one digest at two sizes")
+	_, err := f.router.planSession(context.Background(), f.newSession(), entries)
+	if err == nil || !strings.Contains(err.Error(), "declared as 10 bytes") {
+		t.Fatalf("planSession = %v, want a refusal naming both sizes", err)
 	}
 }
 

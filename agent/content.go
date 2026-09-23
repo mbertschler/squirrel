@@ -134,6 +134,14 @@ func (sess *peerSession) markLanded(rel string) {
 	sess.landed[rel] = struct{}{}
 }
 
+// unmarkLanded withdraws rel after /verify found its bytes gone or
+// changed, so a failed close does not commit what verify contradicted.
+func (sess *peerSession) unmarkLanded(rel string) {
+	sess.landedMu.Lock()
+	defer sess.landedMu.Unlock()
+	delete(sess.landed, rel)
+}
+
 // commits reports whether /close records a live row for path. A failed
 // close comes from an initiator that gave up mid-flight and cannot say
 // what landed, so it commits only the paths an upload materialised with

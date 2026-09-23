@@ -140,7 +140,7 @@ type nodeSyncDriver struct {
 	// uploadFailures carries the error behind each path whose upload
 	// failed, so the run's failed-file list says why a path the final
 	// /verify still reports failing never landed.
-	uploadFailures map[string]string
+	uploadFailures map[string]uploadFailure
 	// durabilityAdvance is the present-set origin maxima captured before
 	// the transfer. phaseClose advances the peer's durability vector to
 	// exactly this snapshot, so a row committed between enumeration and
@@ -699,12 +699,13 @@ func (d *nodeSyncDriver) phaseVerify() error {
 	}
 	d.report.NodeVerify = resp
 
-	for attempt := 0; attempt < nodeSyncRetries && verifyHasDelta(resp); attempt++ {
+	for attempt := 0; attempt < nodeSyncRetries && verifyHasDelta(resp) && !d.opts.DryRun; attempt++ {
 		failing := failingPaths(resp)
-		if len(failing) == 0 {
+		retry := d.retryable(failing)
+		if len(retry) == 0 {
 			break
 		}
-		if err := d.uploadPaths(failing); err != nil {
+		if err := d.uploadPaths(retry); err != nil {
 			return fmt.Errorf("retry %d transfer: %w", attempt+1, err)
 		}
 		resp, err = d.client.verify(d.ctx, syncproto.VerifyRequest{
@@ -717,7 +718,9 @@ func (d *nodeSyncDriver) phaseVerify() error {
 		d.report.NodeVerify = resp
 	}
 	if verifyHasDelta(resp) {
-		d.recordFailedPaths(resp)
+		if !d.opts.DryRun {
+			d.recordFailedPaths(resp)
+		}
 		d.report.Status = store.RunStatusPartial
 		return nil
 	}
@@ -808,10 +811,16 @@ func dropSample(drops []DurabilityDrop) string {
 	return strings.Join(names, ", ")
 }
 
+// abortWithError fails the run and tells the receiver, so it commits what
+// landed and releases the volume. The /close is sent even when the run's
+// own context is done, and bounded by the stall timeout: a receiver still
+// finishing an abandoned upload answers only once that upload returns.
 func (d *nodeSyncDriver) abortWithError(phase string, err error) error {
 	d.report.Status = store.RunStatusFailed
 	if d.receiverRunID != 0 {
-		_ = d.client.close(d.ctx, syncproto.CloseRequest{
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(d.ctx), d.client.stallTimeout)
+		defer cancel()
+		_ = d.client.close(ctx, syncproto.CloseRequest{
 			ReceiverRunID: d.receiverRunID,
 			Status:        store.RunStatusFailed,
 		})

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
@@ -544,14 +545,38 @@ func TestNodeSyncContestedFreezeEndToEnd(t *testing.T) {
 
 // TestNodeSyncContestedMirroredOnTransferFailure guards the observability
 // fix: the initiator must mirror a freeze into its own contested_paths
-// latch even when the sync fails *after* /plan. The receiver already
+// latch even when the transfer fails *after* /plan. The receiver already
 // pre-staged the loser and froze the path during /plan, so recording the
 // badge only on a successful close would hide it on the losing edge
-// exactly when a sync broke mid-flight (#158, F27). Removing the source
-// file after indexing fails the transfer deterministically: /plan still
-// classifies the conflict from the index, and the upload phase then finds
-// nothing to send.
-func TestNodeSyncContestedMirroredWhenUploadFails(t *testing.T) {
+// exactly when a sync broke mid-flight (#158, F27). Both ways a transfer
+// fails are covered: the one upload failing (the run ends partial) and the
+// peer failing the whole transfer (the run aborts).
+func TestNodeSyncContestedMirroredOnTransferFailure(t *testing.T) {
+	t.Run("upload fails", func(t *testing.T) {
+		f := seedDivergedDoc(t)
+		if err := os.Remove(filepath.Join(f.initVol.Path, "doc.md")); err != nil {
+			t.Fatal(err)
+		}
+		rep, err := SyncNode(context.Background(), f.initStore, f.initVol, f.node, Options{})
+		if err != nil || rep.Status != store.RunStatusPartial {
+			t.Fatalf("SyncNode = (%q, %v), want partial", rep.Status, err)
+		}
+		requireContestedLocally(t, f)
+	})
+	t.Run("peer fails the transfer", func(t *testing.T) {
+		f := seedDivergedDoc(t)
+		f.refuseUploads(t, http.StatusNotFound)
+		if _, err := SyncNode(context.Background(), f.initStore, f.initVol, f.node, Options{}); err == nil {
+			t.Fatal("SyncNode succeeded, want the transfer to fail")
+		}
+		requireContestedLocally(t, f)
+	})
+}
+
+// seedDivergedDoc leaves doc.md written locally on the receiver and
+// differently on the initiator, so /plan classifies it a conflict.
+func seedDivergedDoc(t *testing.T) *nodeFixture {
+	t.Helper()
 	f := setupNodeFixture(t)
 	ctx := context.Background()
 
@@ -579,22 +604,14 @@ func TestNodeSyncContestedMirroredWhenUploadFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.indexInitiator(t)
-	// Indexed, then gone: /plan still sees the conflict, the upload cannot
-	// read the bytes.
-	if err := os.Remove(filepath.Join(f.initVol.Path, "doc.md")); err != nil {
-		t.Fatal(err)
-	}
+	return f
+}
 
-	rep, err := SyncNode(ctx, f.initStore, f.initVol, f.node, Options{})
-	if err != nil {
-		t.Fatalf("SyncNode: %v", err)
-	}
-	if rep.Status != store.RunStatusPartial {
-		t.Fatalf("status = %q, want partial: doc.md could not be uploaded", rep.Status)
-	}
-
-	// Despite the failure, the initiator mirrored the freeze locally — the
-	// losing edge's badge / `squirrel conflicts` signal is present.
+// requireContestedLocally asserts the initiator mirrored the freeze on
+// doc.md — the losing edge's badge / `squirrel conflicts` signal.
+func requireContestedLocally(t *testing.T, f *nodeFixture) {
+	t.Helper()
+	ctx := context.Background()
 	initVolRow, err := f.initStore.GetVolumeByName(ctx, "pics")
 	if err != nil {
 		t.Fatalf("initiator GetVolumeByName: %v", err)
@@ -602,6 +619,26 @@ func TestNodeSyncContestedMirroredWhenUploadFails(t *testing.T) {
 	if _, contested, err := f.initStore.IsPathContested(ctx, initVolRow.ID, "doc.md"); err != nil || !contested {
 		t.Fatalf("initiator IsPathContested = (%v, %v), want frozen after a post-plan failure", contested, err)
 	}
+}
+
+// refuseUploads points the node at a proxy that answers every content
+// upload with status and passes the rest of the protocol to the receiver.
+func (f *nodeFixture) refuseUploads(t *testing.T, status int) {
+	t.Helper()
+	receiver := f.server.Config.Handler
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodPut {
+			http.Error(w, "refused by test", status)
+			return
+		}
+		receiver.ServeHTTP(w, req)
+	}))
+	t.Cleanup(front.Close)
+	endpoint, err := url.Parse(front.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.node.Endpoint = endpoint
 }
 
 // TestNodeSyncVerifyMismatchPartialStatus simulates rclone "succeeding"

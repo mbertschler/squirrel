@@ -1464,6 +1464,7 @@ func (r *peerSyncRouter) verifySession(sess *peerSession, scope []string) (syncp
 		actual, err := hashOnDisk(abs)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
+				sess.unmarkLanded(p)
 				resp.Missing = append(resp.Missing, p)
 				continue
 			}
@@ -1473,6 +1474,7 @@ func (r *peerSyncRouter) verifySession(sess *peerSession, scope []string) (syncp
 			resp.Matched = append(resp.Matched, p)
 			continue
 		}
+		sess.unmarkLanded(p)
 		resp.Mismatched = append(resp.Mismatched, syncproto.VerifyMismatch{
 			Path:        p,
 			ExpectedHex: hex.EncodeToString(entry.blake3),
@@ -1565,9 +1567,10 @@ func (r *peerSyncRouter) handleClose(w http.ResponseWriter, req *http.Request) {
 	defer r.releaseVolumeLock(sess.volumeID)
 	sess.uploads.Wait()
 
-	committed, err := r.closeSession(req.Context(), sess, body.Status, body.FailedPaths)
+	ctx := context.WithoutCancel(req.Context())
+	committed, err := r.closeSession(ctx, sess, body.Status, body.FailedPaths)
 	if err != nil {
-		r.finalizeFailedClose(req.Context(), sess.receiverRunID, committed, err)
+		r.finalizeFailedClose(ctx, sess.receiverRunID, committed, err)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
