@@ -9,12 +9,12 @@ import (
 )
 
 // transport is byte-level access to one destination root. Names are
-// slash-separated and relative to the root; symlinks are never followed.
-// Nothing replaces an existing name: Put creates exclusively and Rename
-// never replaces its target, so no transport call can overwrite bytes.
+// slash-separated and relative to the root, and a name whose path crosses
+// a symlink is refused. Put creates exclusively and Rename fails on an
+// existing target, so every call leaves bytes already there in place.
 type transport interface {
-	// Stat describes name without following a symlink there;
-	// fs.ErrNotExist when absent.
+	// Stat describes name itself, a symlink as a symlink; fs.ErrNotExist
+	// when absent.
 	Stat(ctx context.Context, name string) (entry, error)
 	// List describes the entries directly in dir ("." is the root).
 	List(ctx context.Context, dir string) ([]entry, error)

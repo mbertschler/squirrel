@@ -33,7 +33,8 @@ const (
 )
 
 // permit is the whole audit surface for destroying or moving bytes on a
-// destination. It allows:
+// destination. A guard held by no run (runID 0, a dry run's reads) refuses
+// everything; otherwise it allows:
 //
 //   - Remove of a staging entry, or an emptied staging run directory,
 //     of a run that has finished: <volume>/.squirrel-staging/run-<id>[/<key>];
@@ -44,7 +45,6 @@ const (
 func (g nameGuard) permit(op guardOp, name, to string) error {
 	switch {
 	case g.runID == 0:
-		// A guard no run holds allows nothing; a dry run moves no bytes.
 	case op == opRemove:
 		if g.removable(name) {
 			return nil

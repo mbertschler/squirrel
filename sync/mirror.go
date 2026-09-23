@@ -182,9 +182,8 @@ func (h *mirrorHandler) seal(ctx context.Context, _ *Report, runID int64, p push
 	return nil
 }
 
-// advanceMethod is presence+size: every path's bytes were hashed as they
-// streamed out and confirmed present at their size, but nothing read the
-// landed bytes back.
+// advanceMethod is presence+size: the push hashed every path's bytes as
+// they streamed out and confirmed each landed at its size.
 func (h *mirrorHandler) advanceMethod(context.Context, *Report, pushPlan) (string, error) {
 	return store.VerifyMethodPresenceSize, nil
 }

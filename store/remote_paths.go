@@ -26,14 +26,11 @@ const (
 )
 
 // RemotePath is one version squirrel wrote at a mirror path on a
-// destination, keyed on the files row (FolderID, Name, ContentID) it came
-// from. Path and SizeBytes are read through that row's folder and content.
-// MtimeNs is the mtime the destination reported for the written version.
+// destination, keyed on the files row it came from. Path and SizeBytes are
+// read through that row's folder and content. MtimeNs is the mtime the
+// destination reported for the written version.
 type RemotePath struct {
 	ID             int64
-	Destination    string
-	FolderID       int64
-	Name           string
 	ContentID      int64
 	WrittenRunID   int64
 	State          string
@@ -113,9 +110,9 @@ func (s *Store) MarkRemotePathsLost(ctx context.Context, ids ...int64) error {
 }
 
 // transitionRemotePaths applies one state transition to every id in one
-// transaction. update takes the prefix args followed by the row id; a row
-// that is not in the transition's source state fails the whole batch, so
-// a record never jumps a move it did not witness.
+// transaction. update takes the prefix args followed by the row id. Each
+// row must be in the transition's source state or the whole batch fails,
+// so a record moves only through the moves it witnessed.
 func (s *Store) transitionRemotePaths(ctx context.Context, ids []int64, to, update string, prefix ...any) error {
 	if len(ids) == 0 {
 		return nil
@@ -144,7 +141,7 @@ func (s *Store) transitionRemotePaths(ctx context.Context, ids []int64, to, upda
 // remotePathSelect reads remote_paths rows with their volume-relative path
 // and content size (table aliases rp, fo, c).
 const remotePathSelect = `
-	SELECT rp.id, rp.destination, rp.folder_id, rp.name, rp.content_id, rp.written_run_id,
+	SELECT rp.id, rp.content_id, rp.written_run_id,
 	       rp.state, rp.displaced_run_id, rp.mtime_ns,
 	       CASE fo.path WHEN '' THEN rp.name ELSE fo.path || '/' || rp.name END,
 	       c.size_bytes
@@ -154,7 +151,7 @@ const remotePathSelect = `
 
 func scanRemotePath(s rowScanner) (RemotePath, error) {
 	var r RemotePath
-	err := s.Scan(&r.ID, &r.Destination, &r.FolderID, &r.Name, &r.ContentID, &r.WrittenRunID,
+	err := s.Scan(&r.ID, &r.ContentID, &r.WrittenRunID,
 		&r.State, &r.DisplacedRunID, &r.MtimeNs, &r.Path, &r.SizeBytes)
 	return r, err
 }
@@ -165,7 +162,7 @@ func scanRemotePath(s rowScanner) (RemotePath, error) {
 func (s *Store) ListLiveRemotePaths(ctx context.Context, destination string, volumeID int64) ([]RemotePath, error) {
 	return queryRows(ctx, s.db, remotePathSelect+`
 		WHERE rp.destination = ? AND fo.volume_id = ? AND rp.state = 'live'
-		ORDER BY 10
+		ORDER BY 7
 	`, scanRemotePath, destination, volumeID)
 }
 

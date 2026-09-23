@@ -162,8 +162,8 @@ func (w *mirrorWriter) clearParents(ctx context.Context, rel string) error {
 // displace moves whatever rel holds into this run's history. A version
 // whose size and mtime match its live record moves as that record; a
 // directory moves with every live record under it; anything else moves as
-// unrecorded bytes, and a record they contradict becomes lost. A record
-// never claims history holds bytes it doesn't.
+// unrecorded bytes, and a record they contradict becomes lost, so a
+// record in history always vouches for the bytes there.
 func (w *mirrorWriter) displace(ctx context.Context, rel string) error {
 	e, err := w.tr.Stat(ctx, w.h.liveName(rel))
 	if errors.Is(err, fs.ErrNotExist) {
@@ -268,8 +268,8 @@ func (w *mirrorWriter) commit(ctx context.Context, d store.PathDelta, staged str
 	if err := w.h.store.ConfirmRemotePathsLive(ctx, id); err != nil {
 		return err
 	}
-	w.live[d.Path] = store.RemotePath{ID: id, Destination: w.h.dest.Name, FolderID: d.FolderID, Name: path.Base(d.Path),
-		ContentID: d.ContentID, WrittenRunID: w.runID, State: store.RemotePathLive, MtimeNs: mtime.UnixNano(), Path: d.Path, SizeBytes: d.SizeBytes}
+	w.live[d.Path] = store.RemotePath{ID: id, ContentID: d.ContentID, WrittenRunID: w.runID, State: store.RemotePathLive,
+		MtimeNs: mtime.UnixNano(), Path: d.Path, SizeBytes: d.SizeBytes}
 	w.rep.RcloneResult.Transferred++
 	w.rep.RcloneResult.Bytes += d.SizeBytes
 	return nil

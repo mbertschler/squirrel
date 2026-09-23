@@ -68,8 +68,8 @@ type pushTarget struct {
 //	requireIndexedVolume → markers → begin run → reconcile → plan → translate → execute → seal → advance → finish → ride-along
 //
 // A dry run stops after translate and reports the operations' preview; it
-// writes no runs row. The runs row records shallow=true: no layout reads
-// the landed bytes back through BLAKE3, and the audit trail says so.
+// writes no runs row. The runs row records shallow=true: every layout
+// confirms what landed by presence and size, and the audit trail says so.
 func pushThrough[O operations](ctx context.Context, t pushTarget, l layout[O], opts Options) (Report, error) {
 	rep := Report{Volume: t.vol.Name, Destination: t.dest.Name, Layout: t.dest.Layout}
 	// Stamped up front so output renderers key their formatting off the
