@@ -44,8 +44,8 @@ package syncproto
 
 import "strconv"
 
-// DispositionAlreadyCorrect — both sides have the same (path, blake3).
-// rclone need not touch this path.
+// DispositionAlreadyCorrect — both sides have the same (path, blake3),
+// so no bytes move for this path.
 const DispositionAlreadyCorrect = "already-correct"
 
 // DispositionTransfer — receiver has no live row at this path; the
@@ -68,7 +68,7 @@ const DispositionSupersede = "supersede"
 // prior bytes to `.squirrel-conflicts/run-<id>/<path>` and seeds a new
 // `present` row at that path carrying the prior blake3 + prior content
 // origin, so both versions remain reachable by hash and by path. The
-// initiator wins live: rclone delivers its bytes to the original path
+// initiator wins live: its upload lands at the original path
 // and /close inserts a new `present` row there carrying the entry's
 // declared content origin.
 const DispositionConflict = "conflict"
@@ -92,7 +92,7 @@ const DispositionContested = "contested"
 // Instead of forcing the initiator to re-transfer the bytes over the
 // network, the receiver materialises the new path locally by copying
 // from `CopyFromPath` (an independent inode — not a hardlink). The
-// initiator excludes the path from the rclone scope but still verifies
+// initiator uploads nothing for the path but still verifies
 // the post-copy hash and writes a `present` row on /close carrying the
 // entry's declared content origin (the path is logically
 // initiator-owned from the receiver's view, identical to a successful
@@ -146,10 +146,9 @@ const ProtocolVersionContested = 3
 // same authenticated, fingerprint-pinned connection the plan travelled
 // over, so there is exactly one address and one trust anchor per peer.
 //
-// Unlike the earlier bumps this one has no fallback: a receiver below v4
-// has no endpoint to accept bytes on, and the initiator no longer has a
-// byte-path to reach it by. The initiator refuses the sync with an
-// upgrade instruction rather than silently transferring nothing.
+// This bump has no fallback: a receiver below v4 has no endpoint that
+// accepts bytes, and the sync API is the initiator's only way to reach
+// it, so the initiator refuses the sync with an upgrade instruction.
 const ProtocolVersionInlineTransfer = 4
 
 // BeginRequest opens a peer-sync session.
@@ -300,7 +299,7 @@ type IndexEntry struct {
 // PlanResponse carries the receiver's per-path verdict.
 type PlanResponse struct {
 	// Dispositions has one entry per path the initiator sent (so the
-	// client can drive rclone in one pass without re-cross-referencing
+	// client can drive its uploads in one pass without re-cross-referencing
 	// against PlanRequest).
 	Dispositions []PlanDisposition `json:"dispositions"`
 	// Conflicts captures the paths whose disposition was "conflict",
@@ -308,7 +307,7 @@ type PlanResponse struct {
 	// the initiator's CLI can render a meaningful "preserved at ..."
 	// line. A conflict is no longer a fatal disposition: the receiver
 	// has already pre-staged the loser under .squirrel-conflicts/ and
-	// the initiator's bytes are still in scope for the rclone transfer.
+	// the initiator's bytes are still in scope for upload.
 	Conflicts []ConflictDetail `json:"conflicts,omitempty"`
 	// Contested captures the paths whose disposition was "contested":
 	// frozen by a prior conflict, so this initiator's divergent bytes
@@ -369,7 +368,7 @@ type ContestedDetail struct {
 	PreservedAtPath    string `json:"preserved_at_path,omitempty"`
 }
 
-// VerifyRequest tells the receiver "rclone said it finished, please
+// VerifyRequest tells the receiver "the uploads are done, please
 // re-hash the affected paths now".
 type VerifyRequest struct {
 	ReceiverRunID int64 `json:"receiver_run_id"`

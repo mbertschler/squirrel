@@ -1033,8 +1033,8 @@ func (r *peerSyncRouter) dispositionForExisting(ctx context.Context, sess *peerS
 // When the source path is gone from disk (drift between the index
 // observation and the sync) the entry is silently downgraded to
 // Transfer: the response builder later picks up the corrected
-// disposition, and the initiator delivers the bytes via rclone on
-// the same /plan→/verify cycle. Any other I/O error aborts the plan
+// disposition, and the initiator uploads the bytes in the same
+// /plan→/verify cycle. Any other I/O error aborts the plan
 // after unlinking every destination this pre-stage already
 // materialised — partial mutation of the receiver volume is worse
 // than no mutation when /plan is going to fail, and rolling back
@@ -1099,11 +1099,6 @@ func (r *peerSyncRouter) preStageCopyFromExisting(sess *peerSession) error {
 			if errors.Is(err, os.ErrNotExist) {
 				entry.disposition = syncproto.DispositionTransfer
 				entry.copyFromPath = ""
-				// Any out-of-band file we just moved to history stays
-				// there — the next pipeline phase (Transfer via rclone
-				// or the initiator's blob endpoint) writes a fresh
-				// dstAbs, and the user's prior bytes remain reachable
-				// under run-<id>/.
 				continue
 			}
 			rollback()
@@ -1189,10 +1184,9 @@ func copyFileToPath(srcAbs, dstAbs string, mtimeNs int64) error {
 
 // preMoveSupersedes copies prior bytes for every supersede-bucket
 // path into .squirrel-history/run-<receiverRunID>/ before /verify
-// runs. This mirrors the bucket-side `rclone --backup-dir`
-// invariant: the receiver owns the move (since rclone drops the
-// flag for node syncs), and the move happens up front so verify
-// re-hashes a clean tree.
+// runs. This is the receiver's counterpart of the bucket-side
+// `rclone --backup-dir` invariant: the receiver owns the move, and the
+// move happens up front so verify re-hashes a clean tree.
 //
 // classify chose Supersede by reading the index, so the bytes on disk
 // are re-hashed here before they are moved: if they drifted out-of-band
@@ -1256,12 +1250,11 @@ func downgradeToConflict(entry *sessionEntry) {
 }
 
 // preStageConflicts handles every conflict-disposition path before
-// rclone runs:
+// the initiator uploads:
 //
 //  1. Move the prior bytes from <path> to
 //     .squirrel-conflicts/run-<receiverRunID>/<path>. This frees the
-//     original path so rclone can deliver the initiator's bytes
-//     without `--inplace` games.
+//     original path for the initiator's bytes.
 //  2. Atomically supersede the original-path row and insert the
 //     conflict-path row carrying the prior blake3 + prior provenance,
 //     so the losing version stays reachable by hash and by path.
@@ -1374,17 +1367,16 @@ func priorProvenance(r *store.FileRow) *store.Provenance {
 	return &store.Provenance{NodeID: r.OriginNodeID.Int64, RunID: r.OriginRunID.Int64}
 }
 
-// preStageTransfers preserves out-of-band bytes that rclone is about to
-// overwrite at a Transfer destination. classify chose Transfer because
+// preStageTransfers preserves out-of-band bytes that an upload is about
+// to replace at a Transfer destination. classify chose Transfer because
 // the receiver has no live (present) index row at the path, yet a
 // regular file can still exist there (dropped in by a web app, scp, or
-// created since the last index). Without this move the upcoming rclone
-// copy — which runs with no --backup-dir for node syncs — would destroy
-// those bytes with no history. The guard mirrors the one
+// created since the last index). Without this move the upload's rename
+// would destroy those bytes with no history. The guard mirrors the one
 // preStageCopyFromExisting applies to its own destinations: Lstat,
 // then move any regular file into .squirrel-history/run-<receiverRunID>/.
 //
-// This is a move-only pass (rclone delivers the bytes after /plan
+// This is a move-only pass (the initiator uploads the bytes after /plan
 // returns), so a failure aborts the plan with the already-moved files
 // left under run-<id>/ — recoverable by the operator, and the next
 // /plan replans the same Transfer.

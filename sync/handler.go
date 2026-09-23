@@ -63,7 +63,7 @@ type VerifyResult struct {
 func (v VerifyResult) Verified() bool { return v.verified }
 
 // Tools bundles the configured external-tool wrappers the curated
-// handlers drive. Rclone backs bucket and peer targets; Kopia backs
+// handlers drive. Rclone backs bucket targets; Kopia backs
 // kopia targets and is filled in by ToolsFor exactly when a pair needs
 // it.
 type Tools struct {
@@ -224,9 +224,9 @@ func rcloneVerification(dest *config.Destination, opts Options, rep *Report) Ver
 }
 
 // peerVerification derives the typed durability report for one node
-// sync. The receiver re-hashes every delivered path with BLAKE3 during
-// the handshake's verify phase, so a fully successful session is
-// content-verified even when the rclone transfer itself ran shallow.
+// sync. Both ends hash every uploaded byte and the receiver re-hashes
+// every delivered path with BLAKE3 during the handshake's verify phase,
+// so a fully successful session is content-verified.
 func peerVerification(rep *Report) VerifyResult {
 	return VerifyResult{
 		verified: rep.Status == store.RunStatusSuccess,

@@ -108,7 +108,7 @@ Optional single positional. No arg = every `(volume, destination)` pair; one arg
 | Flag | Default | Meaning |
 |---|---|---|
 | `--to` | all | Limit to this destination name. |
-| `--shallow` | `false` | Skip BLAKE3 verification; trust rclone's size+mtime comparison. |
+| `--shallow` | `false` | Skip BLAKE3 verification on bucket destinations; trust rclone's size+mtime comparison. A peer sync hashes every byte on both ends regardless. |
 | `--dry-run` | `false` | Preview rclone actions without transferring; no runs row is written. |
 | `--init` | `false` | Authorise first-use destination bootstrap. |
 | `--progress`, `-P` | auto on a TTY | Show live transfer progress (files, bytes, rate, ETA). |
