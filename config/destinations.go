@@ -134,27 +134,15 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 	if !nameRE.MatchString(name) {
 		return nil, fmt.Errorf("invalid destination name (must match %s)", nameRE)
 	}
-	typ, ok := raw["type"].(string)
-	if !ok || typ == "" {
-		return nil, errors.New("type is required")
-	}
-	schema, ok := destSchemas[typ]
-	if !ok {
-		return nil, fmt.Errorf("unsupported destination type %q (supported: %v)", typ, SupportedTypes())
-	}
-	rootAny, ok := raw["root"]
-	if !ok {
-		return nil, errors.New("root is required")
-	}
-	root, ok := rootAny.(string)
-	if !ok || root == "" {
-		return nil, errors.New("root must be a non-empty string")
-	}
-	crypt, err := resolveCrypt(raw, typ)
+	typ, schema, err := resolveDestinationType(raw)
 	if err != nil {
 		return nil, err
 	}
-	layout, err := resolveLayout(raw, typ)
+	root, err := resolveRoot(raw)
+	if err != nil {
+		return nil, err
+	}
+	crypt, layout, err := resolveCryptAndLayout(raw, typ)
 	if err != nil {
 		return nil, err
 	}
@@ -188,6 +176,58 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 		PackThreshold: pack.threshold, PackSize: pack.size, ZstdLevel: pack.zstdLevel,
 		VerifyEvery: verifyEvery,
 	}, nil
+}
+
+// resolveDestinationType reads the required `type` key and the schema it
+// selects.
+func resolveDestinationType(raw map[string]any) (string, destSchema, error) {
+	typ, ok := raw["type"].(string)
+	if !ok || typ == "" {
+		return "", destSchema{}, errors.New("type is required")
+	}
+	schema, ok := destSchemas[typ]
+	if !ok {
+		return "", destSchema{}, fmt.Errorf("unsupported destination type %q (supported: %v)", typ, SupportedTypes())
+	}
+	return typ, schema, nil
+}
+
+// resolveRoot reads the required, non-empty `root` key.
+func resolveRoot(raw map[string]any) (string, error) {
+	rootAny, ok := raw["root"]
+	if !ok {
+		return "", errors.New("root is required")
+	}
+	root, ok := rootAny.(string)
+	if !ok || root == "" {
+		return "", errors.New("root must be a non-empty string")
+	}
+	return root, nil
+}
+
+// resolveCryptAndLayout resolves the crypt block and the layout together,
+// because the layout decides whether the crypt passwords must also yield an
+// artifact-naming key. A crypt mirror passes its passwords to rclone
+// verbatim and derives none.
+func resolveCryptAndLayout(raw map[string]any, typ string) (*Crypt, string, error) {
+	crypt, err := resolveCrypt(raw, typ)
+	if err != nil {
+		return nil, "", err
+	}
+	layout, err := resolveLayout(raw, typ)
+	if err != nil {
+		return nil, "", err
+	}
+	switch {
+	case crypt == nil:
+	case layoutHidesArtifactNames(layout):
+		if err := crypt.deriveNamingKey(); err != nil {
+			return nil, "", err
+		}
+	case revealsEmpty(crypt.Password):
+		return nil, "", errEmptyRevealedPassword
+	}
+	return crypt, layout, nil
 }
 
 // resolveVerifyEvery validates the optional per-destination `verify_every`
@@ -466,6 +506,38 @@ func resolveCrypt(raw map[string]any, typ string) (*Crypt, error) {
 	return &Crypt{Password: password, Password2: password2}, nil
 }
 
+// errEmptyRevealedPassword refuses an obscured crypt password that decodes
+// to nothing, under which rclone encrypts with an all-zero key.
+var errEmptyRevealedPassword = errors.New("crypt.password: the obscured value reveals to an empty password, which rclone treats as no key at all")
+
+// revealsEmpty reports whether obscured decodes to the empty string. A
+// value that does not decode at all is left for rclone to judge.
+func revealsEmpty(obscured string) bool {
+	plaintext, err := rcloneReveal(obscured)
+	return err == nil && plaintext == ""
+}
+
+// deriveNamingKey fills NamingKey from the plaintext behind the two stored,
+// obscured passwords, so a plaintext config and a pre-obscured one derive
+// the same key.
+func (c *Crypt) deriveNamingKey() error {
+	password, err := rcloneReveal(c.Password)
+	if err != nil {
+		return fmt.Errorf("crypt.password: %w", err)
+	}
+	if password == "" {
+		return errEmptyRevealedPassword
+	}
+	var password2 string
+	if c.Password2 != "" {
+		if password2, err = rcloneReveal(c.Password2); err != nil {
+			return fmt.Errorf("crypt.password2: %w", err)
+		}
+	}
+	c.NamingKey = DeriveNamingKey(password, password2)
+	return nil
+}
+
 // cryptObscuredFlag reads the optional `obscured` marker. Its default —
 // false — means the password fields carry plaintext squirrel obscures
 // itself; true means they already hold rclone-obscured values and must be
@@ -737,8 +809,9 @@ func (d *Destination) RemoteRoot() string {
 // cryptSection renders the crypt overlay remote. Its remote line bakes the
 // destination root in, so transfers through the overlay address
 // volume-relative paths directly. filename_encryption is fixed off: the
-// overlay encrypts file contents only, and the destination keeps the same
-// browsable tree layout as an unencrypted destination.
+// overlay encrypts file contents only, and the names are squirrel's to
+// choose — keyed on the append-only layouts, the volume's own paths on a
+// mirror.
 func (d *Destination) cryptSection() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "[%s]\n", d.CryptRemoteName())
@@ -757,6 +830,21 @@ func sortedSubset(in []string) []string {
 	out := append([]string(nil), in...)
 	sort.Strings(out)
 	return out
+}
+
+// HidesArtifactNames reports whether this destination names its content
+// objects, packs, and per-volume directories by a keyed BLAKE3 hash derived
+// from its crypt passwords, so the remote discloses neither a path nor a
+// content hash. It holds for an encrypted destination on the append-only
+// layouts; a mirror's names are the volume's own paths.
+func (d *Destination) HidesArtifactNames() bool {
+	return d.Crypt != nil && layoutHidesArtifactNames(d.Layout)
+}
+
+// layoutHidesArtifactNames reports whether layout stores its artifacts
+// under names squirrel chooses, which it can key.
+func layoutHidesArtifactNames(layout string) bool {
+	return layout == LayoutContentAddressed || layout == LayoutPacked
 }
 
 // CanEverGateOffload reports whether a durability push to this destination

@@ -222,7 +222,7 @@ func (ar *archiveRestore) restoreObject(ctx context.Context, rep *Report, c rest
 		ar.countContent(rep, c)
 		return
 	}
-	tmp, err := ar.fetch(ctx, path.Join(ObjectsDirName, hex.EncodeToString(c.blake3)))
+	tmp, err := ar.fetch(ctx, path.Join(ObjectsDirName, namerFor(ar.dest).object(c.blake3)))
 	if err != nil {
 		ar.recordFailure(rep, c.firstPath(), err)
 		return
@@ -249,7 +249,7 @@ func (ar *archiveRestore) restorePack(ctx context.Context, rep *Report, g *packG
 		}
 		return
 	}
-	tmp, err := ar.fetch(ctx, path.Join(PacksDirName, hex.EncodeToString(g.key)))
+	tmp, err := ar.fetch(ctx, path.Join(PacksDirName, namerFor(ar.dest).pack(g.key)))
 	if err != nil {
 		ar.failMembers(rep, g.members, err)
 		return

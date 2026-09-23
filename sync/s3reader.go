@@ -29,10 +29,9 @@ import (
 type s3ETagReader interface {
 	// objectETags lists every file under the reader's configured prefix (a
 	// paginated ListObjectsV2, archive-tier-safe with no per-object HEAD)
-	// and returns its raw ETag keyed by the file's basename — the lowercase
-	// BLAKE3 hex (of the content, or of the pack's compressed bytes), since
-	// filename encryption is off and the underlying key equals the overlay
-	// path.
+	// and returns its raw ETag keyed by the file's basename — the name the
+	// artifact is stored under (namer.object / namer.pack), since filename
+	// encryption is off and the underlying key equals the overlay path.
 	objectETags(ctx context.Context) (map[string]string, error)
 }
 

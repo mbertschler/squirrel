@@ -55,6 +55,29 @@ placement map per run) alongside the same `objects/` and `index/`:
     .squirrel-index/index-…-run-13.db
 ```
 
+## Encrypted destinations key these names
+
+The trees above show an unencrypted destination. Add a
+[`crypt`](/squirrel/layouts/encrypted/) block to a content-addressed or packed
+destination and squirrel names each artifact by a keyed BLAKE3 hash derived from
+the crypt passwords, so no content hash or volume name appears at the remote:
+
+```
+<dest.root>/
+  .squirrel-naming                 # records the naming scheme (carries no key material)
+  objects/<name("object", blake3)> # keyed name of the content hash
+  packs/<name("pack", pack)>       # keyed name of the pack key
+  packs/map-13                     # run id in clear
+  <name("volume", volume)>/        # keyed volume directory
+    index/run-13                   # run id in clear
+    .squirrel-index/index-…-run-13.db
+```
+
+A mirror is unchanged: its names are the volume's own paths. Run identifiers stay
+in clear so segments and placement maps still sort into replay order without the
+key — see [deriving the stored
+names](/squirrel/reference/formats/#deriving-the-stored-names-on-an-encrypted-destination).
+
 ## Reserved directories
 
 Three directory names are reserved and **filtered out** of all sync and restore
@@ -66,6 +89,12 @@ for user content:
 | `.squirrel-history/run-<id>/` | rclone's `--backup-dir` target — prior bytes of overwritten files ([mirror](/squirrel/layouts/mirror/)). |
 | `.squirrel-index/` | Ride-along [index snapshots](/squirrel/configuration/index-snapshots/). |
 | `.squirrel-restore-history/run-<id>/` | Files displaced by an [`--in-place` restore](/squirrel/guides/restore/). |
+
+One reserved **file** sits at the destination root rather than in a volume tree:
+`.squirrel-naming`, which records the artifact-naming scheme of an
+[encrypted](/squirrel/layouts/encrypted/) content-addressed or packed root. It is
+the gate that stops two naming schemes from being mixed into one root, and it
+never carries key material.
 
 A directory literally called `.squirrel-history` in your **source** volume is
 also filtered (with a warning) to keep the reserved name out of the destination

@@ -244,8 +244,8 @@ const (
 // squirrel renders it as an rclone crypt remote stacked on the underlying
 // remote and addresses sync/restore transfers through it, so file contents
 // are encrypted before they leave the machine. Contents only:
-// filename_encryption is fixed off, keeping the destination tree layout
-// identical to an unencrypted destination.
+// filename_encryption is fixed off; the append-only layouts key the names
+// they choose instead (NamingKey), and a mirror keeps the volume's paths.
 type Crypt struct {
 	// Password is the content-encryption password already in rclone-obscured
 	// form — the representation rclone's own crypt config stores and rclone
@@ -257,6 +257,10 @@ type Crypt struct {
 	// Password2 is the salt, in the same obscured form as Password.
 	// Optional but recommended, matching rclone's crypt config.
 	Password2 string
+	// NamingKey is the artifact-naming key Load derives from the two
+	// passwords (DeriveNamingKey) where Destination.HidesArtifactNames
+	// holds; it is zero on a crypt mirror.
+	NamingKey [32]byte
 }
 
 // nameRE is the syntactic rule for volume and destination names. We pick a

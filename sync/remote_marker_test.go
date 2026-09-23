@@ -216,7 +216,7 @@ func TestIsNotFoundErrClassification(t *testing.T) {
 // push (with the --init hint) before any runs row is allocated.
 func TestContentAddressedRefusesUninitialisedRemote(t *testing.T) {
 	f := setupContentAddressedFixture(t)
-	if err := os.Remove(f.remoteBlob("pics", volmark.MarkerName)); err != nil {
+	if err := os.Remove(f.volumeBlob(t, "pics", volmark.MarkerName)); err != nil {
 		t.Fatalf("remove seeded marker: %v", err)
 	}
 	f.write(t, "a.txt", "alpha")
@@ -237,7 +237,7 @@ func TestContentAddressedRefusesUninitialisedRemote(t *testing.T) {
 // the marker on a content-addressed remote and the push then succeeds.
 func TestContentAddressedInitWritesRemoteMarker(t *testing.T) {
 	f := setupContentAddressedFixture(t)
-	if err := os.Remove(f.remoteBlob("pics", volmark.MarkerName)); err != nil {
+	if err := os.Remove(f.volumeBlob(t, "pics", volmark.MarkerName)); err != nil {
 		t.Fatalf("remove seeded marker: %v", err)
 	}
 	f.write(t, "a.txt", "alpha")
@@ -249,7 +249,7 @@ func TestContentAddressedInitWritesRemoteMarker(t *testing.T) {
 	if rep.Status != store.RunStatusSuccess {
 		t.Fatalf("Status = %q, want success", rep.Status)
 	}
-	data, err := os.ReadFile(f.remoteBlob("pics", volmark.MarkerName))
+	data, err := os.ReadFile(f.volumeBlob(t, "pics", volmark.MarkerName))
 	if err != nil {
 		t.Fatalf("marker not written on --init: %v", err)
 	}

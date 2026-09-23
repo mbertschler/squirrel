@@ -32,6 +32,14 @@ Instead of a browsable tree, the destination holds:
   segments in run order yields its full current path→content mapping, and any
   past state. See the [manifest segment format](/squirrel/reference/formats/#manifest-segment-format).
 
+:::note[On an encrypted destination these names are keyed]
+Add a [`crypt`](/squirrel/layouts/encrypted/) block and the object name is no
+longer the content hash, nor the directory the volume name: both become a keyed
+BLAKE3 hash derived from the crypt passwords, so the remote discloses neither.
+Deduplication is unaffected — identical content still derives one name and
+uploads once.
+:::
+
 ## Transactional durability
 
 Durability is **transactional per run**: the run only counts as successful — and

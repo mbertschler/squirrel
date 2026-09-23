@@ -120,7 +120,11 @@ destination). See [Encrypted (crypt)](/squirrel/layouts/encrypted/).
 | `password2` | Plaintext salt; optional but recommended. Secret. |
 | `obscured` | `true` if `password`/`password2` are already rclone-obscured (renders them verbatim; default `false`). |
 
-Filenames are **not** encrypted (`filename_encryption = off`, fixed by design).
+rclone's own filename encryption stays off (`filename_encryption = off`, fixed by
+design). On the content-addressed and packed layouts squirrel instead names every
+artifact by a key derived from these passwords, so the destination discloses
+neither a path nor a content hash; on a mirror the replicated tree keeps your own
+names in clear. See [Encrypted (crypt)](/squirrel/layouts/encrypted/).
 
 ## Content-addressed & packed knobs
 

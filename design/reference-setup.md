@@ -20,8 +20,21 @@ what happens to it at each lifecycle checkpoint below.
 | **laptop** | Daily driver, roaming, often asleep or away | 512 GB | Edge node. Originates photos and docs; pushes to nas; offloads old photo years to reclaim space |
 | **homepc** | Desktop at home, GUI, regularly on | 2 TB | Edge node. Originates photos and docs; pushes to nas; also mirrors to a USB disk (`local` destination) |
 | **htpc** | Home theater PC on the TV, no GUI, always at home | 1 TB | Edge node, receive-only. Holds the media + photos it plays back; nas pushes to it; offloads what it no longer needs locally |
-| **cloudbox** | Rented storage box: **pure SFTP access, cannot run programs** (Hetzner-Storage-Box-like) | 5 TB | `sftp` **destination** only — no agent, no index. Encrypted, browsable mirror |
+| **cloudbox** | Rented storage box: **pure SFTP access, cannot run programs** (Hetzner-Storage-Box-like) | 5 TB | `sftp` **destination** only — no agent, no index. Encrypted, browsable mirror: its names are the household's own paths, in clear |
 | *(bucket)* **s3archive** | S3 bucket on an archive-ish tier | ∞ | `s3` **destination**, packed + crypt: the cold, cheap, append-only copy |
+
+The two encrypted destinations disclose different amounts, and the split is
+the layout's, not the encryption's. `cloudbox` is a mirror, so its tree is
+browsable by design and the household's paths are legible to whoever runs the
+storage box — that is the price of a copy you can restore with nothing but an
+SFTP client. `s3archive` is packed, so every name under it is one squirrel
+chose, and squirrel keys those names from the crypt passwords: the bucket
+discloses no path, no volume name, and no content hash, so nobody holding a
+candidate file can test whether the household stores it without first finding
+the crypt passwords, at the same scrypt cost as attacking the encrypted data
+itself. A household that considers its filenames sensitive should read
+`cloudbox` as the weaker leg and lean on `s3archive` (or `kopia-mirror`) for
+that property.
 
 The Synology-vs-QNAP question dissolves at this level: both run the
 agent as a container with the volumes bind-mounted; every difference

@@ -678,7 +678,7 @@ func ensureLocalDestinationMarker(ctx context.Context, s *store.Store, dest *con
 // without writing — the invariant favours refusing over risking a write
 // to the wrong root.
 func ensureRemoteDestinationMarker(ctx context.Context, s *store.Store, rcl *Rclone, dest *config.Destination, volumeName string, init bool) error {
-	markerURI := remoteSubpathURI(dest, path.Join(volumeName, volmark.MarkerName))
+	markerURI := remoteSubpathURI(dest, path.Join(namerFor(dest).volumeDir(volumeName), volmark.MarkerName))
 	// Absence is decided by a stat, not by cat's exit: bucket backends
 	// (s3/b2/gcs) return an empty body on a zero exit for a missing
 	// object, indistinguishable from an empty file, so inferring absence
@@ -869,7 +869,7 @@ func remoteSubpathURI(dest *config.Destination, subpath string) string {
 // layout-switch is recoverable while a delta against a stale watermark
 // silently skips content.
 func freshStartOnEmptyRoot(ctx context.Context, rcl *Rclone, dest *config.Destination) bool {
-	empty, err := rcl.remoteRootEmpty(ctx, remoteSubpathURI(dest, ""), checkersArgs(dest)...)
+	empty, err := rcl.remoteRootEmpty(ctx, remoteSubpathURI(dest, ""), rootMarkerNames(dest), checkersArgs(dest)...)
 	return err == nil && empty
 }
 

@@ -183,7 +183,7 @@ func (sn *Snapshotter) rotateCloud(ctx context.Context, dirURI string) error {
 // directory under dest, addressed the same way the data transfer is
 // (through the crypt overlay when the destination has one).
 func indexDirURI(dest *config.Destination, volumeName string) string {
-	return remoteSubpathURI(dest, path.Join(volumeName, IndexDirName))
+	return remoteSubpathURI(dest, path.Join(namerFor(dest).volumeDir(volumeName), IndexDirName))
 }
 
 // rotateSnapshots deletes the oldest snapshot-on-sync files in dir until
