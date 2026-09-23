@@ -30,6 +30,7 @@ func blakeHex(b []byte) string {
 // seed the index and the volume tree, then call plan with one initiator
 // entry per path.
 type preStageFixture struct {
+	srv      *Server
 	router   *peerSyncRouter
 	store    *store.Store
 	vol      *config.Volume
@@ -87,6 +88,7 @@ func newPreStageFixture(t *testing.T) *preStageFixture {
 		t.Fatalf("BeginPeerSyncRun (receiver): %v", err)
 	}
 	return &preStageFixture{
+		srv:      srv,
 		router:   srv.router,
 		store:    srv.store,
 		vol:      vol,

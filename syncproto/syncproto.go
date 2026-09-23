@@ -8,7 +8,11 @@
 //	POST /v1/sync/begin   handshake → receiver allocates a run id
 //	POST /v1/sync/plan    initiator sends index slice; receiver
 //	                      returns per-path dispositions
-//	POST /v1/sync/verify  initiator notifies "rclone done"; receiver
+//	PUT  /v1/sync/content/{run}/{blake3}
+//	                      initiator streams one content object's bytes;
+//	                      receiver hashes the stream and materialises it
+//	                      at every path in the session wanting that content
+//	POST /v1/sync/verify  initiator notifies "bytes sent"; receiver
 //	                      re-hashes transfer+supersede paths
 //	POST /v1/sync/close   initiator finalises; receiver commits the
 //	                      index updates and advances the watermark
@@ -38,8 +42,10 @@
 //     without bumping the version path.
 package syncproto
 
-// DispositionAlreadyCorrect — both sides have the same (path, blake3).
-// rclone need not touch this path.
+import "strconv"
+
+// DispositionAlreadyCorrect — both sides have the same (path, blake3),
+// so no bytes move for this path.
 const DispositionAlreadyCorrect = "already-correct"
 
 // DispositionTransfer — receiver has no live row at this path; the
@@ -62,7 +68,7 @@ const DispositionSupersede = "supersede"
 // prior bytes to `.squirrel-conflicts/run-<id>/<path>` and seeds a new
 // `present` row at that path carrying the prior blake3 + prior content
 // origin, so both versions remain reachable by hash and by path. The
-// initiator wins live: rclone delivers its bytes to the original path
+// initiator wins live: its upload lands at the original path
 // and /close inserts a new `present` row there carrying the entry's
 // declared content origin.
 const DispositionConflict = "conflict"
@@ -86,7 +92,7 @@ const DispositionContested = "contested"
 // Instead of forcing the initiator to re-transfer the bytes over the
 // network, the receiver materialises the new path locally by copying
 // from `CopyFromPath` (an independent inode — not a hardlink). The
-// initiator excludes the path from the rclone scope but still verifies
+// initiator uploads nothing for the path but still verifies
 // the post-copy hash and writes a `present` row on /close carrying the
 // entry's declared content origin (the path is logically
 // initiator-owned from the receiver's view, identical to a successful
@@ -128,6 +134,22 @@ const ProtocolVersionMerkleWalk = 2
 // folder walk is unchanged from v2; this only widens the /plan verdict
 // set for initiators that opt in.
 const ProtocolVersionContested = 3
+
+// ProtocolVersionInlineTransfer moves the bytes themselves onto the
+// sync API. Up to ProtocolVersionContested the initiator negotiated a
+// plan over HTTP and then delivered the bytes out-of-band, through an
+// rclone target prefix the operator configured separately (`[nodes.X]
+// path`) and squirrel could not validate: a directory that existed but
+// was not the peer's storage looked identical to a correct one, and the
+// bytes landed somewhere the receiver never saw (friction log F34).
+// From v4 the initiator PUTs each content object to ContentPath on the
+// same authenticated, fingerprint-pinned connection the plan travelled
+// over, so there is exactly one address and one trust anchor per peer.
+//
+// This bump has no fallback: a receiver below v4 has no endpoint that
+// accepts bytes, and the sync API is the initiator's only way to reach
+// it, so the initiator refuses the sync with an upgrade instruction.
+const ProtocolVersionInlineTransfer = 4
 
 // BeginRequest opens a peer-sync session.
 type BeginRequest struct {
@@ -277,7 +299,7 @@ type IndexEntry struct {
 // PlanResponse carries the receiver's per-path verdict.
 type PlanResponse struct {
 	// Dispositions has one entry per path the initiator sent (so the
-	// client can drive rclone in one pass without re-cross-referencing
+	// client can drive its uploads in one pass without re-cross-referencing
 	// against PlanRequest).
 	Dispositions []PlanDisposition `json:"dispositions"`
 	// Conflicts captures the paths whose disposition was "conflict",
@@ -285,7 +307,7 @@ type PlanResponse struct {
 	// the initiator's CLI can render a meaningful "preserved at ..."
 	// line. A conflict is no longer a fatal disposition: the receiver
 	// has already pre-staged the loser under .squirrel-conflicts/ and
-	// the initiator's bytes are still in scope for the rclone transfer.
+	// the initiator's bytes are still in scope for upload.
 	Conflicts []ConflictDetail `json:"conflicts,omitempty"`
 	// Contested captures the paths whose disposition was "contested":
 	// frozen by a prior conflict, so this initiator's divergent bytes
@@ -346,7 +368,7 @@ type ContestedDetail struct {
 	PreservedAtPath    string `json:"preserved_at_path,omitempty"`
 }
 
-// VerifyRequest tells the receiver "rclone said it finished, please
+// VerifyRequest tells the receiver "the uploads are done, please
 // re-hash the affected paths now".
 type VerifyRequest struct {
 	ReceiverRunID int64 `json:"receiver_run_id"`
@@ -519,4 +541,24 @@ type DestinationCapability struct {
 // errorResponse type but is exported so client-side decoding can name it.
 type ErrorResponse struct {
 	Error string `json:"error"`
+}
+
+// ContentPath builds the upload URL path for one content object in a
+// session: PUT <ContentPath(run, blake3hex)> with the object's bytes as
+// the request body. Keying by BLAKE3 rather than by path is what makes
+// the endpoint safe and cheap — the hex digest is a fixed 64-character
+// alphabet the receiver validates before it touches the filesystem, so
+// no peer-supplied path ever reaches a filesystem join, and one upload
+// satisfies every path in the session that wants that content.
+func ContentPath(receiverRunID int64, blake3Hex string) string {
+	return "/v1/sync/content/" + strconv.FormatInt(receiverRunID, 10) + "/" + blake3Hex
+}
+
+// ContentResponse acknowledges one accepted content upload. Paths lists
+// the volume-relative paths the receiver materialised from these bytes,
+// in sorted order — normally one, more when the same content lands at
+// several paths in the same run. The initiator surfaces the count; the
+// authoritative check remains /verify, which re-reads what is on disk.
+type ContentResponse struct {
+	Paths []string `json:"paths"`
 }

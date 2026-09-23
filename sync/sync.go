@@ -904,11 +904,12 @@ func EffectiveShallow(dest *config.Destination, shallow bool) bool {
 // ShallowForPairs reports whether an invocation covering pairs runs
 // rclone entirely without BLAKE3 verification: either the operator
 // passed --shallow, or every rclone-driven target is a crypt
-// destination that forces it. Kopia pairs are skipped — they drive the
-// kopia binary, so they put no constraint on rclone. Content-addressed
-// pairs are skipped for the same reason: their per-object copyto and
-// lsjson calls never pass --hash blake3. Used to scope the rclone
-// version preflight to what the run will actually invoke.
+// destination that forces it. Kopia and peer pairs are skipped — they
+// drive the kopia binary and the sync API respectively, so they put no
+// constraint on rclone. Content-addressed pairs are skipped for another
+// reason: their per-object copyto and lsjson calls never pass
+// --hash blake3. Used to scope the rclone version preflight to what the
+// run will actually invoke.
 func ShallowForPairs(pairs []Pair, shallow bool) bool {
 	if shallow {
 		return true
@@ -920,7 +921,10 @@ func ShallowForPairs(pairs []Pair, shallow bool) bool {
 		if p.Destination != nil && p.Destination.Layout == config.LayoutContentAddressed {
 			continue
 		}
-		if p.Destination == nil || p.Destination.Crypt == nil {
+		if p.Destination == nil {
+			continue
+		}
+		if p.Destination.Crypt == nil {
 			return false
 		}
 	}

@@ -10,12 +10,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"os"
 	"path"
-	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/store"
@@ -31,11 +29,12 @@ const nodeSyncRetries = 2
 // SyncNode runs one (volume, node) pair via the five-phase peer-sync
 // flow described in issue #18. It mirrors Sync's shape — same Report,
 // same runs-row lifecycle, same prerequisite that the source volume
-// is indexed — but instead of invoking rclone directly against a
-// passive bucket it negotiates a plan with the receiver agent and
-// runs rclone strictly between /plan and /verify, with --backup-dir
-// elided (the receiver pre-moves prior bytes itself).
-func SyncNode(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, node *config.Node, opts Options) (rep Report, err error) {
+// is indexed — but instead of driving a transfer against a passive
+// bucket it negotiates a plan with the receiver agent and then streams
+// each content object to it over the same authenticated connection,
+// with no destination-side history to manage (the receiver pre-moves
+// prior bytes itself).
+func SyncNode(ctx context.Context, s *store.Store, vol *config.Volume, node *config.Node, opts Options) (rep Report, err error) {
 	rep = Report{Volume: vol.Name, Destination: node.Name}
 	if w := historyDirInSourceWarning(vol); w != "" {
 		rep.Warnings = append(rep.Warnings, w)
@@ -44,7 +43,7 @@ func SyncNode(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volu
 	if err != nil {
 		return rep, err
 	}
-	err = runNodeSession(ctx, s, rcl, vol, volID, node, opts, &rep)
+	err = runNodeSession(ctx, s, vol, volID, node, opts, &rep)
 	if !opts.DryRun {
 		rep.Verification = peerVerification(&rep)
 	}
@@ -61,7 +60,7 @@ func SyncNode(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volu
 // terminal-state write. It is split out of SyncNode so the deferred
 // finishRun commits before the snapshot-on-sync hook runs — the snapshot
 // must reflect this run's own committed row.
-func runNodeSession(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, volID int64, node *config.Node, opts Options, rep *Report) (err error) {
+func runNodeSession(ctx context.Context, s *store.Store, vol *config.Volume, volID int64, node *config.Node, opts Options, rep *Report) (err error) {
 	rep.Status = store.RunStatusFailed
 	defer func() {
 		// Re-derive on the way out: when we never made it past Begin we
@@ -92,7 +91,6 @@ func runNodeSession(ctx context.Context, s *store.Store, rcl *Rclone, vol *confi
 	driver := &nodeSyncDriver{
 		ctx:    ctx,
 		store:  s,
-		rcl:    rcl,
 		vol:    vol,
 		volID:  volID,
 		node:   node,
@@ -110,15 +108,14 @@ func runNodeSession(ctx context.Context, s *store.Store, rcl *Rclone, vol *confi
 type nodeSyncDriver struct {
 	ctx    context.Context
 	store  *store.Store
-	rcl    *Rclone
 	vol    *config.Volume
 	volID  int64
 	node   *config.Node
 	client *nodeClient
 	opts   Options
 	report *Report
-	// receiverRunID is filled in after the begin handshake; rclone +
-	// verify + close reference it.
+	// receiverRunID is filled in after the begin handshake; transfer,
+	// verify, and close reference it.
 	receiverRunID int64
 	// peerNodeID is the local nodes-row id of the destination peer,
 	// resolved at /begin. Recorded on any contested_paths latch this run
@@ -135,6 +132,15 @@ type nodeSyncDriver struct {
 	// originNodeNames caches local node id → name lookups so a plan
 	// full of same-origin entries resolves each origin node once.
 	originNodeNames map[int64]string
+	// planned maps each volume-relative path sent to /plan to the content
+	// this node claimed for it. The transfer phase groups uploads by it,
+	// and the verify-retry path re-derives a failing subset from it
+	// without re-running /plan.
+	planned map[string]plannedContent
+	// uploadFailures carries the error behind each path whose upload
+	// failed, so the run's failed-file list says why a path the final
+	// /verify still reports failing never landed.
+	uploadFailures map[string]uploadFailure
 	// durabilityAdvance is the present-set origin maxima captured before
 	// the transfer. phaseClose advances the peer's durability vector to
 	// exactly this snapshot, so a row committed between enumeration and
@@ -219,14 +225,17 @@ func (d *nodeSyncDriver) run() error {
 	if err := d.phaseBegin(); err != nil {
 		return fmt.Errorf("begin: %w", err)
 	}
+	if err := d.requireInlineTransfer(); err != nil {
+		return d.abortWithError("negotiate", err)
+	}
 	plan, err := d.phasePlan()
 	if err != nil {
 		return d.abortWithError("plan", err)
 	}
 	// Conflicts flow through the transfer path: the receiver has
 	// already pre-staged each loser under .squirrel-conflicts/ and
-	// the original path is empty, so rclone treats the entry like a
-	// fresh transfer. Contested paths are frozen: the receiver refused
+	// the original path is empty, so the upload lands like a fresh
+	// transfer. Contested paths are frozen: the receiver refused
 	// them, no bytes move, and the initiator only surfaces the freeze.
 	d.report.NodeConflicts = plan.Conflicts
 	d.report.NodeContested = plan.Contested
@@ -363,7 +372,6 @@ func (d *nodeSyncDriver) phaseBegin() error {
 		VolumeID:    d.volID,
 		Destination: d.node.Name,
 		PeerNodeID:  sql.NullInt64{Int64: peer.ID, Valid: true},
-		Shallow:     d.opts.Shallow,
 	})
 	if err != nil {
 		return fmt.Errorf("begin local run: %w", err)
@@ -380,7 +388,7 @@ func (d *nodeSyncDriver) phaseBegin() error {
 		InitiatorNodeName: self.Name,
 		InitiatorRunID:    runID,
 		DedupStrategy:     d.node.DedupStrategy,
-		ProtocolVersion:   syncproto.ProtocolVersionContested,
+		ProtocolVersion:   syncproto.ProtocolVersionInlineTransfer,
 	})
 	if err != nil {
 		return err
@@ -399,6 +407,20 @@ func (d *nodeSyncDriver) phaseBegin() error {
 	return nil
 }
 
+// requireInlineTransfer refuses a peer that negotiated below
+// ProtocolVersionInlineTransfer. Such a peer expects its bytes to arrive
+// out-of-band through a separately configured byte-path; this version
+// delivers them over the sync API, so continuing would negotiate a plan,
+// move nothing, and fail at /verify with a mismatch per path. Refusing
+// up front names the fix instead.
+func (d *nodeSyncDriver) requireInlineTransfer() error {
+	if d.protocolVersion >= syncproto.ProtocolVersionInlineTransfer {
+		return nil
+	}
+	return fmt.Errorf("node %q speaks peer-sync protocol v%d, but delivering bytes over the sync API needs v%d — upgrade squirrel on %q",
+		d.node.Name, d.protocolVersion, syncproto.ProtocolVersionInlineTransfer, d.node.Name)
+}
+
 // phasePlan streams the initiator's index slice and parses the
 // receiver's verdict. Under ProtocolVersionMerkleWalk the slice is
 // scoped to files in folders the walk identified as differing; under
@@ -408,6 +430,7 @@ func (d *nodeSyncDriver) phasePlan() (syncproto.PlanResponse, error) {
 	if err != nil {
 		return syncproto.PlanResponse{}, fmt.Errorf("collect index entries: %w", err)
 	}
+	d.planned = plannedContentByPath(entries)
 	return d.client.plan(d.ctx, syncproto.PlanRequest{
 		ReceiverRunID: d.receiverRunID,
 		Entries:       entries,
@@ -654,55 +677,12 @@ func isReservedFolderPath(p string) bool {
 		p == IndexDirName || isReservedSyncPath(p)
 }
 
-// phaseTransfer invokes rclone exactly once over the transfer +
-// supersede + conflict paths the plan returned. Re-uses the existing
-// Rclone wrapper but with a different argv: no --backup-dir, an
-// --files-from containing the in-scope paths, and no .squirrel-history
-// filter (the receiver doesn't share that namespace through HTTP).
-// Conflict paths are in scope because the receiver moved the prior
-// bytes aside in pre-stage; rclone just delivers the initiator's
-// version to the now-empty original path.
+// phaseTransfer streams every content object the plan asked for to the
+// receiver. Conflict paths are in scope because the receiver moved the
+// prior bytes aside during pre-stage, so the original path is empty and
+// the upload lands like a fresh transfer.
 func (d *nodeSyncDriver) phaseTransfer(plan syncproto.PlanResponse) error {
-	transferPaths := pathsInScope(plan)
-	if len(transferPaths) == 0 {
-		return nil
-	}
-	return d.invokeRclone(transferPaths)
-}
-
-// invokeRclone runs rclone copy with --files-from over the supplied
-// relative paths. The destination URI is constructed from the node's
-// Path field (the rclone target prefix) joined with the volume name.
-// For node syncs the source argument is the volume's absolute path,
-// just as for bucket syncs.
-func (d *nodeSyncDriver) invokeRclone(transferPaths []string) error {
-	listFile, cleanup, err := writeFilesFrom(transferPaths)
-	if err != nil {
-		return fmt.Errorf("write files-from list: %w", err)
-	}
-	defer cleanup()
-
-	args := []string{
-		"copy",
-		"--files-from-raw", listFile,
-	}
-	if !d.opts.Shallow {
-		args = append(args, "--checksum", "--hash", "blake3")
-	}
-	if d.opts.DryRun {
-		args = append(args, "--dry-run")
-	}
-	args = append(args, withTrailingSlash(d.vol.Path), nodeRcloneDest(d.node, d.vol.Name))
-
-	result, err := d.rcl.RunWithProgress(d.ctx, d.opts.Progress, args...)
-	d.report.RcloneResult = result
-	if err != nil {
-		return fmt.Errorf("rclone: %w", err)
-	}
-	if result.Errors > 0 || result.FatalError {
-		return fmt.Errorf("rclone reported %d errors", result.Errors)
-	}
-	return nil
+	return d.uploadPaths(pathsInScope(plan))
 }
 
 // phaseVerify drives the verify endpoint plus up to nodeSyncRetries
@@ -719,12 +699,13 @@ func (d *nodeSyncDriver) phaseVerify() error {
 	}
 	d.report.NodeVerify = resp
 
-	for attempt := 0; attempt < nodeSyncRetries && verifyHasDelta(resp); attempt++ {
+	for attempt := 0; attempt < nodeSyncRetries && verifyHasDelta(resp) && !d.opts.DryRun; attempt++ {
 		failing := failingPaths(resp)
-		if len(failing) == 0 {
+		retry := d.retryable(failing)
+		if len(retry) == 0 {
 			break
 		}
-		if err := d.invokeRclone(failing); err != nil {
+		if err := d.uploadPaths(retry); err != nil {
 			return fmt.Errorf("retry %d transfer: %w", attempt+1, err)
 		}
 		resp, err = d.client.verify(d.ctx, syncproto.VerifyRequest{
@@ -737,6 +718,9 @@ func (d *nodeSyncDriver) phaseVerify() error {
 		d.report.NodeVerify = resp
 	}
 	if verifyHasDelta(resp) {
+		if !d.opts.DryRun {
+			d.recordFailedPaths(resp)
+		}
 		d.report.Status = store.RunStatusPartial
 		return nil
 	}
@@ -827,10 +811,16 @@ func dropSample(drops []DurabilityDrop) string {
 	return strings.Join(names, ", ")
 }
 
+// abortWithError fails the run and tells the receiver, so it commits what
+// landed and releases the volume. The /close is sent even when the run's
+// own context is done, and bounded by the stall timeout: a receiver still
+// finishing an abandoned upload answers only once that upload returns.
 func (d *nodeSyncDriver) abortWithError(phase string, err error) error {
 	d.report.Status = store.RunStatusFailed
 	if d.receiverRunID != 0 {
-		_ = d.client.close(d.ctx, syncproto.CloseRequest{
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(d.ctx), d.client.stallTimeout)
+		defer cancel()
+		_ = d.client.close(ctx, syncproto.CloseRequest{
 			ReceiverRunID: d.receiverRunID,
 			Status:        store.RunStatusFailed,
 		})
@@ -842,13 +832,22 @@ func (d *nodeSyncDriver) abortWithError(phase string, err error) error {
 // http.Client carries the optional TLS pin so the verifier sees the
 // node-specific fingerprint without leaking it into request paths.
 type nodeClient struct {
-	node   *config.Node
-	client *http.Client
+	node         *config.Node
+	client       *http.Client
+	stallTimeout time.Duration
 }
 
 func newNodeClient(n *config.Node) *nodeClient {
 	cli := &http.Client{Transport: buildTransport(n)}
-	return &nodeClient{node: n, client: cli}
+	return &nodeClient{node: n, client: cli, stallTimeout: peerUploadStallTimeout}
+}
+
+// url joins urlPath onto the node's configured endpoint path, so a node
+// reachable under a prefix (https://nas.local:8443/squirrel/) keeps it.
+func (c *nodeClient) url(urlPath string) string {
+	full := *c.node.Endpoint
+	full.Path = path.Join(c.node.Endpoint.Path, urlPath)
+	return full.String()
 }
 
 // buildTransport returns an http.Transport tuned for the node. When
@@ -919,22 +918,15 @@ func (c *nodeClient) durability(ctx context.Context, body syncproto.DurabilityRe
 	return resp, c.do(ctx, "/v1/sync/durability", body, &resp)
 }
 
-// do is the shared "POST JSON, decode JSON" implementation. The URL
-// is built by joining the configured endpoint's path with urlPath
-// (rather than concatenating raw strings, per CLAUDE.md) — a node
-// reachable at https://nas.local:8443/squirrel/ would dispatch to
-// https://nas.local:8443/squirrel/v1/sync/begin without leaking
-// either the prefix or the action name into request bodies.
-// Non-2xx responses surface as errors carrying the receiver's
-// `error` field when present.
+// do is the shared "POST JSON, decode JSON" implementation. Non-2xx
+// responses surface as errors carrying the receiver's `error` field when
+// present.
 func (c *nodeClient) do(ctx context.Context, urlPath string, body, out any) error {
-	full := *c.node.Endpoint
-	full.Path = path.Join(c.node.Endpoint.Path, urlPath)
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("encode %s: %w", urlPath, err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, full.String(), bytes.NewReader(encoded))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(urlPath), bytes.NewReader(encoded))
 	if err != nil {
 		return fmt.Errorf("new request %s: %w", urlPath, err)
 	}
@@ -946,13 +938,7 @@ func (c *nodeClient) do(ctx context.Context, urlPath string, body, out any) erro
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode/100 != 2 {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		var errBody syncproto.ErrorResponse
-		_ = json.Unmarshal(bodyBytes, &errBody)
-		if errBody.Error != "" {
-			return fmt.Errorf("%s: %s (%d)", urlPath, errBody.Error, resp.StatusCode)
-		}
-		return fmt.Errorf("%s: status %d", urlPath, resp.StatusCode)
+		return fmt.Errorf("%s: %s", urlPath, responseError(resp))
 	}
 	if out == nil {
 		return nil
@@ -961,12 +947,12 @@ func (c *nodeClient) do(ctx context.Context, urlPath string, body, out any) erro
 }
 
 // pathsInScope returns the relative paths from the plan whose
-// disposition needs rclone to deliver bytes — transfer, supersede,
-// conflict. Already-correct paths are skipped (no bytes need move).
-// Copy-from-existing paths are skipped too: the receiver has already
-// materialised them locally during pre-stage, and the initiator's
-// verify step picks them up via the receiver-side scope (which
-// includes them) rather than via a redundant rclone pass.
+// disposition needs the initiator to deliver bytes — transfer,
+// supersede, conflict. Already-correct paths are skipped (no bytes need
+// move). Copy-from-existing paths are skipped too: the receiver has
+// already materialised them locally during pre-stage, and the
+// initiator's verify step picks them up via the receiver-side scope
+// (which includes them) rather than via a redundant upload.
 func pathsInScope(plan syncproto.PlanResponse) []string {
 	out := make([]string, 0, len(plan.Dispositions))
 	for _, d := range plan.Dispositions {
@@ -995,46 +981,4 @@ func failingPaths(r syncproto.VerifyResponse) []string {
 
 func verifyHasDelta(r syncproto.VerifyResponse) bool {
 	return len(r.Mismatched) > 0 || len(r.Missing) > 0
-}
-
-// nodeRcloneDest builds the rclone destination URI for the given
-// volume under a node. The node's Path field is treated as an
-// rclone-style prefix: absolute filesystem path, or "remote:path".
-// We never pass `.squirrel-history` through here — the receiver owns
-// that directory.
-func nodeRcloneDest(node *config.Node, volumeName string) string {
-	joined := path.Join(node.Path, volumeName)
-	if len(joined) > 0 && joined[len(joined)-1] != '/' {
-		joined += "/"
-	}
-	return joined
-}
-
-// writeFilesFrom writes the given relative paths to a temp file and
-// returns the path. The caller invokes cleanup() to remove the file
-// once rclone has been launched (rclone reads the list in full at
-// startup so deferring is safe).
-func writeFilesFrom(paths []string) (string, func(), error) {
-	dir, err := os.MkdirTemp("", "squirrel-files-from-")
-	if err != nil {
-		return "", func() {}, err
-	}
-	listPath := filepath.Join(dir, "list")
-	f, err := os.Create(listPath)
-	if err != nil {
-		_ = os.RemoveAll(dir)
-		return "", func() {}, err
-	}
-	for _, p := range paths {
-		if _, err := f.WriteString(p + "\n"); err != nil {
-			_ = f.Close()
-			_ = os.RemoveAll(dir)
-			return "", func() {}, err
-		}
-	}
-	if err := f.Close(); err != nil {
-		_ = os.RemoveAll(dir)
-		return "", func() {}, err
-	}
-	return listPath, func() { _ = os.RemoveAll(dir) }, nil
 }

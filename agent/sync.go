@@ -119,6 +119,13 @@ type peerSession struct {
 	// (and the CLI rendering downstream) is deterministic instead of
 	// reflecting the map iteration order.
 	conflictOrder []string
+	// uploads counts content uploads in flight. /close waits on it, so
+	// no upload lands after the session has committed.
+	uploads sync.WaitGroup
+	// landedMu guards landed: the paths an upload materialised with bytes
+	// that hashed to their digest. A failed close commits exactly these.
+	landedMu sync.Mutex
+	landed   map[string]struct{}
 }
 
 // sessionEntry is one path's state across the session: the
@@ -175,6 +182,7 @@ func (r *peerSyncRouter) register(mux *http.ServeMux) {
 	mux.Handle("POST /v1/sync/begin", r.srv.requireBearer(http.HandlerFunc(r.handleBegin)))
 	mux.Handle("POST /v1/sync/plan", r.srv.requireBearer(http.HandlerFunc(r.handlePlan)))
 	mux.Handle("POST /v1/sync/plan-folders", r.srv.requireBearer(http.HandlerFunc(r.handlePlanFolders)))
+	mux.Handle("PUT /v1/sync/content/{run}/{blake3}", r.srv.requireBearer(http.HandlerFunc(r.handlePutContent)))
 	mux.Handle("POST /v1/sync/verify", r.srv.requireBearer(http.HandlerFunc(r.handleVerify)))
 	mux.Handle("POST /v1/sync/close", r.srv.requireBearer(http.HandlerFunc(r.handleClose)))
 	mux.Handle("POST /v1/sync/durability", r.srv.requireBearer(http.HandlerFunc(r.handleDurability)))
@@ -401,10 +409,10 @@ func (r *peerSyncRouter) finishBegin(ctx context.Context, body syncproto.BeginRe
 // An initiator that omits the field (or sends zero) is treated as
 // ProtocolVersionFlat — the only behaviour we ever spoke before #44.
 // A future initiator that asks for a version this receiver doesn't
-// know is clamped down to ProtocolVersionMerkleWalk rather than
-// rejected, so a partial rollout doesn't break syncs.
+// know is clamped down to receiverMax rather than rejected, so a partial
+// rollout doesn't break syncs.
 func negotiateProtocol(requested int) int {
-	const receiverMax = syncproto.ProtocolVersionContested
+	const receiverMax = syncproto.ProtocolVersionInlineTransfer
 	if requested <= 0 {
 		return syncproto.ProtocolVersionFlat
 	}
@@ -517,6 +525,9 @@ func (r *peerSyncRouter) planSession(ctx context.Context, sess *peerSession, ent
 	if err != nil {
 		return syncproto.PlanResponse{}, fmt.Errorf("look up self node: %w", err)
 	}
+	if err := validateContentSizes(entries); err != nil {
+		return syncproto.PlanResponse{}, err
+	}
 	for _, e := range entries {
 		if err := validateRelPath(e.Path); err != nil {
 			return syncproto.PlanResponse{}, fmt.Errorf("path %q: %w", e.Path, err)
@@ -583,6 +594,30 @@ func (r *peerSyncRouter) planSession(ctx context.Context, sess *peerSession, ent
 	}
 	resp.Contested = contested
 	return resp, nil
+}
+
+// validateContentSizes refuses a plan that declares one digest at two
+// sizes. Equal digests are equal bytes, and an upload is bounded by the
+// one size its digest was declared at.
+func validateContentSizes(entries []syncproto.IndexEntry) error {
+	type declared struct {
+		path string
+		size int64
+	}
+	seen := make(map[string]declared, len(entries))
+	for _, e := range entries {
+		key := strings.ToLower(e.Blake3Hex)
+		prior, ok := seen[key]
+		if !ok {
+			seen[key] = declared{path: e.Path, size: e.SizeBytes}
+			continue
+		}
+		if prior.size != e.SizeBytes {
+			return fmt.Errorf("content %s is declared as %d bytes at %q and %d bytes at %q",
+				e.Blake3Hex, prior.size, prior.path, e.SizeBytes, e.Path)
+		}
+	}
+	return nil
 }
 
 // collectContested builds the wire-format contested list from the entries
@@ -998,8 +1033,8 @@ func (r *peerSyncRouter) dispositionForExisting(ctx context.Context, sess *peerS
 // When the source path is gone from disk (drift between the index
 // observation and the sync) the entry is silently downgraded to
 // Transfer: the response builder later picks up the corrected
-// disposition, and the initiator delivers the bytes via rclone on
-// the same /plan→/verify cycle. Any other I/O error aborts the plan
+// disposition, and the initiator uploads the bytes in the same
+// /plan→/verify cycle. Any other I/O error aborts the plan
 // after unlinking every destination this pre-stage already
 // materialised — partial mutation of the receiver volume is worse
 // than no mutation when /plan is going to fail, and rolling back
@@ -1064,11 +1099,6 @@ func (r *peerSyncRouter) preStageCopyFromExisting(sess *peerSession) error {
 			if errors.Is(err, os.ErrNotExist) {
 				entry.disposition = syncproto.DispositionTransfer
 				entry.copyFromPath = ""
-				// Any out-of-band file we just moved to history stays
-				// there — the next pipeline phase (Transfer via rclone
-				// or the initiator's blob endpoint) writes a fresh
-				// dstAbs, and the user's prior bytes remain reachable
-				// under run-<id>/.
 				continue
 			}
 			rollback()
@@ -1154,10 +1184,9 @@ func copyFileToPath(srcAbs, dstAbs string, mtimeNs int64) error {
 
 // preMoveSupersedes copies prior bytes for every supersede-bucket
 // path into .squirrel-history/run-<receiverRunID>/ before /verify
-// runs. This mirrors the bucket-side `rclone --backup-dir`
-// invariant: the receiver owns the move (since rclone drops the
-// flag for node syncs), and the move happens up front so verify
-// re-hashes a clean tree.
+// runs. This is the receiver's counterpart of the bucket-side
+// `rclone --backup-dir` invariant: the receiver owns the move, and the
+// move happens up front so verify re-hashes a clean tree.
 //
 // classify chose Supersede by reading the index, so the bytes on disk
 // are re-hashed here before they are moved: if they drifted out-of-band
@@ -1221,12 +1250,11 @@ func downgradeToConflict(entry *sessionEntry) {
 }
 
 // preStageConflicts handles every conflict-disposition path before
-// rclone runs:
+// the initiator uploads:
 //
 //  1. Move the prior bytes from <path> to
 //     .squirrel-conflicts/run-<receiverRunID>/<path>. This frees the
-//     original path so rclone can deliver the initiator's bytes
-//     without `--inplace` games.
+//     original path for the initiator's bytes.
 //  2. Atomically supersede the original-path row and insert the
 //     conflict-path row carrying the prior blake3 + prior provenance,
 //     so the losing version stays reachable by hash and by path.
@@ -1339,17 +1367,16 @@ func priorProvenance(r *store.FileRow) *store.Provenance {
 	return &store.Provenance{NodeID: r.OriginNodeID.Int64, RunID: r.OriginRunID.Int64}
 }
 
-// preStageTransfers preserves out-of-band bytes that rclone is about to
-// overwrite at a Transfer destination. classify chose Transfer because
+// preStageTransfers preserves out-of-band bytes that an upload is about
+// to replace at a Transfer destination. classify chose Transfer because
 // the receiver has no live (present) index row at the path, yet a
 // regular file can still exist there (dropped in by a web app, scp, or
-// created since the last index). Without this move the upcoming rclone
-// copy — which runs with no --backup-dir for node syncs — would destroy
-// those bytes with no history. The guard mirrors the one
+// created since the last index). Without this move the upload's rename
+// would destroy those bytes with no history. The guard mirrors the one
 // preStageCopyFromExisting applies to its own destinations: Lstat,
 // then move any regular file into .squirrel-history/run-<receiverRunID>/.
 //
-// This is a move-only pass (rclone delivers the bytes after /plan
+// This is a move-only pass (the initiator uploads the bytes after /plan
 // returns), so a failure aborts the plan with the already-moved files
 // left under run-<id>/ — recoverable by the operator, and the next
 // /plan replans the same Transfer.
@@ -1437,6 +1464,7 @@ func (r *peerSyncRouter) verifySession(sess *peerSession, scope []string) (syncp
 		actual, err := hashOnDisk(abs)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
+				sess.unmarkLanded(p)
 				resp.Missing = append(resp.Missing, p)
 				continue
 			}
@@ -1446,6 +1474,7 @@ func (r *peerSyncRouter) verifySession(sess *peerSession, scope []string) (syncp
 			resp.Matched = append(resp.Matched, p)
 			continue
 		}
+		sess.unmarkLanded(p)
 		resp.Mismatched = append(resp.Mismatched, syncproto.VerifyMismatch{
 			Path:        p,
 			ExpectedHex: hex.EncodeToString(entry.blake3),
@@ -1536,10 +1565,12 @@ func (r *peerSyncRouter) handleClose(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	defer r.releaseVolumeLock(sess.volumeID)
+	sess.uploads.Wait()
 
-	committed, err := r.closeSession(req.Context(), sess, body.Status, body.FailedPaths)
+	ctx := context.WithoutCancel(req.Context())
+	committed, err := r.closeSession(ctx, sess, body.Status, body.FailedPaths)
 	if err != nil {
-		r.finalizeFailedClose(req.Context(), sess.receiverRunID, committed, err)
+		r.finalizeFailedClose(ctx, sess.receiverRunID, committed, err)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -1573,10 +1604,10 @@ func (r *peerSyncRouter) finalizeFailedClose(ctx context.Context, runID int64, c
 		"run_id", runID, "err", err.Error(), "cause", cause.Error())
 }
 
-// closeSession persists the new file rows for every path the receiver
-// expected bytes at post-pre-stage (transfer + supersede + conflict +
-// copy-from-existing) that did not appear in failedPaths, advances the
-// watermark on success, and finalises the receiver-side runs row.
+// closeSession persists the new file rows for every path the session
+// commits (see peerSession.commits) that did not appear in failedPaths,
+// advances the watermark on success, and finalises the receiver-side
+// runs row.
 // Returns the number of file rows the function wrote, distinct from
 // the original plan size when some paths were dropped due to verify
 // mismatch.
@@ -1592,7 +1623,7 @@ func (r *peerSyncRouter) closeSession(ctx context.Context, sess *peerSession, st
 	origins := newOriginResolver(r.srv.store, sess)
 	committed := 0
 	for path, entry := range sess.dispositions {
-		if !materializesAtPath(entry.disposition) {
+		if !sess.commits(path, entry, status) {
 			continue
 		}
 		if _, dropped := skip[path]; dropped {
@@ -1686,12 +1717,12 @@ func decodeJSON(w http.ResponseWriter, req *http.Request, v any) error {
 }
 
 // materializesAtPath reports whether the receiver expects bytes at the
-// path once pre-stage finishes (whether delivered by rclone for
-// transfer/supersede/conflict or by the local copy for
-// copy-from-existing). Verify uses it to pick which paths to re-hash,
-// close uses it to pick which paths warrant a new live row; keeping
-// the two in lockstep means a successful local copy is committed with
-// the same provenance shape as a successful rclone transfer.
+// path once pre-stage finishes: uploaded by the initiator for
+// transfer/supersede/conflict, copied locally for copy-from-existing.
+// Verify uses it to pick which paths to re-hash, close to pick which
+// paths warrant a new live row, and the content endpoint to pick which
+// paths an upload may satisfy — copy-from-existing included, so a retry
+// can repair a local copy that failed or vanished.
 func materializesAtPath(disposition string) bool {
 	switch disposition {
 	case syncproto.DispositionTransfer,

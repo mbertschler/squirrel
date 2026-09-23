@@ -23,7 +23,7 @@ const (
 )
 
 // newConfigCheckCmd returns `squirrel config check`: parse + resolve the
-// whole config (env vars included), stat volume paths and node byte-paths,
+// whole config (env vars included), stat volume paths,
 // validate offload policies against target capabilities, and print an
 // affirmative summary (F4). It is strictly read-only — it never creates a
 // path, cert, or database — per the "CLI is for change and for questions"
@@ -69,7 +69,7 @@ func runConfigCheck(cmd *cobra.Command) error {
 	var tally checkTally
 	checkVolumes(cfg, out, &tally)
 	checkDestinations(cfg, out)
-	checkNodes(cfg, out, &tally)
+	checkNodes(cfg, out)
 	checkOffloadPolicies(cfg, out, &tally)
 
 	return printSummary(out, cfg, tally)
@@ -109,13 +109,14 @@ func checkDestinations(cfg *config.Config, out io.Writer) {
 	}
 }
 
-func checkNodes(cfg *config.Config, out io.Writer, tally *checkTally) {
+func checkNodes(cfg *config.Config, out io.Writer) {
 	fmt.Fprintf(out, "nodes (%d)\n", len(cfg.Nodes))
 	for _, name := range sortedKeys(cfg.Nodes) {
 		n := cfg.Nodes[name]
-		status, detail := statNodeBytePath(n)
-		tally.add(status)
-		printCheckLine(out, status, name, joinDetail(n.Endpoint.String(), detail))
+		// A node resolves to one endpoint and nothing else to stat: bytes
+		// and plan both travel over it, so whether the peer answers is a
+		// sync-time concern, exactly as a destination's reachability is.
+		printCheckLine(out, statusOK, name, n.Endpoint.String())
 	}
 }
 
@@ -193,28 +194,6 @@ func statVolumePath(path string) (status, detail string) {
 		return statusWarn, "empty directory — new volume or wrong mount?"
 	}
 	return statusOK, ""
-}
-
-// statNodeBytePath renders a node's byte-path verdict (F34) as this
-// command's status word plus a detail suffix. The rules themselves live in
-// config.Node.CheckBytePath, which the status build also calls — one set of
-// rules about what a byte-path may be, two renderings of the answer.
-//
-// A missing local mount is advisory rather than fatal: the share may
-// legitimately be down when the check runs. A node no volume syncs to is
-// reported plainly, not as an omission — it is the durability-pull-only
-// relationship, which moves no bytes and needs no path.
-func statNodeBytePath(n *config.Node) (status, detail string) {
-	state, reason := n.CheckBytePath()
-	switch state {
-	case config.BytePathNone:
-		return statusOK, "no byte-path (" + reason + ")"
-	case config.BytePathRemote:
-		return statusOK, "byte-path " + n.Path + " (" + reason + ")"
-	case config.BytePathUnavailable:
-		return statusWarn, "byte-path " + n.Path + " (" + reason + ")"
-	}
-	return statusOK, "byte-path " + n.Path
 }
 
 // dirIsEmpty reports whether dir contains no entries, reading just one name

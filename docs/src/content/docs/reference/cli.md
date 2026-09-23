@@ -35,7 +35,7 @@ squirrel destination reset <dest>    [--yes] [--dry-run]
 squirrel audit   [<volume>]          [--deep | --folders]
 squirrel config check
 squirrel node pair <peer>            [--local-endpoint URL] [--peer-endpoint URL]
-                                     [--peer-fingerprint sha256:HEX] [--peer-path PATH]
+                                     [--peer-fingerprint sha256:HEX]
 squirrel peer-sync history <volume> <peer>
 squirrel peer-sync pull-durability <volume> <peer> [--allow-rewind]
 squirrel db backup                   [--to PATH] [--keep N]
@@ -108,7 +108,7 @@ Optional single positional. No arg = every `(volume, destination)` pair; one arg
 | Flag | Default | Meaning |
 |---|---|---|
 | `--to` | all | Limit to this destination name. |
-| `--shallow` | `false` | Skip BLAKE3 verification; trust rclone's size+mtime comparison. |
+| `--shallow` | `false` | Skip BLAKE3 verification on bucket destinations; trust rclone's size+mtime comparison. A peer sync hashes every byte on both ends regardless. |
 | `--dry-run` | `false` | Preview rclone actions without transferring; no runs row is written. |
 | `--init` | `false` | Authorise first-use destination bootstrap. |
 | `--progress`, `-P` | auto on a TTY | Show live transfer progress (files, bytes, rate, ETA). |
@@ -200,14 +200,8 @@ check without parsing the grid:
 | Exit | Level | Meaning |
 |---|---|---|
 | `0` | green / neutral | Caught up within cadence and durable where policy requires; nothing to report. |
-| `1` | amber | Not caught up yet, needs a one-time bootstrap, has a peer byte-path that does not currently resolve, evidence aged past policy, or the agent's config has drifted from the file on disk. Recoverable and expected. |
+| `1` | amber | Not caught up yet, needs a one-time bootstrap, evidence aged past policy, or the agent's config has drifted from the file on disk. Recoverable and expected. |
 | `2` | red | A latched alarm, a failed or regressed sync, or a pair far past its cadence. |
-
-A target sitting on a peer node also reports `byte-path` when that node's
-configured [`path`](/squirrel/reference/configuration/) does not currently
-resolve to a directory — bytes cannot land until it does, and the symptom
-otherwise is only that transfers never arrive. It is checked on every status
-build rather than cached, so a mount coming back is reflected immediately.
 
 Passing a volume name scopes both the grid and the exit code to that volume, so
 a per-volume check is not reddened by an unrelated one. Config drift is the one
@@ -551,8 +545,9 @@ nodes (0)
 1 volumes, 1 destinations, 0 nodes — all resolvable
 ```
 
-It also stats each node's byte-path and flags one that is missing, catching the
-out-of-band mount assumption before bytes silently fail to land.
+Nodes report their endpoint. Whether a peer answers is a sync-time question,
+not one a read-only check can settle — the same way a destination's remote
+reachability is left to the sync that needs it.
 
 ---
 
@@ -582,7 +577,6 @@ they match by construction.
 | `--local-endpoint` | — | This node's agent endpoint as the peer dials it (e.g. `https://nas.home:8443`). |
 | `--peer-endpoint` | — | The peer's agent endpoint. |
 | `--peer-fingerprint` | — | The peer's TLS cert fingerprint (`sha256:…`), as printed by [`agent cert`](#squirrel-agent-cert). |
-| `--peer-path` | — | The byte-path where this node mounts the peer's data. |
 
 It **emits** config; it never edits a file. Paste each half into the machine it
 names.

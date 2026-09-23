@@ -522,7 +522,7 @@ any node stops refreshing when nothing changes — exactly when
 freshness needs its own cadence, not a piggyback.
 
 **F34 · S3 — ~~the node byte-path is an unvalidated, undocumented
-out-of-band contract.~~ (#171, #195)** `[nodes.X] path` silently assumed an
+out-of-band contract.~~ (#171, #195; fully closed by the v4 peer transport)** `[nodes.X] path` silently assumed an
 SMB/NFS mount or rclone-style prefix that squirrel neither validated at
 load time nor mentioned when it was wrong (bytes just failed to land); the
 htpc even needed a `[nodes.nas]` entry with a mandatory `path` that no
@@ -538,10 +538,14 @@ shows as amber `byte-path` on the target in `squirrel status` and the TUI,
 so it is visible without choosing to run a command. Amber, not red, because
 the usual cause is a mount that is not up yet and resolves on its own.
 
-The out-of-band part is inherent and stays: squirrel can stat the local end,
-but whether the mount points where the operator believes is not checkable
-from here. `reference/configuration.md` now says so rather than leaving it
-implied.
+*Closed outright by the v4 peer transport.* The residue above — "the
+out-of-band part is inherent and stays" — was only inherent to having a
+second transport. Peer syncs now stream their bytes to the node's
+`endpoint` alongside the plan, so there is no byte-path: `path` is gone
+from `[nodes.X]` (an obsolete one is rejected by name at load), and with it
+`CheckBytePath`, the amber `byte-path` standing, the `config check` stat,
+and the `--peer-path` scaffold flag. One address, one trust anchor, nothing
+left for squirrel to be unable to verify.
 
 **F35 · S3 — ~~cadence-only machines must still run the full agent.~~ (fixed in #175)**
 A machine that never receives (laptop) runs the HTTP listener and

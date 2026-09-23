@@ -16,6 +16,44 @@ destinations, so a node can trust that content is durable on a target that only
 a *peer* pushes to. This feeds the [offload](/squirrel/guides/offloading/)
 durability gate.
 
+## How the bytes travel
+
+A peer sync is one conversation over one connection. The initiator opens a
+session against the peer's `endpoint`, negotiates a per-path plan, streams
+each content object it owes straight to that same endpoint, and asks the
+receiver to verify and commit. Bearer token, TLS, and the optional
+certificate pin cover the transfer exactly as they cover the plan — there is
+no second address to configure and no second trust anchor to get right.
+
+Two properties fall out of keying the transfer by content hash rather than
+by path:
+
+- **Duplicate files cross the wire once.** Several paths wanting the same
+  BLAKE3 in one run are satisfied by a single upload, which the receiver
+  fans out locally.
+- **The receiver is the authority on what landed.** It hashes the stream as
+  it writes and refuses anything that does not match the digest it was
+  addressed to, so a file edited between indexing and sending is rejected
+  rather than stored under the wrong hash. The verify phase then re-reads
+  what is on disk, and only a clean verify advances durability.
+
+A problem with one file costs only that file. If it was deleted or rewritten
+since it was indexed, or the receiver cannot take its bytes, the run ends
+**partial**: it names the path and why, and commits everything else. A
+receiver-side failure is retried within the run; a local file that changed
+waits for the next index. The run gives up on the peer as a whole only when
+the peer itself is unwell — several uploads in a row failing, or one it stops
+taking for ten minutes, as a hung disk behind a live agent would. Either way
+the receiver keeps every upload it verified on the way in, so the next run
+picks up where this one stopped rather than starting over.
+
+Peer sync uses no external binary — [rclone](/squirrel/start/install/) is for
+bucket destinations. A machine whose only targets are peers needs none
+installed.
+
+Both ends must speak peer-sync protocol v4 or later. An older peer is refused
+with an upgrade instruction rather than silently degraded.
+
 ## Watermark history
 
 ```sh

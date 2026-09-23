@@ -3,11 +3,8 @@ package config
 import (
 	"errors"
 	"fmt"
-	"maps"
 	"net/url"
-	"os"
 	"regexp"
-	"slices"
 	"strings"
 	"time"
 
@@ -24,26 +21,16 @@ import (
 // receiver's TLS certificate — when set, the initiator verifies the
 // presented cert's SHA-256 fingerprint against this value before
 // trusting the connection (self-signed certs are normal for LAN
-// agents; pinning is the trust anchor in lieu of a CA chain). Path
-// is the rclone-URI prefix the initiator copies bytes into, joined
-// with `/<volume>/<file-path>` per transfer; it lives in the node
-// block (not derived from the endpoint) because the HTTP API and the
-// rclone-reachable filesystem are independent concerns.
+// agents; pinning is the trust anchor in lieu of a CA chain).
+//
+// Bytes travel over this same endpoint: the initiator PUTs each content
+// object to the peer-sync API, so a peer is reached by exactly one
+// address with exactly one trust anchor.
 type Node struct {
 	Name            string
 	Endpoint        *url.URL
 	Token           string
 	CertFingerprint string
-	// Path is required only of a node some volume actually syncs to —
-	// the one relationship that moves bytes through it. A node this
-	// machine only pulls durability evidence from carries no bytes, so
-	// demanding a byte-path for it would make the operator invent one to
-	// satisfy a validator, teaching them the field does not matter about
-	// a field that silently eats bytes when it is wrong (F34). Empty
-	// therefore means "no bytes traverse this relationship", and
-	// resolve() rejects an empty Path only for a node named in some
-	// volume's sync_to.
-	Path string
 	// DedupStrategy is the initiator's preference for receiver-side
 	// content-addressable dedup when syncing to this peer. Resolved
 	// values are "copy" (default, lets the receiver materialise a
@@ -67,8 +54,14 @@ type Node struct {
 // it transparently — accepting either a literal string or
 // `{ env = "VAR" }`.
 type rawNode struct {
-	Endpoint            string       `toml:"endpoint"`
-	Path                string       `toml:"path"`
+	Endpoint string `toml:"endpoint"`
+	// Path is accepted only so an obsolete `path` can be rejected by
+	// name. Bytes travel over the endpoint now; leaving the key to the
+	// decoder's strict mode would report it as an unrecognised field and
+	// leave the operator guessing whether they had typoed it. A pointer
+	// so presence is what triggers the rejection — `path = ""` is a line
+	// to delete just as much as one naming a mount.
+	Path                *string      `toml:"path"`
 	DedupStrategy       string       `toml:"dedup_strategy"`
 	PullDurabilityEvery string       `toml:"pull_durability_every"`
 	Auth                *rawNodeAuth `toml:"auth"`
@@ -81,88 +74,6 @@ type rawNodeAuth struct {
 
 type rawNodeTLS struct {
 	CertFingerprint string `toml:"cert_fingerprint"`
-}
-
-// validateNodeBytePaths rejects a node that receives bytes but has no
-// byte-path to receive them into. `path` is optional on the node block
-// itself (F34) because whether bytes traverse a relationship is a property
-// of the volumes, not of the node — so the requirement is enforced exactly
-// where it is true: a node named in some volume's sync_to. Volumes are
-// walked in name order so a config with several holes reports the same one
-// first on every load.
-func validateNodeBytePaths(cfg *Config) error {
-	for _, vname := range slices.Sorted(maps.Keys(cfg.Volumes)) {
-		for _, target := range cfg.Volumes[vname].SyncTo {
-			node, ok := cfg.Nodes[target]
-			if !ok || node.Path != "" {
-				continue
-			}
-			return fmt.Errorf("nodes.%s: path is required because volumes.%s syncs to it "+
-				"(rclone target prefix the initiator copies bytes into)", target, vname)
-		}
-	}
-	return nil
-}
-
-// BytePathState classifies what squirrel can currently say about a node's
-// byte-path. It exists so the one reader below can serve both `config
-// check` and the status surfaces without either re-implementing the
-// stat rules — and so neither has to guess what an empty Path means.
-type BytePathState int
-
-const (
-	// BytePathOK: the path resolves to a directory on this machine.
-	BytePathOK BytePathState = iota
-	// BytePathNone: no byte-path is configured, and none is needed — no
-	// volume syncs to this node, so nothing ever copies bytes into it.
-	BytePathNone
-	// BytePathRemote: an rclone remote spec (`remote:path`). Reaching it
-	// means asking rclone, which is a transfer-time concern, not something
-	// a local read-only check can answer.
-	BytePathRemote
-	// BytePathUnavailable: the path is a local one that does not currently
-	// resolve to a directory. Amber, not red: the commonest cause is a
-	// mount that is not up yet, which resolves on its own.
-	BytePathUnavailable
-)
-
-// CheckBytePath reports what can be determined about this node's
-// byte-path right now, with a short human reason for the states that carry
-// one. It is a point-in-time read of the filesystem, deliberately: a
-// network mount can come and go under a running agent, so no caller may
-// cache the answer.
-//
-// Both `squirrel config check` and the status build call this, which is
-// what keeps one set of rules about what a byte-path may look like — an
-// absolute directory, an rclone remote spec, or legitimately absent.
-func (n *Node) CheckBytePath() (BytePathState, string) {
-	if n.Path == "" {
-		return BytePathNone, "no bytes are synced to this node"
-	}
-	if isRcloneRemoteSpec(n.Path) {
-		return BytePathRemote, "rclone remote spec — not checked"
-	}
-	info, err := os.Stat(n.Path)
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-		return BytePathUnavailable, "does not exist — mount not up?"
-	case err != nil:
-		return BytePathUnavailable, err.Error()
-	case !info.IsDir():
-		return BytePathUnavailable, "not a directory"
-	}
-	return BytePathOK, ""
-}
-
-// isRcloneRemoteSpec reports whether p is an rclone "remote:path" reference
-// rather than a filesystem path. An absolute path (leading /) is always a
-// filesystem path; otherwise a leading "name:" segment marks a remote.
-func isRcloneRemoteSpec(p string) bool {
-	if strings.HasPrefix(p, "/") {
-		return false
-	}
-	i := strings.IndexByte(p, ':')
-	return i > 0
 }
 
 // fingerprintRE pins the cert_fingerprint shape to `sha256:<hex>` so
@@ -191,6 +102,9 @@ func resolveNode(name string, r *rawNode) (*Node, error) {
 	if !nameRE.MatchString(name) {
 		return nil, fmt.Errorf("invalid node name (must match %s)", nameRE)
 	}
+	if r.Path != nil {
+		return nil, errors.New("path is obsolete: peer syncs now stream bytes over the node's endpoint, so there is no separate byte-path to configure — delete the line")
+	}
 	if r.Endpoint == "" {
 		return nil, errors.New("endpoint is required")
 	}
@@ -204,9 +118,6 @@ func resolveNode(name string, r *rawNode) (*Node, error) {
 	if u.Host == "" {
 		return nil, errors.New("endpoint: host is required")
 	}
-	// Path is deliberately not required here: whether this node ever
-	// receives bytes is a property of the volumes, not of the node block,
-	// so the check belongs to resolve() once sync_to is known.
 	if r.Auth == nil || r.Auth.Bearer == nil {
 		return nil, errors.New("auth.bearer is required")
 	}
@@ -232,7 +143,6 @@ func resolveNode(name string, r *rawNode) (*Node, error) {
 		Name:                name,
 		Endpoint:            u,
 		Token:               tok,
-		Path:                r.Path,
 		DedupStrategy:       strategy,
 		PullDurabilityEvery: pullEvery,
 	}

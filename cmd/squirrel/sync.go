@@ -62,23 +62,22 @@ func runSync(cmd *cobra.Command, volumeName, destinationName string, progress bo
 	}
 	defer s.Close()
 
-	rcl, err := sync.Find()
-	if err != nil {
-		return err
+	var rcl *sync.Rclone
+	if pairsNeedRclone(pairs) {
+		rcl, err = sync.Find()
+		if err != nil {
+			return err
+		}
 	}
 	tools, err := sync.ToolsFor(cfg, pairs, rcl)
 	if err != nil {
 		return err
 	}
 	out := cmd.OutOrStdout()
-	if opts.Shallow {
-		fmt.Fprintln(out, shallowSyncWarning)
-	}
-	// Skip the rclone preamble entirely when every pair targets kopia:
-	// kopia never invokes rclone, so a version check is pointless and
-	// "rclone.conf updated" is misleading noise on a kopia-only sync
-	// (friction F11b).
-	if pairsNeedRclone(pairs) {
+	if rcl != nil {
+		if opts.Shallow {
+			fmt.Fprintln(out, shallowSyncWarning)
+		}
 		if err := sync.EnsureMinVersion(cmd.Context(), rcl, out, sync.ShallowForPairs(pairs, opts.Shallow)); err != nil {
 			return err
 		}
@@ -153,13 +152,14 @@ func rcloneConfigPathFor(cfg *config.Config) string {
 }
 
 // pairsNeedRclone reports whether any pair in the batch drives rclone.
-// Peer nodes (Destination nil) transfer bytes with rclone, as do every
-// non-kopia bucket destination; only a batch composed entirely of kopia
-// destinations skips rclone. Used to suppress the rclone preamble on a
-// kopia-only sync (F11b).
+// Every non-kopia bucket destination does; kopia drives its own binary
+// and a peer node streams its bytes over the sync API, so a batch of
+// those alone starts on a host without rclone and prints none of its
+// preamble: no version check, no "rclone.conf updated" line, no
+// --shallow warning (F11b).
 func pairsNeedRclone(pairs []sync.Pair) bool {
 	for _, p := range pairs {
-		if p.Destination == nil || p.Destination.Type != "kopia" {
+		if p.Destination != nil && p.Destination.Type != "kopia" {
 			return true
 		}
 	}

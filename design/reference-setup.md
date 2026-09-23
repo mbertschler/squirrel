@@ -199,7 +199,6 @@ password = { env = "KOPIA_REPO_PASSWORD" }
 
 [nodes.htpc]
 endpoint = "https://htpc.home:8443"
-path     = "/mnt/htpc-export"         # htpc's data dir, NFS-mounted on the nas
 [nodes.htpc.auth]
 bearer = { env = "SQUIRREL_PEER_HTPC" }
 [nodes.htpc.tls]
@@ -231,7 +230,6 @@ sync_every = "1h"
 
 [nodes.nas]
 endpoint = "https://nas.home:8443"
-path     = "/Volumes/squirrel"        # the nas volume share, SMB-mounted
 [nodes.nas.auth]
 bearer = { env = "SQUIRREL_PEER_LAPTOP" }
 [nodes.nas.tls]
@@ -279,8 +277,7 @@ path = "/data/photos"
 
 [nodes.nas]                            # not in any sync_to: exists so the
 endpoint              = "https://nas.home:8443"  # htpc can *pull durability*
-path                  = "/mnt/nas-export"        # from nas …
-pull_durability_every = "24h"          # … on its own clock (F33), so the
+pull_durability_every = "24h"          # from nas on its own clock (F33), so the
                                        # media offload gate's relayed
                                        # s3archive evidence stays fresh with
                                        # zero typed commands
@@ -311,9 +308,9 @@ bootstrap the household should run itself. Today's coverage:
 The moments the testbed walk has to cover, in rough story order:
 
 1. **Bootstrap day** — five configs written by hand; tokens generated
-   and distributed; TLS certs created and fingerprints pinned; SMB/NFS
-   byte-paths mounted; `sync --init` per fresh destination. How many
-   steps, how many chances to get one silently wrong?
+   and distributed; TLS certs created and fingerprints pinned;
+   `sync --init` per fresh destination. How many steps, how many chances
+   to get one silently wrong?
 2. **First full push** — terabytes to two offsites over home upload
    bandwidth: interruptions, resume, progress visibility over days.
 3. **Steady state** — a week of untyped operation; does the TUI answer

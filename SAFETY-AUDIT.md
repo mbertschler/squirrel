@@ -27,10 +27,11 @@ Every one of the 22 round-one findings was re-checked against the tree in
 August 2026 — behaviour spot-checked in the code, not inferred from issue
 titles. The result:
 
-- **18 discharged** — 17 by a shipped fix, one (M4) dissolved by a schema
-  change that removed the mutable field the finding was about.
+- **19 discharged** — 17 by a shipped fix, one (M4) dissolved by a schema
+  change that removed the mutable field the finding was about, and one
+  (L3) dissolved when peer syncs stopped running rclone.
 - **2 partial** — C3 and M8, detailed below.
-- **2 open** — M7 and L3, detailed below.
+- **1 open** — M7, detailed below.
 
 Nothing in the Critical or High tiers is open.
 
@@ -45,7 +46,6 @@ fingerprint narrowed the gap; the [D2 status note](#d2) has the detail.
 | Finding | Why it is still open |
 |---|---|
 | **M7** — orphan-volume warning is only a warning | `warnOrphanVolumes` (`cmd/squirrel/root.go`) still only prints a stderr advisory; nothing refuses to run and there is no acknowledgement to clear. The latch-then-acknowledge shape this needs now exists twice over (`destination_alarms` + `verify ack`; `contested_paths` + `conflicts resolve`), so closing it is wiring, not design. See [principle 4](design/ux-principles.md#4-scary-moments-are-first-class-ux). |
-| **L3** — no rclone-version gate on restore-from-node | Still prospective, as written: `restoreFromNode` does not exist, so there is nothing to gate. `runRestore` now calls `EnsureMinVersion` unconditionally before any transfer, so a restore-from-node routed through that command would inherit the gate for free; a separate code path would not. Keep the placeholder. |
 
 ### Partial
 
@@ -223,10 +223,12 @@ missing findings. There have always been exactly 22.)
     UUID-based name.
     → tracked in [#79](https://github.com/mbertschler/squirrel/issues/79),
     fixed in [#82](https://github.com/mbertschler/squirrel/pull/82)
-22. ○ [#L3](#l3-no-pre-flight-rclone-version-check-for-restore-from-node)
+22. ✅ [#L3](#l3-no-pre-flight-rclone-version-check-for-restore-from-node)
     — restoreFromNode isn't yet implemented, but when it lands we need
     the same `EnsureMinVersion` gate the bucket path has.
-    → **still open, still prospective**: the feature does not exist yet
+    → **dissolved** by [#210](https://github.com/mbertschler/squirrel/pull/210):
+    bytes between peers travel over the sync API, so a restore from a
+    node has no rclone to gate
 
 ---
 
@@ -362,6 +364,15 @@ The finding's own aside — "the same risk exists on the disposition
 symmetric `preStageTransfers` pass, which applies the same Lstat-and-
 preserve treatment to every rclone-delivered path. Both passes now share
 the same contract.
+
+The finding's reasoning about *why* the Transfer path was less exposed —
+"rclone's `--checksum --hash blake3` would catch the divergence" — was
+wrong twice over, which is worth recording rather than quietly dropping.
+`--hash` is not a comparison-hash selector on `rclone copy` (it is the
+lsf report-format flag), so `--checksum` was in fact comparing MD5
+([#211](https://github.com/mbertschler/squirrel/issues/211)); and peer
+syncs no longer run rclone at all. `preStageTransfers` is what
+actually holds the contract, and it does not depend on the comparison.
 
 **Issue:** [#62 — agent: CopyFromExisting pre-stage must preserve any out-of-band file at the destination path](https://github.com/mbertschler/squirrel/issues/62)
 
@@ -1418,22 +1429,18 @@ fixed in [#82](https://github.com/mbertschler/squirrel/pull/82)
 **Mitigation**: Track in the issue tracker so the gate isn't forgotten
 when restoreFromNode lands.
 
-**Status:** **Open, and still prospective** — correctly so. `restoreFromNode`
-does not exist; `squirrel restore` always pulls from an rclone destination.
-`--from <node>` looks like the missing feature but is not: it filters the
-restore to paths whose *content originates* at that node, and the bytes
-still come from a destination.
+**Status:** **Dissolved** by
+[#210](https://github.com/mbertschler/squirrel/pull/210). `restoreFromNode`
+still does not exist — `squirrel restore` always pulls from an rclone
+destination, and `--from <node>` only filters the restore to paths whose
+*content originates* at that node — but the premise of the finding is
+gone. Peer syncs stream their bytes over the peer's sync API, where both
+ends hash every byte, and no longer run rclone at all, so a restore that
+pulls from a node would have no rclone version to gate. What such a
+restore does need is the same end-to-end hashing, which it gets by using
+that API rather than by remembering a flag.
 
-Two things have improved the odds since. `runRestore` now calls
-`EnsureMinVersion` unconditionally before any transfer, so a
-restore-from-node routed through that command inherits the gate without
-anyone remembering to add it; and the version gate is now shallow-aware
-(`EffectiveShallow`), so it checks the right minimum for the mode. A
-peer-API restore built as a separate path would still miss it. Keep the
-placeholder until the feature lands or is ruled out.
-
-**Issue:** `restore: ensure EnsureMinVersion runs in the restore-from-node path when implemented`
-→ **still open**; nothing to gate yet
+**Issue:** none needed; the premise no longer holds
 
 ---
 

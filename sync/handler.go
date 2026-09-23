@@ -63,7 +63,7 @@ type VerifyResult struct {
 func (v VerifyResult) Verified() bool { return v.verified }
 
 // Tools bundles the configured external-tool wrappers the curated
-// handlers drive. Rclone backs bucket and peer targets; Kopia backs
+// handlers drive. Rclone backs bucket targets; Kopia backs
 // kopia targets and is filled in by ToolsFor exactly when a pair needs
 // it.
 type Tools struct {
@@ -114,10 +114,7 @@ type Handler interface {
 func HandlerFor(s *store.Store, tools Tools, p Pair) (Handler, error) {
 	switch {
 	case p.IsNode():
-		if tools.Rclone == nil {
-			return nil, fmt.Errorf("node %q: rclone wrapper is required", p.Node.Name)
-		}
-		return &peerHandler{store: s, rcl: tools.Rclone, vol: p.Volume, node: p.Node}, nil
+		return &peerHandler{store: s, vol: p.Volume, node: p.Node}, nil
 	case p.Destination == nil:
 		return nil, errors.New("pair names no destination or node")
 	case p.Destination.Type == "kopia":
@@ -162,7 +159,6 @@ func (h *rcloneHandler) sealed() {}
 // peerHandler pushes to a peer node via the SyncNode handshake.
 type peerHandler struct {
 	store *store.Store
-	rcl   *Rclone
 	vol   *config.Volume
 	node  *config.Node
 }
@@ -170,7 +166,7 @@ type peerHandler struct {
 func (h *peerHandler) TargetName() string { return h.node.Name }
 
 func (h *peerHandler) Push(ctx context.Context, opts Options) (Report, error) {
-	return SyncNode(ctx, h.store, h.rcl, h.vol, h.node, opts)
+	return SyncNode(ctx, h.store, h.vol, h.node, opts)
 }
 
 func (h *peerHandler) sealed() {}
@@ -228,9 +224,9 @@ func rcloneVerification(dest *config.Destination, opts Options, rep *Report) Ver
 }
 
 // peerVerification derives the typed durability report for one node
-// sync. The receiver re-hashes every delivered path with BLAKE3 during
-// the handshake's verify phase, so a fully successful session is
-// content-verified even when the rclone transfer itself ran shallow.
+// sync. Both ends hash every uploaded byte and the receiver re-hashes
+// every delivered path with BLAKE3 during the handshake's verify phase,
+// so a fully successful session is content-verified.
 func peerVerification(rep *Report) VerifyResult {
 	return VerifyResult{
 		verified: rep.Status == store.RunStatusSuccess,

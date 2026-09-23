@@ -30,7 +30,7 @@ func recoverConfig(t *testing.T) (cfgPath, destRoot string) {
 		"node_name = \"thisnode\"\n\n" +
 		"[volumes.photos]\npath = \"" + photos + "\"\nsync_to = [\"scratch\"]\n\n" +
 		"[destinations.scratch]\ntype = \"local\"\nroot = \"" + dest + "\"\n\n" +
-		"[nodes.peer]\nendpoint = \"https://peer.home:8443\"\npath = \"" + peer + "\"\n" +
+		"[nodes.peer]\nendpoint = \"https://peer.home:8443\"\n" +
 		"[nodes.peer.auth]\nbearer = \"tok\"\n"
 	return writeCheckConfig(t, body), dest
 }

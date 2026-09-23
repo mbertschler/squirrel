@@ -24,7 +24,6 @@ var nodeNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`)
 type nodePairOpts struct {
 	localEndpoint   string
 	peerEndpoint    string
-	peerPath        string
 	peerFingerprint string
 }
 
@@ -46,7 +45,6 @@ func newNodePairCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&opts.localEndpoint, "local-endpoint", "", "this node's agent endpoint as the peer dials it (e.g. https://nas.home:8443)")
 	cmd.Flags().StringVar(&opts.peerEndpoint, "peer-endpoint", "", "the peer's agent endpoint")
-	cmd.Flags().StringVar(&opts.peerPath, "peer-path", "", "the byte-path where this node mounts the peer's data")
 	cmd.Flags().StringVar(&opts.peerFingerprint, "peer-fingerprint", "", "the peer's TLS cert fingerprint (sha256:...)")
 	return cmd
 }
@@ -90,23 +88,20 @@ func printNodePair(out io.Writer, cfg *config.Config, peer, tokenLtoP, tokenPtoL
 
 	fmt.Fprintf(out, "# ===== on %s (this machine) — add to %s =====\n\n", local, cfg.Path)
 	writeNodeBlock(out, peer, placeholder(opts.peerEndpoint, "https://<"+peer+"-host>:8443"),
-		placeholder(opts.peerPath, "<path where "+local+" mounts "+peer+"'s data>"),
 		tokenLtoP, placeholder(opts.peerFingerprint, "sha256:<"+peer+"'s fingerprint — run `squirrel agent cert` on "+peer+">"))
 	fmt.Fprintf(out, "\n[agent.auth.peers.%s]\nbearer = %q\n\n", peer, tokenPtoL)
 
 	fmt.Fprintf(out, "# ===== on %s (the peer) — add to its config =====\n\n", peer)
 	writeNodeBlock(out, local, placeholder(opts.localEndpoint, localEndpointGuess(cfg)),
-		"<path where "+peer+" mounts "+local+"'s data>",
 		tokenPtoL, localFingerprint(cfg))
 	fmt.Fprintf(out, "\n[agent.auth.peers.%s]\nbearer = %q\n", local, tokenLtoP)
 }
 
 // writeNodeBlock renders one [nodes.<name>] block with its auth + tls
 // sub-tables.
-func writeNodeBlock(out io.Writer, name, endpoint, path, bearer, fingerprint string) {
+func writeNodeBlock(out io.Writer, name, endpoint, bearer, fingerprint string) {
 	fmt.Fprintf(out, "[nodes.%s]\n", name)
 	fmt.Fprintf(out, "endpoint = %q\n", endpoint)
-	fmt.Fprintf(out, "path     = %q\n", path)
 	fmt.Fprintf(out, "[nodes.%s.auth]\n", name)
 	fmt.Fprintf(out, "bearer = %q\n", bearer)
 	fmt.Fprintf(out, "[nodes.%s.tls]\n", name)

@@ -49,7 +49,7 @@ go install github.com/mbertschler/squirrel/cmd/squirrel@latest
 
 A source build reports its version as `0.0.0-dev` — the version is only stamped into the released binaries at build time.
 
-You will also need [rclone](https://rclone.org) ≥ 1.66 on `PATH` for `sync` and `restore` to work (BLAKE3 hash support landed in rclone 1.66):
+You will also need [rclone](https://rclone.org) ≥ 1.66 on `PATH` to sync or restore against a **bucket destination** (BLAKE3 hash support landed in rclone 1.66). Syncing to a **peer node** does not use it — those bytes stream over the peer's own sync API — so a machine whose only targets are peers needs no rclone at all:
 
 ```
 brew install rclone     # macOS

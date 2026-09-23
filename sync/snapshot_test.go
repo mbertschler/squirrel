@@ -392,3 +392,28 @@ func argsHaveFilter(args []string, want string) bool {
 	}
 	return false
 }
+
+// TestSnapshotterWithoutRcloneServesPeerPairs pins the coupling that lets
+// a peer-only or kopia-only sync run on a host with no rclone installed:
+// `runSync` now leaves the wrapper nil for such a batch, and the
+// Snapshotter is still constructed and still takes its local snapshot.
+// Only the destination ride-along needs rclone, and both handlers that
+// never have one (peer sync, kopia) pass a nil destination, which
+// afterSync returns on before reaching it.
+//
+// A test rather than a comment because the safety of the nil is a
+// cross-package invariant: it holds only as long as every caller reaching
+// rideAlong is an rclone-driven handler.
+func TestSnapshotterWithoutRcloneServesPeerPairs(t *testing.T) {
+	f := setupFixture(t)
+	sn := NewSnapshotter(f.store, nil, SnapshotConfig{
+		Dir: filepath.Join(t.TempDir(), "backups"), Keep: 7, Cloud: true, CloudKeep: 7,
+	})
+
+	rep := &Report{RunID: 1, Status: store.RunStatusSuccess}
+	sn.afterSync(context.Background(), rep, f.vol, nil)
+
+	if rep.SnapshotErr != nil {
+		t.Fatalf("SnapshotErr = %v, want the local snapshot to succeed without rclone", rep.SnapshotErr)
+	}
+}
