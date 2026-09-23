@@ -104,3 +104,21 @@ func (s *Store) ContentFingerprintVerified(ctx context.Context, contentID int64,
 	}
 	return verified != 0, nil
 }
+
+// DestinationHasUploadRecords reports whether the index records any upload
+// to the destination, in any volume: a per-hash object or a pack. The push
+// watermark rule reads an empty root as a fresh start only when this is
+// false; otherwise the root was wiped behind squirrel's back, and a push
+// would skip content these records still claim is there.
+func (s *Store) DestinationHasUploadRecords(ctx context.Context, destination string) (bool, error) {
+	var has int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT
+			EXISTS (SELECT 1 FROM remote_objects WHERE destination = ?)
+			OR EXISTS (SELECT 1 FROM remote_packs WHERE destination = ?)
+	`, destination, destination).Scan(&has)
+	if err != nil {
+		return false, fmt.Errorf("lookup upload records on %q: %w", destination, err)
+	}
+	return has != 0, nil
+}

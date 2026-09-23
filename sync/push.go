@@ -181,7 +181,8 @@ func planPush[O operations](ctx context.Context, t pushTarget, l layout[O], volI
 //
 //  1. no successful sync of this (volume, destination): 0;
 //  2. the last success left its landing evidence: that run's id;
-//  3. the evidence is absent but the destination is a fresh start: 0;
+//  3. the evidence is absent but the destination is a fresh start
+//     (freshStart): 0;
 //  4. otherwise refuse, because a delta computed against a history this
 //     destination no longer shows would silently skip content.
 func pushWatermark[O operations](ctx context.Context, t pushTarget, l layout[O], volID int64) (int64, error) {
@@ -199,12 +200,33 @@ func pushWatermark[O operations](ctx context.Context, t pushTarget, l layout[O],
 	if landed {
 		return last.ID, nil
 	}
-	fresh, err := l.rootEmpty(ctx)
+	fresh, err := freshStart(ctx, t, l)
 	if err != nil {
-		return 0, fmt.Errorf("destination %q: check whether the root is empty: %w", t.dest.Name, err)
+		return 0, err
 	}
 	if fresh {
 		return 0, nil
 	}
 	return 0, l.foreignHistory(last.ID)
+}
+
+// freshStart reports whether a destination whose last success left no
+// landing evidence may start over from watermark 0: its root holds nothing
+// beyond squirrel's markers, and squirrel holds no upload records for it.
+// An empty root with records left behind was wiped without a `squirrel
+// destination reset`; starting over would skip every upload those records
+// still claim and close the run as success.
+func freshStart[O operations](ctx context.Context, t pushTarget, l layout[O]) (bool, error) {
+	empty, err := l.rootEmpty(ctx)
+	if err != nil {
+		return false, fmt.Errorf("destination %q: check whether the root is empty: %w", t.dest.Name, err)
+	}
+	if !empty {
+		return false, nil
+	}
+	recorded, err := t.store.DestinationHasUploadRecords(ctx, t.dest.Name)
+	if err != nil {
+		return false, err
+	}
+	return !recorded, nil
 }

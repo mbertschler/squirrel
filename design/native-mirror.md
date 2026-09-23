@@ -168,8 +168,8 @@ Each layout's landing evidence lives at a different place:
 No two layouts share a location, so a destination switched from one layout to
 another is refused.
 
-**The last condition in rule 3 is new, and it fixes a live bug.** Today
-`freshStartOnEmptyRoot` checks only that the remote root is empty.
+**The last condition in rule 3 is new, and it fixes a live bug.** Before the
+planner, `freshStartOnEmptyRoot` checked only that the remote root was empty.
 Consider a content-addressed destination whose root was wiped without a
 `destination reset`, then re-marked with `--init`:
 
@@ -179,11 +179,12 @@ Consider a content-addressed destination whose root was wiped without a
 4. The run closes as `success` and advances the durability vector. If the old
    fingerprints were verified, it advances as `fingerprint-verified`.
 
-A throwaway test confirmed this. It ran one push, wiped the fake remote,
-re-seeded the marker and ran a second push. The second push reported
-`success` with `transferred=0 checked=1`, and the object was absent. Only a
-later verify pass would notice. The planner has to fail closed here, because
-the mirror's records would repeat the same mistake.
+`TestPushRefusesWipedRootWithUploadRecords` pins it. It runs one push, wipes
+the fake remote, re-seeds the markers and runs a second push. Before the fix
+that push reported `success` with `transferred=0 checked=1`, and the object
+was absent; only a later verify pass would have noticed. The planner now fails
+closed here (`DestinationHasUploadRecords`), because the mirror's records would
+repeat the same mistake.
 
 ### Repairs: the planner's second input
 
