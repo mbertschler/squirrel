@@ -97,7 +97,7 @@ var rcloneOptionNames = map[string]map[string]bool{
 	"sftp": {
 		"host": true, "user": true, "port": true, "key_file": true,
 		"known_hosts_file": true, "host_key_algorithms": true, "pass": true,
-		"blake3sum_command": true, "hashes": true,
+		"hashes": true,
 	},
 	"s3": {
 		"provider": true, "region": true, "endpoint": true, "storage_class": true,

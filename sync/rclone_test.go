@@ -495,7 +495,6 @@ password2 = "obscured-salt"
 type = sftp
 host = host.example
 user = u
-blake3sum_command = b3sum
 pass = AAAAAAAAAAAAAAAAAAAAADCpyAwmj8ezVRxkXA
 
 [offsite-crypt]

@@ -741,15 +741,8 @@ func (d *Destination) RcloneSection() string {
 	// each band. Stable output makes the rendered file diffable.
 	d.renderParams(&b, schema, schema.requiredString)
 	d.renderParams(&b, schema, schema.optionalString)
-	if d.Type == "sftp" {
-		// rclone's sftp backend only autodetects md5sum/sha1sum, so BLAKE3
-		// must be named explicitly or squirrel's `--hash blake3` syncs abort
-		// with "hash type not supported". b3sum is the canonical BLAKE3 CLI
-		// and must be on the remote's PATH.
-		fmt.Fprintf(&b, "blake3sum_command = b3sum\n")
-		if d.HashAlgo != "" {
-			fmt.Fprintf(&b, "hashes = %s\n", d.HashAlgo)
-		}
+	if d.Type == "sftp" && d.HashAlgo != "" {
+		fmt.Fprintf(&b, "hashes = %s\n", d.HashAlgo)
 	}
 	d.renderParams(&b, schema, schema.secretFields)
 	if d.Crypt != nil {

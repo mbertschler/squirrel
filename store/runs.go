@@ -95,10 +95,10 @@ type Run struct {
 	ChangedCount    sql.NullInt64
 	PeerNodeID      sql.NullInt64
 	CorrelatedRunID sql.NullInt64
-	// Shallow is true when the run skipped BLAKE3 verification in
+	// Shallow is true when the run skipped its content comparison in
 	// favour of the (size, mtime) shortcut: a skipped rehash for index
-	// and audit runs, an rclone copy without --checksum --hash blake3
-	// for initiator-side sync and restore runs. NULL (Valid=false) for
+	// and audit runs, an rclone copy without --checksum for
+	// initiator-side sync and restore runs. NULL (Valid=false) for
 	// the receiver side of a node sync (which makes no such choice) and
 	// for the pre-v10 history that never recorded it.
 	Shallow sql.NullBool
@@ -131,8 +131,8 @@ func (r Run) NoOp() bool {
 // error pointer or an explicit terminal call). volumeID must reference
 // an existing volume; destination must be non-empty (sync/restore must
 // name an rclone target). shallow records whether the transfer skipped
-// BLAKE3 verification (rclone's size+mtime shortcut) so forensic readers
-// can tell which restores were content-verified. Index and audit kinds
+// the checksum comparison (rclone's size+mtime shortcut) so forensic
+// readers can tell which restores compared content. Index and audit kinds
 // belong on BeginIndexRun and are rejected here.
 func (s *Store) BeginRun(ctx context.Context, kind string, volumeID int64, destination string, shallow bool) (int64, error) {
 	if kind == RunKindIndex || kind == RunKindAudit {
@@ -616,8 +616,8 @@ func (s *Store) CountMissingFilesByRun(ctx context.Context, runID int64) (int, e
 // linkage for node syncs. Destination is exact-match against the same
 // string the guard query checks (bucket destination name, or peer node
 // name from the initiator's config). Shallow records whether the
-// transfer skipped BLAKE3 verification (rclone's size+mtime shortcut)
-// so forensic readers can tell which syncs were content-verified.
+// transfer skipped the checksum comparison (rclone's size+mtime shortcut)
+// so forensic readers can tell which syncs compared content.
 type SyncRunSpec struct {
 	VolumeID        int64
 	Destination     string

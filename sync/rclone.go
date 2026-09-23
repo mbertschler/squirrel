@@ -31,9 +31,10 @@ import (
 )
 
 // MinRcloneVersion is the lowest rclone version this binary supports.
-// 1.66 introduced BLAKE3 as a built-in hash type; below that, the
-// --hash blake3 flag used by sync would be rejected by rclone.
-var MinRcloneVersion = Version{Major: 1, Minor: 66}
+// 1.71 added the sftp backend's `hashes` option, which squirrel writes
+// from a destination's hash_algo so fingerprint capture and verify can
+// read that checksum from an sftp server.
+var MinRcloneVersion = Version{Major: 1, Minor: 71}
 
 // DefaultStallTimeout is the no-progress bound the agent scheduler applies
 // to every automatic rclone transfer (see Rclone.StallTimeout), and every
@@ -268,10 +269,9 @@ type RunResult struct {
 	// FatalError is true when the run failed in a way that did not produce
 	// per-file errors — e.g. source root missing, auth failure.
 	FatalError bool
-	// HashFallback is true when rclone reported that --checksum could not
-	// use the requested hash because source and destination share none,
-	// and silently fell back to a size-based comparison. A run that asked
-	// for BLAKE3 verification but hit this path was not content-verified,
+	// HashFallback is true when rclone reported that --checksum found no
+	// hash source and destination share, and silently fell back to a
+	// size-based comparison. A run that hit this path compared no content,
 	// however rclone exited, so the caller must not record it as verified.
 	HashFallback bool
 	// Stderr is a bounded tail of rclone's non-JSON stderr — the
@@ -842,7 +842,7 @@ func parseJSONLog(r io.Reader, result *RunResult, onProgress func(runevents.Prog
 		if isHashFallback(ev.Msg) {
 			// Emitted at NOTICE level (which the level filter below drops),
 			// so it is detected here before that filter: a run that asked
-			// for BLAKE3 but lost the hash must not be recorded as verified.
+			// for --checksum but lost the hash must not be recorded as verified.
 			result.HashFallback = true
 		}
 		if ev.Stats != nil {

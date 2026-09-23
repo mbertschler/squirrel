@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"io"
 	"testing"
 	"time"
 
@@ -99,7 +98,7 @@ func TestAnyNodeNeedsScheduledPull(t *testing.T) {
 // kick a moment earlier, under the config that did. Losing the race would
 // turn a cadence the operator merely removed into a failed run.
 func TestSchedulerToolsRebuildKeepsRclone(t *testing.T) {
-	tools := &schedulerTools{out: io.Discard}
+	tools := &schedulerTools{}
 	located := &sync.Rclone{}
 	tools.rcl.Store(located)
 
