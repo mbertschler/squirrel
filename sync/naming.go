@@ -23,23 +23,19 @@ const (
 	nameDomainVolume = "volume"
 )
 
-// NamingMarkerName is the reserved file at the root of a destination whose
+// namingMarkerName is the reserved file at the root of a destination whose
 // artifact names are keyed. It records the naming scheme the root's
 // artifacts were written under, so a root written one way is never mixed
 // with artifacts named another.
-const NamingMarkerName = ".squirrel-naming"
+const namingMarkerName = ".squirrel-naming"
 
 // namingSchemeKeyed is the scheme recorded for keyed BLAKE3 artifact names.
-// It is compared verbatim, so a future scheme refuses an existing root
-// instead of writing a second naming generation into it.
+// It is compared verbatim, so a root recording any other scheme is refused.
 const namingSchemeKeyed = "keyed-blake3-v1"
 
-// namingMarker is the parsed content of NamingMarkerName. It rides the
-// crypt overlay like every other artifact, so it is encrypted at rest, and
-// it records the scheme alone: the key stays re-derivable from the crypt
-// passwords (config.DeriveNamingKey), so an archive's recoverability rests
-// on the secret its operator already keeps rather than on a file at the
-// destination.
+// namingMarker is the content of namingMarkerName, encrypted at rest by the
+// crypt overlay. It records the scheme alone; the key is re-derived from
+// the crypt passwords (config.DeriveNamingKey).
 type namingMarker struct {
 	Naming    string `json:"naming"`
 	CreatedAt string `json:"created_at,omitempty"`
@@ -99,13 +95,12 @@ func (n namer) keyedName(domain string, input []byte) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// rootMarkerNames are the basenames a layout guard discounts when deciding
-// whether a root is fresh: squirrel's own markers, each written by a gate
-// that runs before the guard. The naming marker joins the list only for a
-// destination that writes one.
+// rootMarkerNames are the basenames of the markers squirrel writes under
+// dest's root, which a layout guard discounts when deciding whether the
+// root is fresh.
 func rootMarkerNames(dest *config.Destination) []string {
 	if dest.HidesArtifactNames() {
-		return []string{volmark.MarkerName, NamingMarkerName}
+		return []string{volmark.MarkerName, namingMarkerName}
 	}
 	return []string{volmark.MarkerName}
 }
@@ -128,10 +123,10 @@ func (h *contentPusher) checkNamingScheme(ctx context.Context) (needsMarker bool
 	if !h.dest.HidesArtifactNames() {
 		return false, nil
 	}
-	uri := remoteSubpathURI(h.dest, NamingMarkerName)
+	uri := remoteSubpathURI(h.dest, namingMarkerName)
 	present, err := h.rcl.statRemoteExists(ctx, uri, checkersArgs(h.dest)...)
 	if err != nil {
-		return false, fmt.Errorf("destination %q: stat %s at %s: %w", h.dest.Name, NamingMarkerName, uri, err)
+		return false, fmt.Errorf("destination %q: stat %s at %s: %w", h.dest.Name, namingMarkerName, uri, err)
 	}
 	if present {
 		return false, validateNamingScheme(ctx, h.rcl, h.dest, uri)
@@ -153,40 +148,37 @@ func (h *contentPusher) requireEmptyRoot(ctx context.Context) error {
 	}
 	if !empty {
 		return fmt.Errorf("destination %q holds files at %s but no %s, so they were written under other names than the keyed ones this destination derives — point the destination at a fresh root, or (after wiping the remote root) run `squirrel destination reset %s`: %w",
-			h.dest.Name, rootURI, NamingMarkerName, h.dest.Name, ErrRefused)
+			h.dest.Name, rootURI, namingMarkerName, h.dest.Name, ErrRefused)
 	}
 	return nil
 }
 
-// validateNamingScheme reads the marker at uri and refuses any scheme this
-// binary does not write. A marker that will not parse refuses too: it is
-// the only record of how the root was named, so treating an unreadable one
-// as absent would write a second naming generation into a populated root.
+// validateNamingScheme refuses the marker at uri when it will not parse or
+// records a scheme this binary does not write.
 func validateNamingScheme(ctx context.Context, rcl *Rclone, dest *config.Destination, uri string) error {
 	data, err := rcl.catRemote(ctx, uri, checkersArgs(dest)...)
 	if err != nil {
-		return fmt.Errorf("destination %q: read %s at %s: %w", dest.Name, NamingMarkerName, uri, err)
+		return fmt.Errorf("destination %q: read %s at %s: %w", dest.Name, namingMarkerName, uri, err)
 	}
 	var m namingMarker
 	if err := json.Unmarshal(data, &m); err != nil {
-		return fmt.Errorf("destination %q: %s at %s is unreadable — inspect the root before syncing again: %w: %w", dest.Name, NamingMarkerName, uri, err, ErrRefused)
+		return fmt.Errorf("destination %q: %s at %s is unreadable — inspect the root before syncing again: %w: %w", dest.Name, namingMarkerName, uri, err, ErrRefused)
 	}
 	if m.Naming != namingSchemeKeyed {
 		return fmt.Errorf("destination %q: %s at %s records naming scheme %q, this squirrel writes %q — point the destination at a fresh root, or (after wiping the remote root) run `squirrel destination reset %s`: %w",
-			dest.Name, NamingMarkerName, uri, m.Naming, namingSchemeKeyed, dest.Name, ErrRefused)
+			dest.Name, namingMarkerName, uri, m.Naming, namingSchemeKeyed, dest.Name, ErrRefused)
 	}
 	return nil
 }
 
-// writeNamingMarker stamps the scheme on a fresh destination root, through
-// the same overlay every artifact rides.
+// writeNamingMarker stamps the scheme on a fresh destination root.
 func (h *contentPusher) writeNamingMarker(ctx context.Context) error {
 	body, err := json.Marshal(namingMarker{
 		Naming:    namingSchemeKeyed,
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
 	})
 	if err != nil {
-		return fmt.Errorf("encode %s: %w", NamingMarkerName, err)
+		return fmt.Errorf("encode %s: %w", namingMarkerName, err)
 	}
-	return h.uploadBytes(ctx, body, remoteSubpathURI(h.dest, NamingMarkerName), NamingMarkerName)
+	return h.uploadBytes(ctx, body, remoteSubpathURI(h.dest, namingMarkerName), namingMarkerName)
 }

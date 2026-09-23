@@ -18,8 +18,8 @@ import (
 // TestKeyedNamesDiscloseNothing is the property the feature exists for:
 // after a push to an encrypted archive destination, nothing at the remote
 // is named by a content hash or by a volume name. It walks the whole
-// materialised tree rather than checking the paths the push reported, so an
-// artifact written through some other path would still be caught.
+// materialised tree, so an artifact written through any code path is
+// caught.
 func TestKeyedNamesDiscloseNothing(t *testing.T) {
 	f := setupPackedFixture(t, "1KiB")
 	small, large := "tiny-content", strings.Repeat("B", 4096)
@@ -48,8 +48,8 @@ func TestKeyedNamesDiscloseNothing(t *testing.T) {
 }
 
 // TestPlainDestinationKeepsContentHashNames: without a crypt block there is
-// no key to derive from, so the append-only layouts keep naming artifacts by
-// content hash — the shape every existing destination already holds.
+// no key to derive from, so the append-only layouts name artifacts by
+// content hash and write no naming marker.
 func TestPlainDestinationKeepsContentHashNames(t *testing.T) {
 	f := setupPlainContentAddressedFixture(t)
 	f.write(t, "a.txt", "alpha")
@@ -60,8 +60,8 @@ func TestPlainDestinationKeepsContentHashNames(t *testing.T) {
 	if _, err := os.Stat(f.remotePath(ObjectsDirName, blake3Hex("alpha"))); err != nil {
 		t.Fatalf("object not at its content-hash name: %v", err)
 	}
-	if _, err := os.Stat(f.remotePath(NamingMarkerName)); err == nil {
-		t.Fatalf("an unencrypted destination wrote a %s marker", NamingMarkerName)
+	if _, err := os.Stat(f.remotePath(namingMarkerName)); err == nil {
+		t.Fatalf("an unencrypted destination wrote a %s marker", namingMarkerName)
 	}
 }
 
@@ -138,13 +138,13 @@ func TestNamingMarkerBootstrappedOnInit(t *testing.T) {
 			if _, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, f.pair, Options{Init: true}); err != nil {
 				t.Fatalf("init push: %v", err)
 			}
-			data, err := os.ReadFile(f.remoteBlob(NamingMarkerName))
+			data, err := os.ReadFile(f.remoteBlob(namingMarkerName))
 			if err != nil {
-				t.Fatalf("read %s: %v", NamingMarkerName, err)
+				t.Fatalf("read %s: %v", namingMarkerName, err)
 			}
 			var m namingMarker
 			if err := json.Unmarshal(data, &m); err != nil {
-				t.Fatalf("parse %s (%q): %v", NamingMarkerName, data, err)
+				t.Fatalf("parse %s (%q): %v", namingMarkerName, data, err)
 			}
 			if m.Naming != namingSchemeKeyed {
 				t.Errorf("marker naming = %q, want %q", m.Naming, namingSchemeKeyed)
@@ -196,8 +196,8 @@ func TestNamingRefusesPopulatedRootWithoutMarker(t *testing.T) {
 	f.index(t)
 
 	rep, err := f.sync(t)
-	if err == nil || !strings.Contains(err.Error(), NamingMarkerName) {
-		t.Fatalf("want a refusal naming %s, got %v", NamingMarkerName, err)
+	if err == nil || !strings.Contains(err.Error(), namingMarkerName) {
+		t.Fatalf("want a refusal naming %s, got %v", namingMarkerName, err)
 	}
 	if !errors.Is(err, ErrRefused) {
 		t.Fatalf("the naming gate should be a refusal (ErrRefused), got %v", err)
@@ -228,11 +228,11 @@ func TestNamingRefusesClearVolumeMarker(t *testing.T) {
 			f.index(t)
 
 			_, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, f.pair, Options{Init: true})
-			if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), NamingMarkerName) {
+			if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), namingMarkerName) {
 				t.Fatalf("want a naming refusal, got %v", err)
 			}
-			if _, statErr := os.Stat(f.remoteBlob(NamingMarkerName)); statErr == nil {
-				t.Fatalf("the refused push wrote %s", NamingMarkerName)
+			if _, statErr := os.Stat(f.remoteBlob(namingMarkerName)); statErr == nil {
+				t.Fatalf("the refused push wrote %s", namingMarkerName)
 			}
 		})
 	}
@@ -261,11 +261,10 @@ func TestNamingGateSurfacesListingErrors(t *testing.T) {
 }
 
 // TestNamingRefusesUnknownScheme: a marker naming a scheme this binary does
-// not write refuses rather than writing a second naming generation into the
-// root — the forward-compatibility half of the gate.
+// not write refuses the push, so a root never gains a second naming scheme.
 func TestNamingRefusesUnknownScheme(t *testing.T) {
 	f := setupContentAddressedFixture(t)
-	writeRemoteJSON(t, f, NamingMarkerName, namingMarker{Naming: "keyed-blake3-v9"})
+	writeRemoteJSON(t, f, namingMarkerName, namingMarker{Naming: "keyed-blake3-v9"})
 	f.write(t, "a.txt", "alpha")
 	f.index(t)
 
@@ -283,7 +282,7 @@ func TestNamingRefusesUnknownScheme(t *testing.T) {
 // absent would write keyed names into a root whose naming is unknown.
 func TestNamingRefusesUnreadableMarker(t *testing.T) {
 	f := setupContentAddressedFixture(t)
-	p := f.remoteBlob(NamingMarkerName)
+	p := f.remoteBlob(namingMarkerName)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -311,7 +310,7 @@ func TestNamingGateHoldsOnDryRun(t *testing.T) {
 	f.index(t)
 
 	_, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, f.pair, Options{DryRun: true})
-	if err == nil || !strings.Contains(err.Error(), NamingMarkerName) {
+	if err == nil || !strings.Contains(err.Error(), namingMarkerName) {
 		t.Fatalf("want the dry run refused by the naming gate, got %v", err)
 	}
 }
@@ -326,21 +325,17 @@ func TestDryRunWritesNoNamingMarker(t *testing.T) {
 	if _, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, f.pair, Options{DryRun: true}); err != nil {
 		t.Fatalf("dry run: %v", err)
 	}
-	if _, err := os.Stat(f.remoteBlob(NamingMarkerName)); err == nil {
-		t.Fatalf("a dry run wrote %s", NamingMarkerName)
+	if _, err := os.Stat(f.remoteBlob(namingMarkerName)); err == nil {
+		t.Fatalf("a dry run wrote %s", namingMarkerName)
 	}
 }
 
 // TestKeyedVolumeDirFoundByRecovery covers the disaster-recovery entry
 // point across the keyed volume directory: the ride-along index snapshot
-// lands under the keyed directory, and DiscoverIndexSnapshots — which
-// derives that directory from the volume names in the config — finds it
-// again.
-//
-// It is the one path where a naming mistake would be silent rather than
-// loud: a wrongly derived directory lists as absent, and absent is
-// reported as "this destination holds no snapshots for you" at the moment
-// an operator has least to work with.
+// lands under the keyed directory, and DiscoverIndexSnapshots finds it
+// again from the volume names in the config. A wrongly derived directory
+// lists as absent, which recovery reports as a destination holding no
+// snapshots, so this mistake would otherwise go unnoticed.
 func TestKeyedVolumeDirFoundByRecovery(t *testing.T) {
 	f := setupContentAddressedFixture(t)
 	f.write(t, "a.txt", "alpha")
@@ -384,8 +379,8 @@ func TestKeyedVolumeDirFoundByRecovery(t *testing.T) {
 	}
 }
 
-// keyedTestDest is a destination configured exactly as an encrypted archive
-// one, for the pure naming assertions that need no remote.
+// keyedTestDest is an encrypted content-addressed destination, for the
+// naming assertions that need no remote.
 func keyedTestDest(t *testing.T) *config.Destination {
 	t.Helper()
 	d := &config.Destination{

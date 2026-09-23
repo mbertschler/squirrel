@@ -222,10 +222,7 @@ password = "obscured-pw"
 }
 
 // setupPlainContentAddressedFixture is setupContentAddressedFixture
-// without the crypt block. Artifacts keep their content-hash names and no
-// naming marker is involved, so the layout guards can be exercised on their
-// own — an encrypted root is held to the keyed-naming gate first, which
-// would answer before the layout guard ever ran.
+// without the crypt block.
 func setupPlainContentAddressedFixture(t *testing.T) *caFixture {
 	t.Helper()
 	return setupCAFixture(t, `[destinations.offsite]
@@ -338,7 +335,7 @@ func (f *caFixture) seedNamingMarker(t *testing.T) {
 	t.Helper()
 	h := &contentPusher{store: f.store, rcl: f.rcl, dest: f.cfg.Destinations["offsite"]}
 	if err := h.writeNamingMarker(context.Background()); err != nil {
-		t.Fatalf("seed %s: %v", NamingMarkerName, err)
+		t.Fatalf("seed %s: %v", namingMarkerName, err)
 	}
 }
 
@@ -440,10 +437,8 @@ func (f *caFixture) remoteBlob(parts ...string) string {
 // dest is the destination every fixture push targets.
 func (f *caFixture) dest() *config.Destination { return f.cfg.Destinations["offsite"] }
 
-// objectBlob is where the object for the content named by hashHex landed.
-// Tests keep naming content by its BLAKE3 — the thing they actually mean —
-// and this maps it onto the basename the destination stores it under, which
-// on an encrypted destination is keyed rather than the hash itself.
+// objectBlob is where the object for the content hashing to hashHex
+// landed, under the basename the destination stores it by.
 func (f *caFixture) objectBlob(t *testing.T, hashHex string) string {
 	t.Helper()
 	return f.remoteBlob(ObjectsDirName, namerFor(f.dest()).object(mustHex(t, hashHex)))
@@ -837,7 +832,7 @@ func TestContentAddressedReservedDirsStayHome(t *testing.T) {
 // last success left no manifest segment (a mirror-era run) is refused
 // rather than silently diffed against the wrong baseline.
 func TestContentAddressedWatermarkGuard(t *testing.T) {
-	f := setupPlainContentAddressedFixture(t)
+	f := setupContentAddressedFixture(t)
 	f.write(t, "a.txt", "alpha")
 	f.index(t)
 
@@ -1028,7 +1023,7 @@ func TestContentAddressedDryRunSkipsRecorded(t *testing.T) {
 // silently diff against the wrong baseline and under-report the upload,
 // the same content-loss trap the real-push guard closes.
 func TestContentAddressedDryRunRefusesLayoutFlip(t *testing.T) {
-	f := setupPlainContentAddressedFixture(t)
+	f := setupContentAddressedFixture(t)
 	f.write(t, "a.txt", "alpha")
 	f.index(t)
 

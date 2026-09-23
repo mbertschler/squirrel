@@ -27,18 +27,19 @@ const (
 	// ObjectsDirName holds one immutable object per BLAKE3 content
 	// hash at the destination root: objects/<lowercase hex>, raw file
 	// bytes (encrypted by the crypt overlay when the destination has
-	// one). On an encrypted destination the basename is keyed instead
-	// of the hash itself (see objectName), so the remote discloses no
-	// content hash. The directory is destination-global — shared by
-	// every volume, matching remote_objects' (content, destination)
-	// key — so duplicated content across volumes uploads once. An
-	// object is uploaded once and never moved, overwritten, or deleted.
+	// one). On an encrypted destination the basename is the keyed
+	// name namer.object derives, so the remote discloses no content
+	// hash. The directory is destination-global — shared by every
+	// volume, matching remote_objects' (content, destination) key —
+	// so duplicated content across volumes uploads once. An object is
+	// uploaded once and never moved, overwritten, or deleted.
 	ObjectsDirName = "objects"
 	// ManifestDirName holds one immutable manifest segment per sync
-	// run, per volume: <volume>/index/run-<run id>, the JSONL
-	// path-level delta of that run (see ManifestEntry). Replaying a
-	// volume's segments in run-id order reconstructs its full
-	// path→content mapping with no SQLite required. Distinct from
+	// run, per volume: <volume>/index/run-<run id> (the volume
+	// directory keyed by namer.volumeDir on an encrypted destination),
+	// the JSONL path-level delta of that run (see ManifestEntry).
+	// Replaying a volume's segments in run-id order reconstructs its
+	// full path→content mapping with no SQLite required. Distinct from
 	// IndexDirName, the dot-directory the snapshot ride-along writes.
 	ManifestDirName = "index"
 )
@@ -104,9 +105,7 @@ type contentPusher struct {
 	dest  *config.Destination
 }
 
-// names is the naming scheme a push writes under: the destination's own,
-// since ensureNamingScheme has already refused a root written under any
-// other.
+// names is how this push names the artifacts it writes.
 func (h *contentPusher) names() namer { return namerFor(h.dest) }
 
 // ensureMarkers gates a remote content-layout push on the root's naming
@@ -513,8 +512,7 @@ func (h *contentPusher) uploadSegment(ctx context.Context, delta []store.PathDel
 
 // objectURI addresses one content object under the destination-root
 // objects/ directory, through the crypt overlay when the destination
-// has one. The basename is objectName's, so an encrypted destination
-// addresses the object by its keyed name rather than its content hash.
+// has one. The basename is namer.object's.
 func (h *contentPusher) objectURI(contentHash []byte) string {
 	return remoteSubpathURI(h.dest, path.Join(ObjectsDirName, h.names().object(contentHash)))
 }

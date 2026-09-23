@@ -30,8 +30,8 @@ import (
 // compressed bytes, so an identical pack assembled from an identical
 // content set names the same file — and run ids are globally unique, so a
 // map name never collides across volumes. An encrypted destination keys
-// the pack basename (see packName); the map keeps its run id, which
-// recovery needs in order to replay in order.
+// the pack basename (namer.pack); the map keeps its run id, which recovery
+// needs in order to replay in order.
 const PacksDirName = "packs"
 
 // packMapPrefix names a run's placement map under PacksDirName.
@@ -518,9 +518,7 @@ func (h *packedHandler) uploadPlacementMap(ctx context.Context, placements []Pla
 
 // uploadBytes stages body in a temp file, copies it to uri through the
 // crypt overlay, and confirms it landed at len(body). what names the
-// artifact in error messages. It lives on contentPusher because every
-// small artifact both layouts write — manifest segment, placement map,
-// naming marker — lands through it.
+// artifact in error messages.
 func (h *contentPusher) uploadBytes(ctx context.Context, body []byte, uri, what string) error {
 	tmp, err := os.CreateTemp("", "squirrel-meta-*")
 	if err != nil {
@@ -549,7 +547,7 @@ func (h *contentPusher) uploadBytes(ctx context.Context, body []byte, uri, what 
 
 // packURI addresses one pack under the destination-root packs/ directory,
 // through the crypt overlay when the destination has one. The basename is
-// packName's, keyed on an encrypted destination.
+// namer.pack's.
 func (h *packedHandler) packURI(packKey []byte) string {
 	return remoteSubpathURI(h.dest, path.Join(PacksDirName, h.names().pack(packKey)))
 }

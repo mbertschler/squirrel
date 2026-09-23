@@ -48,22 +48,6 @@ password = "obscured-pw"
 	return f
 }
 
-// setupPlainPackedFixture is setupPackedFixture without the crypt block,
-// for the layout guards (see setupPlainContentAddressedFixture).
-func setupPlainPackedFixture(t *testing.T, threshold string) *caFixture {
-	t.Helper()
-	return setupCAFixture(t, fmt.Sprintf(`[destinations.offsite]
-type   = "sftp"
-host   = "remote.invalid"
-user   = "u"
-root   = "/data"
-layout = "packed"
-pack_threshold = %q
-pack_size      = "512MiB"
-zstd_level     = 3
-`, threshold), "/data")
-}
-
 func (f *caFixture) readPlacementMap(t *testing.T, runID int64) []PlacementEntry {
 	t.Helper()
 	data, err := os.ReadFile(f.remoteBlob(PacksDirName, fmt.Sprintf("map-%d", runID)))
@@ -145,14 +129,8 @@ func TestPackedSizeRouting(t *testing.T) {
 }
 
 // mustPackKeyOf returns the single pack key the fixture produced, read out
-// of the placement maps at the destination.
-//
-// The key comes from the map rather than from the pack's filename because
-// an encrypted destination names its packs by a key derived from its crypt
-// secrets (packName), so the filename is no longer the pack key. The map
-// records the true key — which is what lets a recovery script find a pack
-// at all — so reading it here keeps the helper remote-only, deriving
-// nothing from the local store.
+// of the placement maps at the destination: an encrypted destination's pack
+// filename is its keyed name (namer.pack), and the map records the key.
 func mustPackKeyOf(t *testing.T, f *caFixture) []byte {
 	t.Helper()
 	entries, err := os.ReadDir(f.remotePath(PacksDirName))
@@ -520,7 +498,7 @@ func TestPackedDedupAcrossRuns(t *testing.T) {
 // success looks content-addressed (a segment but no placement map) is
 // refused rather than diffed against the wrong baseline.
 func TestPackedWatermarkGuardRefusesContentAddressed(t *testing.T) {
-	f := setupPlainPackedFixture(t, "1MiB")
+	f := setupPackedFixture(t, "1MiB")
 	f.write(t, "a.txt", "tiny")
 	f.index(t)
 
@@ -557,7 +535,7 @@ func TestPackedWatermarkGuardRefusesContentAddressed(t *testing.T) {
 // TestPackedWatermarkGuardRefusesMirror: a mirror-era success (no segment,
 // no map) is refused too.
 func TestPackedWatermarkGuardRefusesMirror(t *testing.T) {
-	f := setupPlainPackedFixture(t, "1MiB")
+	f := setupPackedFixture(t, "1MiB")
 	f.write(t, "a.txt", "tiny")
 	f.index(t)
 
@@ -679,7 +657,7 @@ func TestPackedDryRunPreview(t *testing.T) {
 // placement map) is refused in preview exactly as in a real push — and
 // the refusal writes no runs row.
 func TestPackedDryRunRefusesLayoutFlip(t *testing.T) {
-	f := setupPlainPackedFixture(t, "1MiB")
+	f := setupPackedFixture(t, "1MiB")
 	f.write(t, "a.txt", "tiny")
 	f.index(t)
 
