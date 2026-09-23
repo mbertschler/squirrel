@@ -16,6 +16,7 @@ A tree shaped like the local volumes:
   pictures/
     2024/cat.jpg
     .squirrel-history/run-7/2024/cat.jpg     # prior content of cat.jpg
+    .squirrel-index/run-12                   # receipt for run 12 (local disks)
     .squirrel-index/index-20260604T120000.000Z-run-12.db   # global index snapshot (ride-along)
   docs/
     invoice.pdf
@@ -86,8 +87,8 @@ for user content:
 
 | Directory | Purpose |
 |---|---|
-| `.squirrel-history/run-<id>/` | rclone's `--backup-dir` target — prior bytes of overwritten files ([mirror](/squirrel/layouts/mirror/)). |
-| `.squirrel-index/` | Ride-along [index snapshots](/squirrel/configuration/index-snapshots/). |
+| `.squirrel-history/run-<id>/` | Prior bytes of the files a sync run replaced on a [mirror](/squirrel/layouts/mirror/). |
+| `.squirrel-index/` | Ride-along [index snapshots](/squirrel/configuration/index-snapshots/), and a local mirror's receipts. |
 | `.squirrel-restore-history/run-<id>/` | Files displaced by an [`--in-place` restore](/squirrel/guides/restore/). |
 | `.squirrel-staging/run-<id>/` | A native [mirror](/squirrel/layouts/mirror/)'s in-flight writes, renamed onto their paths once complete. |
 

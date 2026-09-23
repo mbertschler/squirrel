@@ -26,7 +26,7 @@ func newSyncCmd() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "sync [<volume>]",
-		Short: "Push configured volumes to their rclone destinations",
+		Short: "Push configured volumes to their destinations",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			volumeName := ""
@@ -41,8 +41,8 @@ func newSyncCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&to, "to", "", "limit to this destination name (default: every destination declared on the volume)")
-	cmd.Flags().BoolVar(&shallow, "shallow", false, "skip the checksum comparison; trust rclone's default size+mtime comparison")
-	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview rclone actions without transferring; no runs row is written")
+	cmd.Flags().BoolVar(&shallow, "shallow", false, "skip the checksum comparison on a remote mirror; trust rclone's default size+mtime comparison (refused on a local mirror)")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview what a push would transfer without transferring; no runs row is written")
 	cmd.Flags().BoolVar(&initDst, "init", false, "authorise first-use destination bootstrap: write a .squirrel-volume marker, or create a kopia repository when connect finds none (refused without --init so a typo or outage can't mint a fresh empty target)")
 	cmd.Flags().BoolVarP(&progress, "progress", "P", false, "show live transfer progress (auto-enabled on a terminal; use --progress=false to force off)")
 	return cmd

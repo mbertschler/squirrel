@@ -3,8 +3,7 @@ title: Syncing & first use
 description: Push configured volumes to their destinations with checksum verification, and bootstrap first-use destinations safely with --init.
 ---
 
-`squirrel sync` pushes configured volumes to their rclone (or kopia)
-destinations.
+`squirrel sync` pushes configured volumes to their destinations.
 
 ```sh
 squirrel sync pictures              # all destinations declared on pictures
@@ -18,30 +17,37 @@ squirrel sync                       # every (volume, destination) pair in config
 
 ## Verification
 
-Sync compares every file with its copy on a mirror destination by checksum
-(rclone's `--checksum`), under the first hash both ends support — MD5 on local
-disks and S3, independent of the BLAKE3 in the index. A copy that fails the check
-after transfer is an error, so the runs row is **not** marked success. The run is
-recorded with the `checksum` method, which the offload gate does not accept, so a
-mirror cannot back an offload. Peer syncs are different: both ends hash every
-byte with BLAKE3 (see [Peer sync](/squirrel/guides/peer-sync/)).
+A mirror on a `local` disk is written by squirrel itself: it hashes every file
+with BLAKE3 as it streams out, confirms each written path's size and mtime, and
+records the run with the `presence+size` method (see
+[Mirror](/squirrel/layouts/mirror/)).
 
-Use `--shallow` to fall back to rclone's default size+mtime comparison if you
-want speed over integrity for a big initial push. Encrypted
+Sync compares every file with its copy on a remote mirror destination by
+checksum (rclone's `--checksum`), under the first hash both ends support — MD5
+on S3, independent of the BLAKE3 in the index. A copy that fails the check after
+transfer is an error, so the runs row is **not** marked success. The run is
+recorded with the `checksum` method.
+
+The offload gate accepts neither method, so a mirror cannot back an offload.
+Peer syncs are different: both ends hash every byte with BLAKE3 (see
+[Peer sync](/squirrel/guides/peer-sync/)).
+
+Use `--shallow` to fall back to rclone's default size+mtime comparison on a
+remote mirror if you want speed over integrity for a big initial push. A local
+mirror refuses it: there is no comparison to switch off. Encrypted
 ([`crypt`](/squirrel/layouts/encrypted/)) destinations always use the size+mtime
 comparison, and content-addressed/packed destinations use presence+size plus the
 [scan-back fingerprint](/squirrel/guides/verification/).
 
-Sync runs do **not** pass `--delete-*` to rclone. Files removed locally remain at
-the destination.
+Sync never deletes at a destination: files removed locally remain there.
 
 ## Flags
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--to <dest>` | all | Limit to this destination name. |
-| `--shallow` | off | Skip the checksum comparison; trust rclone's size+mtime comparison. |
-| `--dry-run` | off | Preview rclone actions without transferring; no runs row is written. |
+| `--shallow` | off | Skip the checksum comparison on a remote mirror; trust rclone's size+mtime comparison. Refused on a local mirror. |
+| `--dry-run` | off | Preview what a push would transfer without transferring; no runs row is written. |
 | `--init` | off | Authorise first-use destination bootstrap (see below). |
 | `--progress`, `-P` | auto on a TTY | Show a live transfer progress line (files, bytes, rate, ETA). |
 

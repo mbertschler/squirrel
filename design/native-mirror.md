@@ -259,18 +259,26 @@ type transport interface {
 ### Local implementation
 
 - Built on `os.Root` (Go 1.25+). It resolves every name inside the root and
-  refuses to follow symlinks out of it.
+  refuses to follow symlinks out of it. `os.Root` does follow symlinks that
+  stay inside the root, so every call also checks its name's parent chain with
+  `Lstat` and refuses a symlink anywhere along it (`sync/transport_local.go`).
 - `Put` opens with `O_CREATE|O_EXCL`, copies, sets the times, then syncs.
 - `Rename` avoids replacing its target in one of two ways:
   - **Preferred:** the platform's no-replace rename (`renameat2` with
     `RENAME_NOREPLACE` on Linux, `renamex_np` with `RENAME_EXCL` on macOS),
-    or `Link` followed by `Remove`.
+    called on the parent directories' handles.
   - **Fallback:** where the filesystem supports neither (exFAT, common on
-    USB disks), squirrel checks with `Lstat` and then renames. A concurrent
+    USB disks), and on every other platform, squirrel checks with `Lstat` and
+    then renames. A concurrent
     writer from outside squirrel could still slip in between the check and
     the rename. Squirrel can't collide with itself here, because the run guard
     and the volume marker already exclude a second squirrel writer.
 - After a rename, the parent directories are synced.
+- **Every call is bounded by progress.** A call that makes none for
+  `DefaultStallTimeout` (a `Put` progresses with every chunk it reads) fails the
+  push. A local call blocked in the kernel can't be interrupted and may still
+  finish a move later, so a push refuses while a call an earlier push gave up
+  on is still outstanding (`sync/transport_stall.go`).
 
 ### sftp implementation
 
@@ -382,13 +390,19 @@ is treated as changed behind squirrel's back: its row becomes `lost` and the pat
 1. **Reconcile** (once, at push start). Squirrel settles every `committing`
    and `displacing` row for this destination by checking both locations
    (next table). Staging left by finished runs is removed.
-2. **Stage.** The source is streamed into `.squirrel-staging/run-<id>/<row>`,
-   and BLAKE3 is computed over the same bytes. If the hash doesn't match the
-   indexed hash, the staged file is removed and the run fails before its seal,
-   so the watermark stays put. That is the `errContentDrift` contract. Here the
+2. **Stage.** The source is streamed into
+   `.squirrel-staging/run-<id>/<path key>`, and BLAKE3 is computed over the same
+   bytes. The path key is the lowercase hex BLAKE3 of the volume-relative path:
+   the row doesn't exist yet (step 4 inserts it), and hex stays unique on a
+   destination that folds case. If the hash doesn't match the indexed hash, the
+   path fails and the run fails before its seal, so the watermark stays put. The
+   staged file stays until the next push's reconcile removes it with the
+   finished run's staging: the name guard removes no running run's staging. That is the `errContentDrift` contract. Here the
    hash covers exactly the bytes sent, which closes the re-hash-then-read gap
    noted on `uploadOneObject`.
-3. **Displace.** If `Lstat` finds an entry at the path:
+3. **Displace.** First any parent of the path that isn't a directory (a
+   file↔directory swap, a symlink) is displaced the same way. Then, if `Lstat`
+   finds an entry at the path:
    - **The entry's size and mtime match the live row:**
      1. mark the row `displacing` with this run;
      2. rename the entry to `.squirrel-history/run-<id>/<path>`;
@@ -399,6 +413,9 @@ is treated as changed behind squirrel's back: its row becomes `lost` and the pat
         runs_audit note report.
 
      A record never claims history holds bytes it doesn't.
+   - **It is a directory** a file replaced: every live row under it becomes
+     `displacing`, the directory moves, and they become `displaced`; a row whose
+     bytes changed becomes `lost` first.
 4. **Commit:**
    1. insert the new row as `committing`;
    2. rename the staged file to the path;
@@ -418,9 +435,16 @@ until the next push, never content.
 | staging write | partial file in staging | removed with the finished run's staging |
 | `displacing` recorded | old version still at the path | size matches the record, so the row goes back to `live` |
 | displace rename | old version in history | history entry present, so the row becomes `displaced` |
-| `committing` recorded | new version in staging, path empty | the intent is withdrawn, the staging file removed, and the path planned again (no seal, so it's still in the delta) |
+| `committing` recorded | new version in staging, path empty | the intent is withdrawn (the row becomes `lost`: its version never reached the path), the staging file removed, and the path planned again (no seal, so it's still in the delta) |
 | commit rename | new version at the path | staging gone and path present, so the row becomes `live` |
 | every write, before the seal | tree complete, no receipt | the watermark holds, and the next push translates every path to "already correct" |
+
+`TestMirrorCrashTable` runs each row above; `TestMirrorTranslationRules` and
+`TestMirrorWriteDisplacesWhatThePathHolds` run the translation table.
+
+A native push reports as `already_correct` every path whose live row holds its
+present content, planned or not, so an unchanged push still reads as in sync
+(friction F7).
 
 ### What the tests must cover
 

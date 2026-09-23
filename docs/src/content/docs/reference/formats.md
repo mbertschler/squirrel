@@ -25,6 +25,10 @@ sorted by `(path, status)`:
 | `size_bytes` | File size as indexed. |
 | `mtime_ns` | Modification time (nanoseconds) as indexed. |
 
+A [mirror](/squirrel/layouts/mirror/) on a local disk writes the same format as
+its receipt, at `<volume>/.squirrel-index/run-<id>`; there the bytes of a
+`present` path are at the path itself.
+
 ### Replaying segments
 
 Process segments in **ascending run id**; each line with status `present`,

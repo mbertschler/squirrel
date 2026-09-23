@@ -384,7 +384,7 @@ squirrel sync pictures --to nas     # just one
 squirrel sync                       # every (volume, destination) pair in config
 ```
 
-Sync compares every file with its copy on a mirror destination by checksum (rclone's `--checksum`), under the first hash both ends support — MD5 on local disks and S3, independent of the BLAKE3 in the index. A copy that fails the check after transfer is an error, so the runs row is not marked success. The run records the `checksum` method, which the offload gate does not accept: a mirror can never be named in `offload_requires`. Use `--shallow` to fall back to rclone's default size+mtime comparison if you want speed over integrity for a big initial push. Encrypted (`crypt`) destinations always use the size+mtime comparison (see [Encrypted destinations](#encrypted-destinations)).
+A mirror on a `local` disk is written by squirrel itself: it hashes every file with BLAKE3 as it streams out, confirms each written path's size and mtime, and records the `presence+size` method; `--shallow` is refused there, since there is no comparison to skip. Sync compares every file with its copy on a remote mirror destination by checksum (rclone's `--checksum`), under the first hash both ends support — MD5 on S3, independent of the BLAKE3 in the index. A copy that fails the check after transfer is an error, so the runs row is not marked success, and the run records the `checksum` method. The offload gate accepts neither: a mirror can never be named in `offload_requires`. Use `--shallow` to fall back to rclone's default size+mtime comparison on a remote mirror if you want speed over integrity for a big initial push. Encrypted (`crypt`) destinations always use the size+mtime comparison (see [Encrypted destinations](#encrypted-destinations)).
 
 ### First use and the `.squirrel-volume` marker
 
@@ -470,13 +470,15 @@ Each mirrored destination (`layout = "mirror"`, the default) is a tree shaped li
   pictures/
     2024/cat.jpg
     .squirrel-history/run-7/2024/cat.jpg     # prior content of cat.jpg
+    .squirrel-index/run-12                   # receipt for run 12 (local disks)
     .squirrel-index/index-20260604T120000.000Z-run-12.db   # global index snapshot (ride-along)
+    .squirrel-staging/                       # in-flight writes (local disks)
   docs/
     invoice.pdf
     .squirrel-history/run-9/invoice.pdf
 ```
 
-`.squirrel-history/run-<run-id>/` is rclone's `--backup-dir` target for that sync run. It is filtered out of all subsequent comparisons so it does not grow rclone's listing time or get uploaded back. A directory literally called `.squirrel-history` in your source volume is also filtered (with a warning), to keep the reserved name out of the destination tree by accident.
+`.squirrel-history/run-<run-id>/` holds the prior bytes of every file that sync run replaced, moved there first and never deleted. On a local disk squirrel writes the mirror itself: each file is staged under `.squirrel-staging/`, whatever its path held moves into history, and the staged copy is renamed into place; each run leaves a receipt of its changes at `.squirrel-index/run-<id>`, and a local mirror starts on a fresh or emptied root. Remote mirrors are written by rclone, with history as its `--backup-dir`. History is filtered out of all subsequent comparisons so it does not grow listing time or get uploaded back. A directory literally called `.squirrel-history` in your source volume is also filtered (with a warning), to keep the reserved name out of the destination tree by accident.
 
 `.squirrel-index/` holds the index snapshots ridden along after each successful sync (see [Index snapshots](#index-snapshots)). Like `.squirrel-history`, it is filtered out of all sync and restore transfers and from peer-sync, so a snapshot is never mistaken for user content.
 

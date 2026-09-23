@@ -95,7 +95,7 @@ Indexing by raw path is not supported. See [Indexing](/squirrel/guides/indexing/
 
 ## squirrel sync
 
-**Push configured volumes to their rclone destinations.**
+**Push configured volumes to their destinations.**
 
 ```
 squirrel sync [<volume>]
@@ -108,8 +108,8 @@ Optional single positional. No arg = every `(volume, destination)` pair; one arg
 | Flag | Default | Meaning |
 |---|---|---|
 | `--to` | all | Limit to this destination name. |
-| `--shallow` | `false` | Skip the checksum comparison on mirror destinations; trust rclone's size+mtime comparison. A peer sync hashes every byte on both ends regardless. |
-| `--dry-run` | `false` | Preview rclone actions without transferring; no runs row is written. |
+| `--shallow` | `false` | Skip the checksum comparison on remote mirror destinations; trust rclone's size+mtime comparison. Refused on a local mirror, which has no comparison to skip. A peer sync hashes every byte on both ends regardless. |
+| `--dry-run` | `false` | Preview what a push would transfer without transferring; no runs row is written. |
 | `--init` | `false` | Authorise first-use destination bootstrap. |
 | `--progress`, `-P` | auto on a TTY | Show live transfer progress (files, bytes, rate, ETA). |
 
