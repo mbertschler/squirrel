@@ -244,8 +244,8 @@ const (
 // squirrel renders it as an rclone crypt remote stacked on the underlying
 // remote and addresses sync/restore transfers through it, so file contents
 // are encrypted before they leave the machine. Contents only:
-// filename_encryption is fixed off, keeping the destination tree layout
-// identical to an unencrypted destination.
+// filename_encryption is fixed off; the append-only layouts key the names
+// they choose instead (NamingKey), and a mirror keeps the volume's paths.
 type Crypt struct {
 	// Password is the content-encryption password already in rclone-obscured
 	// form — the representation rclone's own crypt config stores and rclone

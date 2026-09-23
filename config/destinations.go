@@ -218,10 +218,14 @@ func resolveCryptAndLayout(raw map[string]any, typ string) (*Crypt, string, erro
 	if err != nil {
 		return nil, "", err
 	}
-	if crypt != nil && layoutHidesArtifactNames(layout) {
+	switch {
+	case crypt == nil:
+	case layoutHidesArtifactNames(layout):
 		if err := crypt.deriveNamingKey(); err != nil {
 			return nil, "", err
 		}
+	case revealsEmpty(crypt.Password):
+		return nil, "", errEmptyRevealedPassword
 	}
 	return crypt, layout, nil
 }
@@ -502,6 +506,17 @@ func resolveCrypt(raw map[string]any, typ string) (*Crypt, error) {
 	return &Crypt{Password: password, Password2: password2}, nil
 }
 
+// errEmptyRevealedPassword refuses an obscured crypt password that decodes
+// to nothing, under which rclone encrypts with an all-zero key.
+var errEmptyRevealedPassword = errors.New("crypt.password: the obscured value reveals to an empty password, which rclone treats as no key at all")
+
+// revealsEmpty reports whether obscured decodes to the empty string. A
+// value that does not decode at all is left for rclone to judge.
+func revealsEmpty(obscured string) bool {
+	plaintext, err := rcloneReveal(obscured)
+	return err == nil && plaintext == ""
+}
+
 // deriveNamingKey fills NamingKey from the plaintext behind the two stored,
 // obscured passwords, so a plaintext config and a pre-obscured one derive
 // the same key.
@@ -511,7 +526,7 @@ func (c *Crypt) deriveNamingKey() error {
 		return fmt.Errorf("crypt.password: %w", err)
 	}
 	if password == "" {
-		return errors.New("crypt.password: the obscured value reveals to an empty password, which rclone treats as no key at all")
+		return errEmptyRevealedPassword
 	}
 	var password2 string
 	if c.Password2 != "" {
@@ -794,8 +809,9 @@ func (d *Destination) RemoteRoot() string {
 // cryptSection renders the crypt overlay remote. Its remote line bakes the
 // destination root in, so transfers through the overlay address
 // volume-relative paths directly. filename_encryption is fixed off: the
-// overlay encrypts file contents only, and the destination keeps the same
-// browsable tree layout as an unencrypted destination.
+// overlay encrypts file contents only, and the names are squirrel's to
+// choose — keyed on the append-only layouts, the volume's own paths on a
+// mirror.
 func (d *Destination) cryptSection() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "[%s]\n", d.CryptRemoteName())

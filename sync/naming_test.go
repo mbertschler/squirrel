@@ -164,6 +164,35 @@ func TestNamingMarkerBootstrappedOnInit(t *testing.T) {
 	}
 }
 
+// TestNamingMarkerRestoredOnKeyedRoot: a root that lost only its naming
+// marker still holds this volume's keyed directory, which proves it was
+// written under this key, so a plain push restores the marker instead of
+// telling the operator to wipe an intact archive.
+func TestNamingMarkerRestoredOnKeyedRoot(t *testing.T) {
+	for layout, setup := range keyedArchiveFixtures() {
+		t.Run(layout, func(t *testing.T) {
+			f := setup(t)
+			f.wipeRemote(t)
+			f.write(t, "a.txt", "alpha")
+			f.index(t)
+			if _, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, f.pair, Options{Init: true}); err != nil {
+				t.Fatalf("init push: %v", err)
+			}
+			if err := os.Remove(f.remoteBlob(namingMarkerName)); err != nil {
+				t.Fatal(err)
+			}
+			f.write(t, "b.txt", "bravo")
+			f.index(t)
+			if _, err := f.sync(t); err != nil {
+				t.Fatalf("push to a keyed root that lost its marker: %v", err)
+			}
+			if _, err := os.Stat(f.remoteBlob(namingMarkerName)); err != nil {
+				t.Fatalf("marker not restored: %v", err)
+			}
+		})
+	}
+}
+
 // TestPushWithoutInitWritesNothingToFreshRoot: without --init a fresh root
 // may be a typo, so the push is refused and leaves the root as empty as it
 // found it.

@@ -173,9 +173,16 @@ lsf)
   # index- prefix). Listed through a crypt overlay it reports decrypted
   # names too — without the data suffix it appends on the underlying
   # remote — so the suffix comes off here as well.
+  # A file without the suffix was not written through the overlay, and
+  # real rclone skips it there as an undecryptable name.
   [ -d "$dir" ] && find "$dir" -type f | while IFS= read -r n; do
     n="${n#"$dir"/}"
-    [ -n "$lsfsfx" ] && n="${n%"$lsfsfx"}"
+    if [ -n "$lsfsfx" ]; then
+      case "$n" in
+      *"$lsfsfx") n="${n%"$lsfsfx"}" ;;
+      *) continue ;;
+      esac
+    fi
     printf '%s\n' "$n"
   done
   exit 0
@@ -892,7 +899,7 @@ func TestRemoteRootEmptyClassifiesErrors(t *testing.T) {
 // in for the bytes a prior (mirror) era left there so the root is non-empty.
 func seedRemoteFile(t *testing.T, f *caFixture, parts ...string) {
 	t.Helper()
-	p := f.remotePath(parts...)
+	p := f.remoteBlob(parts...)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		t.Fatalf("mkdir remote file dir: %v", err)
 	}

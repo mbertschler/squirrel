@@ -59,9 +59,7 @@ a [kopia](/squirrel/layouts/kopia/) repository, which encrypts its own
 metadata).
 
 What no layout hides: artifact sizes, object and pack counts, upload
-timestamps, and your sync cadence. Identical content also still lands under one
-name — that is what makes deduplication work — so the destination discloses
-that two paths share content, without disclosing which content.
+timestamps, and your sync cadence.
 
 #### What is keyed, and what stays readable
 
@@ -81,10 +79,12 @@ that ordering has to survive without the key.
 
 The `.squirrel-naming` marker records *which* scheme a root was written under, so
 two naming schemes are never mixed into one root. The first `--init` push to an
-empty root writes it. A push refuses a root that holds files but no marker, or a
-marker recording a scheme it does not write, and names the remedy: point the
-destination at a fresh root, or wipe the remote root and run
-`squirrel destination reset <name>`.
+empty root writes it, and a push that finds it missing from a root still holding
+the volume's keyed directory — so written under these very passwords — writes it
+back. A push refuses a root that holds anything else without a marker (files an
+unencrypted destination or other passwords left there), or a marker recording a
+scheme it does not write, and names the remedy: point the destination at a
+fresh root, or wipe the remote root and run `squirrel destination reset <name>`.
 
 :::note[The key is derived from your passwords, never stored]
 The naming key comes from `password` and `password2` through rclone crypt's

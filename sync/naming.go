@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"path"
 	"time"
 
 	"github.com/zeebo/blake3"
@@ -105,52 +106,85 @@ func rootMarkerNames(dest *config.Destination) []string {
 	return []string{volmark.MarkerName}
 }
 
-// ensureNamingScheme gates a push on the root's recorded naming scheme and,
-// under init, stamps the scheme on a fresh root. A fresh root without init
-// is left untouched for the volume-marker gate to refuse.
+// namingStamp is what a push must write for the root's naming marker.
+type namingStamp int
+
+const (
+	stampNone namingStamp = iota
+	// stampFresh: the root is empty, so the marker is written under --init.
+	stampFresh
+	// stampRepair: the root holds this volume's keyed directory, so it was
+	// written under this very key and only lost its marker.
+	stampRepair
+)
+
+// ensureNamingScheme gates a push on the root's recorded naming scheme and
+// writes the marker when the root needs one: under init on a fresh root,
+// always on a root proven to be keyed under this destination's key. A
+// fresh root without init is left untouched for the volume-marker gate to
+// refuse.
 func (h *contentPusher) ensureNamingScheme(ctx context.Context, init bool) error {
-	needsMarker, err := h.checkNamingScheme(ctx)
-	if err != nil || !needsMarker || !init {
+	stamp, err := h.checkNamingScheme(ctx)
+	if err != nil {
 		return err
 	}
-	return h.writeNamingMarker(ctx)
+	if stamp == stampRepair || (stamp == stampFresh && init) {
+		return h.writeNamingMarker(ctx)
+	}
+	return nil
 }
 
 // checkNamingScheme refuses a push to a root whose artifacts are named under
-// any other scheme, and reports whether the root is fresh and still needs
-// its naming marker. Read-only, so a dry run asks it too.
-func (h *contentPusher) checkNamingScheme(ctx context.Context) (needsMarker bool, err error) {
+// any other scheme, and reports what the root still needs stamped.
+// Read-only, so a dry run asks it too.
+func (h *contentPusher) checkNamingScheme(ctx context.Context) (namingStamp, error) {
 	if !h.dest.HidesArtifactNames() {
-		return false, nil
+		return stampNone, nil
 	}
 	uri := remoteSubpathURI(h.dest, namingMarkerName)
 	present, err := h.rcl.statRemoteExists(ctx, uri, checkersArgs(h.dest)...)
 	if err != nil {
-		return false, fmt.Errorf("destination %q: stat %s at %s: %w", h.dest.Name, namingMarkerName, uri, err)
+		return stampNone, fmt.Errorf("destination %q: stat %s at %s: %w", h.dest.Name, namingMarkerName, uri, err)
 	}
 	if present {
-		return false, validateNamingScheme(ctx, h.rcl, h.dest, uri)
+		return stampNone, validateNamingScheme(ctx, h.rcl, h.dest, uri)
 	}
-	if err := h.requireEmptyRoot(ctx); err != nil {
-		return false, err
-	}
-	return true, nil
+	return h.classifyUnmarkedRoot(ctx)
 }
 
-// requireEmptyRoot refuses a root without a naming marker that holds any
-// file at all: whatever is there was named under another scheme, and adding
-// keyed names beside it would leave it disclosing what it always did.
-func (h *contentPusher) requireEmptyRoot(ctx context.Context) error {
-	rootURI := remoteSubpathURI(h.dest, "")
+// classifyUnmarkedRoot decides a root without a naming marker. It lists
+// the underlying remote, because the crypt overlay hides every file that
+// was not written through it. A root holding anything but this volume's
+// keyed directory was named some other way — or under other crypt
+// passwords — and adding keyed names beside it would leave it disclosing
+// what it always did.
+func (h *contentPusher) classifyUnmarkedRoot(ctx context.Context) (namingStamp, error) {
+	rootURI := underlyingDirURI(h.dest, "")
 	empty, err := h.rcl.remoteRootEmpty(ctx, rootURI, nil, checkersArgs(h.dest)...)
 	if err != nil {
-		return fmt.Errorf("destination %q: list %s: %w", h.dest.Name, rootURI, err)
+		return stampNone, fmt.Errorf("destination %q: list %s: %w", h.dest.Name, rootURI, err)
 	}
-	if !empty {
-		return fmt.Errorf("destination %q holds files at %s but no %s, so they were written under other names than the keyed ones this destination derives — point the destination at a fresh root, or (after wiping the remote root) run `squirrel destination reset %s`: %w",
-			h.dest.Name, rootURI, namingMarkerName, h.dest.Name, ErrRefused)
+	if empty {
+		return stampFresh, nil
 	}
-	return nil
+	keyed, err := h.holdsKeyedVolumeMarker(ctx)
+	if err != nil {
+		return stampNone, err
+	}
+	if keyed {
+		return stampRepair, nil
+	}
+	return stampNone, fmt.Errorf("destination %q holds files at %s but no %s and no keyed directory for volume %q, so they were written under other names than the keyed ones this destination derives, or under other crypt passwords. If another volume already syncs here, sync it first: that restores the marker. Otherwise point the destination at a fresh root, or wipe the remote root and run `squirrel destination reset %s`: %w",
+		h.dest.Name, rootURI, namingMarkerName, h.vol.Name, h.dest.Name, ErrRefused)
+}
+
+func (h *contentPusher) holdsKeyedVolumeMarker(ctx context.Context) (bool, error) {
+	uri := remoteSubpathURI(h.dest, path.Join(h.names().volumeDir(h.vol.Name), volmark.MarkerName))
+	present, err := h.rcl.statRemoteExists(ctx, uri, checkersArgs(h.dest)...)
+	if err != nil {
+		return false, fmt.Errorf("destination %q: stat %s at %s: %w", h.dest.Name, volmark.MarkerName, uri, err)
+	}
+	return present, nil
 }
 
 // validateNamingScheme refuses the marker at uri when it will not parse or
@@ -158,7 +192,7 @@ func (h *contentPusher) requireEmptyRoot(ctx context.Context) error {
 func validateNamingScheme(ctx context.Context, rcl *Rclone, dest *config.Destination, uri string) error {
 	data, err := rcl.catRemote(ctx, uri, checkersArgs(dest)...)
 	if err != nil {
-		return fmt.Errorf("destination %q: read %s at %s: %w", dest.Name, namingMarkerName, uri, err)
+		return fmt.Errorf("destination %q: read %s at %s — a root written under other crypt passwords cannot be read with these: %w", dest.Name, namingMarkerName, uri, err)
 	}
 	var m namingMarker
 	if err := json.Unmarshal(data, &m); err != nil {

@@ -160,20 +160,22 @@ password = "not-really-obscured"
 // to "" leaves rclone encrypting under an all-zero key, so it is refused at
 // load rather than named as if it were a secret.
 func TestEmptyRevealedPasswordRefused(t *testing.T) {
-	_, err := Load(writeConfig(t, `
+	for _, layout := range []string{"packed", "content-addressed", "mirror"} {
+		_, err := Load(writeConfig(t, `
 [destinations.offsite]
 type   = "sftp"
 host   = "h"
 user   = "u"
 root   = "/data"
-layout = "packed"
+layout = "`+layout+`"
 
 [destinations.offsite.crypt]
 obscured = true
 password = "`+rcloneObscure("")+`"
 `))
-	if err == nil || !strings.Contains(err.Error(), "empty password") {
-		t.Fatalf("want an empty-password refusal, got %v", err)
+		if err == nil || !strings.Contains(err.Error(), "empty password") {
+			t.Errorf("%s: want an empty-password refusal, got %v", layout, err)
+		}
 	}
 }
 
