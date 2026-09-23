@@ -662,7 +662,8 @@ func isReservedSyncPath(p string) bool {
 	return strings.HasPrefix(p, HistoryDirName+"/") ||
 		strings.HasPrefix(p, ConflictsDirName+"/") ||
 		strings.HasPrefix(p, RestoreHistoryDirName+"/") ||
-		strings.HasPrefix(p, IndexDirName+"/")
+		strings.HasPrefix(p, IndexDirName+"/") ||
+		strings.HasPrefix(p, StagingDirName+"/")
 }
 
 // isReservedFolderPath is the folder-path variant of
@@ -674,7 +675,7 @@ func isReservedSyncPath(p string) bool {
 // rejects, aborting the whole walk.
 func isReservedFolderPath(p string) bool {
 	return p == HistoryDirName || p == ConflictsDirName || p == RestoreHistoryDirName ||
-		p == IndexDirName || isReservedSyncPath(p)
+		p == IndexDirName || p == StagingDirName || isReservedSyncPath(p)
 }
 
 // phaseTransfer streams every content object the plan asked for to the

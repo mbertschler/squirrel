@@ -80,7 +80,7 @@ names](/squirrel/reference/formats/#deriving-the-stored-names-on-an-encrypted-de
 
 ## Reserved directories
 
-Three directory names are reserved and **filtered out** of all sync and restore
+Four directory names are reserved and **filtered out** of all sync and restore
 transfers (and from peer-sync), so squirrel's own bookkeeping is never mistaken
 for user content:
 
@@ -89,6 +89,7 @@ for user content:
 | `.squirrel-history/run-<id>/` | rclone's `--backup-dir` target — prior bytes of overwritten files ([mirror](/squirrel/layouts/mirror/)). |
 | `.squirrel-index/` | Ride-along [index snapshots](/squirrel/configuration/index-snapshots/). |
 | `.squirrel-restore-history/run-<id>/` | Files displaced by an [`--in-place` restore](/squirrel/guides/restore/). |
+| `.squirrel-staging/run-<id>/` | A native [mirror](/squirrel/layouts/mirror/)'s in-flight writes, renamed onto their paths once complete. |
 
 One reserved **file** sits at the destination root rather than in a volume tree:
 `.squirrel-naming`, which records the artifact-naming scheme of an
@@ -96,8 +97,8 @@ One reserved **file** sits at the destination root rather than in a volume tree:
 the gate that stops two naming schemes from being mixed into one root, and it
 never carries key material.
 
-A directory literally called `.squirrel-history` in your **source** volume is
-also filtered (with a warning) to keep the reserved name out of the destination
+A directory literally called `.squirrel-history` or `.squirrel-staging` in your
+**source** volume is also filtered (with a warning) to keep the reserved name out of the destination
 tree by accident.
 
 ## Related formats

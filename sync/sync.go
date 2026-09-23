@@ -50,6 +50,13 @@ const RestoreHistoryDirName = ".squirrel-restore-history"
 // and from peer-sync so a snapshot is never mistaken for user content.
 const IndexDirName = ".squirrel-index"
 
+// StagingDirName is the per-volume directory at a native mirror destination
+// that holds in-flight writes: <dest.root>/<volume>/.squirrel-staging/
+// run-<id>/<path key>. A version is staged there, hashed while it streams,
+// and renamed onto its path only once its predecessor is in history. Like
+// the other reserved directories it never travels as user content.
+const StagingDirName = ".squirrel-staging"
+
 // ErrRefused marks a preflight safety refusal: a gate that declined to
 // proceed before any transfer began — a missing or mismatched
 // .squirrel-volume marker, a kopia connect that found no repository
@@ -565,16 +572,18 @@ func finishRunRow(ctx context.Context, s *store.Store, runID int64, status, errM
 }
 
 // historyDirInSourceWarning returns a one-line advisory when the source
-// volume already contains a literal .squirrel-history directory. Sync
-// filters it out of the rclone transfer so it can't pollute the
-// destination tree, but the user should know that some local content is
-// being silently skipped under the reserved name.
+// volume already contains a literal .squirrel-history or .squirrel-staging
+// directory. Sync filters them out of the transfer so they can't pollute
+// the destination tree, but the user should know that some local content
+// is being silently skipped under a reserved name.
 func historyDirInSourceWarning(vol *config.Volume) string {
-	if _, err := os.Stat(filepath.Join(vol.Path, HistoryDirName)); err != nil {
-		return ""
+	for _, dir := range []string{HistoryDirName, StagingDirName} {
+		if _, err := os.Stat(filepath.Join(vol.Path, dir)); err == nil {
+			return fmt.Sprintf("volume %q contains a reserved %s/ directory in its source tree — its contents will not be uploaded; rename or move the directory if you want it synced",
+				vol.Name, dir)
+		}
 	}
-	return fmt.Sprintf("volume %q contains a reserved %s/ directory in its source tree — its contents will not be uploaded; rename or move the directory if you want it synced",
-		vol.Name, HistoryDirName)
+	return ""
 }
 
 // localVolumeHasContent reports whether vol.Path contains anything
@@ -820,6 +829,9 @@ func buildRcloneArgs(vol *config.Volume, dest *config.Destination, runID int64, 
 		// dir from being treated as user content (re-uploaded, or pulled
 		// back down on restore).
 		"--filter", "- /" + IndexDirName + "/**",
+		// .squirrel-staging holds a native mirror's in-flight writes;
+		// the name is reserved on every layout.
+		"--filter", "- /" + StagingDirName + "/**",
 	}
 	args = append(args, checkersArgs(dest)...)
 	if !EffectiveShallow(dest, opts.Shallow) {
@@ -1180,6 +1192,7 @@ func buildRestoreArgs(vol *config.Volume, dest *config.Destination, runID int64,
 		args = append(args, "--filter", "- /"+volmark.MarkerName)
 		args = append(args, "--filter", "- /"+RestoreHistoryDirName+"/**")
 		args = append(args, "--filter", "- /"+IndexDirName+"/**")
+		args = append(args, "--filter", "- /"+StagingDirName+"/**")
 	}
 	args = append(args, checkersArgs(dest)...)
 	if !EffectiveShallow(dest, opts.Shallow) {

@@ -28,7 +28,8 @@ type PathDelta struct {
 const reservedSubtreeFilter = `fo.path != '.squirrel-history'         AND fo.path NOT LIKE '.squirrel-history/%'
 		  AND fo.path != '.squirrel-conflicts'       AND fo.path NOT LIKE '.squirrel-conflicts/%'
 		  AND fo.path != '.squirrel-restore-history' AND fo.path NOT LIKE '.squirrel-restore-history/%'
-		  AND fo.path != '.squirrel-index'           AND fo.path NOT LIKE '.squirrel-index/%'`
+		  AND fo.path != '.squirrel-index'           AND fo.path NOT LIKE '.squirrel-index/%'
+		  AND fo.path != '.squirrel-staging'         AND fo.path NOT LIKE '.squirrel-staging/%'`
 
 // ListPathDeltaSince returns every row in the volume whose status last
 // changed after sinceRunID, ordered by (path, status) so the export is

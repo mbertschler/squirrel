@@ -584,7 +584,7 @@ func TestPreStageTransferPreservesOutOfBandFile(t *testing.T) {
 }
 
 // TestValidateRelPathRejectsAllReservedDirs (#106b): the receiver's wire
-// path allow-list must reject all four reserved sync directories, matching
+// path allow-list must reject all five reserved sync directories, matching
 // the initiator-side filter. A path under .squirrel-restore-history or
 // .squirrel-index could otherwise let a peer overwrite the receiver's only
 // pre-restore backup or its index ride-along.
@@ -594,8 +594,10 @@ func TestValidateRelPathRejectsAllReservedDirs(t *testing.T) {
 		ConflictsDirName + "/run-1/x",
 		RestoreHistoryDirName + "/run-1/x",
 		IndexDirName + "/index.db",
+		StagingDirName + "/run-1/x",
 		RestoreHistoryDirName,
 		IndexDirName,
+		StagingDirName,
 	}
 	for _, p := range reserved {
 		t.Run(p, func(t *testing.T) {

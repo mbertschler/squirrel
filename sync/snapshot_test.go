@@ -357,11 +357,13 @@ func TestSyncFiltersOutIndexDirFromSource(t *testing.T) {
 // reserved-path predicates exclude .squirrel-index, so a node whose index
 // carries rows there never re-publishes them.
 func TestReservedSyncPathCoversIndexDir(t *testing.T) {
-	if !isReservedSyncPath(IndexDirName + "/index-x-run-1.db") {
-		t.Fatalf("isReservedSyncPath does not cover %s/", IndexDirName)
-	}
-	if !isReservedFolderPath(IndexDirName) {
-		t.Fatalf("isReservedFolderPath does not cover bare %s", IndexDirName)
+	for _, dir := range []string{IndexDirName, StagingDirName} {
+		if !isReservedSyncPath(dir + "/run-1/x") {
+			t.Fatalf("isReservedSyncPath does not cover %s/", dir)
+		}
+		if !isReservedFolderPath(dir) {
+			t.Fatalf("isReservedFolderPath does not cover bare %s", dir)
+		}
 	}
 }
 
