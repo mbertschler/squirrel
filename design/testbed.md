@@ -17,6 +17,37 @@ machines are five processes on loopback ports.
 | kopia-mirror | `kopia` binary + a repo directory | Same as production: squirrel drives the CLI |
 | usb disk | a plain directory; "unplugging" = renaming it | `local` destination + marker semantics don't care about hardware |
 
+### The sftp server and native mirrors
+
+`rclone serve sftp` is also the server the sftp transport's contract suite runs
+against: `go test ./sync` starts one per case whenever rclone is on PATH
+(`TestSFTPTransportContractAgainstRcloneServe`). It differs from an OpenSSH
+server in three ways the suite accounts for:
+
+- its rename replaces an existing target (`TestSFTPServersRenameOverAnExistingName`),
+  which is why the transport checks every target first;
+- it hides symlinks, so the symlink cases skip there;
+- it offers no `fsync@openssh.com`, so a push to it skips the flush.
+
+cloudbox is an encrypted mirror, so rclone still writes it. To walk a native
+sftp mirror, declare a second, plain sftp destination against the same server:
+
+```toml
+[destinations.cloudbox-plain]
+type             = "sftp"
+host             = "127.0.0.1"
+port             = "2222"
+user             = "u123456"
+password         = { env = "CLOUDBOX_PASS" }
+root             = "/plain"
+known_hosts_file = ".testbed/cloudbox/known_hosts"
+```
+
+squirrel refuses the server until its host key is pinned; the first push's
+refusal prints the known_hosts line to add. Serve with `--key <file>` to keep
+the key stable across restarts (without it, rclone reuses keys it generated in
+its cache directory).
+
 Deliberately not simulated: Synology/QNAP packaging (below squirrel),
 b2/gcs (same shape as s3), real network partitions — a dead machine or
 dark destination is simulated by stopping its process, which is also

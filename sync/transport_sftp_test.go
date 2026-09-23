@@ -188,21 +188,30 @@ func TestSFTPTransportContract(t *testing.T) {
 	})
 }
 
-// TestSFTPServerRenameReplaces pins why the transport checks a rename's
-// target itself: the in-process server's rename replaces an existing
-// name, as some real servers do.
-func TestSFTPServerRenameReplaces(t *testing.T) {
-	srv := startSFTPServer(t)
-	dir := t.TempDir()
-	tr := mustDialSFTP(t, srv.destination(t, dir))
-	t.Cleanup(func() { _ = tr.Close() })
-	mustPut(t, tr, "x", "from")
-	mustPut(t, tr, "y", "to")
-	if err := tr.client.Rename(tr.full("x"), tr.full("y")); err != nil {
-		t.Skipf("this server refuses the replacing rename itself: %v", err)
+// TestSFTPServersRenameOverAnExistingName pins why the transport checks a
+// rename's target itself: the raw protocol rename of both test servers —
+// pkg/sftp's own, and rclone serve sftp, the testbed's — replaces an
+// existing name.
+func TestSFTPServersRenameOverAnExistingName(t *testing.T) {
+	servers := map[string]func(t *testing.T) *sftpTransport{
+		"pkg-sftp": func(t *testing.T) *sftpTransport {
+			return mustDialSFTP(t, startSFTPServer(t).destination(t, t.TempDir()))
+		},
+		"rclone-serve": rcloneServeTransport,
 	}
-	if got := mustRead(t, tr, "y"); got != "from" {
-		t.Fatalf("y after the raw rename = %q, want from", got)
+	for name, open := range servers {
+		t.Run(name, func(t *testing.T) {
+			tr := open(t)
+			t.Cleanup(func() { _ = tr.Close() })
+			mustPut(t, tr, "x", "from")
+			mustPut(t, tr, "y", "to")
+			if err := tr.client.Rename(tr.full("x"), tr.full("y")); err != nil {
+				t.Skipf("this server refuses the replacing rename itself: %v", err)
+			}
+			if got := mustRead(t, tr, "y"); got != "from" {
+				t.Fatalf("y after the raw rename = %q, want from", got)
+			}
+		})
 	}
 }
 
@@ -321,6 +330,15 @@ func shortTempDir(t *testing.T) string {
 // the testbed's server, `rclone serve sftp`. That server hides symlinks,
 // so the symlink cases skip there.
 func TestSFTPTransportContractAgainstRcloneServe(t *testing.T) {
+	runTransportContract(t, func(t *testing.T) (transport, func(target, name string)) {
+		return rcloneServeTransport(t), func(string, string) { t.Skip("rclone serve sftp hides symlinks") }
+	})
+}
+
+// rcloneServeTransport serves a fresh directory with `rclone serve sftp`
+// and dials it; the test skips without rclone on PATH.
+func rcloneServeTransport(t *testing.T) *sftpTransport {
+	t.Helper()
 	rclone, err := exec.LookPath("rclone")
 	if err != nil {
 		t.Skip("rclone not on PATH")
@@ -334,12 +352,8 @@ func TestSFTPTransportContractAgainstRcloneServe(t *testing.T) {
 	if err := os.WriteFile(keyFile, pem.EncodeToMemory(block), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	runTransportContract(t, func(t *testing.T) (transport, func(target, name string)) {
-		dir := t.TempDir()
-		srv := startRcloneServe(t, rclone, dir, keyFile, hostKey)
-		dest := srv.destination(t, "/")
-		return mustDialSFTP(t, dest), func(string, string) { t.Skip("rclone serve sftp hides symlinks") }
-	})
+	srv := startRcloneServe(t, rclone, t.TempDir(), keyFile, hostKey)
+	return mustDialSFTP(t, srv.destination(t, "/"))
 }
 
 // startRcloneServe serves dir with `rclone serve sftp` on a free loopback

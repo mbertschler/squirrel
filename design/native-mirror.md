@@ -293,8 +293,8 @@ type transport interface {
 - **mtime is whole seconds.** Protocol version 3 carries only seconds, so the
   records store the mtime the server reports.
 - **`Put` and `Rename` check first.** The protocol's rename fails when the
-  target exists, but servers don't all honour that: `pkg/sftp`'s own server
-  replaces it (`TestSFTPServerRenameReplaces`). Version 3 also has no
+  target exists, but servers don't all honour that: `pkg/sftp`'s own server and
+  `rclone serve sftp` both replace it (`TestSFTPServersRenameOverAnExistingName`). Version 3 also has no
   "already exists" status, so an exclusive create that fails can't say why. So
   both calls run `Lstat` on their target first and fail with `fs.ErrExist`,
   and every call checks its name's parent chain for symlinks, as the local
@@ -604,8 +604,10 @@ for local mirrors.
   everywhere, and `hash_algo` on sftp mirrors. On content-addressed and packed
   sftp destinations, `hash_algo` still chooses the hash, which now names the
   command the transport runs on the server. No key is added.
-  Concurrency is fixed: a few parallel writes on sftp, and one or two on a
-  local disk.
+  Concurrency is fixed. On sftp each file goes out as concurrent write
+  requests (`pkg/sftp`'s default of 64 in flight); paths are written one at a
+  time on both transports. The testbed benchmark against rclone (section 8)
+  decides whether several paths in flight are worth their bookkeeping.
 
 ## 8. What we give up
 
