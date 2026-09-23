@@ -102,19 +102,27 @@ type pushPlan struct {
 	advance   []store.OriginComponent // captured before any transfer
 }
 
-// layout is one destination layout's part of a push.
-type layout interface {
+// layout is one destination layout's part of a push. O is the layout's
+// own operations type; a dry run reports its preview.
+type layout[O operations] interface {
+	// markers gates the push on the destination's markers (writes them
+	// under --init; a dry run only checks).
+	markers(ctx context.Context, rep *Report, volumeID int64, opts Options) error
 	// landed reports whether runID left this layout's landing evidence.
 	landed(ctx context.Context, runID int64) (bool, error)
+	// rootEmpty and foreignHistory complete the watermark rule below.
+	rootEmpty(ctx context.Context) (bool, error)
+	foreignHistory(runID int64) error
 	// translate turns the plan into this layout's operations. It reads
 	// squirrel's records and writes nothing: a dry run is translate alone.
-	translate(ctx context.Context, p pushPlan) (operations, error)
+	translate(ctx context.Context, p pushPlan) (O, error)
 	// execute performs the operations and records each confirmed one.
-	execute(ctx context.Context, rep *Report, runID int64, ops operations) error
+	execute(ctx context.Context, rep *Report, runID int64, ops O) error
 	// seal writes the run's landing evidence once every operation is confirmed.
-	seal(ctx context.Context, runID int64, p pushPlan) error
-	// advanceMethod names the evidence the confirmed landing earns.
-	advanceMethod(ctx context.Context, p pushPlan) (string, error)
+	seal(ctx context.Context, rep *Report, runID int64, p pushPlan, ops O) error
+	// advanceMethod names the evidence the confirmed landing earns; an
+	// empty method holds the vector (packed, while a fingerprint is pending).
+	advanceMethod(ctx context.Context, rep *Report, p pushPlan) (string, error)
 }
 ```
 
@@ -122,8 +130,13 @@ One driver runs every layout:
 
     requireIndexedVolume → markers → begin run → plan → translate → execute → seal → advance → finish → ride-along
 
-A dry run stops after translate and reports `operations`' summary. Today's
-separate `previewDryRun` in each handler becomes that summary.
+A dry run stops after translate and reports the operations' preview. The
+separate `previewDryRun` each handler carried became that preview
+(`sync/push.go`).
+
+The driver promotes a run to success only after the vector advanced, for
+every layout. Before the refactor a packed run whose advance failed still
+closed as success; it now closes as failed, like content-addressed.
 
 ### Watermark rule
 
@@ -139,6 +152,10 @@ This rule is shared by all three layouts:
    - squirrel holds **no upload records** for the destination.
 4. In every other case, refuse with `ErrRefused`. The message points at a
    fresh root or `squirrel destination reset`.
+
+A probe that fails, for the evidence or for the root's emptiness, fails the run
+with its error instead: it can't tell either way, so it neither refuses nor
+starts fresh.
 
 Each layout's landing evidence lives at a different place:
 

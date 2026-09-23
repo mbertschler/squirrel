@@ -125,6 +125,27 @@ func (h *contentPusher) ensureMarkers(ctx context.Context, init bool) error {
 	return ensureRemoteDestinationMarker(ctx, h.store, h.rcl, h.dest, h.vol.Name, init)
 }
 
+// markers is the content layouts' marker gate. A dry run checks the naming
+// scheme read-only and writes nothing.
+func (h *contentPusher) markers(ctx context.Context, _ *Report, _ int64, opts Options) error {
+	if opts.DryRun {
+		_, err := h.checkNamingScheme(ctx)
+		return err
+	}
+	return h.ensureMarkers(ctx, opts.Init)
+}
+
+// rootEmpty reports whether the destination root holds no files beyond
+// squirrel's markers — a wiped or repointed destination, or one whose
+// recorded state was cleared by `squirrel destination reset`.
+func (h *contentPusher) rootEmpty(ctx context.Context) (bool, error) {
+	return h.rcl.remoteRootEmpty(ctx, remoteSubpathURI(h.dest, ""), rootMarkerNames(h.dest), checkersArgs(h.dest)...)
+}
+
+func (h *contentPusher) target() pushTarget {
+	return pushTarget{store: h.store, vol: h.vol, dest: h.dest}
+}
+
 // contentAddressedHandler pushes a volume to a content-addressed rclone
 // destination: per-hash `rclone copyto` for each content object the
 // destination lacks, then the run's manifest segment. The landing is
@@ -141,136 +162,44 @@ type contentAddressedHandler struct {
 func (h *contentAddressedHandler) TargetName() string { return h.dest.Name }
 
 func (h *contentAddressedHandler) Push(ctx context.Context, opts Options) (Report, error) {
-	rep := Report{Volume: h.vol.Name, Destination: h.dest.Name}
-	// Stamped up front so output renderers key content-addressed
-	// formatting off the method even when the push fails early.
-	rep.Verification.Method = VerifyMethodPresenceSize
 	if h.vol.Name == ObjectsDirName {
+		rep := Report{Volume: h.vol.Name, Destination: h.dest.Name}
+		rep.Verification.Method = VerifyMethodPresenceSize
 		return rep, fmt.Errorf("volume %q: the name collides with the destination-root %s/ directory of content-addressed destination %q — rename the volume or use a mirrored destination", h.vol.Name, ObjectsDirName, h.dest.Name)
 	}
-	volID, err := requireIndexedVolume(ctx, h.store, h.vol)
-	if err != nil {
-		return rep, err
-	}
-	if opts.DryRun {
-		if _, err := h.checkNamingScheme(ctx); err != nil {
-			return rep, err
-		}
-		return rep, h.previewDryRun(ctx, &rep, volID)
-	}
-	if err := h.ensureMarkers(ctx, opts.Init); err != nil {
-		return rep, err
-	}
-	// shallow=true on the runs row: the per-object transfers carry no
-	// BLAKE3 end-to-end check (crypt remotes expose no hashes), and the
-	// audit trail stays honest about that.
-	runID, err := beginSyncRunGuarded(ctx, h.store, false, store.SyncRunSpec{
-		VolumeID:    volID,
-		Destination: h.dest.Name,
-		Shallow:     true,
-	}, h.vol.Name)
-	if err != nil {
-		return rep, err
-	}
-	rep.RunID = runID
-	if opts.OnRunID != nil {
-		opts.OnRunID(runID)
-	}
-
-	err = h.push(ctx, &rep, volID, runID)
-	finishHandlerRun(ctx, h.store, &rep, err)
-	opts.Snapshot.afterSync(ctx, &rep, h.vol, h.dest)
-	return rep, err
+	return pushThrough(ctx, h.target(), h, opts)
 }
 
 func (h *contentAddressedHandler) sealed() {}
 
-// previewDryRun reports what a real push would upload without transferring
-// anything or writing a runs row: rep.RunID stays 0, no objects land, and
-// no remote_objects or manifest-segment rows are written. It computes the
-// same delta and new-content selection the real push does (watermark →
-// delta → plannedUploads), so the preview matches what the next real run
-// would land. The watermark check still reads the destination, so a
-// layout-flip is refused here too — a dry-run is an honest rehearsal.
-func (h *contentAddressedHandler) previewDryRun(ctx context.Context, rep *Report, volID int64) error {
-	watermark, err := h.watermark(ctx, volID)
-	if err != nil {
-		return err
-	}
-	delta, err := h.store.ListPathDeltaSince(ctx, volID, watermark)
-	if err != nil {
-		return fmt.Errorf("compute path delta since run %d: %w", watermark, err)
-	}
-	rep.Verification.Files = int64(len(delta))
-	if err := h.previewObjectUploads(ctx, rep, plannedUploads(delta)); err != nil {
-		return err
-	}
-	rep.Status = store.RunStatusSuccess
-	return nil
+// translate selects the delta's present content, one source path per hash,
+// and splits it by whether the destination already records it.
+func (h *contentAddressedHandler) translate(ctx context.Context, p pushPlan) (objectUploads, error) {
+	return h.splitRecorded(ctx, plannedUploads(p.delta))
 }
 
-// push runs the transactional landing: delta → objects → segment →
-// vector. rep.Status starts failed and is promoted to success only at
-// the end, after the destination vector advanced — a confirmed landing
-// whose evidence failed to record must not present as success, or the
-// next run's watermark would skip past it.
-func (h *contentAddressedHandler) push(ctx context.Context, rep *Report, volID, runID int64) error {
-	rep.Status = store.RunStatusFailed
-	watermark, err := h.watermark(ctx, volID)
-	if err != nil {
-		return err
-	}
-	advance, err := captureDurabilityAdvance(ctx, h.store, volID)
-	if err != nil {
-		return err
-	}
-	delta, err := h.store.ListPathDeltaSince(ctx, volID, watermark)
-	if err != nil {
-		return fmt.Errorf("compute path delta since run %d: %w", watermark, err)
-	}
-	rep.Verification.Files = int64(len(delta))
-	// The delta is exactly what this push changes at the destination: the
-	// paths whose content the manifest segment newly maps. An empty delta
-	// is a genuine no-op, which is what the runs fold keys on (#182).
-	rep.Changed = knownChanged(int64(len(delta)))
-	if err := h.uploadObjects(ctx, rep, runID, plannedUploads(delta)); err != nil {
-		return err
-	}
-	if err := h.uploadSegment(ctx, delta, runID); err != nil {
-		return err
-	}
-	// presence+size is not a content-verified method (crypt remotes expose
-	// no hashes): the component advances so the offload gate's per-object
-	// scan-back can back it locally. When this run's capture leaves the
-	// whole (volume, destination) pair with a verified fingerprint behind
-	// every present content, the advance is instead stamped
-	// fingerprint-verified — the content-verified method that also relays
-	// over the durability pull (see the durability-vector upgrade in
-	// store). A single still-pending object holds it at presence+size.
-	method, err := h.advanceMethod(ctx, volID, len(advance))
-	if err != nil {
-		return err
-	}
-	if err := h.store.AdvanceDestinationVectorTo(ctx, volID, h.dest.Name, method, advance); err != nil {
-		return fmt.Errorf("advance destination vector for %s: %w", h.dest.Name, err)
-	}
-	rep.Status = store.RunStatusSuccess
-	rep.Verification.Bytes = rep.RcloneResult.Bytes
-	return nil
+// execute lands every object the destination has no record of.
+func (h *contentAddressedHandler) execute(ctx context.Context, rep *Report, runID int64, ops objectUploads) error {
+	return h.uploadObjects(ctx, rep, runID, ops)
 }
 
-// advanceMethod chooses the method the content-addressed push advances its
-// durability vector with: fingerprint-verified when every present content
-// of the volume already carries a verified provider fingerprint on this
+// seal writes the run's manifest segment, the layout's landing evidence.
+func (h *contentAddressedHandler) seal(ctx context.Context, _ *Report, runID int64, p pushPlan, _ objectUploads) error {
+	return h.uploadSegment(ctx, p.delta, runID)
+}
+
+// advanceMethod chooses fingerprint-verified when every present content of
+// the volume already carries a verified provider fingerprint on this
 // destination (the whole-state check, not just this run's uploads), and
-// presence+size otherwise. advanceLen is the size of the advance snapshot;
-// an empty snapshot advances nothing, so the method is immaterial and the
-// pending query is skipped.
-func (h *contentPusher) advanceMethod(ctx context.Context, volID int64, advanceLen int) (string, error) {
-	if advanceLen == 0 {
+// presence+size otherwise: presence+size is not content-verified (crypt
+// remotes expose no hashes), so the offload gate's per-object scan-back
+// backs it locally, and a single still-pending object holds the upgrade.
+// An empty advance advances nothing, so the pending query is skipped.
+func (h *contentAddressedHandler) advanceMethod(ctx context.Context, _ *Report, p pushPlan) (string, error) {
+	if len(p.advance) == 0 {
 		return store.VerifyMethodPresenceSize, nil
 	}
-	pending, err := h.store.CountVolumeContentsPendingFingerprint(ctx, volID, h.dest.Name)
+	pending, err := h.store.CountVolumeContentsPendingFingerprint(ctx, p.volumeID, h.dest.Name)
 	if err != nil {
 		return "", err
 	}
@@ -280,64 +209,65 @@ func (h *contentPusher) advanceMethod(ctx context.Context, volID int64, advanceL
 	return store.VerifyMethodPresenceSize, nil
 }
 
-// watermark resolves the run id the delta starts after: the last
-// successful sync of this (volume, destination), or 0 for a fresh
-// destination. The last success must still have its manifest segment at
-// the destination — every successful content-addressed run uploads one,
-// so its absence means the recorded history belongs to a different
-// layout (a destination flipped from mirror) and a delta computed
-// against it would silently skip everything the mirror era covered.
-func (h *contentAddressedHandler) watermark(ctx context.Context, volID int64) (int64, error) {
-	last, err := h.store.LatestSuccessfulSyncRun(ctx, volID, h.dest.Name)
-	if store.IsNotFound(err) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, fmt.Errorf("lookup last successful sync of %s: %w", h.dest.Name, err)
-	}
-	segURI := h.segmentURI(last.ID)
-	if _, err := h.rcl.statRemote(ctx, segURI, checkersArgs(h.dest)...); err != nil {
-		if freshStartOnEmptyRoot(ctx, h.rcl, h.dest) {
-			return 0, nil
-		}
-		return 0, fmt.Errorf("destination %q: the last successful sync (run %d) left no manifest segment at %s — its history does not look content-addressed; point the layout at a fresh destination or root, or (after wiping the remote root) run `squirrel destination reset %s`, instead of switching an existing one: %w: %w", h.dest.Name, last.ID, segURI, h.dest.Name, err, ErrRefused)
-	}
-	return last.ID, nil
+// landed reports whether runID's manifest segment is at the destination.
+// Every successful content-addressed run uploads one, so its absence means
+// the recorded history belongs to a different layout or a wiped root.
+func (h *contentAddressedHandler) landed(ctx context.Context, runID int64) (bool, error) {
+	return h.rcl.statRemoteExists(ctx, h.segmentURI(runID), checkersArgs(h.dest)...)
 }
 
-// previewObjectUploads counts, without uploading, the split uploadObjects
-// would record: planned content the destination has no record of lands on
-// rep.RcloneResult as Transferred + Bytes, content already offsite (as a
-// per-hash object or a pack member) as Checked. It writes nothing and
-// touches no object. Both layouts' dry-run preview use it — the packed
-// layout passes only its object-routed (large) content.
-func (h *contentPusher) previewObjectUploads(ctx context.Context, rep *Report, planned []store.PathDelta) error {
-	for _, d := range planned {
-		recorded, err := h.store.ContentPresentOnDestination(ctx, d.ContentID, h.dest.Name)
-		if err != nil {
-			return fmt.Errorf("lookup upload record for %s: %w", d.Path, err)
-		}
-		if recorded {
-			rep.RcloneResult.Checked++
-			continue
-		}
+func (h *contentAddressedHandler) foreignHistory(runID int64) error {
+	return fmt.Errorf("destination %q: the last successful sync (run %d) left no manifest segment at %s — its history does not look content-addressed; point the layout at a fresh destination or root, or (after wiping the remote root) run `squirrel destination reset %s`, instead of switching an existing one: %w", h.dest.Name, runID, h.segmentURI(runID), h.dest.Name, ErrRefused)
+}
+
+// objectUploads is the object side of a content push: the planned content
+// the destination has no upload record for, and how many planned contents
+// it already records (as a per-hash object or a pack member).
+type objectUploads struct {
+	needed   []store.PathDelta
+	recorded int64
+}
+
+// preview counts the split uploadObjects would record: needed content as
+// Transferred + Bytes, recorded content as Checked.
+func (o objectUploads) preview(rep *Report) {
+	rep.RcloneResult.Checked += o.recorded
+	for _, d := range o.needed {
 		rep.RcloneResult.Transferred++
 		rep.RcloneResult.Bytes += d.SizeBytes
 	}
-	return nil
 }
 
-// uploadObjects lands every planned content object that the destination
-// has no upload record for. planned is the deduplicated, present-only
-// upload set (plannedUploads) — the content-addressed layout passes its
-// whole delta's uploads, the packed layout passes only the files at or
-// above its pack threshold. Counters land on
-// rep.RcloneResult so the run report reads like the other rclone
-// flows: Transferred = objects uploaded, Checked = objects skipped as
-// already recorded, Errors/FailedFiles = per-object failures. Per-object
-// failures don't stop the loop — every object that lands now is recorded
-// and saves work on the retry — but any failure fails the run before
-// the segment is written.
+// splitRecorded splits planned content by whether the destination already
+// records it offsite, as a per-hash object or a pack member, so a threshold
+// change that reclassifies content never re-uploads bytes the destination
+// already holds in the other form. Both content layouts translate their
+// object side through it.
+func (h *contentPusher) splitRecorded(ctx context.Context, planned []store.PathDelta) (objectUploads, error) {
+	var out objectUploads
+	for _, d := range planned {
+		recorded, err := h.store.ContentPresentOnDestination(ctx, d.ContentID, h.dest.Name)
+		if err != nil {
+			return objectUploads{}, fmt.Errorf("lookup upload record for %s: %w", d.Path, err)
+		}
+		if recorded {
+			out.recorded++
+			continue
+		}
+		out.needed = append(out.needed, d)
+	}
+	return out, nil
+}
+
+// uploadObjects lands every planned content object the destination has
+// no upload record for. The content-addressed layout passes its whole
+// delta's uploads, the packed layout only the files at or above its pack
+// threshold. Counters land on rep.RcloneResult so the run report reads
+// like the other rclone flows: Transferred = objects uploaded, Checked =
+// objects skipped as already recorded, Errors/FailedFiles = per-object
+// failures. Per-object failures don't stop the loop — every object that
+// lands now is recorded and saves work on the retry — but any failure
+// fails the run before the segment is written.
 //
 // A source whose bytes drifted from the indexed hash is refused without a
 // remote_objects row (errContentDrift): it is surfaced as a warning and
@@ -345,22 +275,11 @@ func (h *contentPusher) previewObjectUploads(ctx context.Context, rep *Report, p
 // advance. The next run recomputes the same delta and re-offers the
 // object, letting the honest bytes land once they are restored — without
 // the drifted bytes ever being recorded under the hash.
-func (h *contentPusher) uploadObjects(ctx context.Context, rep *Report, runID int64, planned []store.PathDelta) error {
+func (h *contentPusher) uploadObjects(ctx context.Context, rep *Report, runID int64, ops objectUploads) error {
+	rep.RcloneResult.Checked += ops.recorded
 	var confirmed []store.PathDelta
 	var drifted int
-	for _, d := range planned {
-		// Two-source presence: skip content already offsite as a per-hash
-		// object or bundled in a pack already uploaded to this destination,
-		// so a threshold change that reclassifies content never re-uploads
-		// bytes the destination already holds in the other form.
-		recorded, err := h.store.ContentPresentOnDestination(ctx, d.ContentID, h.dest.Name)
-		if err != nil {
-			return fmt.Errorf("lookup upload record for %s: %w", d.Path, err)
-		}
-		if recorded {
-			rep.RcloneResult.Checked++
-			continue
-		}
+	for _, d := range ops.needed {
 		if err := h.uploadOneObject(ctx, runID, d); err != nil {
 			if errors.Is(err, errContentDrift) {
 				drifted++

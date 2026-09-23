@@ -107,13 +107,12 @@ type PackPreview struct {
 //
 // Durability: this handler uploads packs, records them in the local
 // packs/pack_members tables, reads each pack's scan-back fingerprint into
-// remote_packs, and advances the destination durability vector at
-// presence+size only once every pack this run assembled is
-// fingerprint-verified alongside the placement map and manifest segment
-// (see certifyPacked). The offload gate then certifies a packed content
-// through its pack's verified remote_packs row. Large files reuse the
-// content-addressed object path and keep its per-object remote_objects
-// record and fingerprint capture.
+// remote_packs, and advances the destination durability vector — as
+// fingerprint-verified, never presence+size — only once every present
+// content of the pair is fingerprint-verified (see advanceMethod). The
+// offload gate then certifies a packed content through its pack's verified
+// remote_packs row. Large files reuse the content-addressed object path and
+// keep its per-object remote_objects record and fingerprint capture.
 type packedHandler struct {
 	contentPusher
 }
@@ -123,86 +122,44 @@ func (h *packedHandler) TargetName() string { return h.dest.Name }
 func (h *packedHandler) sealed() {}
 
 func (h *packedHandler) Push(ctx context.Context, opts Options) (Report, error) {
-	rep := Report{Volume: h.vol.Name, Destination: h.dest.Name}
-	// Presence+size is the strongest check the packed push claims; it is
-	// not content-verified (crypt remotes expose no hashes, and packs carry
-	// no fingerprint until PR 3), so results stay unverified.
-	rep.Verification.Method = VerifyMethodPresenceSize
 	if h.vol.Name == ObjectsDirName || h.vol.Name == PacksDirName {
+		rep := Report{Volume: h.vol.Name, Destination: h.dest.Name}
+		rep.Verification.Method = VerifyMethodPresenceSize
 		return rep, fmt.Errorf("volume %q: the name collides with the destination-root %s/ directory of packed destination %q — rename the volume or use a mirrored destination", h.vol.Name, h.vol.Name, h.dest.Name)
 	}
-	volID, err := requireIndexedVolume(ctx, h.store, h.vol)
-	if err != nil {
-		return rep, err
-	}
-	if opts.DryRun {
-		if _, err := h.checkNamingScheme(ctx); err != nil {
-			return rep, err
-		}
-		return rep, h.previewDryRun(ctx, &rep, volID)
-	}
-	if err := h.ensureMarkers(ctx, opts.Init); err != nil {
-		return rep, err
-	}
-	// shallow=true: neither the per-object copyto nor the pack copyto
-	// carries a BLAKE3 end-to-end check, and the audit trail stays honest.
-	runID, err := beginSyncRunGuarded(ctx, h.store, false, store.SyncRunSpec{
-		VolumeID:    volID,
-		Destination: h.dest.Name,
-		Shallow:     true,
-	}, h.vol.Name)
-	if err != nil {
-		return rep, err
-	}
-	rep.RunID = runID
-	if opts.OnRunID != nil {
-		opts.OnRunID(runID)
-	}
-
-	err = h.push(ctx, &rep, volID, runID)
-	finishHandlerRun(ctx, h.store, &rep, err)
-	opts.Snapshot.afterSync(ctx, &rep, h.vol, h.dest)
-	return rep, err
+	return pushThrough(ctx, h.target(), h, opts)
 }
 
-// previewDryRun reports what a real packed push would do — which content
-// would upload as per-hash objects vs. be bundled into packs — without
-// assembling or uploading any pack and without writing a runs row:
-// rep.RunID stays 0 and no packs, pack_members, remote_*, objects, or
-// pack artifacts are written. It computes the same delta and routing the
-// real push does (watermark → delta → routeBySize); the object side lands
-// on rep.RcloneResult exactly as the content-addressed preview reports it,
-// the pack side on rep.PackPreview. The watermark check still reads the
-// destination, so a layout-flip is refused here too.
-func (h *packedHandler) previewDryRun(ctx context.Context, rep *Report, volID int64) error {
-	watermark, err := h.watermark(ctx, volID)
-	if err != nil {
-		return err
-	}
-	delta, err := h.store.ListPathDeltaSince(ctx, volID, watermark)
-	if err != nil {
-		return fmt.Errorf("compute path delta since run %d: %w", watermark, err)
-	}
-	rep.Verification.Files = int64(len(delta))
-	large, small, err := h.routeBySize(ctx, rep, plannedUploads(delta))
-	if err != nil {
-		return err
-	}
-	if err := h.previewObjectUploads(ctx, rep, large); err != nil {
-		return err
-	}
-	rep.PackPreview = h.previewPacks(small)
-	rep.Status = store.RunStatusSuccess
-	return nil
+// packedOps is the packed translation of a plan: the large content routed
+// to per-hash objects, the small content still to be packed (hash-sorted,
+// so assembly is deterministic), and how much small content an earlier
+// pack already holds. execute fills in the packs it assembled, which seal
+// records.
+type packedOps struct {
+	objects       objectUploads
+	members       []store.PathDelta
+	alreadyInPack int64
+	packSize      int64
+
+	writes     []store.PackWrite
+	placements []PlacementEntry
 }
 
-// previewPacks summarises the small (pack-routed) content routeBySize
-// selected, without assembling a pack. small is already hash-sorted, so
-// the size-band walk mirrors buildOnePack's — accumulate members until the
-// running total reaches PackSize, then close a pack — but over uncompressed
-// sizes, yielding an estimated (not bounded) pack count (see PackPreview).
-func (h *packedHandler) previewPacks(small []store.PathDelta) PackPreview {
-	p := PackPreview{SizeBand: h.dest.PackSize}
+// preview reports the object side on rep.RcloneResult, exactly as the
+// content-addressed preview does, and the pack side on rep.PackPreview.
+func (o *packedOps) preview(rep *Report) {
+	o.objects.preview(rep)
+	rep.RcloneResult.Checked += o.alreadyInPack
+	rep.PackPreview = previewPacks(o.members, o.packSize)
+}
+
+// previewPacks summarises the small (pack-routed) content without
+// assembling a pack. small is already hash-sorted, so the size-band walk
+// mirrors buildOnePack's — accumulate members until the running total
+// reaches packSize, then close a pack — but over uncompressed sizes,
+// yielding an estimated (not bounded) pack count (see PackPreview).
+func previewPacks(small []store.PathDelta, packSize int64) PackPreview {
+	p := PackPreview{SizeBand: packSize}
 	for i := 0; i < len(small); {
 		var packBytes int64
 		for i < len(small) {
@@ -210,7 +167,7 @@ func (h *packedHandler) previewPacks(small []store.PathDelta) PackPreview {
 			p.Contents++
 			p.Bytes += small[i].SizeBytes
 			i++
-			if packBytes >= h.dest.PackSize {
+			if packBytes >= packSize {
 				break
 			}
 		}
@@ -219,65 +176,58 @@ func (h *packedHandler) previewPacks(small []store.PathDelta) PackPreview {
 	return p
 }
 
-// push runs the transactional landing: delta → objects (large) + packs
-// (small) → placement map → manifest segment → local pack rows → per-pack
-// fingerprints → vector advance. rep.Status starts failed and is promoted
-// only after every piece is confirmed present, so a partial landing never
-// presents as success.
-func (h *packedHandler) push(ctx context.Context, rep *Report, volID, runID int64) error {
-	rep.Status = store.RunStatusFailed
-	watermark, err := h.watermark(ctx, volID)
+// translate routes the delta's present content by dest.PackThreshold (see
+// routeBySize) and splits the large side by upload record.
+func (h *packedHandler) translate(ctx context.Context, p pushPlan) (*packedOps, error) {
+	large, small, alreadyInPack, err := h.routeBySize(ctx, plannedUploads(p.delta))
 	if err != nil {
-		return err
+		return nil, err
 	}
-	// Snapshot the advance before any transfer so a row committed mid-push
-	// is never folded into it — the same discipline the content-addressed
-	// handler uses.
-	advance, err := captureDurabilityAdvance(ctx, h.store, volID)
+	objects, err := h.splitRecorded(ctx, large)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	delta, err := h.store.ListPathDeltaSince(ctx, volID, watermark)
-	if err != nil {
-		return fmt.Errorf("compute path delta since run %d: %w", watermark, err)
-	}
-	rep.Verification.Files = int64(len(delta))
-	// Same reading as the content-addressed push: the delta is what this
-	// run changes at the destination, so an empty one folds as a no-op.
-	rep.Changed = knownChanged(int64(len(delta)))
-	large, small, err := h.routeBySize(ctx, rep, plannedUploads(delta))
-	if err != nil {
-		return err
-	}
-	if err := h.uploadObjects(ctx, rep, runID, large); err != nil {
-		return err
-	}
-	writes, placements, err := h.assembleAndUploadPacks(ctx, rep, runID, small)
-	if err != nil {
-		return err
-	}
-	if err := h.uploadPlacementMap(ctx, placements, runID); err != nil {
-		return err
-	}
-	if err := h.uploadSegment(ctx, delta, runID); err != nil {
-		return err
-	}
-	// Recorded only after every pack, the map, and the segment confirmed
-	// landing: a pack_members row always has its bytes (and their location)
-	// offsite, and a run that failed earlier left nothing here to re-pack.
-	if err := h.store.InsertPacks(ctx, writes); err != nil {
-		return fmt.Errorf("record packs for run %d: %w", runID, err)
-	}
-	rep.Status = store.RunStatusSuccess
-	rep.Verification.Bytes = rep.RcloneResult.Bytes
-	return h.certifyPacked(ctx, rep, volID, runID, writes, advance)
+	return &packedOps{objects: objects, members: small, alreadyInPack: alreadyInPack, packSize: h.dest.PackSize}, nil
 }
 
-// certifyPacked closes the durability seam: it records a remote_packs row
-// per landed pack, reads each pack's scan-back fingerprint, and advances
-// the destination vector to fingerprint-verified only once the whole
-// (volume, destination) pair carries a verified fingerprint behind every
-// present file content. That whole-state check is
+// execute lands the large content as objects, then assembles and uploads
+// the small content's packs. Nothing about the packs is recorded in the
+// store yet: seal does that once the map and segment landed.
+func (h *packedHandler) execute(ctx context.Context, rep *Report, runID int64, ops *packedOps) error {
+	rep.RcloneResult.Checked += ops.alreadyInPack
+	if err := h.uploadObjects(ctx, rep, runID, ops.objects); err != nil {
+		return err
+	}
+	writes, placements, err := h.assembleAndUploadPacks(ctx, rep, runID, ops.members)
+	if err != nil {
+		return err
+	}
+	ops.writes, ops.placements = writes, placements
+	return nil
+}
+
+// seal writes the placement map (the layout's landing evidence) and the
+// manifest segment, then records the packs and reads their fingerprints.
+// A pack_members row therefore always has its bytes, and their location,
+// offsite, and a run that failed earlier left nothing here to re-pack.
+func (h *packedHandler) seal(ctx context.Context, rep *Report, runID int64, p pushPlan, ops *packedOps) error {
+	if err := h.uploadPlacementMap(ctx, ops.placements, runID); err != nil {
+		return err
+	}
+	if err := h.uploadSegment(ctx, p.delta, runID); err != nil {
+		return err
+	}
+	if err := h.store.InsertPacks(ctx, ops.writes); err != nil {
+		return fmt.Errorf("record packs for run %d: %w", runID, err)
+	}
+	h.capturePackFingerprints(ctx, rep, runID, ops.writes)
+	return nil
+}
+
+// advanceMethod closes the durability seam: the vector advances as
+// fingerprint-verified only once the whole (volume, destination) pair
+// carries a verified fingerprint behind every present file content, and is
+// held otherwise. That whole-state check is
 // CountVolumeContentsPendingFingerprint, which counts present contents
 // lacking a verified remote_objects (per-hash object) or remote_packs (pack
 // member) fingerprint on this destination — so it covers packs and per-hash
@@ -285,11 +235,8 @@ func (h *packedHandler) push(ctx context.Context, rep *Report, volID, runID int6
 //
 // The placement map and manifest segment are deliberately NOT in that
 // pending set: they are re-derivable squirrel-written metadata that carry
-// no scan-back fingerprint. Their durability before this advance is handled
-// upstream in push, which uploads and confirms both landed at their
-// expected size before promoting the run to success — a run whose map or
-// segment failed to land returns failed and never reaches certifyPacked, so
-// the vector is untouched.
+// no scan-back fingerprint, and seal confirmed both landed at their
+// expected size before this runs.
 //
 // Gating on the whole pending set rather than this run's writes is the
 // friction-log F13 fix: a run that packs nothing no longer advances
@@ -297,26 +244,17 @@ func (h *packedHandler) push(ctx context.Context, rep *Report, volID, runID int6
 // anywhere in the pair holds the whole advance. `squirrel verify` fills a
 // pending fingerprint later and re-attempts this advance itself (see the
 // store upgrade), so the vector no longer stalls until the next
-// content-writing sync. rep.Verification stays unverified (presence+size is
-// not content-verified), so RunPair does not advance the vector a second
-// time.
-func (h *packedHandler) certifyPacked(ctx context.Context, rep *Report, volID, runID int64, writes []store.PackWrite, advance []store.OriginComponent) error {
-	h.capturePackFingerprints(ctx, rep, runID, writes)
-	pending, err := h.store.CountVolumeContentsPendingFingerprint(ctx, volID, h.dest.Name)
+// content-writing sync.
+func (h *packedHandler) advanceMethod(ctx context.Context, rep *Report, p pushPlan) (string, error) {
+	pending, err := h.store.CountVolumeContentsPendingFingerprint(ctx, p.volumeID, h.dest.Name)
 	if err != nil {
-		return fmt.Errorf("count pending fingerprints for %s: %w", h.dest.Name, err)
+		return "", fmt.Errorf("count pending fingerprints for %s: %w", h.dest.Name, err)
 	}
 	if pending > 0 {
 		rep.Warnings = append(rep.Warnings, fmt.Sprintf("destination %q: %d content(s) are not yet fingerprint-verified; the durability vector was not advanced — run `squirrel verify` to certify them", h.dest.Name, pending))
-		return nil
+		return "", nil
 	}
-	if len(advance) == 0 {
-		return nil
-	}
-	if err := h.store.AdvanceDestinationVectorTo(ctx, volID, h.dest.Name, store.VerifyMethodFingerprint, advance); err != nil {
-		return fmt.Errorf("advance destination vector for %s: %w", h.dest.Name, err)
-	}
-	return nil
+	return store.VerifyMethodFingerprint, nil
 }
 
 // capturePackFingerprints records a per-destination upload row for each
@@ -327,7 +265,7 @@ func (h *packedHandler) certifyPacked(ctx context.Context, rep *Report, volID, r
 // backends read `rclone lsjson --hash`. A pack whose fingerprint could not
 // be read stays pending (checksum NULL) with a warning — never a fabricated
 // value. The whole-pair pending tally (CountVolumeContentsPendingFingerprint)
-// is what certifyPacked gates the vector advance on, so this returns nothing.
+// is what advanceMethod gates the vector advance on, so this returns nothing.
 func (h *packedHandler) capturePackFingerprints(ctx context.Context, rep *Report, runID int64, writes []store.PackWrite) {
 	targets := make([]captureTarget, 0, len(writes))
 	for _, w := range writes {
@@ -354,41 +292,26 @@ func (h *packedHandler) capturePackFingerprints(ctx context.Context, rep *Report
 	h.captureScanBackFingerprints(ctx, rep, PacksDirName, targets)
 }
 
-// watermark resolves the run id the delta starts after: the last
-// successful sync of this (volume, destination), or 0 for a fresh
-// destination. The last success must still have its placement map at the
-// destination — every successful packed run uploads one (empty when no
-// small content was new) — so its absence means the recorded history
-// belongs to a different layout (a mirror leaves no map, a
-// content-addressed root leaves objects and segments but no packs/ map) and
-// a delta computed against it would silently skip everything that era
-// covered. This is the packed analogue of the content-addressed watermark
-// guard, strengthened to also refuse an object-per-hash history.
-func (h *packedHandler) watermark(ctx context.Context, volID int64) (int64, error) {
-	last, err := h.store.LatestSuccessfulSyncRun(ctx, volID, h.dest.Name)
-	if store.IsNotFound(err) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, fmt.Errorf("lookup last successful sync of %s: %w", h.dest.Name, err)
-	}
-	mapURI := h.mapURI(last.ID)
-	if _, err := h.rcl.statRemote(ctx, mapURI, checkersArgs(h.dest)...); err != nil {
-		if freshStartOnEmptyRoot(ctx, h.rcl, h.dest) {
-			return 0, nil
-		}
-		return 0, fmt.Errorf("destination %q: the last successful sync (run %d) left no pack placement map at %s — its history is not packed (a mirror or content-addressed root); point the layout at a fresh destination or root, or (after wiping the remote root) run `squirrel destination reset %s`, instead of switching an existing one: %w: %w", h.dest.Name, last.ID, mapURI, h.dest.Name, err, ErrRefused)
-	}
-	return last.ID, nil
+// landed reports whether runID's placement map is at the destination.
+// Every successful packed run uploads one (empty when no small content was
+// new), so its absence means the recorded history belongs to a different
+// layout — a mirror leaves no map, a content-addressed root leaves objects
+// and segments but no packs/ map — or a wiped root.
+func (h *packedHandler) landed(ctx context.Context, runID int64) (bool, error) {
+	return h.rcl.statRemoteExists(ctx, h.mapURI(runID), checkersArgs(h.dest)...)
+}
+
+func (h *packedHandler) foreignHistory(runID int64) error {
+	return fmt.Errorf("destination %q: the last successful sync (run %d) left no pack placement map at %s — its history is not packed (a mirror or content-addressed root); point the layout at a fresh destination or root, or (after wiping the remote root) run `squirrel destination reset %s`, instead of switching an existing one: %w", h.dest.Name, runID, h.mapURI(runID), h.dest.Name, ErrRefused)
 }
 
 // routeBySize splits the planned uploads by dest.PackThreshold: content at
 // or above it becomes a per-hash object (large), content below it becomes a
 // pack member (small) unless it is already packed — a pack is
 // content-global and assembled once, so already-packed content is skipped
-// and counted as checked. small is returned sorted by hash so pack
-// assembly is deterministic.
-func (h *packedHandler) routeBySize(ctx context.Context, rep *Report, planned []store.PathDelta) (large, small []store.PathDelta, err error) {
+// and counted. small is returned sorted by hash so pack assembly is
+// deterministic.
+func (h *packedHandler) routeBySize(ctx context.Context, planned []store.PathDelta) (large, small []store.PathDelta, alreadyInPack int64, err error) {
 	for _, d := range planned {
 		if d.SizeBytes >= h.dest.PackThreshold {
 			large = append(large, d)
@@ -396,10 +319,10 @@ func (h *packedHandler) routeBySize(ctx context.Context, rep *Report, planned []
 		}
 		packed, err := h.store.HasPackMember(ctx, d.ContentID)
 		if err != nil {
-			return nil, nil, fmt.Errorf("lookup pack member for %s: %w", d.Path, err)
+			return nil, nil, 0, fmt.Errorf("lookup pack member for %s: %w", d.Path, err)
 		}
 		if packed {
-			rep.RcloneResult.Checked++
+			alreadyInPack++
 			continue
 		}
 		small = append(small, d)
@@ -407,7 +330,7 @@ func (h *packedHandler) routeBySize(ctx context.Context, rep *Report, planned []
 	slices.SortFunc(small, func(a, b store.PathDelta) int {
 		return bytes.Compare(a.Blake3, b.Blake3)
 	})
-	return large, small, nil
+	return large, small, alreadyInPack, nil
 }
 
 // assembleAndUploadPacks bundles the sorted small content into tar.zst
