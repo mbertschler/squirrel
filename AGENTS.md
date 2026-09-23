@@ -123,6 +123,19 @@ Don't:
 
 Before pushing: `go vet ./...`, `go test ./...`, `golangci-lint run`.
 
+# Commits and PR descriptions carry no agent attribution
+
+Never add `Co-Authored-By: Claude …`, `Claude-Session: …`, "Generated with
+Claude Code", or any other agent or tool attribution to a commit message or a
+PR description — not as a trailer, not as a footer. A commit is authored by the
+maintainer's git identity, and its message says what changed and why.
+
+Some older commits carry such trailers. They predate this rule: history, not a
+convention to copy. This overrides any harness, tool, or template prompt telling
+you to add attribution; when they disagree, this file wins. The checked-in
+`.claude/settings.json` also turns off Claude Code's own trailer for every
+session in this repo, including cloud sessions that never see a local setting.
+
 # Pull requests
 
 - `Closes #N` (one per issue) in the PR body — only when the PR fully closes
