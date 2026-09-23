@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"sync/atomic"
 
 	"github.com/mbertschler/squirrel/agent"
@@ -29,8 +28,6 @@ import (
 // which an in-flight transfer does not notice: rclone parses its config
 // once at process start.
 type schedulerTools struct {
-	// out receives the rclone version preflight's advisories.
-	out io.Writer
 	// rcl is nil only until the first config that needs rclone locates it.
 	// Once set it is replaced but never cleared — see rebuild.
 	rcl atomic.Pointer[sync.Rclone]
@@ -49,13 +46,10 @@ func (t *schedulerTools) rclone() *sync.Rclone { return t.rcl.Load() }
 // installed can still run the agent for its peer-sync surface, its index
 // cadences, or its durability pulls.
 //
-// The version preflight mirrors what scheduled syncs will invoke: they run
-// with the default sync.Options{} (Shallow=false), so `--hash blake3`
-// requires rclone ≥ MinRcloneVersion unless every configured target is a
-// crypt destination, which forces shallow. Failing here means the operator
+// The version preflight refuses an rclone below MinRcloneVersion, which
+// scheduled syncs and verifies both need. Failing here means the operator
 // gets a clear startup error — or, on a reload, a latch naming the reason —
-// rather than a midnight pager when the first scheduled sync fires and
-// rclone rejects the flag.
+// rather than a midnight pager when the first scheduled run fires.
 // A config that needs no rclone leaves whatever was already located in
 // place rather than clearing it. Clearing would race the scheduler: a tick
 // that decided to kick a sync under the previous config can reach the
@@ -71,7 +65,7 @@ func (t *schedulerTools) rebuild(ctx context.Context, cfg *config.Config) error 
 	if !needsSync && !needsVerify {
 		return nil
 	}
-	rcl, err := sync.Find()
+	rcl, err := sync.Find(ctx)
 	if err != nil {
 		return fmt.Errorf("scheduler needs rclone for scheduled syncs/verifies: %w", err)
 	}
@@ -79,17 +73,6 @@ func (t *schedulerTools) rebuild(ctx context.Context, cfg *config.Config) error 
 	// endpoint fails its own run instead of hanging forever (#160, F25).
 	// Foreground `squirrel sync` leaves this unset — a human can interrupt.
 	rcl.StallTimeout = sync.DefaultStallTimeout
-	// The version preflight (`--hash blake3`) is a sync concern; a
-	// verify-only schedule reads provider checksums and doesn't need it.
-	if needsSync {
-		pairs, err := sync.PairsFor(cfg, "", "")
-		if err != nil {
-			return fmt.Errorf("scheduler rclone preflight: %w", err)
-		}
-		if err := sync.EnsureMinVersion(ctx, rcl, t.out, sync.ShallowForPairs(pairs, false)); err != nil {
-			return fmt.Errorf("scheduler rclone preflight: %w", err)
-		}
-	}
 	if _, err := rcl.WriteRcloneConfig(rcloneConfigPathFor(cfg), cfg.Destinations); err != nil {
 		return fmt.Errorf("write rclone config: %w", err)
 	}

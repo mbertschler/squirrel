@@ -42,14 +42,14 @@ func seedDestinationState(t *testing.T, s *Store, vID, runID int64, destination 
 		t.Fatalf("InsertRemotePack: %v", err)
 	}
 
-	if err := s.UpsertDestinationRunIDVerified(ctx, vID, destination, self.ID, 5, VerifyMethodBlake3, false); err != nil {
+	if err := s.UpsertDestinationRunIDVerified(ctx, vID, destination, self.ID, 5, VerifyMethodKopia, false); err != nil {
 		t.Fatalf("UpsertDestinationRunIDVerified: %v", err)
 	}
 	if err := s.UpsertDestinationPushFreshness(ctx, vID, destination, self.ID, 5); err != nil {
 		t.Fatalf("UpsertDestinationPushFreshness: %v", err)
 	}
 	// A second destination whose state must survive a reset of the first.
-	if err := s.UpsertDestinationRunIDVerified(ctx, vID, "other", self.ID, 7, VerifyMethodBlake3, false); err != nil {
+	if err := s.UpsertDestinationRunIDVerified(ctx, vID, "other", self.ID, 7, VerifyMethodKopia, false); err != nil {
 		t.Fatalf("UpsertDestinationRunIDVerified(other): %v", err)
 	}
 	return self.ID

@@ -14,7 +14,7 @@ import (
 
 func TestVerifyResultUnmintableOutsidePackage(t *testing.T) {
 	v := sync.VerifyResult{
-		Method:     sync.VerifyMethodBlake3,
+		Method:     sync.VerifyMethodKopia,
 		SnapshotID: "abc",
 		Files:      100,
 		Bytes:      1 << 20,

@@ -249,8 +249,11 @@ sync_to = ["does-not-exist"]
 func TestLoadOffloadRequires(t *testing.T) {
 	p := writeConfig(t, `
 [destinations.scratch]
-type = "local"
-root = "/tmp/dst"
+type   = "sftp"
+host   = "host.example"
+user   = "u"
+root   = "/data"
+layout = "content-addressed"
 
 [volumes.pictures]
 path = "/tmp/pictures"
@@ -320,10 +323,11 @@ offload_requires = ["cloudbox"]
 	}
 }
 
-// TestLoadAcceptsPlainMirrorOffloadRequires: a plain (non-crypt) mirror is
-// now an evidence-producing target — a BLAKE3-verified sync advances its
-// durability vector — so naming one in offload_requires must load cleanly.
-func TestLoadAcceptsPlainMirrorOffloadRequires(t *testing.T) {
+// TestLoadRejectsPlainMirrorOffloadRequires: a plain mirror's sync is
+// compared by rclone's checksum under a hash rclone picks, never the
+// index's BLAKE3, so it can no more gate offload than a crypt mirror can
+// (#211). Naming one fails at load.
+func TestLoadRejectsPlainMirrorOffloadRequires(t *testing.T) {
 	p := writeConfig(t, `
 [destinations.usb]
 type = "local"
@@ -334,8 +338,9 @@ path = "/tmp/docs"
 sync_to = ["usb"]
 offload_requires = ["usb"]
 `)
-	if _, err := Load(p); err != nil {
-		t.Fatalf("Load with plain-mirror offload_requires: %v", err)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "can never satisfy the durability gate") {
+		t.Fatalf("expected plain-mirror offload_requires rejection, got %v", err)
 	}
 }
 
@@ -664,7 +669,6 @@ password2 = "obscured-salt"
 		"type = sftp\n" +
 		"host = host.example\n" +
 		"user = u\n" +
-		"blake3sum_command = b3sum\n" +
 		"pass = " + rcloneObscure("transport-pw") + "\n" +
 		"\n" +
 		"[offsite-crypt]\n" +
@@ -676,36 +680,6 @@ password2 = "obscured-salt"
 		"password2 = obscured-salt\n"
 	if got := cfg.Destinations["offsite"].RcloneSection(); got != want {
 		t.Fatalf("RcloneSection:\n%s\nwant:\n%s", got, want)
-	}
-}
-
-// TestRcloneSectionSFTPEmitsBlake3sumCommand pins that every sftp section
-// carries a blake3sum_command. rclone never autodetects one, so without it
-// squirrel's `--hash blake3` syncs fail with "hash type not supported". The
-// line is sftp-only: backends with a fixed provider checksum must not get it.
-func TestRcloneSectionSFTPEmitsBlake3sumCommand(t *testing.T) {
-	p := writeConfig(t, `
-[destinations.nas]
-type = "sftp"
-host = "h"
-user = "u"
-root = "/r"
-
-[destinations.s3]
-type     = "s3"
-provider = "AWS"
-bucket   = "b"
-root     = "/r"
-`)
-	cfg, err := Load(p)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if got := cfg.Destinations["nas"].RcloneSection(); !strings.Contains(got, "blake3sum_command = b3sum") {
-		t.Fatalf("sftp section missing blake3sum_command:\n%s", got)
-	}
-	if got := cfg.Destinations["s3"].RcloneSection(); strings.Contains(got, "blake3sum_command") {
-		t.Fatalf("non-sftp section should not carry blake3sum_command:\n%s", got)
 	}
 }
 

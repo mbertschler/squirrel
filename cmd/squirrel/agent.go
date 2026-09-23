@@ -69,7 +69,7 @@ func runAgent(cmd *cobra.Command) error {
 // rclone's view of the destinations from whatever it swaps in (#204).
 func buildAgentConfig(cmd *cobra.Command, cfg *config.Config, s *store.Store, logger *slog.Logger) (agent.Config, error) {
 	live := config.NewLive(cfg)
-	tools := &schedulerTools{out: cmd.ErrOrStderr()}
+	tools := &schedulerTools{}
 	if err := tools.rebuild(cmd.Context(), cfg); err != nil {
 		return agent.Config{}, err
 	}

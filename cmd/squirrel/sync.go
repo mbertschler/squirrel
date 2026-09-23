@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"slices"
 
 	"github.com/spf13/cobra"
 
@@ -40,7 +41,7 @@ func newSyncCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&to, "to", "", "limit to this destination name (default: every destination declared on the volume)")
-	cmd.Flags().BoolVar(&shallow, "shallow", false, "skip BLAKE3 verification; trust rclone's default size+mtime comparison")
+	cmd.Flags().BoolVar(&shallow, "shallow", false, "skip the checksum comparison; trust rclone's default size+mtime comparison")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview rclone actions without transferring; no runs row is written")
 	cmd.Flags().BoolVar(&initDst, "init", false, "authorise first-use destination bootstrap: write a .squirrel-volume marker, or create a kopia repository when connect finds none (refused without --init so a typo or outage can't mint a fresh empty target)")
 	cmd.Flags().BoolVarP(&progress, "progress", "P", false, "show live transfer progress (auto-enabled on a terminal; use --progress=false to force off)")
@@ -62,9 +63,12 @@ func runSync(cmd *cobra.Command, volumeName, destinationName string, progress bo
 	}
 	defer s.Close()
 
+	// A batch of kopia and peer pairs alone starts on a host without
+	// rclone and prints none of its preamble: no version check, no
+	// "rclone.conf updated" line, no --shallow warning (F11b).
 	var rcl *sync.Rclone
-	if pairsNeedRclone(pairs) {
-		rcl, err = sync.Find()
+	if slices.ContainsFunc(pairs, sync.Pair.DrivesRclone) {
+		rcl, err = sync.Find(cmd.Context())
 		if err != nil {
 			return err
 		}
@@ -77,9 +81,6 @@ func runSync(cmd *cobra.Command, volumeName, destinationName string, progress bo
 	if rcl != nil {
 		if opts.Shallow {
 			fmt.Fprintln(out, shallowSyncWarning)
-		}
-		if err := sync.EnsureMinVersion(cmd.Context(), rcl, out, sync.ShallowForPairs(pairs, opts.Shallow)); err != nil {
-			return err
 		}
 		if err := writeRcloneConfigLogged(out, rcl, cfg); err != nil {
 			return err
@@ -141,7 +142,7 @@ func snapshotConfig(cfg *config.Config, dbPath string) sync.SnapshotConfig {
 // runs with --shallow. It spells out the safety trade so the operator
 // knows a destination whose size and mtime happen to match the source
 // won't be re-verified by content hash on this run.
-const shallowSyncWarning = "warning: shallow mode: skipping BLAKE3 verification; destination drift with matching size/mtime will not be detected"
+const shallowSyncWarning = "warning: shallow mode: skipping the checksum comparison; destination drift with matching size/mtime will not be detected"
 
 // rcloneConfigPathFor co-locates the rclone.conf next to the squirrel
 // config so a user inspecting ~/.squirrel/ finds both files. Its contents
@@ -149,21 +150,6 @@ const shallowSyncWarning = "warning: shallow mode: skipping BLAKE3 verification;
 // squirrel rewrites the file only when that derived content changes.
 func rcloneConfigPathFor(cfg *config.Config) string {
 	return filepath.Join(filepath.Dir(cfg.Path), "rclone.conf")
-}
-
-// pairsNeedRclone reports whether any pair in the batch drives rclone.
-// Every non-kopia bucket destination does; kopia drives its own binary
-// and a peer node streams its bytes over the sync API, so a batch of
-// those alone starts on a host without rclone and prints none of its
-// preamble: no version check, no "rclone.conf updated" line, no
-// --shallow warning (F11b).
-func pairsNeedRclone(pairs []sync.Pair) bool {
-	for _, p := range pairs {
-		if p.Destination != nil && p.Destination.Type != "kopia" {
-			return true
-		}
-	}
-	return false
 }
 
 // writeRcloneConfigLogged renders the rclone.conf and logs a single line

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -71,7 +72,7 @@ func setupFixture(t *testing.T) *syncFixture {
 		t.Fatalf("config.Load: %v", err)
 	}
 
-	rcl, err := Find()
+	rcl, err := Find(context.Background())
 	if err != nil {
 		t.Fatalf("Find rclone: %v", err)
 	}
@@ -343,7 +344,7 @@ func TestSyncDryRunPath(t *testing.T) {
 }
 
 // TestSyncHappyPathStampsVerification rides on the happy-path fixture
-// to pin the typed durability report a default (BLAKE3) bucket sync
+// to pin the typed durability report a default (checksum) mirror sync
 // produces.
 func TestSyncHappyPathStampsVerification(t *testing.T) {
 	f := setupFixture(t)
@@ -356,8 +357,8 @@ func TestSyncHappyPathStampsVerification(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Sync: %v", err)
 	}
-	if !rep.Verification.Verified() || rep.Verification.Method != VerifyMethodBlake3 {
-		t.Fatalf("Verification = %+v, want verified blake3", rep.Verification)
+	if !rep.Verification.Verified() || rep.Verification.Method != VerifyMethodChecksum {
+		t.Fatalf("Verification = %+v, want verified checksum", rep.Verification)
 	}
 	if rep.Verification.Files != 1 {
 		t.Fatalf("Verification.Files = %d, want 1", rep.Verification.Files)
@@ -530,34 +531,28 @@ func TestRunPairRefusesConcurrentInvocations(t *testing.T) {
 	}
 }
 
-// TestCheckMinVersionBranches covers the three branches of the
-// version-floor gate without needing a stubbed rclone binary.
-func TestCheckMinVersionBranches(t *testing.T) {
+// TestCheckMinVersion pins the floor at 1.71, the first rclone with the
+// sftp `hashes` option hash_algo renders into, and refuses below it
+// whether or not the run would compare checksums.
+func TestCheckMinVersion(t *testing.T) {
 	v := func(maj, min, pat int) Version {
 		return Version{Major: maj, Minor: min, Patch: pat,
 			Raw: fmt.Sprintf("rclone v%d.%d.%d", maj, min, pat)}
 	}
 	cases := []struct {
-		name     string
-		version  Version
-		shallow  bool
-		wantErr  bool
-		wantWarn bool
+		name    string
+		version Version
+		wantErr bool
 	}{
-		{"at floor, !shallow", v(1, 66, 0), false, false, false},
-		{"above floor, !shallow", v(1, 80, 0), false, false, false},
-		{"below floor, !shallow → error", v(1, 65, 9), false, true, false},
-		{"below floor, shallow → warn only", v(1, 65, 9), true, false, true},
+		{"at floor", v(1, 71, 0), false},
+		{"above floor", v(1, 80, 0), false},
+		{"below floor", v(1, 70, 9), true},
+		{"old BLAKE3-era floor", v(1, 66, 0), true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			var buf strings.Builder
-			err := checkMinVersion(c.version, &buf, c.shallow)
-			if (err != nil) != c.wantErr {
+			if err := checkMinVersion(c.version); (err != nil) != c.wantErr {
 				t.Fatalf("err = %v, wantErr = %v", err, c.wantErr)
-			}
-			if got := strings.Contains(buf.String(), "warning"); got != c.wantWarn {
-				t.Fatalf("warning emitted = %v, want %v (out: %q)", got, c.wantWarn, buf.String())
 			}
 		})
 	}
@@ -701,8 +696,8 @@ func TestBuildRcloneArgsCryptAddressing(t *testing.T) {
 	if !strings.Contains(joined, "--backup-dir offsite-crypt:pics/"+HistoryDirName+"/run-7") {
 		t.Fatalf("backup-dir not addressed through the crypt remote: %s", joined)
 	}
-	if strings.Contains(joined, "--checksum") || strings.Contains(joined, "blake3") {
-		t.Fatalf("BLAKE3 flags passed to a crypt destination: %s", joined)
+	if strings.Contains(joined, "--checksum") || strings.Contains(joined, "--hash") {
+		t.Fatalf("checksum flags passed to a crypt destination: %s", joined)
 	}
 
 	plain := cryptFixtureDest()
@@ -715,13 +710,16 @@ func TestBuildRcloneArgsCryptAddressing(t *testing.T) {
 	if got := plainArgs[len(plainArgs)-1]; got != "offsite:/data/pics/" {
 		t.Fatalf("plain dst arg = %q, want offsite:/data/pics/", got)
 	}
-	if !strings.Contains(plainJoined, "--checksum --hash blake3") {
-		t.Fatalf("plain destination lost its BLAKE3 flags: %s", plainJoined)
+	if !slices.Contains(plainArgs, "--checksum") {
+		t.Fatalf("plain destination lost --checksum: %s", plainJoined)
+	}
+	if slices.Contains(plainArgs, "--hash") {
+		t.Fatalf("plain destination passes --hash, which only picks a listing's output hash (#211): %s", plainJoined)
 	}
 }
 
 // TestBuildRestoreArgsCryptAddressing mirrors the sync case for the pull
-// direction: the source is the crypt remote and the BLAKE3 flags stay off.
+// direction: the source is the crypt remote and the checksum flag stays off.
 func TestBuildRestoreArgsCryptAddressing(t *testing.T) {
 	vol := &config.Volume{Name: "pics", Path: "/tmp/pics"}
 	args := buildRestoreArgs(vol, cryptFixtureDest(), 3, RestoreOptions{ToPath: "/tmp/scratch"})
@@ -729,8 +727,8 @@ func TestBuildRestoreArgsCryptAddressing(t *testing.T) {
 	if got := args[len(args)-2]; got != "offsite-crypt:pics/" {
 		t.Fatalf("src arg = %q, want offsite-crypt:pics/", got)
 	}
-	if strings.Contains(joined, "--checksum") || strings.Contains(joined, "blake3") {
-		t.Fatalf("BLAKE3 flags passed for a crypt source: %s", joined)
+	if strings.Contains(joined, "--checksum") || strings.Contains(joined, "--hash") {
+		t.Fatalf("checksum flags passed for a crypt source: %s", joined)
 	}
 }
 
@@ -763,40 +761,6 @@ func TestEffectiveShallowCrypt(t *testing.T) {
 		if got := EffectiveShallow(c.dest, c.shallow); got != c.want {
 			t.Errorf("EffectiveShallow(crypt=%v, shallow=%v) = %v, want %v",
 				c.dest.Crypt != nil, c.shallow, got, c.want)
-		}
-	}
-}
-
-// TestShallowForPairs pins the version-preflight scope: only an
-// invocation with at least one blake3-verified target (a plain bucket
-// or a peer node) requires the full rclone floor.
-func TestShallowForPairs(t *testing.T) {
-	crypt := cryptFixtureDest()
-	plain := cryptFixtureDest()
-	plain.Crypt = nil
-	node := Pair{Node: &config.Node{Name: "peer"}}
-	kopia := Pair{Destination: &config.Destination{Name: "mirror", Type: "kopia", Root: "/tmp/repo"}}
-	contentAddressed := Pair{Destination: &config.Destination{Name: "archive", Type: "sftp", Root: "/data", Layout: config.LayoutContentAddressed}}
-	cases := []struct {
-		name    string
-		pairs   []Pair
-		shallow bool
-		want    bool
-	}{
-		{"user shallow wins", []Pair{{Destination: plain}}, true, true},
-		{"all crypt", []Pair{{Destination: crypt}, {Destination: crypt}}, false, true},
-		{"mixed crypt and plain", []Pair{{Destination: crypt}, {Destination: plain}}, false, false},
-		{"node pair puts no constraint on rclone", []Pair{{Destination: crypt}, node}, false, true},
-		{"node beside plain still verifies", []Pair{node, {Destination: plain}}, false, false},
-		{"kopia pair puts no constraint on rclone", []Pair{kopia, {Destination: crypt}}, false, true},
-		{"kopia beside plain still verifies", []Pair{kopia, {Destination: plain}}, false, false},
-		{"content-addressed pair puts no constraint on rclone", []Pair{contentAddressed, {Destination: crypt}}, false, true},
-		{"content-addressed beside plain still verifies", []Pair{contentAddressed, {Destination: plain}}, false, false},
-		{"no pairs", nil, false, true},
-	}
-	for _, c := range cases {
-		if got := ShallowForPairs(c.pairs, c.shallow); got != c.want {
-			t.Errorf("%s: ShallowForPairs = %v, want %v", c.name, got, c.want)
 		}
 	}
 }

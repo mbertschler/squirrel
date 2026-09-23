@@ -70,19 +70,21 @@ so nothing ever tries.
 | **media** | nas (master), htpc | nas → htpc; nas → cloudbox + s3archive | htpc offloads watched items once s3archive holds them |
 
 Offload gates may name only targets that *produce durability evidence*.
-Four shapes do: content-addressed and packed destinations (presence+size,
+Three shapes do: content-addressed and packed destinations (presence+size,
 upgraded to content-verified by the scan-back fingerprint), peer nodes the
-offloading machine itself pushes to (`peer-blake3`), kopia repositories
-(`kopia-verify`), and — since #156 — a **plain (non-crypt) mirror synced
-with BLAKE3 verification**, whose full `--checksum` compare is end-to-end
-content verification and advances the vector with the `blake3` method
-(rclone's `--checksum` BLAKE3 comparison). A **crypt** mirror is the one shape that
-never yields evidence: the overlay hides the content hash, so rclone falls
-back to size+mtime forever, and the mirror layout keeps no fingerprint to
-upgrade it (friction log F21). Naming a locally-configured crypt mirror in
-`offload_requires` is therefore rejected at config load as an unsatisfiable
-policy (#156) — fail-early, not the wait-forever gate the walk hit with the
-laptop gating on the crypt-mirror cloudbox.
+offloading machine itself pushes to (`peer-blake3`), and kopia repositories
+(`kopia-verify`). A **mirror** — cloudbox, usb — never yields evidence the
+gate accepts. A plain mirror's sync is rclone's `--checksum` compare, which
+runs under the first hash both backends support (MD5 on local and s3), never
+against the index's BLAKE3; it advances the vector with the `checksum` method
+so `status` can show how current the copy is, but the gate refuses it (#211;
+#156 had accepted it believing the compare was BLAKE3). A crypt mirror is
+weaker still: the overlay hides the content hash, so rclone falls back to
+size+mtime (friction log F21). Neither layout keeps a fingerprint a verify
+pass could upgrade. Naming a locally-configured mirror in `offload_requires`
+is therefore rejected at config load as an unsatisfiable policy —
+fail-early, not the wait-forever gate the walk hit with the laptop gating on
+the crypt-mirror cloudbox.
 
 A receive-only node (htpc) cannot credit its *upstream* peer, so its gate
 rests on the offsites the hub pushes to, reached via the durability pull.

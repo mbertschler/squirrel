@@ -117,8 +117,8 @@ decrypt it.
 
 ### Verification falls back to size+mtime
 
-rclone crypt remotes cannot expose content hashes, so the end-to-end BLAKE3 check
-(`--checksum --hash blake3`) cannot pass through the overlay. Transfers to and
+rclone crypt remotes cannot expose content hashes, so the checksum comparison
+(`--checksum`) cannot pass through the overlay. Transfers to and
 from an encrypted destination compare by **size+mtime** instead — the same
 comparison `--shallow` uses — and say so in the run output; the runs row records
 the transfer as shallow.

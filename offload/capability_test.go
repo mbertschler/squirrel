@@ -35,8 +35,8 @@ func TestOffloadIncapableTargetAbortsUpFront(t *testing.T) {
 	if !strings.Contains(err.Error(), `offload_requires target "backup" can never satisfy the durability gate`) {
 		t.Fatalf("err = %v, want it to name target backup and the gate", err)
 	}
-	if !strings.Contains(err.Error(), "crypt") {
-		t.Fatalf("err = %v, want it to name the crypt overlay as the reason", err)
+	if !strings.Contains(err.Error(), "mirror") {
+		t.Fatalf("err = %v, want it to name the mirror layout as the reason", err)
 	}
 	if len(rep.Results) != 0 || rep.RunID != 0 {
 		t.Fatalf("report = %+v, want empty (no candidates walked, no run opened)", rep)
@@ -154,7 +154,7 @@ func TestOffloadRelayedCapablePendingStillWalks(t *testing.T) {
 }
 
 // TestOffloadCapableTargetPendingStillWalks: a required target that is
-// structurally capable (a plain mirror destination) but whose durability
+// structurally capable (a content-addressed destination) but whose durability
 // evidence is not yet recorded must NOT fail fast — supplying its config to
 // the pre-check does not turn a genuinely-pending state into an abort. The
 // offload walks per file and reports OutcomeNotDurable, exactly as before
@@ -168,7 +168,7 @@ func TestOffloadCapableTargetPendingStillWalks(t *testing.T) {
 	self := selfNode(t, s)
 
 	dests := map[string]*config.Destination{
-		"t1": {Name: "t1", Type: "sftp", Layout: config.LayoutMirror},
+		"t1": {Name: "t1", Type: "sftp", Layout: config.LayoutContentAddressed},
 	}
 	rep, err := Offload(context.Background(), s, root, Options{
 		Name: volName, Paths: []string{"."}, Require: []string{"t1"}, RequireDests: dests,

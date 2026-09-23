@@ -3214,8 +3214,8 @@ func TestBeginSyncRunIfClearRejectsEmptyDestination(t *testing.T) {
 
 // TestBeginSyncRunIfClearRecordsShallow pins M1 on the production sync
 // gate: a run started with Shallow:true persists shallow=1 so a forensic
-// reader can tell the transfer skipped BLAKE3 verification, while
-// Shallow:false (the default, full-verification) persists shallow=0.
+// reader can tell the transfer skipped the checksum comparison, while
+// Shallow:false (the default, checksum comparison) persists shallow=0.
 func TestBeginSyncRunIfClearRecordsShallow(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "test.db")
 	s, err := Open(dsn)

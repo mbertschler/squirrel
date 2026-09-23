@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -75,9 +74,9 @@ func terminalStatus(status string, runErr error) string {
 
 // Options shapes one Sync invocation.
 type Options struct {
-	// Shallow drops --checksum and --hash blake3 so rclone uses its default
-	// size+mtime comparison. Faster but with no end-to-end integrity check.
-	// Off by default — squirrel privileges integrity over speed.
+	// Shallow drops --checksum so rclone uses its default size+mtime
+	// comparison. Faster but with no content comparison at all. Off by
+	// default — squirrel privileges integrity over speed.
 	Shallow bool
 	// DryRun forwards --dry-run to rclone. No bytes are transferred and no
 	// runs row is written (the prerequisite check still happens).
@@ -141,8 +140,8 @@ type Report struct {
 	Changed sql.NullInt64
 	// Verification is the handler's typed durability report for this
 	// push: which comparison backed it, what the tool counted, and —
-	// via Verified() — whether the destination's copy was
-	// content-verified. Zero for restores and dry runs.
+	// via Verified() — whether that comparison passed in full. Zero for
+	// restores and dry runs.
 	Verification VerifyResult
 	// FinishErr captures a failure to write the runs row's terminal state.
 	// It is independent of rclone success — the bytes may have transferred
@@ -229,9 +228,10 @@ type Report struct {
 // for tests and for callers that already have the typed destination in
 // hand.
 //
-// A verified successful bucket push (BLAKE3 for rclone, repository
-// verify for kopia) advances the destination's durability vector;
-// peer pushes advance it inside the handshake's close phase instead.
+// A verified successful bucket push (rclone's checksum comparison for a
+// mirror, repository verify for kopia) advances the destination's
+// durability vector; peer pushes advance it inside the handshake's close
+// phase instead.
 //
 // Concurrency: every handler allocates the 'running' kind='sync' row
 // via store.BeginSyncRunIfClear, which does the check + insert
@@ -501,8 +501,8 @@ func requireIndexedVolume(ctx context.Context, s *store.Store, vol *config.Volum
 
 // beginRestoreRun inserts a kind='restore' runs row, unless dryRun is
 // set in which case it returns (0, nil) and no row is written. shallow
-// records whether the restore skipped BLAKE3 verification so the runs
-// row says which pulls were content-verified. Restore is not gated
+// records whether the restore compared only size+mtime so the runs row
+// says which pulls were content-compared. Restore is not gated
 // against concurrency the way sync is — the destination is the read side
 // here, and parallel restores into separate ToPath targets are a
 // legitimate workflow.
@@ -823,7 +823,7 @@ func buildRcloneArgs(vol *config.Volume, dest *config.Destination, runID int64, 
 	}
 	args = append(args, checkersArgs(dest)...)
 	if !EffectiveShallow(dest, opts.Shallow) {
-		args = append(args, "--checksum", "--hash", "blake3")
+		args = append(args, "--checksum")
 	}
 	if opts.DryRun {
 		args = append(args, "--dry-run")
@@ -891,44 +891,14 @@ func backupDirURI(dest *config.Destination, volumeName string, runID int64, dryR
 	return remoteSubpathURI(dest, path.Join(volumeName, HistoryDirName, "run-"+id))
 }
 
-// EffectiveShallow reports whether a transfer to dest runs without BLAKE3
-// verification. A crypt destination forces shallow: rclone crypt remotes
-// expose no content hashes, so --checksum --hash blake3 cannot pass
-// through the overlay and rclone falls back to its size+mtime comparison.
+// EffectiveShallow reports whether a transfer to dest runs without a
+// content comparison. A crypt destination forces shallow: rclone crypt
+// remotes expose no content hashes, so --checksum cannot pass through the
+// overlay and rclone falls back to its size+mtime comparison.
 // The result is what the runs row records, keeping the audit trail honest
 // about which transfers were content-verified.
 func EffectiveShallow(dest *config.Destination, shallow bool) bool {
 	return shallow || dest.Crypt != nil
-}
-
-// ShallowForPairs reports whether an invocation covering pairs runs
-// rclone entirely without BLAKE3 verification: either the operator
-// passed --shallow, or every rclone-driven target is a crypt
-// destination that forces it. Kopia and peer pairs are skipped — they
-// drive the kopia binary and the sync API respectively, so they put no
-// constraint on rclone. Content-addressed pairs are skipped for another
-// reason: their per-object copyto and lsjson calls never pass
-// --hash blake3. Used to scope the rclone version preflight to what the
-// run will actually invoke.
-func ShallowForPairs(pairs []Pair, shallow bool) bool {
-	if shallow {
-		return true
-	}
-	for _, p := range pairs {
-		if p.Destination != nil && p.Destination.Type == "kopia" {
-			continue
-		}
-		if p.Destination != nil && p.Destination.Layout == config.LayoutContentAddressed {
-			continue
-		}
-		if p.Destination == nil {
-			continue
-		}
-		if p.Destination.Crypt == nil {
-			return false
-		}
-	}
-	return true
 }
 
 // cryptVerificationWarning returns the advisory for a non-shallow transfer
@@ -939,33 +909,7 @@ func cryptVerificationWarning(dest *config.Destination, shallow bool) string {
 	if dest.Crypt == nil || shallow {
 		return ""
 	}
-	return fmt.Sprintf("destination %q is encrypted (crypt): BLAKE3 verification cannot pass through the crypt overlay — comparing by size+mtime for this run, recorded as shallow", dest.Name)
-}
-
-// EnsureMinVersion checks the installed rclone against MinRcloneVersion.
-// When shallow=true the integrity flags are not used, so a below-floor
-// rclone is acceptable and we only warn. When shallow=false we'd be
-// about to invoke --hash blake3, which only exists in rclone ≥ 1.66;
-// refuse rather than hand off a doomed invocation to rclone for a
-// confusing stderr message. The actual decision lives in
-// checkMinVersion so tests don't need a rclone-binary-that-lies fixture.
-func EnsureMinVersion(ctx context.Context, rcl *Rclone, out io.Writer, shallow bool) error {
-	v, err := rcl.Version(ctx)
-	if err != nil {
-		return err
-	}
-	return checkMinVersion(v, out, shallow)
-}
-
-func checkMinVersion(v Version, out io.Writer, shallow bool) error {
-	if v.AtLeast(MinRcloneVersion) {
-		return nil
-	}
-	if shallow {
-		fmt.Fprintf(out, "warning: rclone %s is below the supported floor %s; --shallow keeps this run working but consider upgrading\n", v, MinRcloneVersion)
-		return nil
-	}
-	return fmt.Errorf("rclone %s is below the supported floor %s — --hash blake3 is unavailable; upgrade rclone or pass --shallow", v, MinRcloneVersion)
+	return fmt.Sprintf("destination %q is encrypted (crypt): checksum comparison cannot pass through the crypt overlay — comparing by size+mtime for this run, recorded as shallow", dest.Name)
 }
 
 // PairsFor builds the list of (volume, target) pairs to sync given
@@ -1036,6 +980,13 @@ func (p Pair) TargetName() string {
 
 // IsNode reports whether this pair targets a peer node (vs. a bucket).
 func (p Pair) IsNode() bool { return p.Node != nil }
+
+// DrivesRclone reports whether syncing this pair invokes rclone. Every
+// destination does except kopia, which drives its own binary; a peer node
+// streams its bytes over the sync API.
+func (p Pair) DrivesRclone() bool {
+	return p.Destination != nil && p.Destination.Type != "kopia"
+}
 
 // RestoreOptions shape one Restore invocation. ToPath overrides the local
 // target directory; when empty, the volume's declared path is used. The
@@ -1248,7 +1199,7 @@ func buildRestoreArgs(vol *config.Volume, dest *config.Destination, runID int64,
 	}
 	args = append(args, checkersArgs(dest)...)
 	if !EffectiveShallow(dest, opts.Shallow) {
-		args = append(args, "--checksum", "--hash", "blake3")
+		args = append(args, "--checksum")
 	}
 	if opts.DryRun {
 		args = append(args, "--dry-run")

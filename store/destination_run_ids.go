@@ -13,9 +13,12 @@ import (
 // method before it deletes the only local copy. sync re-exports these as
 // its VerifyMethod* identifiers, keeping one source of truth.
 const (
-	// VerifyMethodBlake3 is rclone's end-to-end content check
-	// (--checksum --hash blake3).
-	VerifyMethodBlake3 = "blake3"
+	// VerifyMethodChecksum is rclone's --checksum comparison of source
+	// against destination under whichever hash both backends support (MD5
+	// on local and s3). The offload gate refuses it: the hash is rclone's
+	// pick, unrelated to the index's BLAKE3, and an object missing its hash
+	// on either side passes on size alone.
+	VerifyMethodChecksum = "checksum"
 	// VerifyMethodSizeMtime is rclone's default size+mtime comparison,
 	// used for --shallow runs and forced by crypt destinations. Not a
 	// content check.
@@ -51,9 +54,9 @@ const (
 // ContentVerifiedMethod reports whether a durability component advanced
 // by method carries genuine, cadence-independent content verification —
 // the precondition the offload gate applies before deleting a local copy.
-// A presence-only or size+mtime method is not content-verified; an empty
-// method (a pre-v19 component, or one whose provenance is unknown) is
-// treated as unverified so the gate refuses rather than over-claims.
+// A presence-only, size+mtime, or checksum method is not content-verified;
+// an empty method (a pre-v19 component, or one whose provenance is unknown)
+// is treated as unverified so the gate refuses rather than over-claims.
 //
 // VerifyMethodFingerprint is deliberately excluded: its evidence counts as
 // content-verified only while a scheduled verify cadence keeps it
@@ -63,7 +66,7 @@ const (
 // apply that cadence check themselves rather than reading it here.
 func ContentVerifiedMethod(method string) bool {
 	switch method {
-	case VerifyMethodBlake3, VerifyMethodPeer, VerifyMethodKopia:
+	case VerifyMethodPeer, VerifyMethodKopia:
 		return true
 	default:
 		return false
@@ -81,7 +84,7 @@ func ContentVerifiedMethod(method string) bool {
 // callers that accept it test for "" explicitly.
 func KnownVerifyMethod(method string) bool {
 	switch method {
-	case VerifyMethodBlake3, VerifyMethodSizeMtime, VerifyMethodPeer, VerifyMethodKopia, VerifyMethodPresenceSize, VerifyMethodFingerprint:
+	case VerifyMethodChecksum, VerifyMethodSizeMtime, VerifyMethodPeer, VerifyMethodKopia, VerifyMethodPresenceSize, VerifyMethodFingerprint:
 		return true
 	default:
 		return false

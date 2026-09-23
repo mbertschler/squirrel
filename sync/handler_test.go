@@ -58,8 +58,8 @@ func TestRcloneVerification(t *testing.T) {
 		wantVerified bool
 		wantMethod   string
 	}{
-		{"checksum success", plain, Options{}, store.RunStatusSuccess, false, true, VerifyMethodBlake3},
-		{"checksum partial", plain, Options{}, store.RunStatusPartial, false, false, VerifyMethodBlake3},
+		{"checksum success", plain, Options{}, store.RunStatusSuccess, false, true, VerifyMethodChecksum},
+		{"checksum partial", plain, Options{}, store.RunStatusPartial, false, false, VerifyMethodChecksum},
 		{"shallow success", plain, Options{Shallow: true}, store.RunStatusSuccess, false, false, VerifyMethodSizeMtime},
 		{"crypt forces shallow", crypt, Options{}, store.RunStatusSuccess, false, false, VerifyMethodSizeMtime},
 		// rclone exited 0 with the integrity flags set, but reported the

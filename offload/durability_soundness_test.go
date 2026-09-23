@@ -85,7 +85,7 @@ func TestOffloadPackedMemberGatesViaPack(t *testing.T) {
 // isolating the freshness condition.
 func seedVerifiedComponent(t *testing.T, s *store.Store, volumeID int64, target string, nodeID, run int64) {
 	t.Helper()
-	if err := s.UpsertDestinationRunIDVerified(context.Background(), volumeID, target, nodeID, run, store.VerifyMethodBlake3, false); err != nil {
+	if err := s.UpsertDestinationRunIDVerified(context.Background(), volumeID, target, nodeID, run, store.VerifyMethodKopia, false); err != nil {
 		t.Fatalf("UpsertDestinationRunIDVerified(%s): %v", target, err)
 	}
 }
@@ -437,7 +437,7 @@ func TestOffloadGateNamesPeerProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetOrCreateOriginNode(nas): %v", err)
 	}
-	if err := s.UpsertDestinationRunIDPulled(ctx, v.ID, "t1", self.ID, idx.RunID-1, store.VerifyMethodBlake3, peer.ID, store.NowNs(), false); err != nil {
+	if err := s.UpsertDestinationRunIDPulled(ctx, v.ID, "t1", self.ID, idx.RunID-1, store.VerifyMethodKopia, peer.ID, store.NowNs(), false); err != nil {
 		t.Fatalf("UpsertDestinationRunIDPulled: %v", err)
 	}
 	recordPush(t, s, v.ID, "t1")
@@ -456,12 +456,12 @@ func TestOffloadGateNamesPeerProvenance(t *testing.T) {
 	mustExist(t, filepath.Join(root, "a.txt"))
 }
 
-// TestOffloadContentVerifiedMethodsGate: blake3, peer-blake3, and
-// kopia-verify components each gate on their own (no fingerprint needed)
+// TestOffloadContentVerifiedMethodsGate: peer-blake3 and kopia-verify
+// components each gate on their own (no fingerprint needed)
 // once the vector and freshness conditions hold — the stricter gate does
 // not refuse legitimately content-verified copies.
 func TestOffloadContentVerifiedMethodsGate(t *testing.T) {
-	for _, method := range []string{store.VerifyMethodBlake3, store.VerifyMethodPeer, store.VerifyMethodKopia} {
+	for _, method := range []string{store.VerifyMethodPeer, store.VerifyMethodKopia} {
 		t.Run(method, func(t *testing.T) {
 			root := t.TempDir()
 			writeFile(t, filepath.Join(root, "a.txt"), "alpha")
@@ -486,6 +486,33 @@ func TestOffloadContentVerifiedMethodsGate(t *testing.T) {
 			mustBeGone(t, filepath.Join(root, "a.txt"))
 		})
 	}
+}
+
+// TestOffloadChecksumMethodRefused: a mirror sync's checksum component
+// covering the file, fresh and locally recorded, still does not gate — the
+// comparison ran under a hash rclone picked, never the index's BLAKE3
+// (#211).
+func TestOffloadChecksumMethodRefused(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), "alpha")
+	s := setupStore(t)
+	ctx := context.Background()
+	idx := indexVolume(t, s, root)
+	v := testVolume(t, s)
+	self := selfNode(t, s)
+
+	if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, "usb", self.ID, idx.RunID, store.VerifyMethodChecksum, false); err != nil {
+		t.Fatalf("UpsertDestinationRunIDVerified: %v", err)
+	}
+	recordPush(t, s, v.ID, "usb")
+
+	rep, err := Offload(ctx, s, root, Options{Name: volName, Paths: []string{"."}, Require: []string{"usb"}})
+	if err != nil {
+		t.Fatalf("Offload: %v", err)
+	}
+	res := oneResult(t, rep, "a.txt", OutcomeNotDurable)
+	oneFailure(t, res, "usb", FailureNotVerified)
+	mustExist(t, filepath.Join(root, "a.txt"))
 }
 
 // TestOffloadDurableFileStillPasses is the anti-wedge guard: a file with

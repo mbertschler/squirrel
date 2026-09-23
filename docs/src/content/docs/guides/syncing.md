@@ -1,6 +1,6 @@
 ---
 title: Syncing & first use
-description: Push configured volumes to their destinations with BLAKE3 verification, and bootstrap first-use destinations safely with --init.
+description: Push configured volumes to their destinations with checksum verification, and bootstrap first-use destinations safely with --init.
 ---
 
 `squirrel sync` pushes configured volumes to their rclone (or kopia)
@@ -16,11 +16,15 @@ squirrel sync                       # every (volume, destination) pair in config
 - One argument → every destination declared on that volume.
 - `--to <dest>` → narrow to a single pair.
 
-## End-to-end verification
+## Verification
 
-Sync verifies each uploaded file's BLAKE3 against the destination using rclone's
-`--checksum --hash blake3`. A mismatch aborts that file **before** the runs row
-is marked success.
+Sync compares every file with its copy on a mirror destination by checksum
+(rclone's `--checksum`), under the first hash both ends support — MD5 on local
+disks and S3, independent of the BLAKE3 in the index. A copy that fails the check
+after transfer is an error, so the runs row is **not** marked success. The run is
+recorded with the `checksum` method, which the offload gate does not accept, so a
+mirror cannot back an offload. Peer syncs are different: both ends hash every
+byte with BLAKE3 (see [Peer sync](/squirrel/guides/peer-sync/)).
 
 Use `--shallow` to fall back to rclone's default size+mtime comparison if you
 want speed over integrity for a big initial push. Encrypted
@@ -36,7 +40,7 @@ the destination.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--to <dest>` | all | Limit to this destination name. |
-| `--shallow` | off | Skip BLAKE3 verification; trust rclone's size+mtime comparison. |
+| `--shallow` | off | Skip the checksum comparison; trust rclone's size+mtime comparison. |
 | `--dry-run` | off | Preview rclone actions without transferring; no runs row is written. |
 | `--init` | off | Authorise first-use destination bootstrap (see below). |
 | `--progress`, `-P` | auto on a TTY | Show a live transfer progress line (files, bytes, rate, ETA). |

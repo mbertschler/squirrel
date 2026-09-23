@@ -87,7 +87,7 @@ func TestAdvanceDestinationVectorRecordsFreshness(t *testing.T) {
 		{OriginNodeID: self.ID, OriginRunID: 5},
 		{OriginNodeID: ext.ID, OriginRunID: 42},
 	}
-	if err := s.AdvanceDestinationVectorTo(ctx, vID, "offsite", VerifyMethodBlake3, components); err != nil {
+	if err := s.AdvanceDestinationVectorTo(ctx, vID, "offsite", VerifyMethodKopia, components); err != nil {
 		t.Fatalf("AdvanceDestinationVectorTo: %v", err)
 	}
 	fresh, err := s.ListDestinationPushFreshness(ctx, vID, "offsite")

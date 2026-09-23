@@ -45,7 +45,7 @@ func newRestoreCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&from, "from", "", "destination name to pull from, or peer node name to filter by content origin (overloaded; names are unique across both kinds)")
 	cmd.Flags().StringVar(&to, "to", "", "local target path (default: the volume's declared path)")
-	cmd.Flags().BoolVar(&shallow, "shallow", false, "skip BLAKE3 verification on the way down")
+	cmd.Flags().BoolVar(&shallow, "shallow", false, "skip the checksum comparison on the way down")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview rclone actions without transferring")
 	cmd.Flags().BoolVar(&inPlace, "in-place", false, "permit restore against a non-empty live vol.Path; overwritten files are moved to .squirrel-restore-history/run-<id>/")
 	return cmd
@@ -84,16 +84,13 @@ func runRestore(cmd *cobra.Command, volumeName, fromName string, opts sync.Resto
 		opts.IncludeFromFile = includeFile
 	}
 
-	rcl, err := sync.Find()
+	rcl, err := sync.Find(cmd.Context())
 	if err != nil {
 		return err
 	}
 	out := cmd.OutOrStdout()
 	if opts.Shallow {
 		fmt.Fprintln(out, shallowSyncWarning)
-	}
-	if err := sync.EnsureMinVersion(cmd.Context(), rcl, out, sync.EffectiveShallow(dest, opts.Shallow)); err != nil {
-		return err
 	}
 	if err := writeRcloneConfigLogged(out, rcl, cfg); err != nil {
 		return err

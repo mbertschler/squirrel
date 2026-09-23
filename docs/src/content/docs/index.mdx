@@ -83,9 +83,10 @@ How the guarantees above are enforced, one layer down.
     still finds a hash whose path now holds different content.
   </Card>
   <Card title="Verified uploads" icon="seti:lock">
-    Sync verifies each uploaded file's BLAKE3 against the destination. Encrypted
-    remotes fall back to size+mtime, and cold-archive tiers get a metadata-only
-    scan-back fingerprint check that never re-downloads a byte.
+    Peer syncs hash every byte with BLAKE3 on both ends, and mirror syncs compare
+    every copy by checksum. Encrypted remotes fall back to size+mtime, and
+    cold-archive tiers get a metadata-only scan-back fingerprint check that never
+    re-downloads a byte.
   </Card>
   <Card title="Append-only by design" icon="seti:folder">
     Overwrites are preserved under `.squirrel-history/`, and sync never deletes

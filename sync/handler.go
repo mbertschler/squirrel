@@ -16,9 +16,9 @@ import (
 // method are the same strings — store owns them because the offload gate
 // reads them to decide whether a component is content-verified.
 const (
-	// VerifyMethodBlake3 is rclone's end-to-end content check
-	// (--checksum --hash blake3).
-	VerifyMethodBlake3 = store.VerifyMethodBlake3
+	// VerifyMethodChecksum is rclone's --checksum comparison under the
+	// first hash both backends support.
+	VerifyMethodChecksum = store.VerifyMethodChecksum
 	// VerifyMethodSizeMtime is rclone's default comparison, used for
 	// --shallow runs and forced by crypt destinations.
 	VerifyMethodSizeMtime = store.VerifyMethodSizeMtime
@@ -46,7 +46,9 @@ const (
 // verified flag is unexported, so a positive result can only be minted
 // by the curated handlers in this package — that keeps durability
 // reporting structurally separate from the hook mechanism, whose
-// outcomes are exit-code-only by design.
+// outcomes are exit-code-only by design. Whether Method is strong enough
+// to gate offload is store.ContentVerifiedMethod's judgement, separate
+// from verified.
 type VerifyResult struct {
 	verified bool
 	// Method names the comparison that backed this push.
@@ -58,8 +60,8 @@ type VerifyResult struct {
 	Bytes int64
 }
 
-// Verified reports whether the destination's copy of this push was
-// content-verified.
+// Verified reports whether this push's check passed in full, so RunPair
+// advances the destination's durability vector under Method.
 func (v VerifyResult) Verified() bool { return v.verified }
 
 // Tools bundles the configured external-tool wrappers the curated
@@ -202,24 +204,25 @@ func finishHandlerRun(ctx context.Context, s *store.Store, rep *Report, runErr e
 }
 
 // rcloneVerification derives the typed durability report for one rclone
-// bucket transfer: BLAKE3 end-to-end when the integrity flags were in
-// force, rclone's size+mtime comparison otherwise. Only a fully
-// successful BLAKE3 run counts as verified.
+// mirror transfer: rclone's --checksum comparison when it was in force,
+// its size+mtime comparison otherwise. Only a fully successful checksum
+// run is verified, advancing the durability vector under
+// VerifyMethodChecksum — a method the offload gate refuses.
 //
-// A run that asked for BLAKE3 but hit rclone's "no hashes in common"
-// fallback is downgraded to size+mtime here even though the flags were
-// set and rclone exited 0: rclone silently compared by size, so the copy
-// was not content-verified and must not advance the durability vector.
+// A run that asked for --checksum but hit rclone's "no hashes in common"
+// fallback is downgraded to size+mtime here even though the flag was set
+// and rclone exited 0: rclone silently compared by size, so the vector
+// must not advance.
 func rcloneVerification(dest *config.Destination, opts Options, rep *Report) VerifyResult {
 	v := VerifyResult{
-		Method: VerifyMethodBlake3,
+		Method: VerifyMethodChecksum,
 		Files:  rep.RcloneResult.Transferred + rep.RcloneResult.Checked,
 		Bytes:  rep.RcloneResult.Bytes,
 	}
 	if EffectiveShallow(dest, opts.Shallow) || rep.RcloneResult.HashFallback {
 		v.Method = VerifyMethodSizeMtime
 	}
-	v.verified = v.Method == VerifyMethodBlake3 && rep.Status == store.RunStatusSuccess
+	v.verified = v.Method == VerifyMethodChecksum && rep.Status == store.RunStatusSuccess
 	return v
 }
 

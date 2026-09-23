@@ -11,11 +11,12 @@ go install github.com/mbertschler/squirrel/cmd/squirrel@latest
 
 ## Install rclone
 
-You will also need [rclone](https://rclone.org) ≥ 1.66 on your `PATH` to
+You will also need [rclone](https://rclone.org) ≥ 1.71 on your `PATH` to
 [`sync`](/squirrel/guides/syncing/) or [`restore`](/squirrel/guides/restore/)
-against a **bucket destination** (`local`, `sftp`, `s3`, `b2`, `gcs`). BLAKE3
-hash support — which squirrel relies on for end-to-end verification — landed in
-rclone 1.66.
+against a **bucket destination** (`local`, `sftp`, `s3`, `b2`, `gcs`). 1.71
+added the sftp `hashes` option, which squirrel sets from
+[`hash_algo`](/squirrel/reference/configuration/) so the offsite fingerprint of an
+sftp destination uses the hash you chose.
 
 Syncing to a **[peer node](/squirrel/guides/peer-sync/)** does not use rclone:
 those bytes stream over the peer's own sync API. A machine whose only targets

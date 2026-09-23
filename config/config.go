@@ -509,12 +509,12 @@ func validateOffloadRequires(names []string) error {
 
 // rejectUnsatisfiableOffloadRequires fails config load when offload_requires
 // names a locally-configured destination that can never contribute a
-// durability component the offload gate accepts — the one structural case
-// being a crypt mirror, whose size+mtime comparison is never content-verified
-// and whose layout records no scan-back fingerprint to upgrade
-// (Destination.CanEverGateOffload). offload_requires is a conjunction, so a
-// single such target makes every file undeletable forever: a policy error,
-// not a pending state. Catching it here is fail-early — before, it was found
+// durability component the offload gate accepts — the structural case being
+// an rclone mirror, whose checksum or size+mtime comparison is never
+// content-verified and whose layout records no scan-back fingerprint to
+// upgrade (Destination.CanEverGateOffload). offload_requires is a
+// conjunction, so a single such target makes every file undeletable
+// forever: a policy error, not a pending state. Catching it here is fail-early — before, it was found
 // only at the first offload (#121's pre-check) or, for the reference laptop
 // gating on the crypt-mirror cloudbox, never (friction log F21).
 //
@@ -531,7 +531,7 @@ func rejectUnsatisfiableOffloadRequires(names []string, dests map[string]*Destin
 			continue
 		}
 		if capable, reason := d.CanEverGateOffload(); !capable {
-			return fmt.Errorf("offload_requires names %q, which can never satisfy the durability gate (%s); require a content-addressed or packed destination, a kopia repository, a plain (non-crypt) mirror synced with BLAKE3 verification, or a peer node instead", n, reason)
+			return fmt.Errorf("offload_requires names %q, which can never satisfy the durability gate (%s); require a content-addressed or packed destination, a kopia repository, or a peer node instead", n, reason)
 		}
 	}
 	return nil

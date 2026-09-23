@@ -125,7 +125,7 @@ func TestDurabilityEndpointRelaysVerifyCadence(t *testing.T) {
 	if err := srv.store.UpsertDestinationRunIDVerified(ctx, v.ID, "s3archive", self.ID, 7, store.VerifyMethodFingerprint, false); err != nil {
 		t.Fatalf("seed s3archive: %v", err)
 	}
-	if err := srv.store.UpsertDestinationRunIDVerified(ctx, v.ID, "mirror", self.ID, 3, store.VerifyMethodBlake3, false); err != nil {
+	if err := srv.store.UpsertDestinationRunIDVerified(ctx, v.ID, "mirror", self.ID, 3, store.VerifyMethodKopia, false); err != nil {
 		t.Fatalf("seed mirror: %v", err)
 	}
 

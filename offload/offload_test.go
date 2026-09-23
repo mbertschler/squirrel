@@ -78,7 +78,7 @@ func selfNode(t *testing.T, s *store.Store) store.Node {
 // and break the one under test explicitly.
 func seedVector(t *testing.T, s *store.Store, volumeID int64, target string, nodeID, run int64) {
 	t.Helper()
-	if err := s.UpsertDestinationRunIDVerified(context.Background(), volumeID, target, nodeID, run, store.VerifyMethodBlake3, false); err != nil {
+	if err := s.UpsertDestinationRunIDVerified(context.Background(), volumeID, target, nodeID, run, store.VerifyMethodKopia, false); err != nil {
 		t.Fatalf("UpsertDestinationRunID(%s): %v", target, err)
 	}
 	recordPush(t, s, volumeID, target)

@@ -82,7 +82,7 @@ func requireRclone(t *testing.T) *Rclone {
 	if _, err := exec.LookPath("rclone"); err != nil {
 		t.Skip("rclone not on PATH; install rclone ≥ 1.66 to run these tests")
 	}
-	r, err := Find()
+	r, err := Find(context.Background())
 	if err != nil {
 		t.Fatalf("Find: %v", err)
 	}
@@ -495,7 +495,6 @@ password2 = "obscured-salt"
 type = sftp
 host = host.example
 user = u
-blake3sum_command = b3sum
 pass = AAAAAAAAAAAAAAAAAAAAADCpyAwmj8ezVRxkXA
 
 [offsite-crypt]
