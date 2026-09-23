@@ -63,14 +63,15 @@ What no layout hides:
 - **Exact sizes.** rclone crypt adds a fixed overhead — a 32-byte header plus
   16 bytes per 64 KiB block — so every stored file's plaintext size follows from
   its ciphertext size. Each content object therefore discloses the exact size of
-  one distinct file; on a packed destination, files below `pack_threshold` show
-  only as part of their pack's compressed size.
+  one distinct content, however many paths share it; on a packed destination,
+  files below `pack_threshold` show only as part of their pack's compressed
+  size.
 - **Source modification times.** rclone carries a source file's modification
   time onto the stored copy — the file's own mtime on sftp, object metadata on
   the bucket backends — and the overlay passes it through. Every content object
   (each file on a content-addressed destination, each file at or above
   `pack_threshold` on a packed one) therefore shows the modification time of the
-  file it was uploaded from. Packs, manifest segments, and placement maps are
+  file it was first uploaded from. Packs, manifest segments, and placement maps are
   built during the run, so they show only when the run wrote them.
 - **Counts and timing.** Object, pack, and volume counts; the run identifiers
   and snapshot timestamps in the names below; upload times; and your sync
