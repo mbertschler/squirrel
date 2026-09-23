@@ -12,9 +12,9 @@ destination without a `layout` key.
   pictures/
     2024/cat.jpg
     .squirrel-history/run-7/2024/cat.jpg     # prior content of cat.jpg
-    .squirrel-index/run-12                   # receipt: what run 12 changed (local disks)
+    .squirrel-index/run-12                   # receipt: what run 12 changed (native mirrors)
     .squirrel-index/index-20260604T120000.000Z-run-12.db   # global index snapshot (ride-along)
-    .squirrel-staging/                       # in-flight writes (local disks)
+    .squirrel-staging/                       # in-flight writes (native mirrors)
   docs/
     invoice.pdf
     .squirrel-history/run-9/invoice.pdf
@@ -22,7 +22,9 @@ destination without a `layout` key.
 
 ## How a mirror is written
 
-On a `local` destination squirrel writes the mirror itself. A push plans from
+On a `local` destination, and on an `sftp` destination without
+[crypt](/squirrel/layouts/encrypted/), squirrel writes the mirror itself: a
+*native* mirror. A push plans from
 the index: it sends the changes recorded since the destination's last confirmed
 run, not what a fresh walk of the disk finds. For each changed path it:
 
@@ -37,10 +39,13 @@ push leaves a **receipt** at `.squirrel-index/run-<id>`: the run's changes in th
 [manifest segment format](/squirrel/reference/formats/), so the mirror can be
 checked without the index. A push that finds no receipt for the last success it
 recorded refuses, unless the root is empty and squirrel holds no records for it.
-So a local mirror starts on a fresh or emptied root: squirrel does not adopt a
-tree some other tool wrote.
+So a native mirror starts on a fresh or emptied root: squirrel does not adopt a
+tree some other tool wrote, rclone included.
 
-Mirrors on remote destinations (`sftp`, `s3`, `b2`, `gcs`) are written by rclone,
+On sftp, squirrel checks the server's host key against `known_hosts` and refuses
+a server it does not know (see [sftp keys](/squirrel/reference/configuration/#sftp)).
+
+Encrypted mirrors, and mirrors on `s3`, `b2` and `gcs`, are written by rclone,
 which compares both trees and moves overwritten files into its `--backup-dir`.
 
 ## Append-only history
@@ -48,7 +53,7 @@ which compares both trees and moves overwritten files into its `--backup-dir`.
 `.squirrel-history/run-<run-id>/` holds the prior bytes of every file a sync run
 replaced. They are moved there first, never deleted.
 
-- On a local mirror, anything found at a path squirrel is about to write moves
+- On a native mirror, anything found at a path squirrel is about to write moves
   there, including bytes squirrel did not write. The run names each one in a
   warning and in its audit trail.
 - It is **filtered out** of all subsequent comparisons, so it does not grow
@@ -61,13 +66,13 @@ Files removed locally remain at the destination.
 
 ## Verification
 
-A local mirror push hashes every file with BLAKE3 as it streams out and
+A native mirror push hashes every file with BLAKE3 as it streams out and
 confirms each written path's size and mtime. Nothing reads the landed bytes back
 yet, so the run advances the destination's durability evidence under the
-`presence+size` method. `--shallow` is refused on a local mirror: there is no
+`presence+size` method. `--shallow` is refused on a native mirror: there is no
 comparison to switch off.
 
-A remote mirror compares every file with its copy by checksum (rclone's
+An rclone mirror compares every file with its copy by checksum (rclone's
 `--checksum`), under the first hash both ends support — MD5 on S3, independent
 of the BLAKE3 in the index. A copy that fails the check after transfer is an
 error, so the run is not marked success, and the run advances the evidence under
@@ -81,7 +86,7 @@ offload gate accepts neither: a mirror cannot be named in
 ## Index snapshots
 
 `.squirrel-index/` holds the [index snapshots](/squirrel/configuration/index-snapshots/)
-ridden along after each successful sync, and a local mirror's receipts. Like
+ridden along after each successful sync, and a native mirror's receipts. Like
 `.squirrel-history`, it is filtered out of all sync and restore transfers and
 from peer-sync.
 

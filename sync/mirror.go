@@ -32,7 +32,7 @@ type mirrorHandler struct {
 	dest  *config.Destination
 	// openTransport opens the destination root; tests wrap it to inject
 	// faults.
-	openTransport func(*config.Destination) (transport, error)
+	openTransport func(context.Context, *config.Destination) (transport, error)
 	// stallTimeout bounds every transport call by progress.
 	stallTimeout time.Duration
 
@@ -60,9 +60,9 @@ func (h *mirrorHandler) Push(ctx context.Context, opts Options) (Report, error) 
 
 // root is the destination root as a layout may hold it: guarded, so only
 // runID's own moves pass (none when runID is 0), and bounded by progress.
-func (h *mirrorHandler) root(runID int64) (transport, error) {
+func (h *mirrorHandler) root(ctx context.Context, runID int64) (transport, error) {
 	if h.raw == nil {
-		raw, err := h.openTransport(h.dest)
+		raw, err := h.openTransport(ctx, h.dest)
 		if err != nil {
 			return nil, err
 		}
@@ -99,7 +99,7 @@ func (h *mirrorHandler) markers(ctx context.Context, rep *Report, volumeID int64
 	if opts.DryRun {
 		return nil
 	}
-	merr := ensureLocalDestinationMarker(ctx, h.store, h.dest, h.vol.Name, opts.Init)
+	merr := h.ensureMarker(ctx, opts.Init)
 	if merr == nil {
 		return nil
 	}
@@ -109,7 +109,7 @@ func (h *mirrorHandler) markers(ctx context.Context, rep *Report, volumeID int64
 
 // landed reports whether runID left its receipt at the destination.
 func (h *mirrorHandler) landed(ctx context.Context, runID int64) (bool, error) {
-	tr, err := h.root(0)
+	tr, err := h.root(ctx, 0)
 	if err != nil {
 		return false, err
 	}
@@ -126,7 +126,7 @@ func (h *mirrorHandler) landed(ctx context.Context, runID int64) (bool, error) {
 // rootEmpty reports whether the destination root holds no file beyond
 // the volume markers, walking it until the first one.
 func (h *mirrorHandler) rootEmpty(ctx context.Context) (bool, error) {
-	tr, err := h.root(0)
+	tr, err := h.root(ctx, 0)
 	if err != nil {
 		return false, err
 	}
@@ -164,7 +164,7 @@ func (h *mirrorHandler) seal(ctx context.Context, _ *Report, runID int64, p push
 	if err != nil {
 		return err
 	}
-	tr, err := h.root(runID)
+	tr, err := h.root(ctx, runID)
 	if err != nil {
 		return err
 	}

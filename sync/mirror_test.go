@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -21,8 +23,9 @@ import (
 	"github.com/mbertschler/squirrel/volmark"
 )
 
-// mirrorFixture is one volume, "pics", mirrored to a native local
-// destination, "usb", with the destination's volume marker in place.
+// mirrorFixture is one volume, "pics", mirrored to a native destination,
+// "usb", with the destination's volume marker in place. The destination
+// is a local directory unless the fixture is set up on another backend.
 type mirrorFixture struct {
 	store *store.Store
 	pair  Pair
@@ -30,7 +33,34 @@ type mirrorFixture struct {
 	dst   string // the destination root
 }
 
+// mirrorBackend is where a mirror fixture's destination lives: its name,
+// and the settings of a destination rooted at dst on it.
+type mirrorBackend struct {
+	name     string
+	settings func(t *testing.T, dst string) string
+}
+
+var (
+	localBackend = mirrorBackend{"local", func(_ *testing.T, dst string) string {
+		return fmt.Sprintf("type = \"local\"\nroot = %q\n", dst)
+	}}
+	// sftpBackend serves the destination root from an in-process sftp
+	// server, so the fixture reads what landed straight off the disk.
+	sftpBackend = mirrorBackend{"sftp", func(t *testing.T, dst string) string {
+		srv := startSFTPServer(t)
+		host, port, _ := net.SplitHostPort(srv.addr)
+		return fmt.Sprintf("type = \"sftp\"\nroot = %q\nhost = %q\nport = %q\nuser = \"u\"\npassword = \"p\"\nknown_hosts_file = %q\n",
+			dst, host, port, srv.knownHosts(t, srv.hostKeys[0].PublicKey()))
+	}}
+	mirrorBackends = []mirrorBackend{localBackend, sftpBackend}
+)
+
 func setupMirrorFixture(t *testing.T) *mirrorFixture {
+	t.Helper()
+	return setupMirrorFixtureOn(t, localBackend)
+}
+
+func setupMirrorFixtureOn(t *testing.T, b mirrorBackend) *mirrorFixture {
 	t.Helper()
 	root := t.TempDir()
 	f := &mirrorFixture{src: filepath.Join(root, "src"), dst: filepath.Join(root, "usb")}
@@ -49,7 +79,7 @@ func setupMirrorFixture(t *testing.T) *mirrorFixture {
 	t.Cleanup(func() { s.Close() })
 	f.store = s
 	cfgPath := filepath.Join(root, "config.toml")
-	body := "[destinations.usb]\ntype = \"local\"\nroot = \"" + f.dst + "\"\n\n" +
+	body := "[destinations.usb]\n" + b.settings(t, f.dst) + "\n" +
 		"[volumes.pics]\npath = \"" + f.src + "\"\nsync_to = [\"usb\"]\n"
 	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
@@ -100,8 +130,8 @@ func (f *mirrorFixture) mustPush(t *testing.T) Report {
 func (f *mirrorFixture) pushCrashing(t *testing.T, crashAt func(transportCall) bool, mode crashMode) (Report, error) {
 	t.Helper()
 	h := f.handler(t)
-	h.openTransport = func(d *config.Destination) (transport, error) {
-		raw, err := openLocalDestination(d)
+	h.openTransport = func(ctx context.Context, d *config.Destination) (transport, error) {
+		raw, err := openDestinationTransport(ctx, d)
 		if err != nil {
 			return nil, err
 		}
@@ -467,22 +497,26 @@ func isReceiptPut(c transportCall) bool {
 	return c.op == "put" && strings.Contains(c.name, IndexDirName+"/run-")
 }
 
+// mirrorCrashCase is one row of the crash table: where the push dies, and
+// what it leaves recorded.
+type mirrorCrashCase struct {
+	name    string
+	crashAt func(transportCall) bool
+	mode    crashMode
+	// crashed is the changed path's rows after the crash, oldest first.
+	crashed []string
+	check   func(t *testing.T, f *mirrorFixture, clean Report)
+}
+
 // TestMirrorCrashTable is the design's crash table: a push that dies at
-// each point of writing one changed path, then a clean push. Each row pins
-// what the crash leaves recorded and how reconcile settles it; afterwards
-// the three invariants hold.
+// each point of writing one changed path, then a clean push, on both
+// transports. Each row pins what the crash leaves recorded and how
+// reconcile settles it; afterwards the three invariants hold.
 func TestMirrorCrashTable(t *testing.T) {
 	staged := func(c transportCall) bool { return strings.Contains(c.name, StagingDirName+"/") }
 	intoHistory := func(c transportCall) bool { return c.op == "rename" && strings.Contains(c.to, HistoryDirName+"/") }
 	commitRename := func(c transportCall) bool { return c.op == "rename" && staged(c) }
-	cases := []struct {
-		name    string
-		crashAt func(transportCall) bool
-		mode    crashMode
-		// rows after the crash, oldest first
-		crashed []string
-		check   func(t *testing.T, f *mirrorFixture, clean Report)
-	}{
+	cases := []mirrorCrashCase{
 		{"staging write", func(c transportCall) bool { return c.op == "put" && staged(c) }, crashMidway,
 			[]string{store.RemotePathLive}, nil},
 		{"displacing recorded", intoHistory, crashBefore,
@@ -501,34 +535,39 @@ func TestMirrorCrashTable(t *testing.T) {
 				}
 			}},
 	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			f := setupMirrorFixture(t)
-			f.write(t, "keep.txt", "untouched")
-			f.write(t, "a.txt", "v1")
-			f.index(t)
-			f.mustPush(t)
-			f.write(t, "a.txt", "v2 is longer")
-			f.index(t)
-			before := f.contentHashes(t)
-
-			if rep, err := f.pushCrashing(t, c.crashAt, c.mode); !crashedOn(rep, err) {
-				t.Fatalf("crashing push = %v (failures %+v), want the injected crash", err, rep.RcloneResult.FailedFiles)
-			}
-			if got := f.rowsAt(t, "a.txt"); !slicesEqual(got, c.crashed) {
-				t.Fatalf("rows after the crash = %v, want %v", got, c.crashed)
-			}
-			clean := f.mustPush(t)
-			if f.readDest(t, "a.txt") != "v2 is longer" {
-				t.Fatal("the clean push did not land the new version")
-			}
-			if c.check != nil {
-				c.check(t, f, clean)
-			}
-			f.checkInvariants(t, before)
-			f.checkStagingEmpty(t, clean.RunID)
-		})
+	for _, b := range mirrorBackends {
+		for _, c := range cases {
+			t.Run(b.name+"/"+c.name, func(t *testing.T) {
+				runCrashCase(t, setupMirrorFixtureOn(t, b), c)
+			})
+		}
 	}
+}
+
+func runCrashCase(t *testing.T, f *mirrorFixture, c mirrorCrashCase) {
+	f.write(t, "keep.txt", "untouched")
+	f.write(t, "a.txt", "v1")
+	f.index(t)
+	f.mustPush(t)
+	f.write(t, "a.txt", "v2 is longer")
+	f.index(t)
+	before := f.contentHashes(t)
+
+	if rep, err := f.pushCrashing(t, c.crashAt, c.mode); !crashedOn(rep, err) {
+		t.Fatalf("crashing push = %v (failures %+v), want the injected crash", err, rep.RcloneResult.FailedFiles)
+	}
+	if got := f.rowsAt(t, "a.txt"); !slicesEqual(got, c.crashed) {
+		t.Fatalf("rows after the crash = %v, want %v", got, c.crashed)
+	}
+	clean := f.mustPush(t)
+	if f.readDest(t, "a.txt") != "v2 is longer" {
+		t.Fatal("the clean push did not land the new version")
+	}
+	if c.check != nil {
+		c.check(t, f, clean)
+	}
+	f.checkInvariants(t, before)
+	f.checkStagingEmpty(t, clean.RunID)
 }
 
 // crashedOn reports whether a push failed on the injected crash, directly
@@ -793,8 +832,8 @@ func TestMirrorStallFailsThePush(t *testing.T) {
 	release := make(chan struct{})
 	h := f.handler(t)
 	h.stallTimeout = 50 * time.Millisecond
-	h.openTransport = func(d *config.Destination) (transport, error) {
-		raw, err := openLocalDestination(d)
+	h.openTransport = func(ctx context.Context, d *config.Destination) (transport, error) {
+		raw, err := openDestinationTransport(ctx, d)
 		return blockingTransport{transport: raw, release: release}, err
 	}
 	if _, err := h.Push(context.Background(), Options{}); !errors.Is(err, errTransportStalled) {

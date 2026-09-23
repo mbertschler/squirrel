@@ -16,7 +16,7 @@ import (
 // recorded but may not have finished, deciding each from where the bytes
 // actually are, then removes the staging finished runs left behind.
 func (h *mirrorHandler) reconcile(ctx context.Context, rep *Report, volumeID, runID int64) error {
-	tr, err := h.root(runID)
+	tr, err := h.root(ctx, runID)
 	if err != nil {
 		return err
 	}

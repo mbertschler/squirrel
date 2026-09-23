@@ -108,7 +108,7 @@ Optional single positional. No arg = every `(volume, destination)` pair; one arg
 | Flag | Default | Meaning |
 |---|---|---|
 | `--to` | all | Limit to this destination name. |
-| `--shallow` | `false` | Skip the checksum comparison on remote mirror destinations; trust rclone's size+mtime comparison. Refused on a local mirror, which has no comparison to skip. A peer sync hashes every byte on both ends regardless. |
+| `--shallow` | `false` | Skip the checksum comparison on rclone mirror destinations; trust rclone's size+mtime comparison. Refused on a native mirror (`local`, or `sftp` without crypt), which has no comparison to skip. A peer sync hashes every byte on both ends regardless. |
 | `--dry-run` | `false` | Preview what a push would transfer without transferring; no runs row is written. |
 | `--init` | `false` | Authorise first-use destination bootstrap. |
 | `--progress`, `-P` | auto on a TTY | Show live transfer progress (files, bytes, rate, ETA). |

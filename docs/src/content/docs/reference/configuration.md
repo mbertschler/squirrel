@@ -59,13 +59,30 @@ See [Hooks](/squirrel/guides/hooks/).
 | Key | Meaning |
 |---|---|
 | `host` | Server hostname. |
-| `port` | SSH port (optional; rclone's default when omitted). |
+| `port` | SSH port (optional; `22` when omitted). |
 | `user` | SSH user. |
 | `password` | Secret (literal or `{ env }`). |
-| `key_file` | Path to a private key file, as an alternative to `password` (optional). |
+| `key_file` | Path to a private key file, as an alternative to `password` (optional; a leading `~/` is expanded). A passphrase-protected key goes through ssh-agent instead. |
 | `root` | Base path on the server. |
-| `known_hosts_file` | Path to a known_hosts file; **validates the server host key** (recommended). Without it, rclone connects to whatever host answers. |
+| `known_hosts_file` | Path to a known_hosts file holding the server's host key. |
 | `host_key_algorithms` | Space-separated list pinning accepted host-key algorithms (optional). |
+
+With neither `password` nor `key_file` set, squirrel logs in with the keys of the
+running ssh-agent (`SSH_AUTH_SOCK`).
+
+A mirror without [crypt](/squirrel/layouts/encrypted/) is a
+[native mirror](/squirrel/layouts/mirror/#how-a-mirror-is-written): squirrel
+connects to the server itself, and **always checks its host key**, against
+`known_hosts_file` or `~/.ssh/known_hosts` when that is unset. A server whose key
+the file does not hold is refused; the message gives the key's fingerprint and
+the known_hosts line that trusts it, to add once you have confirmed it. A key
+that differs from the pinned one is refused too. Unless `host_key_algorithms` is
+set, squirrel asks the server for the key types the file holds for it. `checkers`
+and `hash_algo` tune rclone, so a native mirror rejects them.
+
+Every other sftp destination — an encrypted mirror, or the content-addressed and
+packed layouts — is written by rclone, which checks the host key against
+`known_hosts_file` and accepts whatever key the server presents when it is unset.
 
 ### `s3`
 

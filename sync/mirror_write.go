@@ -40,7 +40,7 @@ type mirrorWriter struct {
 // recorded and saves work on the retry — but any failure fails the run
 // before its receipt is written, so the watermark holds.
 func (h *mirrorHandler) execute(ctx context.Context, rep *Report, runID int64, ops *mirrorOps) error {
-	tr, err := h.root(runID)
+	tr, err := h.root(ctx, runID)
 	if err != nil {
 		return err
 	}

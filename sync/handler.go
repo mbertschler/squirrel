@@ -134,8 +134,8 @@ func HandlerFor(s *store.Store, tools Tools, p Pair) (Handler, error) {
 			return nil, fmt.Errorf("destination %q: rclone wrapper is required", p.Destination.Name)
 		}
 		return &contentAddressedHandler{contentPusher{store: s, rcl: tools.Rclone, vol: p.Volume, dest: p.Destination}}, nil
-	case p.Destination.Type == "local":
-		return &mirrorHandler{store: s, vol: p.Volume, dest: p.Destination, openTransport: openLocalDestination, stallTimeout: DefaultStallTimeout}, nil
+	case p.Destination.NativeMirror():
+		return &mirrorHandler{store: s, vol: p.Volume, dest: p.Destination, openTransport: openDestinationTransport, stallTimeout: DefaultStallTimeout}, nil
 	default:
 		if tools.Rclone == nil {
 			return nil, fmt.Errorf("destination %q: rclone wrapper is required", p.Destination.Name)
@@ -144,8 +144,12 @@ func HandlerFor(s *store.Store, tools Tools, p Pair) (Handler, error) {
 	}
 }
 
-// openLocalDestination opens a local destination's root directory.
-func openLocalDestination(dest *config.Destination) (transport, error) {
+// openDestinationTransport opens a native mirror's destination root: a
+// directory on this machine, or on an sftp server.
+func openDestinationTransport(ctx context.Context, dest *config.Destination) (transport, error) {
+	if dest.Type == "sftp" {
+		return dialSFTP(ctx, dest)
+	}
 	return openLocalTransport(dest.Root)
 }
 

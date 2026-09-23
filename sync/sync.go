@@ -312,14 +312,12 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 		return rep, err
 	}
 
-	// Marker gate. Local destinations validate the marker on the
-	// filesystem; remote rclone destinations (sftp/s3/b2/gcs) read and,
-	// with --init, write it through the same overlay the transfer uses.
-	// The dry-run path skips: it never writes, and refusing a dry-run on
+	// Marker gate, read and (with --init) written through the same
+	// overlay the transfer uses. The dry-run path skips: it never writes, and refusing a dry-run on
 	// an uninitialised destination would prevent the "preview what would
 	// happen" workflow.
 	if !opts.DryRun {
-		if merr := ensureDestinationMarker(ctx, s, rcl, dest, vol.Name, opts.Init); merr != nil {
+		if merr := ensureRemoteDestinationMarker(ctx, s, rcl, dest, vol.Name, opts.Init); merr != nil {
 			// A marker refusal fires before the sync run is allocated, so
 			// record it as its own terminal 'refused' run — otherwise a
 			// month-dead backup disk produces zero red anywhere but agent
@@ -630,57 +628,12 @@ func validateLocalVolumeMarker(vol *config.Volume) error {
 	return fmt.Errorf("volume %q marker check: %w", vol.Name, err)
 }
 
-// ensureDestinationMarker validates (or, with init, writes) the
-// .squirrel-volume marker at the destination's per-volume root. It is
-// the single gate against pushing to a wrong or unmounted root: a
-// matching marker passes, a missing marker is bootstrapped only under
-// init (refused otherwise, in case the root is a typo or the remote is
-// unreachable), and a marker naming a different volume is always
-// refused — overwriting it would erase the trail that distinguishes the
-// two volumes.
-//
-// Local destinations reach the marker on the filesystem; remote rclone
-// destinations reach it through the same overlay their transfers use.
-func ensureDestinationMarker(ctx context.Context, s *store.Store, rcl *Rclone, dest *config.Destination, volumeName string, init bool) error {
-	if dest.Type != "local" {
-		return ensureRemoteDestinationMarker(ctx, s, rcl, dest, volumeName, init)
-	}
-	return ensureLocalDestinationMarker(ctx, s, dest, volumeName, init)
-}
-
-// ensureLocalDestinationMarker is the filesystem gate for local
-// destinations. The directory is created on first --init so the marker
-// can land even when the destination tree is empty.
-func ensureLocalDestinationMarker(ctx context.Context, s *store.Store, dest *config.Destination, volumeName string, init bool) error {
-	root := filepath.Join(dest.Root, volumeName)
-	err := volmark.Validate(root, volumeName)
-	if err == nil {
-		return nil
-	}
-	if _, ok := errors.AsType[*volmark.ErrMismatch](err); ok {
-		return fmt.Errorf("destination %q: %w (refuse to init over a different volume's tree): %w", dest.Name, err, ErrRefused)
-	}
-	if !errors.Is(err, volmark.ErrMissing) {
-		return fmt.Errorf("destination %q marker check: %w", dest.Name, err)
-	}
-	if !init {
-		return fmt.Errorf("destination %q at %s has no %s marker — re-run with --init to bootstrap (refusing in case the root is a typo): %w", dest.Name, root, volmark.MarkerName, ErrRefused)
-	}
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		return fmt.Errorf("destination %q: mkdir %s: %w", dest.Name, root, err)
-	}
-	m, err := selfMarker(ctx, s, volumeName)
-	if err != nil {
-		return fmt.Errorf("destination %q: %w", dest.Name, err)
-	}
-	if err := volmark.Write(root, m); err != nil {
-		return fmt.Errorf("destination %q: %w", dest.Name, err)
-	}
-	return nil
-}
-
-// ensureRemoteDestinationMarker is the rclone-mediated gate for remote
-// destinations (sftp/s3/b2/gcs). It probes the marker at the per-volume
+// ensureRemoteDestinationMarker is the gate against pushing to a wrong or
+// unreachable root for the destinations rclone writes (crypt mirrors,
+// mirrors on s3/b2/gcs, and the content layouts). It validates (or, with
+// init, writes) the .squirrel-volume marker at the per-volume root: a
+// matching marker passes, a missing one is bootstrapped only under init,
+// and one naming a different volume is always refused. It probes the marker at the per-volume
 // root through remoteSubpathURI — the same overlay the layout's
 // transfers use, so a crypt destination's marker rides the encrypted
 // path too — and applies the identical rules as the local gate.
@@ -705,7 +658,7 @@ func ensureRemoteDestinationMarker(ctx context.Context, s *store.Store, rcl *Rcl
 	}
 	if !present {
 		if !init {
-			return fmt.Errorf("destination %q at %s has no %s marker — re-run with --init to bootstrap (refusing in case the root is a typo)", dest.Name, markerURI, volmark.MarkerName)
+			return fmt.Errorf("destination %q at %s has no %s marker — re-run with --init to bootstrap (refusing in case the root is a typo): %w", dest.Name, markerURI, volmark.MarkerName, ErrRefused)
 		}
 		return writeRemoteMarker(ctx, s, rcl, dest, markerURI, volumeName)
 	}
@@ -728,8 +681,8 @@ func validateRemoteMarker(dest *config.Destination, markerURI, volumeName string
 		return fmt.Errorf("destination %q: %w at %s", dest.Name, err, markerURI)
 	}
 	if m.Volume != volumeName {
-		return fmt.Errorf("destination %q: %s at %s names %q, want %q (refuse to sync over a different volume's tree)",
-			dest.Name, volmark.MarkerName, markerURI, m.Volume, volumeName)
+		return fmt.Errorf("destination %q: %s at %s names %q, want %q (refuse to sync over a different volume's tree): %w",
+			dest.Name, volmark.MarkerName, markerURI, m.Volume, volumeName, ErrRefused)
 	}
 	return nil
 }

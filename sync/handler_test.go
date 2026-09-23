@@ -9,8 +9,10 @@ import (
 
 func TestHandlerForDispatch(t *testing.T) {
 	vol := &config.Volume{Name: "pics", Path: "/tmp/pics"}
-	bucket := &config.Destination{Name: "offsite", Type: "sftp", Root: "/data"}
+	bucket := &config.Destination{Name: "offsite", Type: "s3", Root: "/data"}
 	usb := &config.Destination{Name: "usb", Type: "local", Root: "/tmp/dst"}
+	box := &config.Destination{Name: "box", Type: "sftp", Root: "/data"}
+	cryptBox := &config.Destination{Name: "box", Type: "sftp", Root: "/data", Crypt: &config.Crypt{Password: "pw"}}
 	node := &config.Node{Name: "nas"}
 	tools := Tools{Rclone: &Rclone{Binary: "rclone"}}
 
@@ -29,6 +31,22 @@ func TestHandlerForDispatch(t *testing.T) {
 	}
 	if _, ok := h.(*mirrorHandler); !ok || h.TargetName() != "usb" {
 		t.Fatalf("local mirror pair resolved to %T (%q), want *mirrorHandler usb", h, h.TargetName())
+	}
+
+	// So is a plain sftp mirror; an encrypted one stays on rclone.
+	h, err = HandlerFor(nil, Tools{}, Pair{Volume: vol, Destination: box})
+	if err != nil {
+		t.Fatalf("sftp mirror pair: %v", err)
+	}
+	if _, ok := h.(*mirrorHandler); !ok {
+		t.Fatalf("sftp mirror pair resolved to %T, want *mirrorHandler", h)
+	}
+	h, err = HandlerFor(nil, tools, Pair{Volume: vol, Destination: cryptBox})
+	if err != nil {
+		t.Fatalf("crypt sftp mirror pair: %v", err)
+	}
+	if _, ok := h.(*rcloneHandler); !ok {
+		t.Fatalf("crypt sftp mirror pair resolved to %T, want *rcloneHandler", h)
 	}
 
 	h, err = HandlerFor(nil, tools, Pair{Volume: vol, Node: node})

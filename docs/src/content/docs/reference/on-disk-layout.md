@@ -88,7 +88,7 @@ for user content:
 | Directory | Purpose |
 |---|---|
 | `.squirrel-history/run-<id>/` | Prior bytes of the files a sync run replaced on a [mirror](/squirrel/layouts/mirror/). |
-| `.squirrel-index/` | Ride-along [index snapshots](/squirrel/configuration/index-snapshots/), and a local mirror's receipts. |
+| `.squirrel-index/` | Ride-along [index snapshots](/squirrel/configuration/index-snapshots/), and a native mirror's receipts. |
 | `.squirrel-restore-history/run-<id>/` | Files displaced by an [`--in-place` restore](/squirrel/guides/restore/). |
 | `.squirrel-staging/run-<id>/` | A native [mirror](/squirrel/layouts/mirror/)'s in-flight writes, renamed onto their paths once complete. |
 

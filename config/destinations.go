@@ -841,7 +841,7 @@ func (d *Destination) NativeMirror() bool {
 }
 
 func nativeMirror(typ, layout string, crypt bool) bool {
-	return layout == LayoutMirror && !crypt && (typ == "local" || typ == "sftp")
+	return !layoutHidesArtifactNames(layout) && !crypt && (typ == "local" || typ == "sftp")
 }
 
 // HidesArtifactNames reports whether this destination names its content
@@ -866,10 +866,11 @@ func layoutHidesArtifactNames(layout string) bool {
 // reason names the structural gap for the caller's message; it is empty
 // when capable.
 //
-// The structurally-incapable shape is a mirror. A native local mirror hashes
-// each file as it sends it but reads nothing back, so it advances with
-// presence+size and nothing upgrades it. An rclone mirror, plain or crypt,
-// compares source against destination by rclone's --checksum — under
+// The structurally-incapable shape is a mirror. A native mirror (local, or
+// sftp without crypt) hashes each file as it sends it but reads nothing
+// back, so it advances with presence+size and nothing upgrades it. An
+// rclone mirror compares source against destination by rclone's
+// --checksum — under
 // a hash rclone picks, unrelated to the index's BLAKE3 — or, behind a crypt
 // overlay, by size+mtime alone (sync.EffectiveShallow); and the mirror
 // layout records no scan-back fingerprint that a later `squirrel verify`
@@ -885,8 +886,8 @@ func (d *Destination) CanEverGateOffload() (bool, string) {
 	switch {
 	case d.Layout == LayoutContentAddressed || d.Layout == LayoutPacked:
 		return true, ""
-	case d.Type == "local":
-		return false, "local mirror destination: a push hashes each file as it sends it but reads nothing back from the disk, so its evidence stays presence+size, which is not content-verified"
+	case d.NativeMirror():
+		return false, fmt.Sprintf("%s mirror destination: a push hashes each file as it sends it but reads nothing back, so its evidence stays presence+size, which is not content-verified", d.Type)
 	}
 	return false, "mirror destination: a sync compares it with the source by rclone's checksum or by size+mtime, never against the index's BLAKE3, and the mirror layout records no scan-back fingerprint to upgrade"
 }
