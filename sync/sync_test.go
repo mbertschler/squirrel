@@ -344,7 +344,7 @@ func TestSyncDryRunPath(t *testing.T) {
 }
 
 // TestSyncHappyPathStampsVerification rides on the happy-path fixture
-// to pin the typed durability report a default (BLAKE3) bucket sync
+// to pin the typed durability report a default (checksum) mirror sync
 // produces.
 func TestSyncHappyPathStampsVerification(t *testing.T) {
 	f := setupFixture(t)
@@ -357,8 +357,8 @@ func TestSyncHappyPathStampsVerification(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Sync: %v", err)
 	}
-	if !rep.Verification.Verified() || rep.Verification.Method != VerifyMethodBlake3 {
-		t.Fatalf("Verification = %+v, want verified blake3", rep.Verification)
+	if !rep.Verification.Verified() || rep.Verification.Method != VerifyMethodChecksum {
+		t.Fatalf("Verification = %+v, want verified checksum", rep.Verification)
 	}
 	if rep.Verification.Files != 1 {
 		t.Fatalf("Verification.Files = %d, want 1", rep.Verification.Files)

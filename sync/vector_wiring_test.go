@@ -28,8 +28,8 @@ func volumeComponents(t *testing.T, s *store.Store, volName, dest string) []stor
 	return out
 }
 
-// TestRunPairAdvancesVectorOnVerifiedPush: a BLAKE3-verified successful
-// bucket push advances the destination's durability vector for the
+// TestRunPairAdvancesVectorOnVerifiedPush: a checksum-verified successful
+// mirror push advances the destination's durability vector for the
 // volume's origins.
 func TestRunPairAdvancesVectorOnVerifiedPush(t *testing.T) {
 	f := setupFixture(t)

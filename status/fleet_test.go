@@ -115,10 +115,10 @@ func TestFleetAheadFromRelayedEvidence(t *testing.T) {
 	}
 	// The archive holds this machine's content and, relayed via nas,
 	// homepc's — which never reached this machine at all.
-	if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, "s3archive", self.ID, idx.RunID, store.VerifyMethodBlake3, false); err != nil {
+	if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, "s3archive", self.ID, idx.RunID, store.VerifyMethodKopia, false); err != nil {
 		t.Fatalf("seed self component: %v", err)
 	}
-	if err := s.UpsertDestinationRunIDPulled(ctx, v.ID, "s3archive", homepc.ID, 42, store.VerifyMethodBlake3, nas.ID, time.Now().UnixNano(), false); err != nil {
+	if err := s.UpsertDestinationRunIDPulled(ctx, v.ID, "s3archive", homepc.ID, 42, store.VerifyMethodKopia, nas.ID, time.Now().UnixNano(), false); err != nil {
 		t.Fatalf("seed pulled component: %v", err)
 	}
 
@@ -263,7 +263,7 @@ func TestFleetPlaceBeyondConfig(t *testing.T) {
 	if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, "nas", self.ID, idx.RunID, store.VerifyMethodPeer, false); err != nil {
 		t.Fatalf("seed vector: %v", err)
 	}
-	if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, "old-usb", self.ID, idx.RunID, store.VerifyMethodBlake3, false); err != nil {
+	if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, "old-usb", self.ID, idx.RunID, store.VerifyMethodKopia, false); err != nil {
 		t.Fatalf("seed dropped destination: %v", err)
 	}
 	recordSuccessfulSync(t, s, v.ID, "nas")
@@ -316,11 +316,11 @@ func TestFleetVerifiedIsTheWeakestLink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetOrCreateOriginNode: %v", err)
 	}
-	if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, "s3archive", self.ID, idx.RunID, store.VerifyMethodBlake3, false); err != nil {
+	if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, "s3archive", self.ID, idx.RunID, store.VerifyMethodKopia, false); err != nil {
 		t.Fatalf("seed fresh component: %v", err)
 	}
 	stale := time.Now().Add(-72 * time.Hour).UnixNano()
-	if err := s.UpsertDestinationRunIDPulled(ctx, v.ID, "s3archive", homepc.ID, 42, store.VerifyMethodBlake3, nas.ID, stale, false); err != nil {
+	if err := s.UpsertDestinationRunIDPulled(ctx, v.ID, "s3archive", homepc.ID, 42, store.VerifyMethodKopia, nas.ID, stale, false); err != nil {
 		t.Fatalf("seed stale component: %v", err)
 	}
 
@@ -354,7 +354,7 @@ func TestFleetVerifiedUnknownWhenAComponentCarriesNone(t *testing.T) {
 	if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, "nas", self.ID, idx.RunID, store.VerifyMethodPeer, false); err != nil {
 		t.Fatalf("seed verified component: %v", err)
 	}
-	if err := s.UpsertDestinationRunIDPulled(ctx, v.ID, "nas", homepc.ID, 5, store.VerifyMethodBlake3, hub.ID, 0, false); err != nil {
+	if err := s.UpsertDestinationRunIDPulled(ctx, v.ID, "nas", homepc.ID, 5, store.VerifyMethodKopia, hub.ID, 0, false); err != nil {
 		t.Fatalf("seed undated component: %v", err)
 	}
 	recordSuccessfulSync(t, s, v.ID, "nas")
@@ -425,7 +425,7 @@ func TestFleetMissingCountsEveryOrigin(t *testing.T) {
 	}
 	// The archive has this machine's own content but nothing of the
 	// laptop's.
-	if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, "s3archive", self.ID, idx.RunID, store.VerifyMethodBlake3, false); err != nil {
+	if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, "s3archive", self.ID, idx.RunID, store.VerifyMethodKopia, false); err != nil {
 		t.Fatalf("seed vector: %v", err)
 	}
 
@@ -448,7 +448,7 @@ func TestFleetHonoursEvidencePolicy(t *testing.T) {
 	root, idx := indexTree(t, s, "photos")
 	v, _ := s.GetVolumeByName(ctx, "photos")
 	self, _ := s.GetSelfNode(ctx)
-	if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, "s3archive", self.ID, idx.RunID, store.VerifyMethodBlake3, false); err != nil {
+	if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, "s3archive", self.ID, idx.RunID, store.VerifyMethodKopia, false); err != nil {
 		t.Fatalf("seed vector: %v", err)
 	}
 	cfg := cfgFor("photos", root, nil, []string{"s3archive"}, nil, nil)
@@ -501,10 +501,10 @@ func TestFleetDivergedWhenBothDirections(t *testing.T) {
 	self, _ := s.GetSelfNode(ctx)
 	nas, _ := s.GetOrCreateOriginNode(ctx, "nas")
 	homepc, _ := s.GetOrCreateOriginNode(ctx, "homepc")
-	if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, "s3archive", self.ID, idx.RunID-1, store.VerifyMethodBlake3, false); err != nil {
+	if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, "s3archive", self.ID, idx.RunID-1, store.VerifyMethodKopia, false); err != nil {
 		t.Fatalf("seed self component: %v", err)
 	}
-	if err := s.UpsertDestinationRunIDPulled(ctx, v.ID, "s3archive", homepc.ID, 42, store.VerifyMethodBlake3, nas.ID, time.Now().UnixNano(), false); err != nil {
+	if err := s.UpsertDestinationRunIDPulled(ctx, v.ID, "s3archive", homepc.ID, 42, store.VerifyMethodKopia, nas.ID, time.Now().UnixNano(), false); err != nil {
 		t.Fatalf("seed pulled component: %v", err)
 	}
 

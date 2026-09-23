@@ -249,8 +249,11 @@ sync_to = ["does-not-exist"]
 func TestLoadOffloadRequires(t *testing.T) {
 	p := writeConfig(t, `
 [destinations.scratch]
-type = "local"
-root = "/tmp/dst"
+type   = "sftp"
+host   = "host.example"
+user   = "u"
+root   = "/data"
+layout = "content-addressed"
 
 [volumes.pictures]
 path = "/tmp/pictures"
@@ -320,10 +323,11 @@ offload_requires = ["cloudbox"]
 	}
 }
 
-// TestLoadAcceptsPlainMirrorOffloadRequires: a plain (non-crypt) mirror is
-// now an evidence-producing target — a BLAKE3-verified sync advances its
-// durability vector — so naming one in offload_requires must load cleanly.
-func TestLoadAcceptsPlainMirrorOffloadRequires(t *testing.T) {
+// TestLoadRejectsPlainMirrorOffloadRequires: a plain mirror's sync is
+// compared by rclone's checksum under a hash rclone picks, never the
+// index's BLAKE3, so it can no more gate offload than a crypt mirror can
+// (#211). Naming one fails at load.
+func TestLoadRejectsPlainMirrorOffloadRequires(t *testing.T) {
 	p := writeConfig(t, `
 [destinations.usb]
 type = "local"
@@ -334,8 +338,9 @@ path = "/tmp/docs"
 sync_to = ["usb"]
 offload_requires = ["usb"]
 `)
-	if _, err := Load(p); err != nil {
-		t.Fatalf("Load with plain-mirror offload_requires: %v", err)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "can never satisfy the durability gate") {
+		t.Fatalf("expected plain-mirror offload_requires rejection, got %v", err)
 	}
 }
 

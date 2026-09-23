@@ -847,25 +847,25 @@ func layoutHidesArtifactNames(layout string) bool {
 // reason names the structural gap for the caller's message; it is empty
 // when capable.
 //
-// The one structurally-incapable shape is a mirror-layout destination
-// behind a crypt overlay: crypt remotes expose no content hash, so rclone
-// falls back to a size+mtime comparison (never BLAKE3 — see
-// sync.EffectiveShallow), and the mirror layout records no scan-back
-// fingerprint that a later `squirrel verify` could upgrade. The
-// content-addressed and packed layouts, by contrast, advance with
-// presence+size but stay upgradable — their fingerprint is read back over
-// the stored ciphertext, so a crypt overlay does not block it — and every
-// native content-verified destination (a plain mirror's BLAKE3, kopia's own
-// verification) is capable outright.
+// The structurally-incapable shape is an rclone mirror, plain or crypt. Its
+// sync compares source against destination by rclone's --checksum — under
+// a hash rclone picks, unrelated to the index's BLAKE3 — or, behind a crypt
+// overlay, by size+mtime alone (sync.EffectiveShallow); and the mirror
+// layout records no scan-back fingerprint that a later `squirrel verify`
+// could upgrade (#211). The content-addressed and packed layouts, by
+// contrast, advance with presence+size but stay upgradable — their
+// fingerprint is read back over the stored ciphertext, so a crypt overlay
+// does not block it — and kopia's own repository verification is capable
+// outright.
 func (d *Destination) CanEverGateOffload() (bool, string) {
+	if d.Type == "kopia" {
+		return true, ""
+	}
 	switch d.Layout {
 	case LayoutContentAddressed, LayoutPacked:
 		return true, ""
 	}
-	if d.Crypt != nil {
-		return false, "shallow path-mirrored crypt destination: BLAKE3 verification cannot pass through the crypt overlay and the mirror layout records no scan-back fingerprint to upgrade it"
-	}
-	return true, ""
+	return false, "mirror destination: a sync compares it with the source by rclone's checksum or by size+mtime, never against the index's BLAKE3, and the mirror layout records no scan-back fingerprint to upgrade"
 }
 
 // VerifyCadencedTargets marks the required targets that carry an effective

@@ -91,7 +91,7 @@ func TestBuildFullyDurable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSelfNode: %v", err)
 	}
-	if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, "dest", self.ID, idx.RunID, store.VerifyMethodBlake3, false); err != nil {
+	if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, "dest", self.ID, idx.RunID, store.VerifyMethodKopia, false); err != nil {
 		t.Fatalf("seed vector: %v", err)
 	}
 	recordSuccessfulSync(t, s, v.ID, "dest")
@@ -118,7 +118,7 @@ func TestBuildFullyDurable(t *testing.T) {
 	if tg.Standing != StandingNone || tg.SyncLevel != LevelOK {
 		t.Errorf("target coverage = standing %v level %v, want none/ok", tg.Standing, tg.SyncLevel)
 	}
-	if tg.Durability == nil || !tg.Durability.LocalContent || !tg.Durability.Covered || tg.Durability.Method != store.VerifyMethodBlake3 {
+	if tg.Durability == nil || !tg.Durability.LocalContent || !tg.Durability.Covered || tg.Durability.Method != store.VerifyMethodKopia {
 		t.Errorf("durability wrong: %+v", tg.Durability)
 	}
 	if !vs.Offload.Applicable || vs.Offload.OffloadableFiles != 3 || vs.Offload.PresentFiles != 3 {
@@ -287,7 +287,7 @@ func TestBuildSkipOffloadReadiness(t *testing.T) {
 	root, idx := indexTree(t, s, "photos")
 	v, _ := s.GetVolumeByName(ctx, "photos")
 	self, _ := s.GetSelfNode(ctx)
-	if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, "dest", self.ID, idx.RunID, store.VerifyMethodBlake3, false); err != nil {
+	if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, "dest", self.ID, idx.RunID, store.VerifyMethodKopia, false); err != nil {
 		t.Fatalf("seed vector: %v", err)
 	}
 	recordSuccessfulSync(t, s, v.ID, "dest")

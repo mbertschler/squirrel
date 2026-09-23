@@ -44,7 +44,7 @@ func writeOffloadConfig(t *testing.T, requires []string) (configFixture, string)
 
 // seedOffloadEvidence opens the fixture DB directly and records the
 // durability a verified whole-volume push leaves: a content-verified
-// (blake3) vector component for the self node at the file's introduction
+// (kopia-verify) vector component for the self node at the file's introduction
 // run, plus a successful kind='sync' run that advances the freshness
 // watermark past the file's became-present run — the same evidence the
 // destination handlers leave behind.
@@ -69,7 +69,7 @@ func seedOffloadEvidence(t *testing.T, dbPath string, targets []string) {
 		t.Fatalf("GetSelfNode: %v", err)
 	}
 	for _, target := range targets {
-		if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, target, self.ID, row.FirstSeenRunID, store.VerifyMethodBlake3, false); err != nil {
+		if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, target, self.ID, row.FirstSeenRunID, store.VerifyMethodKopia, false); err != nil {
 			t.Fatalf("UpsertDestinationRunID(%s): %v", target, err)
 		}
 		id, blocker, err := s.BeginSyncRunIfClear(ctx, store.SyncRunSpec{VolumeID: v.ID, Destination: target})

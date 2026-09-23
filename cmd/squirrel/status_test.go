@@ -185,7 +185,7 @@ func seedFleetEvidence(t *testing.T, dbPath, destination string) {
 	if err != nil {
 		t.Fatalf("PresentOriginMaxima: %v", err)
 	}
-	if err := s.AdvanceDestinationVectorTo(ctx, vol.ID, destination, store.VerifyMethodBlake3, components); err != nil {
+	if err := s.AdvanceDestinationVectorTo(ctx, vol.ID, destination, store.VerifyMethodKopia, components); err != nil {
 		t.Fatalf("AdvanceDestinationVectorTo: %v", err)
 	}
 	id, err := s.BeginRun(ctx, store.RunKindSync, vol.ID, destination, false)

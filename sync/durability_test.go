@@ -32,9 +32,9 @@ func TestRelayedMethodCadenceCoupling(t *testing.T) {
 	}
 
 	c = base
-	c.VerifyMethod = store.VerifyMethodBlake3
-	if got := relayedMethod(c); got != store.VerifyMethodBlake3 {
-		t.Fatalf("relayedMethod(blake3) = %q, want blake3 unchanged", got)
+	c.VerifyMethod = store.VerifyMethodKopia
+	if got := relayedMethod(c); got != store.VerifyMethodKopia {
+		t.Fatalf("relayedMethod(kopia-verify) = %q, want kopia-verify unchanged", got)
 	}
 }
 
@@ -185,7 +185,7 @@ func TestPullDurabilityTagsSourcePeer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSelfNode: %v", err)
 	}
-	if err := f.initStore.UpsertDestinationRunIDVerified(ctx, v.ID, "offsite-a", self.ID, 4, store.VerifyMethodBlake3, false); err != nil {
+	if err := f.initStore.UpsertDestinationRunIDVerified(ctx, v.ID, "offsite-a", self.ID, 4, store.VerifyMethodKopia, false); err != nil {
 		t.Fatalf("seed local verified component: %v", err)
 	}
 
@@ -460,7 +460,7 @@ func TestValidateComponentVerifyMethod(t *testing.T) {
 	base := syncproto.DurabilityComponent{Destination: "offsite-a", OriginNode: "laptop", OriginRun: 5}
 	for _, method := range []string{
 		"",
-		store.VerifyMethodBlake3,
+		store.VerifyMethodChecksum,
 		store.VerifyMethodSizeMtime,
 		store.VerifyMethodPeer,
 		store.VerifyMethodKopia,

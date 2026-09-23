@@ -6,9 +6,9 @@ import (
 )
 
 // TestCanEverGateOffload pins the structural capability predicate the
-// offload fail-fast reads: the one incapable shape is a mirror-layout crypt
-// destination (size+mtime forever, no fingerprint to upgrade it); every
-// other shape can eventually contribute a content-verified component.
+// offload fail-fast reads: the incapable shape is an rclone mirror, plain or
+// crypt (checksum or size+mtime, no fingerprint to upgrade it); every other
+// shape can eventually contribute a content-verified component.
 func TestCanEverGateOffload(t *testing.T) {
 	crypt := &Crypt{Password: "obscured"}
 	cases := []struct {
@@ -16,13 +16,13 @@ func TestCanEverGateOffload(t *testing.T) {
 		dest        Destination
 		wantCapable bool
 	}{
-		{"mirror plain", Destination{Type: "sftp", Layout: LayoutMirror}, true},
+		{"mirror plain", Destination{Type: "sftp", Layout: LayoutMirror}, false},
 		{"mirror crypt", Destination{Type: "sftp", Layout: LayoutMirror, Crypt: crypt}, false},
 		{"content-addressed plain", Destination{Type: "sftp", Layout: LayoutContentAddressed}, true},
 		{"content-addressed crypt", Destination{Type: "s3", Layout: LayoutContentAddressed, Crypt: crypt}, true},
 		{"packed plain", Destination{Type: "s3", Layout: LayoutPacked}, true},
 		{"packed crypt", Destination{Type: "s3", Layout: LayoutPacked, Crypt: crypt}, true},
-		{"local mirror", Destination{Type: "local", Layout: LayoutMirror}, true},
+		{"local mirror", Destination{Type: "local", Layout: LayoutMirror}, false},
 		{"kopia mirror", Destination{Type: "kopia", Layout: LayoutMirror}, true},
 	}
 	for _, c := range cases {
@@ -34,8 +34,8 @@ func TestCanEverGateOffload(t *testing.T) {
 			switch {
 			case capable && reason != "":
 				t.Fatalf("capable destination returned non-empty reason %q", reason)
-			case !capable && !strings.Contains(reason, "crypt"):
-				t.Fatalf("incapable reason %q should name the crypt overlay", reason)
+			case !capable && !strings.Contains(reason, "mirror"):
+				t.Fatalf("incapable reason %q should name the mirror layout", reason)
 			}
 		})
 	}

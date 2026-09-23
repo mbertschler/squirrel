@@ -140,8 +140,8 @@ type Report struct {
 	Changed sql.NullInt64
 	// Verification is the handler's typed durability report for this
 	// push: which comparison backed it, what the tool counted, and —
-	// via Verified() — whether the destination's copy was
-	// content-verified. Zero for restores and dry runs.
+	// via Verified() — whether that comparison passed in full. Zero for
+	// restores and dry runs.
 	Verification VerifyResult
 	// FinishErr captures a failure to write the runs row's terminal state.
 	// It is independent of rclone success — the bytes may have transferred
@@ -228,9 +228,10 @@ type Report struct {
 // for tests and for callers that already have the typed destination in
 // hand.
 //
-// A verified successful bucket push (BLAKE3 for rclone, repository
-// verify for kopia) advances the destination's durability vector;
-// peer pushes advance it inside the handshake's close phase instead.
+// A verified successful bucket push (rclone's checksum comparison for a
+// mirror, repository verify for kopia) advances the destination's
+// durability vector; peer pushes advance it inside the handshake's close
+// phase instead.
 //
 // Concurrency: every handler allocates the 'running' kind='sync' row
 // via store.BeginSyncRunIfClear, which does the check + insert

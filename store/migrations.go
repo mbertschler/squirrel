@@ -10,7 +10,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 30
+const SchemaVersion = 31
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -73,6 +73,7 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 28, up: migrateV27ToV28},
 		{version: 29, up: migrateV28ToV29},
 		{version: 30, up: migrateV29ToV30},
+		{version: 31, up: migrateV30ToV31},
 	}
 }
 
@@ -2394,4 +2395,57 @@ func migrateV29ToV30(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("record schema v30: %w", err)
 	}
 	return tx.Commit()
+}
+
+// --- v30 → v31 ---
+
+// migrateV30ToV31 relabels every durability component recorded as "blake3"
+// to "checksum" (#211). The mirror sync that minted "blake3" passed
+// `--checksum --hash blake3` to rclone, but `--hash` only picks the hash a
+// listing prints: the comparison ran under the first hash both backends
+// support, MD5 on local and s3. "checksum" names that comparison, and the
+// offload gate no longer accepts it as content-verified.
+//
+// Each relabel appends a destination_run_ids_history row stamped with the
+// migration time, so the log records when the label changed and every
+// earlier row keeps what squirrel claimed at the time. The run and both
+// timestamps stay as they were: the evidence was relabelled, not
+// re-checked. A database whose chain never created the vector tables (a
+// partial fixture) has nothing to relabel.
+func migrateV30ToV31(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	present, err := tableExists(ctx, tx, "destination_run_ids")
+	if err != nil {
+		return err
+	}
+	if present {
+		if err := relabelBlake3ComponentsV31(ctx, tx); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (31)`); err != nil {
+		return fmt.Errorf("record schema v31: %w", err)
+	}
+	return tx.Commit()
+}
+
+func relabelBlake3ComponentsV31(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO destination_run_ids_history
+			(volume_id, destination, origin_node_id, origin_run_id, at_ns, verify_method, source_node_id)
+		SELECT volume_id, destination, origin_node_id, origin_run_id, ?, 'checksum', source_node_id
+		FROM destination_run_ids WHERE verify_method = 'blake3'
+	`, NowNs()); err != nil {
+		return fmt.Errorf("log blake3 → checksum relabel: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE destination_run_ids SET verify_method = 'checksum' WHERE verify_method = 'blake3'`); err != nil {
+		return fmt.Errorf("relabel blake3 components as checksum: %w", err)
+	}
+	return nil
 }

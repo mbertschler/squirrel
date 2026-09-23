@@ -40,7 +40,7 @@ func seedResetVector(t *testing.T, dbPath, destination string) {
 	if err != nil {
 		t.Fatalf("GetSelfNode: %v", err)
 	}
-	if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, destination, self.ID, 5, store.VerifyMethodBlake3, false); err != nil {
+	if err := s.UpsertDestinationRunIDVerified(ctx, v.ID, destination, self.ID, 5, store.VerifyMethodKopia, false); err != nil {
 		t.Fatalf("UpsertDestinationRunIDVerified: %v", err)
 	}
 }
