@@ -77,14 +77,31 @@ type Rclone struct {
 	StallTimeout time.Duration
 }
 
-// Find locates the rclone binary on PATH. The returned Rclone has Config
-// empty — callers fill it in via WriteRcloneConfig before invoking Run.
-func Find() (*Rclone, error) {
+// Find locates the rclone binary on PATH and refuses one below
+// MinRcloneVersion, so every entry point that drives rclone applies the
+// same floor. The returned Rclone has Config empty — callers fill it in
+// via WriteRcloneConfig before invoking Run.
+func Find(ctx context.Context) (*Rclone, error) {
 	bin, err := exec.LookPath("rclone")
 	if err != nil {
 		return nil, fmt.Errorf("rclone not found on PATH (install rclone ≥ %s): %w", MinRcloneVersion, err)
 	}
-	return &Rclone{Binary: bin}, nil
+	r := &Rclone{Binary: bin}
+	v, err := r.Version(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkMinVersion(v); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func checkMinVersion(v Version) error {
+	if v.AtLeast(MinRcloneVersion) {
+		return nil
+	}
+	return fmt.Errorf("rclone %s is below the supported floor %s; upgrade rclone", v, MinRcloneVersion)
 }
 
 // Version is a parsed semver from `rclone version`. Only major/minor/patch

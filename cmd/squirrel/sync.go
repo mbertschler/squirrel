@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"slices"
 
 	"github.com/spf13/cobra"
 
@@ -62,9 +63,12 @@ func runSync(cmd *cobra.Command, volumeName, destinationName string, progress bo
 	}
 	defer s.Close()
 
+	// A batch of kopia and peer pairs alone starts on a host without
+	// rclone and prints none of its preamble: no version check, no
+	// "rclone.conf updated" line, no --shallow warning (F11b).
 	var rcl *sync.Rclone
-	if pairsNeedRclone(pairs) {
-		rcl, err = sync.Find()
+	if slices.ContainsFunc(pairs, sync.Pair.DrivesRclone) {
+		rcl, err = sync.Find(cmd.Context())
 		if err != nil {
 			return err
 		}
@@ -77,9 +81,6 @@ func runSync(cmd *cobra.Command, volumeName, destinationName string, progress bo
 	if rcl != nil {
 		if opts.Shallow {
 			fmt.Fprintln(out, shallowSyncWarning)
-		}
-		if err := sync.EnsureMinVersion(cmd.Context(), rcl); err != nil {
-			return err
 		}
 		if err := writeRcloneConfigLogged(out, rcl, cfg); err != nil {
 			return err
@@ -149,21 +150,6 @@ const shallowSyncWarning = "warning: shallow mode: skipping the checksum compari
 // squirrel rewrites the file only when that derived content changes.
 func rcloneConfigPathFor(cfg *config.Config) string {
 	return filepath.Join(filepath.Dir(cfg.Path), "rclone.conf")
-}
-
-// pairsNeedRclone reports whether any pair in the batch drives rclone.
-// Every non-kopia bucket destination does; kopia drives its own binary
-// and a peer node streams its bytes over the sync API, so a batch of
-// those alone starts on a host without rclone and prints none of its
-// preamble: no version check, no "rclone.conf updated" line, no
-// --shallow warning (F11b).
-func pairsNeedRclone(pairs []sync.Pair) bool {
-	for _, p := range pairs {
-		if p.Destination != nil && p.Destination.Type != "kopia" {
-			return true
-		}
-	}
-	return false
 }
 
 // writeRcloneConfigLogged renders the rclone.conf and logs a single line

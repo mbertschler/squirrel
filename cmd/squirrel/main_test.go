@@ -20,7 +20,7 @@ import (
 func requireRcloneCLI(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("rclone"); err != nil {
-		t.Skip("rclone not on PATH; install rclone ≥ 1.66 to run these tests")
+		t.Skip("rclone not on PATH; install rclone ≥ 1.71 to run these tests")
 	}
 }
 

@@ -232,9 +232,12 @@ func (h *Runs) resolveSyncTarget(ctx context.Context, name, dest string) (syncpk
 	if err != nil {
 		return syncpkg.Pair{}, syncpkg.Tools{}, fmt.Errorf("pairs: %w", err)
 	}
-	rcl, err := h.prepareRclone(ctx)
-	if err != nil {
-		return syncpkg.Pair{}, syncpkg.Tools{}, fmt.Errorf("prepare rclone: %w", err)
+	var rcl *syncpkg.Rclone
+	if pairs[0].DrivesRclone() {
+		rcl, err = h.prepareRclone(ctx)
+		if err != nil {
+			return syncpkg.Pair{}, syncpkg.Tools{}, fmt.Errorf("prepare rclone: %w", err)
+		}
 	}
 	tools, err := syncpkg.ToolsFor(h.Config, pairs[:1], rcl)
 	if err != nil {
@@ -286,11 +289,8 @@ func (h *Runs) runSyncGoroutine(name, dest string, pair syncpkg.Pair, tools sync
 func (h *Runs) prepareRclone(ctx context.Context) (*syncpkg.Rclone, error) {
 	h.rcloneMu.Lock()
 	defer h.rcloneMu.Unlock()
-	rcl, err := syncpkg.Find()
+	rcl, err := syncpkg.Find(ctx)
 	if err != nil {
-		return nil, err
-	}
-	if err := syncpkg.EnsureMinVersion(ctx, rcl); err != nil {
 		return nil, err
 	}
 	confPath := filepath.Join(filepath.Dir(h.Config.Path), "rclone.conf")

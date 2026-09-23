@@ -72,7 +72,7 @@ func setupFixture(t *testing.T) *syncFixture {
 		t.Fatalf("config.Load: %v", err)
 	}
 
-	rcl, err := Find()
+	rcl, err := Find(context.Background())
 	if err != nil {
 		t.Fatalf("Find rclone: %v", err)
 	}

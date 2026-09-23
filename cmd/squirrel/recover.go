@@ -123,7 +123,7 @@ func discoverRecovery(cmd *cobra.Command, cfg *config.Config, opts recoverOption
 			cfg.Path, opts.From)
 	}
 
-	rcl, err := sync.Find()
+	rcl, err := sync.Find(cmd.Context())
 	if err != nil {
 		return recoverPlan{}, err
 	}
@@ -242,7 +242,7 @@ func recoverIndexPhase(cmd *cobra.Command, plan recoverPlan, opts recoverOptions
 		return false, nil
 	}
 
-	rcl, err := sync.Find()
+	rcl, err := sync.Find(cmd.Context())
 	if err != nil {
 		return false, err
 	}

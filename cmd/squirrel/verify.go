@@ -53,7 +53,7 @@ func runVerify(cmd *cobra.Command, destName string) error {
 	}
 	defer s.Close()
 
-	rcl, err := sync.Find()
+	rcl, err := sync.Find(cmd.Context())
 	if err != nil {
 		return err
 	}

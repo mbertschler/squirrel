@@ -82,7 +82,7 @@ func requireRclone(t *testing.T) *Rclone {
 	if _, err := exec.LookPath("rclone"); err != nil {
 		t.Skip("rclone not on PATH; install rclone ≥ 1.66 to run these tests")
 	}
-	r, err := Find()
+	r, err := Find(context.Background())
 	if err != nil {
 		t.Fatalf("Find: %v", err)
 	}

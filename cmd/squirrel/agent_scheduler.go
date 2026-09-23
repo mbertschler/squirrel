@@ -65,7 +65,7 @@ func (t *schedulerTools) rebuild(ctx context.Context, cfg *config.Config) error 
 	if !needsSync && !needsVerify {
 		return nil
 	}
-	rcl, err := sync.Find()
+	rcl, err := sync.Find(ctx)
 	if err != nil {
 		return fmt.Errorf("scheduler needs rclone for scheduled syncs/verifies: %w", err)
 	}
@@ -73,9 +73,6 @@ func (t *schedulerTools) rebuild(ctx context.Context, cfg *config.Config) error 
 	// endpoint fails its own run instead of hanging forever (#160, F25).
 	// Foreground `squirrel sync` leaves this unset — a human can interrupt.
 	rcl.StallTimeout = sync.DefaultStallTimeout
-	if err := sync.EnsureMinVersion(ctx, rcl); err != nil {
-		return fmt.Errorf("scheduler rclone preflight: %w", err)
-	}
 	if _, err := rcl.WriteRcloneConfig(rcloneConfigPathFor(cfg), cfg.Destinations); err != nil {
 		return fmt.Errorf("write rclone config: %w", err)
 	}

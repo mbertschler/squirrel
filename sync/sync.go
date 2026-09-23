@@ -912,24 +912,6 @@ func cryptVerificationWarning(dest *config.Destination, shallow bool) string {
 	return fmt.Sprintf("destination %q is encrypted (crypt): checksum comparison cannot pass through the crypt overlay — comparing by size+mtime for this run, recorded as shallow", dest.Name)
 }
 
-// EnsureMinVersion refuses an installed rclone below MinRcloneVersion.
-// One floor covers every rclone-driven run, so the check applies whether
-// or not the run compares checksums.
-func EnsureMinVersion(ctx context.Context, rcl *Rclone) error {
-	v, err := rcl.Version(ctx)
-	if err != nil {
-		return err
-	}
-	return checkMinVersion(v)
-}
-
-func checkMinVersion(v Version) error {
-	if v.AtLeast(MinRcloneVersion) {
-		return nil
-	}
-	return fmt.Errorf("rclone %s is below the supported floor %s; upgrade rclone", v, MinRcloneVersion)
-}
-
 // PairsFor builds the list of (volume, target) pairs to sync given
 // optional volume-name and destination/node-name filters. An empty
 // volumeName means "every volume with sync_to declared"; an empty
@@ -998,6 +980,13 @@ func (p Pair) TargetName() string {
 
 // IsNode reports whether this pair targets a peer node (vs. a bucket).
 func (p Pair) IsNode() bool { return p.Node != nil }
+
+// DrivesRclone reports whether syncing this pair invokes rclone. Every
+// destination does except kopia, which drives its own binary; a peer node
+// streams its bytes over the sync API.
+func (p Pair) DrivesRclone() bool {
+	return p.Destination != nil && p.Destination.Type != "kopia"
+}
 
 // RestoreOptions shape one Restore invocation. ToPath overrides the local
 // target directory; when empty, the volume's declared path is used. The
