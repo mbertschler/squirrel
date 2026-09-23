@@ -921,9 +921,6 @@ func ShallowForPairs(pairs []Pair, shallow bool) bool {
 		if p.Destination != nil && p.Destination.Layout == config.LayoutContentAddressed {
 			continue
 		}
-		// Peer pairs (Destination nil) stream their bytes over the sync
-		// API and never reach rclone, so they constrain it no more than a
-		// kopia pair does.
 		if p.Destination == nil {
 			continue
 		}

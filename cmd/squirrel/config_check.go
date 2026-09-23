@@ -69,7 +69,7 @@ func runConfigCheck(cmd *cobra.Command) error {
 	var tally checkTally
 	checkVolumes(cfg, out, &tally)
 	checkDestinations(cfg, out)
-	checkNodes(cfg, out, &tally)
+	checkNodes(cfg, out)
 	checkOffloadPolicies(cfg, out, &tally)
 
 	return printSummary(out, cfg, tally)
@@ -109,14 +109,13 @@ func checkDestinations(cfg *config.Config, out io.Writer) {
 	}
 }
 
-func checkNodes(cfg *config.Config, out io.Writer, tally *checkTally) {
+func checkNodes(cfg *config.Config, out io.Writer) {
 	fmt.Fprintf(out, "nodes (%d)\n", len(cfg.Nodes))
 	for _, name := range sortedKeys(cfg.Nodes) {
 		n := cfg.Nodes[name]
 		// A node resolves to one endpoint and nothing else to stat: bytes
 		// and plan both travel over it, so whether the peer answers is a
 		// sync-time concern, exactly as a destination's reachability is.
-		tally.add(statusOK)
 		printCheckLine(out, statusOK, name, n.Endpoint.String())
 	}
 }

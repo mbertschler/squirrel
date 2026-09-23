@@ -175,10 +175,6 @@ func buildSchedulerSyncRunner(live *config.Live, s *store.Store, tools *schedule
 		if err != nil {
 			return agent.SyncRunReport{Err: err}
 		}
-		// A peer pair needs no rclone: it streams over the sync API, and
-		// its snapshot never rides along to a bucket. Demanding the
-		// wrapper for it would fail a peer-only schedule on a host that
-		// has no reason to install rclone at all.
 		rcl := tools.rclone()
 		if rcl == nil && !pair.IsNode() {
 			return agent.SyncRunReport{Err: errors.New("scheduled sync needs rclone, which the configuration in force did not call for")}
