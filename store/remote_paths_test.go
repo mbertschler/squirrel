@@ -148,48 +148,29 @@ func TestRemotePathOneLiveVersionPerPath(t *testing.T) {
 	}
 }
 
-// TestContentPresentOnDestinationSeesMirrorCopies: a live or displaced
-// mirror copy counts as the content being on the destination; a committing
-// or lost one does not.
-func TestContentPresentOnDestinationSeesMirrorCopies(t *testing.T) {
+// TestContentPresentOnDestinationCountsContentLayoutsOnly: the content
+// layouts' upload-once check counts only bytes where they read them. A
+// live mirror copy sits at its path, so a destination whose mirror records
+// outlived a switch to a content layout still uploads the object.
+func TestContentPresentOnDestinationCountsContentLayoutsOnly(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 	d, _, runID := remotePathFixture(t, s)
-	present := func() bool {
-		t.Helper()
-		ok, err := s.ContentPresentOnDestination(ctx, d.ContentID, "usb")
-		if err != nil {
-			t.Fatalf("ContentPresentOnDestination: %v", err)
-		}
-		return ok
-	}
 	id, err := s.BeginRemotePathCommit(ctx, commitWrite(d, runID))
 	if err != nil {
 		t.Fatalf("BeginRemotePathCommit: %v", err)
 	}
-	if present() {
-		t.Fatal("a committing copy counts as present")
-	}
 	if err := s.ConfirmRemotePathsLive(ctx, id); err != nil {
 		t.Fatal(err)
 	}
-	if !present() {
-		t.Fatal("a live copy does not count as present")
+	if ok, err := s.ContentPresentOnDestination(ctx, d.ContentID, "usb"); err != nil || ok {
+		t.Fatalf("ContentPresentOnDestination with only a mirror copy = %t, %v; want false", ok, err)
 	}
-	if err := s.BeginRemotePathsDisplace(ctx, runID, id); err != nil {
+	if err := s.InsertRemoteObject(ctx, RemoteObject{ContentID: d.ContentID, Destination: "usb", UploadedRunID: runID}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.ConfirmRemotePathsDisplaced(ctx, id); err != nil {
-		t.Fatal(err)
-	}
-	if !present() {
-		t.Fatal("a displaced copy does not count as present")
-	}
-	if err := s.MarkRemotePathsLost(ctx, id); err != nil {
-		t.Fatal(err)
-	}
-	if present() {
-		t.Fatal("a lost copy counts as present")
+	if ok, err := s.ContentPresentOnDestination(ctx, d.ContentID, "usb"); err != nil || !ok {
+		t.Fatalf("ContentPresentOnDestination with an object = %t, %v; want true", ok, err)
 	}
 }
 

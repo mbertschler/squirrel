@@ -154,7 +154,7 @@ func treeEmpty(ctx context.Context, tr transport, dir string) (bool, error) {
 }
 
 func (h *mirrorHandler) foreignHistory(runID int64) error {
-	return fmt.Errorf("destination %q: the last successful sync (run %d) left no receipt at %s — the tree was written by rclone or another layout, and a native mirror does not adopt an existing tree; point the destination at a fresh or emptied root, or (after emptying it) run `squirrel destination reset %s`: %w", h.dest.Name, runID, h.receiptName(runID), h.dest.Name, ErrRefused)
+	return fmt.Errorf("destination %q: the last successful sync (run %d) left no receipt at %s, so the root holds a tree this mirror did not write (by rclone, or another layout) or was emptied while squirrel still records uploads to it; a native mirror does not adopt an existing tree: point the destination at a fresh or emptied root, and after emptying it run `squirrel destination reset %s`: %w", h.dest.Name, runID, h.receiptName(runID), h.dest.Name, ErrRefused)
 }
 
 // seal writes the run's receipt, the manifest segment of its delta, and

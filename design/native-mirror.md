@@ -367,9 +367,14 @@ CREATE INDEX idx_remote_paths_unsettled ON remote_paths (destination)
 - **A row is `lost` when its bytes are no longer where it says.** A push or a
   verify pass found other bytes there, or nothing. The row keeps its history
   but stops vouching for its content.
-- **The upload-once check sees mirror copies.** `ContentPresentOnDestination`
-  gains `remote_paths` rows in the `live` and `displaced` states as a third
-  source. `lost` rows never count.
+- **The upload-once check leaves mirror copies out.** The plan was for
+  `ContentPresentOnDestination` to gain `remote_paths` rows in the `live` and
+  `displaced` states as a third source. Its only callers are the content
+  layouts' upload-once checks, and a mirror copy isn't at `objects/<hash>`: a
+  destination whose mirror records outlived a switch to a content layout would
+  skip those objects and still seal. So the check stays with objects and packs,
+  and the mirror decides from its own records. `DestinationHasUploadRecords`
+  does count every `remote_paths` row.
 
 ### Translation rules
 

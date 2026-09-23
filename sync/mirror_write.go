@@ -206,9 +206,15 @@ func (w *mirrorWriter) displaceDir(ctx context.Context, dir string) error {
 			return err
 		}
 	}
-	w.rep.Warnings = append(w.rep.Warnings, fmt.Sprintf("destination %q: directory %s was replaced by a file; it moved into %s with the %d version(s) squirrel recorded in it",
+	if err := w.noteUnrecordedMove(ctx, fmt.Sprintf("directory=%q recorded-versions=%d moving-to=%q", dir, len(ids), w.historyName(dir))); err != nil {
+		return err
+	}
+	if err := w.moveRecorded(ctx, dir, ids); err != nil {
+		return err
+	}
+	w.rep.Warnings = append(w.rep.Warnings, fmt.Sprintf("destination %q: directory %s was replaced by a file; it moved into %s with the %d version(s) squirrel recorded in it and anything else it held",
 		w.h.dest.Name, dir, w.historyName(dir), len(ids)))
-	return w.moveRecorded(ctx, dir, ids)
+	return nil
 }
 
 // moveRecorded records the move of ids, renames rel into history, and
@@ -232,18 +238,26 @@ func (w *mirrorWriter) moveRecorded(ctx context.Context, rel string, ids []int64
 	return nil
 }
 
-// moveUnrecorded moves bytes squirrel did not write into history,
-// reporting them as a warning and in the run's audit trail.
+// moveUnrecorded moves bytes squirrel did not write into history. The
+// move is noted in the run's audit trail before it happens, and reported
+// as a warning once it did.
 func (w *mirrorWriter) moveUnrecorded(ctx context.Context, rel string, e entry) error {
 	to := w.historyName(rel)
+	if err := w.noteUnrecordedMove(ctx, fmt.Sprintf("path=%q size=%d moving-to=%q", rel, e.size, to)); err != nil {
+		return err
+	}
 	if err := w.tr.Rename(ctx, w.h.liveName(rel), to); err != nil {
 		return fmt.Errorf("displace unrecorded %s: %w", rel, err)
 	}
 	w.rep.Warnings = append(w.rep.Warnings, fmt.Sprintf("destination %q: %s held bytes squirrel did not write (%d bytes); they are preserved at %s", w.h.dest.Name, rel, e.size, to))
+	return nil
+}
+
+func (w *mirrorWriter) noteUnrecordedMove(ctx context.Context, note string) error {
 	return w.h.store.AppendRunAudit(ctx, store.RunAuditEntry{
 		RunID:      w.runID,
 		Transition: store.TransitionDisplaceUnrecorded,
-		Note:       fmt.Sprintf("path=%q size=%d moved-to=%q", rel, e.size, to),
+		Note:       note,
 	})
 }
 
