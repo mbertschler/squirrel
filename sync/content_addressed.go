@@ -109,15 +109,19 @@ type contentPusher struct {
 // other.
 func (h *contentPusher) names() namer { return namerFor(h.dest) }
 
-// ensureMarker gates a remote content-layout push on the destination's
-// per-volume .squirrel-volume marker, exactly as the mirror layout does
-// (the marker sits at the volume root regardless of layout). Local
-// content-addressed and packed destinations are intentionally left
-// ungated here: they carry no such gate today, so extending it to them
-// is a separate parity concern — this closes only the remote gap (#150).
-func (h *contentPusher) ensureMarker(ctx context.Context, init bool) error {
+// ensureMarkers gates a remote content-layout push on the root's naming
+// scheme, then on the destination's per-volume .squirrel-volume marker,
+// exactly as the mirror layout does (the marker sits at the volume root
+// regardless of layout). Local content-addressed and packed destinations
+// are intentionally left ungated here: they carry no such gate today, so
+// extending it to them is a separate parity concern — this closes only the
+// remote gap (#150).
+func (h *contentPusher) ensureMarkers(ctx context.Context, init bool) error {
 	if h.dest.Type == "local" {
 		return nil
+	}
+	if err := h.ensureNamingScheme(ctx, init); err != nil {
+		return err
 	}
 	return ensureRemoteDestinationMarker(ctx, h.store, h.rcl, h.dest, h.vol.Name, init)
 }
@@ -155,10 +159,7 @@ func (h *contentAddressedHandler) Push(ctx context.Context, opts Options) (Repor
 		}
 		return rep, h.previewDryRun(ctx, &rep, volID)
 	}
-	if err := h.ensureNamingScheme(ctx); err != nil {
-		return rep, err
-	}
-	if err := h.ensureMarker(ctx, opts.Init); err != nil {
+	if err := h.ensureMarkers(ctx, opts.Init); err != nil {
 		return rep, err
 	}
 	// shallow=true on the runs row: the per-object transfers carry no
@@ -297,7 +298,7 @@ func (h *contentAddressedHandler) watermark(ctx context.Context, volID int64) (i
 	}
 	segURI := h.segmentURI(last.ID)
 	if _, err := h.rcl.statRemote(ctx, segURI, checkersArgs(h.dest)...); err != nil {
-		if freshStartOnEmptyRoot(ctx, h.rcl, h.dest, rootMarkerNames(h.dest)...) {
+		if freshStartOnEmptyRoot(ctx, h.rcl, h.dest) {
 			return 0, nil
 		}
 		return 0, fmt.Errorf("destination %q: the last successful sync (run %d) left no manifest segment at %s — its history does not look content-addressed; point the layout at a fresh destination or root, or (after wiping the remote root) run `squirrel destination reset %s`, instead of switching an existing one: %w: %w", h.dest.Name, last.ID, segURI, h.dest.Name, err, ErrRefused)

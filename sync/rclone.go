@@ -659,14 +659,11 @@ func (r *Rclone) deleteFile(ctx context.Context, fileURI string) error {
 // `squirrel destination reset` — as a fresh start rather than a layout
 // conflict.
 //
-// exempt names basenames that do not count as content — squirrel's own
-// markers, each written by a gate that runs before the guard consulting
-// this, so counting them would make fresh-start recognition unreachable in
-// exactly the situation it exists for. Which markers those are is the
-// caller's to say, because it differs by guard: the naming gate discounts
-// only its own marker, since a volume marker in clear is itself evidence
-// of a root written under the older scheme. Anything not exempt, including
-// a single stray file, reads as non-empty and keeps the caller's refusal.
+// exempt names basenames that do not count as content: squirrel's own
+// markers, which the push gates write before a layout guard consults this,
+// so counting them would make fresh-start recognition unreachable in
+// exactly the situation it exists for. Anything not exempt, including a
+// single stray file, reads as non-empty and keeps the caller's refusal.
 func (r *Rclone) remoteRootEmpty(ctx context.Context, rootURI string, exempt []string, extraArgs ...string) (bool, error) {
 	args := append([]string{"lsf", "-R", "--files-only"}, extraArgs...)
 	out, err := r.runPlain(ctx, append(args, rootURI)...)

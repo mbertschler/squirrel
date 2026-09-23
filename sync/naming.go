@@ -118,69 +118,52 @@ func rootMarkerNames(dest *config.Destination) []string {
 	return []string{volmark.MarkerName}
 }
 
-// rootNaming is what a destination root turns out to be written under.
-type rootNaming int
-
-const (
-	// rootKeyed: the root carries a marker recording this binary's scheme.
-	rootKeyed rootNaming = iota
-	// rootLegacy: the root holds files but no marker, so it was written
-	// before encrypted destinations keyed their names — content-hash
-	// basenames, in clear.
-	rootLegacy
-	// rootFresh: nothing is there yet, so a push may claim it.
-	rootFresh
-)
-
-// probeRootNaming classifies dest's root by what is actually at it. The
-// marker is authoritative where it exists; absent, an empty root is fresh
-// and a populated one is legacy. Only an encrypted append-only destination
-// can be anything but keyed-by-definition, so every other destination
-// answers rootKeyed and the callers' own naming (content-hash) applies
-// unchanged.
-//
-// Read-only, so a dry run can ask it.
-func probeRootNaming(ctx context.Context, rcl *Rclone, dest *config.Destination) (rootNaming, error) {
-	if !dest.HidesArtifactNames() {
-		return rootKeyed, nil
-	}
-	uri := remoteSubpathURI(dest, NamingMarkerName)
-	present, err := rcl.statRemoteExists(ctx, uri, checkersArgs(dest)...)
-	if err != nil {
-		return 0, fmt.Errorf("destination %q: stat %s at %s: %w", dest.Name, NamingMarkerName, uri, err)
-	}
-	if present {
-		return rootKeyed, validateNamingScheme(ctx, rcl, dest, uri)
-	}
-	if freshStartOnEmptyRoot(ctx, rcl, dest, NamingMarkerName) {
-		return rootFresh, nil
-	}
-	return rootLegacy, nil
-}
-
-// ensureNamingScheme gates a push on the destination root's recorded naming
-// scheme and bootstraps the marker on a fresh root.
-func (h *contentPusher) ensureNamingScheme(ctx context.Context) error {
-	root, err := h.checkNamingScheme(ctx)
-	if err != nil || root != rootFresh {
+// ensureNamingScheme gates a push on the root's recorded naming scheme and,
+// under init, stamps the scheme on a fresh root. A fresh root without init
+// is left untouched for the volume-marker gate to refuse.
+func (h *contentPusher) ensureNamingScheme(ctx context.Context, init bool) error {
+	needsMarker, err := h.checkNamingScheme(ctx)
+	if err != nil || !needsMarker || !init {
 		return err
 	}
 	return h.writeNamingMarker(ctx)
 }
 
-// checkNamingScheme classifies the root and refuses a push to one written
-// under another scheme. Mixing the two would leave the pre-existing
-// artifacts named as they already are while squirrel treated the root as
-// private, so the refusal is the honest answer.
-//
-// Read-only, so a dry run can ask the same question.
-func (h *contentPusher) checkNamingScheme(ctx context.Context) (rootNaming, error) {
-	root, err := probeRootNaming(ctx, h.rcl, h.dest)
-	if err != nil || root != rootLegacy {
-		return root, err
+// checkNamingScheme refuses a push to a root whose artifacts are named under
+// any other scheme, and reports whether the root is fresh and still needs
+// its naming marker. Read-only, so a dry run asks it too.
+func (h *contentPusher) checkNamingScheme(ctx context.Context) (needsMarker bool, err error) {
+	if !h.dest.HidesArtifactNames() {
+		return false, nil
 	}
-	return root, fmt.Errorf("destination %q holds files at %s but no %s, so whatever is there was written under other names than the keyed ones this destination derives — point the destination at a fresh root, or (after wiping the remote root) run `squirrel destination reset %s`: %w",
-		h.dest.Name, remoteSubpathURI(h.dest, ""), NamingMarkerName, h.dest.Name, ErrRefused)
+	uri := remoteSubpathURI(h.dest, NamingMarkerName)
+	present, err := h.rcl.statRemoteExists(ctx, uri, checkersArgs(h.dest)...)
+	if err != nil {
+		return false, fmt.Errorf("destination %q: stat %s at %s: %w", h.dest.Name, NamingMarkerName, uri, err)
+	}
+	if present {
+		return false, validateNamingScheme(ctx, h.rcl, h.dest, uri)
+	}
+	if err := h.requireEmptyRoot(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// requireEmptyRoot refuses a root without a naming marker that holds any
+// file at all: whatever is there was named under another scheme, and adding
+// keyed names beside it would leave it disclosing what it always did.
+func (h *contentPusher) requireEmptyRoot(ctx context.Context) error {
+	rootURI := remoteSubpathURI(h.dest, "")
+	empty, err := h.rcl.remoteRootEmpty(ctx, rootURI, nil, checkersArgs(h.dest)...)
+	if err != nil {
+		return fmt.Errorf("destination %q: list %s: %w", h.dest.Name, rootURI, err)
+	}
+	if !empty {
+		return fmt.Errorf("destination %q holds files at %s but no %s, so they were written under other names than the keyed ones this destination derives — point the destination at a fresh root, or (after wiping the remote root) run `squirrel destination reset %s`: %w",
+			h.dest.Name, rootURI, NamingMarkerName, h.dest.Name, ErrRefused)
+	}
+	return nil
 }
 
 // validateNamingScheme reads the marker at uri and refuses any scheme this

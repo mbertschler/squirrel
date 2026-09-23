@@ -141,10 +141,7 @@ func (h *packedHandler) Push(ctx context.Context, opts Options) (Report, error) 
 		}
 		return rep, h.previewDryRun(ctx, &rep, volID)
 	}
-	if err := h.ensureNamingScheme(ctx); err != nil {
-		return rep, err
-	}
-	if err := h.ensureMarker(ctx, opts.Init); err != nil {
+	if err := h.ensureMarkers(ctx, opts.Init); err != nil {
 		return rep, err
 	}
 	// shallow=true: neither the per-object copyto nor the pack copyto
@@ -377,7 +374,7 @@ func (h *packedHandler) watermark(ctx context.Context, volID int64) (int64, erro
 	}
 	mapURI := h.mapURI(last.ID)
 	if _, err := h.rcl.statRemote(ctx, mapURI, checkersArgs(h.dest)...); err != nil {
-		if freshStartOnEmptyRoot(ctx, h.rcl, h.dest, rootMarkerNames(h.dest)...) {
+		if freshStartOnEmptyRoot(ctx, h.rcl, h.dest) {
 			return 0, nil
 		}
 		return 0, fmt.Errorf("destination %q: the last successful sync (run %d) left no pack placement map at %s — its history is not packed (a mirror or content-addressed root); point the layout at a fresh destination or root, or (after wiping the remote root) run `squirrel destination reset %s`, instead of switching an existing one: %w: %w", h.dest.Name, last.ID, mapURI, h.dest.Name, err, ErrRefused)

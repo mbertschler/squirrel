@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/store"
+	"github.com/mbertschler/squirrel/volmark"
 )
 
 // TestKeyedNamesDiscloseNothing is the property the feature exists for:
@@ -31,20 +31,7 @@ func TestKeyedNamesDiscloseNothing(t *testing.T) {
 	}
 
 	secrets := []string{blake3Hex(small), blake3Hex(large), "pics", "docs"}
-	var names []string
-	if err := filepath.WalkDir(f.fakeRoot, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, relErr := filepath.Rel(f.fakeRoot, p)
-		if relErr != nil {
-			return relErr
-		}
-		names = append(names, rel)
-		return nil
-	}); err != nil {
-		t.Fatalf("walk remote: %v", err)
-	}
+	names := f.remoteEntries(t)
 	if len(names) < 4 {
 		t.Fatalf("remote tree looks empty (%v); the push wrote nothing to inspect", names)
 	}
@@ -117,44 +104,73 @@ func TestKeyedNamesFollowTheKey(t *testing.T) {
 	}
 }
 
-// TestNamingMarkerBootstrapped: a push to a fresh encrypted root records
-// the naming scheme, and a second push accepts the root it wrote.
-func TestNamingMarkerBootstrapped(t *testing.T) {
-	f := setupContentAddressedFixture(t)
-	f.write(t, "a.txt", "alpha")
-	f.index(t)
-	if _, err := f.sync(t); err != nil {
-		t.Fatalf("first sync: %v", err)
+// TestNamingMarkerBootstrappedOnInit: an --init push to a fresh encrypted
+// root stamps the naming scheme and then the keyed volume marker, and a
+// plain push afterwards accepts the root it wrote.
+func TestNamingMarkerBootstrappedOnInit(t *testing.T) {
+	for layout, setup := range keyedArchiveFixtures() {
+		t.Run(layout, func(t *testing.T) {
+			f := setup(t)
+			f.wipeRemote(t)
+			f.write(t, "a.txt", "alpha")
+			f.index(t)
+			if _, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, f.pair, Options{Init: true}); err != nil {
+				t.Fatalf("init push: %v", err)
+			}
+			data, err := os.ReadFile(f.remoteBlob(NamingMarkerName))
+			if err != nil {
+				t.Fatalf("read %s: %v", NamingMarkerName, err)
+			}
+			var m namingMarker
+			if err := json.Unmarshal(data, &m); err != nil {
+				t.Fatalf("parse %s (%q): %v", NamingMarkerName, data, err)
+			}
+			if m.Naming != namingSchemeKeyed {
+				t.Errorf("marker naming = %q, want %q", m.Naming, namingSchemeKeyed)
+			}
+			if m.CreatedAt == "" {
+				t.Error("marker carries no created_at")
+			}
+			if _, err := os.Stat(f.volumeBlob(t, "pics", volmark.MarkerName)); err != nil {
+				t.Fatalf("init push wrote no keyed volume marker: %v", err)
+			}
+			f.write(t, "b.txt", "bravo")
+			f.index(t)
+			if _, err := f.sync(t); err != nil {
+				t.Fatalf("plain push against the root it bootstrapped: %v", err)
+			}
+		})
 	}
-	data, err := os.ReadFile(f.remoteBlob(NamingMarkerName))
-	if err != nil {
-		t.Fatalf("read %s: %v", NamingMarkerName, err)
-	}
-	var m namingMarker
-	if err := json.Unmarshal(data, &m); err != nil {
-		t.Fatalf("parse %s (%q): %v", NamingMarkerName, data, err)
-	}
-	if m.Naming != namingSchemeKeyed {
-		t.Errorf("marker naming = %q, want %q", m.Naming, namingSchemeKeyed)
-	}
-	if m.CreatedAt == "" {
-		t.Error("marker carries no created_at")
-	}
-	f.write(t, "b.txt", "bravo")
-	f.index(t)
-	if _, err := f.sync(t); err != nil {
-		t.Fatalf("second sync against the root it bootstrapped: %v", err)
+}
+
+// TestPushWithoutInitWritesNothingToFreshRoot: without --init a fresh root
+// may be a typo, so the push is refused and leaves the root as empty as it
+// found it.
+func TestPushWithoutInitWritesNothingToFreshRoot(t *testing.T) {
+	for layout, setup := range keyedArchiveFixtures() {
+		t.Run(layout, func(t *testing.T) {
+			f := setup(t)
+			f.wipeRemote(t)
+			f.write(t, "a.txt", "alpha")
+			f.index(t)
+			_, err := f.sync(t)
+			if err == nil || !strings.Contains(err.Error(), "--init") {
+				t.Fatalf("want the --init refusal, got %v", err)
+			}
+			if written := f.remoteEntries(t); len(written) != 0 {
+				t.Fatalf("a refused push wrote to the fresh root: %v", written)
+			}
+		})
 	}
 }
 
 // TestNamingRefusesPopulatedRootWithoutMarker: a root holding files but no
-// marker was written under other names — the shape every encrypted archive
-// had before keyed naming. Mixing keyed names in would leave those files
-// named as they are while squirrel treated the root as private, so the push
+// marker was written under other names. Adding keyed names beside them
+// would leave those files disclosing what they always did, so the push
 // refuses and names the remedy.
 func TestNamingRefusesPopulatedRootWithoutMarker(t *testing.T) {
 	f := setupContentAddressedFixture(t)
-	f.makeLegacyRoot(t, "previously-uploaded")
+	f.seedUnmarkedRoot(t, "previously-uploaded")
 	f.write(t, "a.txt", "alpha")
 	f.index(t)
 
@@ -175,6 +191,51 @@ func TestNamingRefusesPopulatedRootWithoutMarker(t *testing.T) {
 	}
 	if rep.Status == store.RunStatusSuccess {
 		t.Errorf("Status = %q on a refused push", rep.Status)
+	}
+}
+
+// TestNamingRefusesClearVolumeMarker: a volume marker under the clear
+// volume name is a file some other naming wrote, so a root holding only
+// that is refused even under --init, and the gate writes nothing.
+func TestNamingRefusesClearVolumeMarker(t *testing.T) {
+	for layout, setup := range keyedArchiveFixtures() {
+		t.Run(layout, func(t *testing.T) {
+			f := setup(t)
+			f.wipeRemote(t)
+			seedRemoteFile(t, f, "pics", volmark.MarkerName+cryptDataSuffix)
+			f.write(t, "a.txt", "alpha")
+			f.index(t)
+
+			_, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, f.pair, Options{Init: true})
+			if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), NamingMarkerName) {
+				t.Fatalf("want a naming refusal, got %v", err)
+			}
+			if _, statErr := os.Stat(f.remoteBlob(NamingMarkerName)); statErr == nil {
+				t.Fatalf("the refused push wrote %s", NamingMarkerName)
+			}
+		})
+	}
+}
+
+// TestNamingGateSurfacesListingErrors: a listing failure on a root without
+// a naming marker is reported as that failure, never as a root holding
+// someone else's files.
+func TestNamingGateSurfacesListingErrors(t *testing.T) {
+	f := setupContentAddressedFixture(t)
+	f.wipeRemote(t)
+	t.Setenv("RCLONE_FAKE_LSF_ERROR", "Failed to create file system: 401 Unauthorized")
+	f.write(t, "a.txt", "alpha")
+	f.index(t)
+
+	_, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, f.pair, Options{Init: true})
+	if err == nil || !strings.Contains(err.Error(), "401 Unauthorized") {
+		t.Fatalf("want the listing failure surfaced, got %v", err)
+	}
+	if errors.Is(err, ErrRefused) || strings.Contains(err.Error(), "holds files") {
+		t.Fatalf("a listing failure was reported as a populated root: %v", err)
+	}
+	if written := f.remoteEntries(t); len(written) != 0 {
+		t.Fatalf("the failed push wrote to the root: %v", written)
 	}
 }
 
@@ -224,7 +285,7 @@ func TestNamingRefusesUnreadableMarker(t *testing.T) {
 // no marker — an honest rehearsal refuses what the real push would refuse.
 func TestNamingGateHoldsOnDryRun(t *testing.T) {
 	f := setupContentAddressedFixture(t)
-	f.makeLegacyRoot(t, "previously-uploaded")
+	f.seedUnmarkedRoot(t, "previously-uploaded")
 	f.write(t, "a.txt", "alpha")
 	f.index(t)
 
@@ -318,6 +379,15 @@ func keyedTestDest(t *testing.T) *config.Destination {
 		t.Fatal("fixture destination does not hide artifact names")
 	}
 	return d
+}
+
+// keyedArchiveFixtures are the encrypted fixtures of both archive layouts,
+// each with an established keyed root.
+func keyedArchiveFixtures() map[string]func(*testing.T) *caFixture {
+	return map[string]func(*testing.T) *caFixture{
+		config.LayoutContentAddressed: setupContentAddressedFixture,
+		config.LayoutPacked:           func(t *testing.T) *caFixture { return setupPackedFixture(t, "1KiB") },
+	}
 }
 
 func mustListRuns(t *testing.T, f *caFixture) []store.Run {

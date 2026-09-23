@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -216,9 +217,6 @@ password = "obscured-pw"
 	// The crypt suffix is now in force, so the marker must be re-seeded
 	// at the suffixed path the overlay resolves to.
 	f.seedMarker(t, "pics", "docs")
-	// An established keyed root records its naming scheme; the volume
-	// markers just seeded are at keyed paths, and without the naming marker
-	// the gate would read them as a root written under the older scheme.
 	f.seedNamingMarker(t)
 	return f
 }
@@ -353,15 +351,36 @@ func (f *caFixture) wipeRemote(t *testing.T) {
 	}
 }
 
-// makeLegacyRoot leaves the remote as an encrypted archive written before
-// keyed naming: content under its own BLAKE3 name, the volume tree under
-// the volume name in clear, and no naming marker.
-func (f *caFixture) makeLegacyRoot(t *testing.T, contents ...string) {
+// seedUnmarkedRoot leaves the remote holding objects under their own
+// BLAKE3 names and no naming marker.
+func (f *caFixture) seedUnmarkedRoot(t *testing.T, contents ...string) {
 	t.Helper()
 	f.wipeRemote(t)
 	for _, c := range contents {
 		seedRemoteFile(t, f, ObjectsDirName, blake3Hex(c))
 	}
+}
+
+// remoteEntries lists every file and directory under the fake remote,
+// relative to its root; a remote never written to lists as empty.
+func (f *caFixture) remoteEntries(t *testing.T) []string {
+	t.Helper()
+	var rels []string
+	err := filepath.WalkDir(f.fakeRoot, func(p string, _ fs.DirEntry, err error) error {
+		if err != nil || p == f.fakeRoot {
+			return err
+		}
+		rel, err := filepath.Rel(f.fakeRoot, p)
+		rels = append(rels, rel)
+		return err
+	})
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("walk remote: %v", err)
+	}
+	return rels
 }
 
 func (f *caFixture) write(t *testing.T, name, content string) {

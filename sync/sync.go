@@ -868,8 +868,8 @@ func remoteSubpathURI(dest *config.Destination, subpath string) string {
 // caller keeps its refusal: fail-closed, because refusing a real
 // layout-switch is recoverable while a delta against a stale watermark
 // silently skips content.
-func freshStartOnEmptyRoot(ctx context.Context, rcl *Rclone, dest *config.Destination, exempt ...string) bool {
-	empty, err := rcl.remoteRootEmpty(ctx, remoteSubpathURI(dest, ""), exempt, checkersArgs(dest)...)
+func freshStartOnEmptyRoot(ctx context.Context, rcl *Rclone, dest *config.Destination) bool {
+	empty, err := rcl.remoteRootEmpty(ctx, remoteSubpathURI(dest, ""), rootMarkerNames(dest), checkersArgs(dest)...)
 	return err == nil && empty
 }
 
