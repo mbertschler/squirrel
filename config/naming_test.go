@@ -10,31 +10,30 @@ import (
 	"testing"
 )
 
-// TestDeriveNamingKeyGolden pins the derivation against a fixed vector.
-// The key names every artifact an encrypted archive destination stores, so
-// a change here renames the whole root and orphans everything already
-// uploaded — this test exists to make that break loud and deliberate rather
-// than a silent incident on someone's next sync.
+// TestDeriveNamingKeyGolden pins the derivation against fixed vectors,
+// cross-checked against Python's hashlib.scrypt and the blake3 package. The
+// key names every artifact an encrypted archive destination stores, so a
+// change here renames the whole root and orphans everything uploaded.
 func TestDeriveNamingKeyGolden(t *testing.T) {
-	both := DeriveNamingKey("hunter2", "the-salt")
-	got := hex.EncodeToString(both[:])
-	const want = "8b0b263faa7f2fa99f574e75c89c9e6fdb862fe08b442832dda9b745ce91e1e9"
-	if got != want {
-		t.Errorf("DeriveNamingKey(hunter2, the-salt) = %s, want %s", got, want)
-	}
-	noSalt := DeriveNamingKey("hunter2", "")
-	gotNoSalt := hex.EncodeToString(noSalt[:])
-	const wantNoSalt = "6f4f9d34e8a3ffa33c67aa739cb910e1edba2fb968a3b82c296b4919d6b3cae3"
-	if gotNoSalt != wantNoSalt {
-		t.Errorf("DeriveNamingKey(hunter2, \"\") = %s, want %s", gotNoSalt, wantNoSalt)
+	for _, tc := range []struct {
+		password, password2, want string
+	}{
+		{"hunter2", "the-salt", "770c6d1e97f8803b232236d7147f809d3a3fc19e129ee93d2d961d76c3ac996f"},
+		{"hunter2", "", "2edefdfcc3ac0124cd86c83baffc0093e3dd01ae8cbe23e8e8c5f0d1f2e03935"},
+	} {
+		key := DeriveNamingKey(tc.password, tc.password2)
+		if got := hex.EncodeToString(key[:]); got != tc.want {
+			t.Errorf("DeriveNamingKey(%q, %q) = %s, want %s", tc.password, tc.password2, got, tc.want)
+		}
 	}
 	if NamingKeyContext != "squirrel destination artifact naming v1" {
 		t.Errorf("NamingKeyContext = %q; changing it renames every stored artifact", NamingKeyContext)
 	}
 }
 
-// TestDeriveNamingKeySeparatesFields covers the NUL separator: two password
-// pairs that would concatenate to the same string must not share a key.
+// TestDeriveNamingKeySeparatesFields: the password and the salt are
+// separate inputs, so two pairs that concatenate to one string derive two
+// keys, and adding a salt changes the key.
 func TestDeriveNamingKeySeparatesFields(t *testing.T) {
 	if DeriveNamingKey("ab", "c") == DeriveNamingKey("a", "bc") {
 		t.Fatal("password fields run together: (ab,c) and (a,bc) derive one key")
