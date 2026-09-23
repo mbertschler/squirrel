@@ -40,8 +40,13 @@ transfers and from peer-sync, so a snapshot is never mistaken for user content.
 
 :::caution[Privacy]
 The ride-along payload is the *full global* `index.db` — paths and BLAKE3 hashes
-for **all** volumes (never file contents). It lands in the same bucket as your
-data (the same trust boundary). Use a private bucket and server-side encryption.
+for **all** volumes (never file contents), so every destination a volume syncs
+to holds the catalog of every other volume too. On a destination with a
+[`crypt`](/squirrel/layouts/encrypted/) block the snapshot's contents are
+encrypted client-side like the rest of the data; its name (snapshot time and
+run id), size, and modification time stay readable. Without one it lands in
+plaintext. To keep your paths from a destination's operator, pair `crypt` with
+the content-addressed or packed layout: a mirror keeps its own tree in clear.
 :::
 
 ## Manual snapshots

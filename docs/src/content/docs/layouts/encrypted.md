@@ -53,13 +53,29 @@ Your paths live inside the manifest segments, which ride the overlay encrypted
 like everything else.
 
 On the [mirror](/squirrel/layouts/mirror/) layout the names *are* your own
-tree, replicated path for path, and they stay in clear. **If the names
-themselves are sensitive, use an append-only layout rather than a mirror** (or
-a [kopia](/squirrel/layouts/kopia/) repository, which encrypts its own
-metadata).
+tree, replicated path for path, and they stay in clear, together with each
+file's size and modification time. **If the names themselves are sensitive, use
+an append-only layout rather than a mirror** (or a
+[kopia](/squirrel/layouts/kopia/) repository, which encrypts its own metadata).
 
-What no layout hides: artifact sizes, object and pack counts, upload
-timestamps, and your sync cadence.
+What no layout hides:
+
+- **Exact sizes.** rclone crypt adds a fixed overhead — a 32-byte header plus
+  16 bytes per 64 KiB block — so every stored file's plaintext size follows from
+  its ciphertext size. Each content object therefore discloses the exact size of
+  one distinct content, however many paths share it; on a packed destination,
+  files below `pack_threshold` show only as part of their pack's compressed
+  size.
+- **Source modification times.** rclone carries a source file's modification
+  time onto the stored copy — the file's own mtime on sftp, object metadata on
+  the bucket backends — and the overlay passes it through. Every content object
+  (each file on a content-addressed destination, each file at or above
+  `pack_threshold` on a packed one) therefore shows the modification time of the
+  file it was first uploaded from. Packs, manifest segments, and placement maps are
+  built during the run, so they show only when the run wrote them.
+- **Counts and timing.** Object, pack, and volume counts; the run identifiers
+  and snapshot timestamps in the names below; upload times; and your sync
+  cadence.
 
 #### What is keyed, and what stays readable
 
@@ -70,6 +86,8 @@ timestamps, and your sync cadence.
   packs/<name("pack", pack)>              # keyed name of the pack key
   packs/map-13                            # run id in clear
   <name("volume", volume)>/index/run-13   # keyed volume directory, run id in clear
+  <name("volume", volume)>/.squirrel-index/index-20260604T120000.000Z-run-13.db
+                                          # snapshot time and run id in clear
 ```
 
 Run identifiers stay in clear deliberately: replaying segments in run order is
