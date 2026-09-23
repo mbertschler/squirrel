@@ -510,6 +510,9 @@ func (c *Crypt) deriveNamingKey() error {
 	if err != nil {
 		return fmt.Errorf("crypt.password: %w", err)
 	}
+	if password == "" {
+		return errors.New("crypt.password: the obscured value reveals to an empty password, which rclone treats as no key at all")
+	}
 	var password2 string
 	if c.Password2 != "" {
 		if password2, err = rcloneReveal(c.Password2); err != nil {

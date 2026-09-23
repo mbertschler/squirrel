@@ -156,6 +156,27 @@ password = "not-really-obscured"
 	}
 }
 
+// TestEmptyRevealedPasswordRefused: an `obscured = true` value that reveals
+// to "" leaves rclone encrypting under an all-zero key, so it is refused at
+// load rather than named as if it were a secret.
+func TestEmptyRevealedPasswordRefused(t *testing.T) {
+	_, err := Load(writeConfig(t, `
+[destinations.offsite]
+type   = "sftp"
+host   = "h"
+user   = "u"
+root   = "/data"
+layout = "packed"
+
+[destinations.offsite.crypt]
+obscured = true
+password = "`+rcloneObscure("")+`"
+`))
+	if err == nil || !strings.Contains(err.Error(), "empty password") {
+		t.Fatalf("want an empty-password refusal, got %v", err)
+	}
+}
+
 // TestHidesArtifactNamesNeedsCrypt: an unencrypted archive destination has
 // no key to derive from, so it names artifacts by content hash.
 func TestHidesArtifactNamesNeedsCrypt(t *testing.T) {
