@@ -1,6 +1,6 @@
 # Native mirror layout: one planner, three layouts, a small transport
 
-*Proposed, not adopted.* This is step 2 of replacing rclone with squirrel's own
+*Implemented in #217.* This is step 2 of replacing rclone with squirrel's own
 transports. Peer sync dropped rclone in #210. #211 made the mirror's evidence
 honest. Step 3 is S3 for the packed and content-addressed layouts.
 
@@ -614,6 +614,25 @@ The suite runs against the local transport. It runs against the sftp
 transport through an in-process `pkg/sftp` server. And it runs against both
 wrapped in the fault injector.
 
+Where each case lives:
+
+| Case | Tests |
+|---|---|
+| Crash at every call, then a clean push | `TestMirrorCrashAtEveryTransportCall`, `TestNativeContentCrashAtEveryTransportCall` (`sync/crash_every_call_test.go`) |
+| Random histories against a model | `TestMirrorModel` (`sync/mirror_model_test.go`) |
+| File↔directory swaps | `TestMirrorFileDirectorySwap`, `TestMirrorNestedFileDirectorySwaps` |
+| Unrecorded and changed entries at a target | `TestMirrorWriteDisplacesWhatThePathHolds`, `TestMirrorRecordChangedBehindSquirrelsBack` |
+| A tree squirrel has no record of | `TestMirrorWatermarkRule`, `TestMirrorRefusesATreeItHasNoRecordOf` |
+| Foreign entries in staging | `TestMirrorForeignStagingIsLeftAlone`, `TestMirrorLeavesForeignStagingAlone` |
+| Symlinks at a target, along its parents, in place of a reserved directory, at an artifact's name | `TestMirrorNeverFollowsASymlinkAtATarget`, `TestMirrorNeverFollowsASymlinkedReservedDirectory`, `TestNativeContentNeverFollowsASymlinkAtAnArtifactName` |
+| Names a destination folds | `TestMirrorProbesHowTheDestinationComparesNames`, `TestMirrorRefusesNamesTheDestinationCannotTellApart`, `TestMirrorRefusesTheSecondOfTwoNewNames`, `TestMirrorFollowsARenameThatChangesOnlyCase`, `TestMirrorFoldingMovesAFileOutOfADirectorysWay` (`sync/mirror_fold_test.go`, with a transport that folds names on any disk) |
+| Disk full, unwritable history, drift while streaming | `TestMirrorDiskFullMidWrite`, `TestMirrorHistoryUnwritable`, `TestMirrorSourceDriftWhileStreaming`, `TestNativeContentSourceDriftWhileStreaming` (`sync/mirror_hostile_test.go`) |
+| Rename onto an existing target | `RenameNeverReplaces` in the contract suite, and `TestSFTPServersRenameOverAnExistingName` |
+
+`checkInvariants` (`sync/mirror_test.go`) asserts the three invariants;
+invariant 1 alone (`checkRecordsVouch`) also runs right after every
+injected crash, since it holds at every point of a push.
+
 ## 5. Evidence and verification (reverses #216)
 
 Until this step, a native mirror push advances its vector as `presence+size`.
@@ -780,7 +799,8 @@ addressed local destinations by path; that restriction is gone.
   Concurrency is fixed. On sftp each file goes out as concurrent write
   requests (`pkg/sftp`'s default of 64 in flight); paths are written one at a
   time on both transports. The testbed benchmark against rclone (section 8)
-  decides whether several paths in flight are worth their bookkeeping.
+  was to decide whether several paths in flight are worth their bookkeeping;
+  it says they are, over sftp at any latency (open question 2).
 
 ## 8. What we give up
 
@@ -794,7 +814,46 @@ addressed local destinations by path; that restriction is gone.
   - Decision 7 keeps a cheap mitigation as a candidate.
 - **Rclone's tuning and backend know-how.** Rclone brings parallel transfers,
   multi-threaded streams, and years of workarounds for sftp servers. The
-  switch should wait for a benchmark on the testbed against rclone.
+  switch should wait for a benchmark on the testbed against rclone: it ran on
+  2026-09-24 (below), and native pushes that write are several times slower.
+
+### The benchmark
+
+One macOS laptop (arm64), `main`'s binary (rclone mirrors) against this
+branch's (native mirrors), each on a fresh index and a fresh destination:
+
+- `usb`: an exFAT disk image, so rclone can't clone files on APFS;
+- `box`: `rclone serve sftp` on loopback;
+- `wan`: the same server behind a proxy that delays every chunk 10 ms each
+  way (20 ms round trip).
+
+`pics` is 4540 files, 724 MB (photo years and small documents, from
+`test/testbed/gendata`); `trip` is 608 files, 114 MB. "Changed" rewrites 150
+files and adds 150 (30 and 30 on `trip`). Wall time in seconds:
+
+| Push | usb (pics) rclone | native | box (pics) rclone | native | wan (trip) rclone | native |
+|---|---|---|---|---|---|---|
+| first | 12.6 | 115.8 | 3.7 | 13.7 | 45.4 | 431.9 |
+| unchanged | 0.63 | 0.13 | 2.11 | 0.09 | 7.72 | 1.80 |
+| changed | 1.51 | 9.96 | 2.41 | 1.46 | 8.85 | 51.06 |
+
+A native first push to APFS on the internal disk took 86.4 s.
+
+- **Local disks pay for durability.** Every written file is synced to stable
+  storage — on macOS a full flush of the drive's cache — read back past the
+  cache, and after its rename both parent directories are synced; rclone
+  syncs nothing. That is about 18 ms per file on the internal SSD, and 25 ms
+  on the exFAT image.
+- **sftp pays in round trips.** A written path costs about 30 sequential
+  requests: `Put` checks its target and each parent with `Lstat`, then
+  creates, writes, closes and sets the mtime; the staged copy, the path's
+  parents and the path are each looked up again, and the rename checks both
+  parent chains. At a 20 ms round trip that is about 0.7 s per path, against
+  rclone's four transfers in flight.
+- **Unchanged pushes are faster natively** everywhere: they read squirrel's
+  records instead of listing both trees.
+
+What to change is open question 2.
 - **A new dependency:** `github.com/pkg/sftp`.
 
 ## 9. Order of work
@@ -855,3 +914,13 @@ Open:
 
 1. **Crypt byte-compatibility with rclone.** This blocks cloudbox only, and is
    to be discussed separately.
+2. **Throughput of pushes that write** (section 8). Candidates, each with its
+   own cost: several paths in flight, which multiplies sftp throughput by
+   the concurrency and overlaps local syncs, at the price of concurrent
+   bookkeeping in the writer; checking each parent chain once per push
+   instead of once per call, which halves the sftp round trips but trusts a
+   directory for the rest of the push; syncing a batch of staged files
+   together before their renames, which keeps every copy durable before it
+   is committed but costs a second pass over staging. Whether the branch
+   switches `local` and plain `sftp` destinations before any of them lands
+   is the maintainer's call.
