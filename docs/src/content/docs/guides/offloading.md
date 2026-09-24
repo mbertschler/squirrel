@@ -36,13 +36,21 @@ destination/node namespace that `sync_to` uses; they may also name targets only 
 has not arrived yet simply keeps the gate closed.
 
 :::caution[An unsatisfiable requirement is a config error, not a closed gate]
-A target whose layout can *never* produce evidence the gate accepts — any
-[mirror](/squirrel/layouts/mirror/) destination, plain or encrypted — is rejected
-when the config loads, rather than leaving a gate that silently never opens. A
-mirror sync compares each copy by checksum or by size+mtime, never against the
-BLAKE3 in the index, and keeps no fingerprint a verify pass could upgrade. The check covers targets only a peer pushes to as well,
-using the capabilities that peer reports. This distinction is the whole point:
-a refusal you see always means **not yet**, never **never**.
+A target that can *never* produce evidence the gate accepts is rejected when the
+config loads, rather than leaving a gate that silently never opens. That is every
+[mirror](/squirrel/layouts/mirror/) except one squirrel writes itself on a
+`local` disk:
+
+- a mirror rclone writes (an encrypted one, or one on `s3`, `b2` or `gcs`)
+  compares each copy by checksum or by size+mtime, never against the BLAKE3 in
+  the index, and records nothing a verify pass could upgrade;
+- a mirror on `sftp` reads nothing back, and never hashes your file names on
+  the server, so its copies are never fingerprinted.
+
+A mirror on a `local` disk reads every copy back through BLAKE3 and can gate.
+The check covers targets only a peer pushes to as well, using the capabilities
+that peer reports. This distinction is the whole point: a refusal you see always
+means **not yet**, never **never**.
 :::
 
 ## The durability gate
@@ -73,6 +81,12 @@ individually addressable at the destination. They are **upgraded** when a
 object and pack fingerprint-verified: the component is re-stamped as
 content-verified and relays to peers that way, so a hub's certified archive can
 open an edge machine's gate.
+
+A mirror on a `local` disk earns the same upgrade at push time: every copy is
+read back through BLAKE3 before it is committed, so once every file of the
+volume has such a copy, the push itself advances the component as
+`fingerprint-verified`. A copy a verify pass later finds gone or changed stops
+counting for its file until the next push writes it again.
 
 The practical consequence: on a cold-archive target, offload becomes possible
 after verification has run, not merely after the sync succeeded. Give
@@ -137,7 +151,7 @@ The causes, in the order the gate applies them:
 | **evidence is behind** | The target's coverage of that origin stops at an earlier run than this file's. |
 | **evidence is too old** | Coverage is sound but was last re-verified outside [`offload_max_evidence_age`](#evidence-staleness-opt-in). |
 | **not pushed since this file appeared** | No completed whole-volume sync covers the run in which the path became present (re-acquisition). |
-| **stored but not content-verified** | The component rests on presence or on a mirror's checksum comparison, not on proof of the bytes; a verify pass upgrades a `presence+size` component. |
+| **stored but not content-verified** | The component rests on presence or on an rclone mirror's checksum comparison, not on proof of the bytes; a verify pass upgrades a `presence+size` component, and a local mirror's next push rewrites a copy verify found gone or changed. |
 
 ## Evidence staleness (opt-in)
 

@@ -296,6 +296,14 @@ advance the vector, now as `checksum`, but the gate refuses that method and
 config load rejects every mirror in `offload_requires`, plain or crypt. The
 fail-fast half stands and now covers both.
 
+*Revised again in the native mirror PR (#217).* A mirror squirrel writes on a
+`local` disk reads every copy back through BLAKE3 before committing it, records
+that as the copy's fingerprint, and advances the vector as
+`fingerprint-verified`; `squirrel verify` re-checks its copies. Such a mirror
+may be named in `offload_requires` again. Every other mirror is still rejected
+at load: an rclone mirror (crypt, or on s3, b2, gcs) compares by checksum or
+size+mtime, and a native sftp mirror reads nothing back.
+
 ## Checkpoints 4–5 — trip return + offload day
 
 **F22 · S2 — ~~gate refusals are per-file walls of jargon that can't

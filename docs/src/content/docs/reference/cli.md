@@ -214,22 +214,24 @@ renders the same facts from the same query layer — see
 
 ## squirrel verify
 
-**Re-check recorded offsite objects and packs against their upload fingerprints.**
+**Re-check what squirrel recorded storing on a destination: objects and packs against their upload fingerprints, a native mirror's copies by size, mtime and BLAKE3.**
 
 ```
 squirrel verify [<destination>]
 ```
 
 Optional single positional. If omitted, verifies every content-addressed or
-packed destination in config (sorted). An explicit destination must have layout
-`content-addressed` or `packed`, else it errors. No flags. See
+packed destination and every native mirror in config (sorted). An explicit
+destination must be one of those, else it errors: a mirror rclone writes records
+nothing to re-check. No flags. See
 [Offsite verification](/squirrel/guides/verification/).
 
 A clean pass does two things beyond reporting: it fills any pending fingerprints
 and then **upgrades the destination's durability vector to a content-verified
 method**, which is what lets [`offload`](#squirrel-offload) accept it. A mismatch
 **latches a standing alarm** on the destination that survives the run and shows
-on every surface until acknowledged.
+on every surface until acknowledged. On a native mirror, a copy found gone or
+changed is also marked lost, and the next push writes it again.
 
 ### squirrel verify ack
 

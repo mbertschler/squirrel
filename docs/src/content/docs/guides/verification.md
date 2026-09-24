@@ -1,6 +1,6 @@
 ---
 title: Offsite verification
-description: Content-addressed and packed destinations get a metadata-only integrity check — the scan-back fingerprint — that re-checks stored objects without downloading a byte.
+description: squirrel verify re-checks what squirrel stored — content-addressed and packed objects by their scan-back fingerprint, a native mirror's copies by size, mtime and BLAKE3.
 ---
 
 Cold archive storage is exactly the copy you can't cheaply re-download and
@@ -45,8 +45,7 @@ The read is done via a direct S3 `ListObjectsV2` for `s3`, or `rclone lsjson
 
 ## Running verify
 
-Re-verify a destination (or all content-addressed and packed destinations) at any
-time:
+Re-verify a destination (or every destination verify covers) at any time:
 
 ```sh
 squirrel verify archive
@@ -54,8 +53,9 @@ squirrel verify
 ```
 
 With no argument, `verify` covers every content-addressed or packed destination
-in config. An explicit destination must have one of those layouts, else it
-errors.
+and every [native mirror](#native-mirrors) in config. An explicit destination
+must be one of those, else it errors: a mirror rclone writes records nothing to
+re-check.
 
 The pass lists the destination's `objects/` directory once (batched,
 metadata-only), then per recorded object:
@@ -115,6 +115,29 @@ by the artifact's keyed name rather than its content hash, which squirrel derive
 locally from the crypt passwords. Verification is otherwise identical, so keying
 the names costs no depth of checking and no offload eligibility.
 :::
+
+## Native mirrors
+
+A [mirror](/squirrel/layouts/mirror/) squirrel writes itself — on a `local`
+disk, or on `sftp` without crypt — records every copy it stored, so verify
+re-checks those instead of objects. It reaches the mirror through squirrel's own
+transport, without rclone. Each pass:
+
+- checks every copy squirrel stored, the live ones and those in
+  `.squirrel-history`, by size and mtime — one `lstat` each;
+- on a `local` disk, also re-reads the least recently checked copies through
+  BLAKE3, until it has read a tenth of the stored bytes, so every byte is read
+  again within about ten passes.
+
+A copy found gone or changed prints one loud line, latches the
+[alarm](#a-mismatch-latches-an-alarm), and stops counting as evidence for its
+file. The next push writes it again as long as the index still holds that file
+there, with a warning; the copy that was found keeps its place in history if the
+push has to move it aside.
+
+A local mirror earns its fingerprints at push time: every copy is read back
+through BLAKE3 before it is committed. An sftp mirror is checked by size and
+mtime alone, and never gates offload.
 
 ## Related knobs
 

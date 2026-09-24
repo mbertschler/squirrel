@@ -70,21 +70,22 @@ so nothing ever tries.
 | **media** | nas (master), htpc | nas → htpc; nas → cloudbox + s3archive | htpc offloads watched items once s3archive holds them |
 
 Offload gates may name only targets that *produce durability evidence*.
-Three shapes do: content-addressed and packed destinations (presence+size,
-upgraded to content-verified by the scan-back fingerprint), peer nodes the
-offloading machine itself pushes to (`peer-blake3`), and kopia repositories
-(`kopia-verify`). A **mirror** — cloudbox, usb — never yields evidence the
-gate accepts. A plain mirror's sync is rclone's `--checksum` compare, which
-runs under the first hash both backends support (MD5 on local and s3), never
-against the index's BLAKE3; it advances the vector with the `checksum` method
-so `status` can show how current the copy is, but the gate refuses it (#211;
-#156 had accepted it believing the compare was BLAKE3). A crypt mirror is
-weaker still: the overlay hides the content hash, so rclone falls back to
-size+mtime (friction log F21). Neither layout keeps a fingerprint a verify
-pass could upgrade. Naming a locally-configured mirror in `offload_requires`
-is therefore rejected at config load as an unsatisfiable policy —
-fail-early, not the wait-forever gate the walk hit with the laptop gating on
-the crypt-mirror cloudbox.
+Four shapes do: content-addressed and packed destinations (presence+size,
+upgraded to content-verified by the scan-back fingerprint), a mirror squirrel
+writes itself on a local disk — usb — which reads every copy back through
+BLAKE3 before committing it and advances as `fingerprint-verified`, peer nodes
+the offloading machine itself pushes to (`peer-blake3`), and kopia
+repositories (`kopia-verify`). Every other **mirror** never yields evidence
+the gate accepts. The crypt mirror cloudbox is written by rclone: the overlay
+hides the content hash, so rclone compares by size+mtime (friction log F21),
+and a plain rclone mirror's `--checksum` compare runs under the first hash
+both backends support, never against the index's BLAKE3 (#211). A native sftp
+mirror reads nothing back, and squirrel never puts its paths — the volume's
+own file names — on a server command line. None of those keeps a fingerprint a
+verify pass could upgrade. Naming one in `offload_requires` is therefore
+rejected at config load as an unsatisfiable policy — fail-early, not the
+wait-forever gate the walk hit with the laptop gating on the crypt-mirror
+cloudbox.
 
 A receive-only node (htpc) cannot credit its *upstream* peer, so its gate
 rests on the offsites the hub pushes to, reached via the durability pull.

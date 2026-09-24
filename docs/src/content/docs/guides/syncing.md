@@ -18,17 +18,18 @@ squirrel sync                       # every (volume, destination) pair in config
 ## Verification
 
 A mirror on a `local` disk is written by squirrel itself: it hashes every file
-with BLAKE3 as it streams out, confirms each written path's size and mtime, and
-records the run with the `presence+size` method (see
-[Mirror](/squirrel/layouts/mirror/)).
+with BLAKE3 as it streams out, reads each copy back through BLAKE3 before
+committing it, and records the run as `fingerprint-verified` once every file
+has such a copy (see [Mirror](/squirrel/layouts/mirror/#verification)). That
+mirror can back an offload. A native mirror on `sftp` reads nothing back, so
+its runs stay `presence+size` and cannot.
 
 Sync compares every file with its copy on an rclone mirror destination by
 checksum (rclone's `--checksum`), under the first hash both ends support — MD5
 on S3, independent of the BLAKE3 in the index. A copy that fails the check after
 transfer is an error, so the runs row is **not** marked success. The run is
-recorded with the `checksum` method.
+recorded with the `checksum` method, which the offload gate refuses.
 
-The offload gate accepts neither method, so a mirror cannot back an offload.
 Peer syncs are different: both ends hash every byte with BLAKE3 (see
 [Peer sync](/squirrel/guides/peer-sync/)).
 

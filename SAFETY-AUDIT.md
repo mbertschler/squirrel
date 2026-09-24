@@ -1019,7 +1019,12 @@ local and s3 — and runs were recorded as `blake3` all the same.
 records such a run as `checksum`, relabels the components already stored,
 and stops the offload gate from accepting it, so a mirror can no longer be
 named in `offload_requires`. The shallow warning now says "skipping the
-checksum comparison".
+checksum comparison". The native mirror
+([#217](https://github.com/mbertschler/squirrel/pull/217)) earns the evidence
+back on a `local` disk: it refuses `--shallow`, hashes every file as it
+streams, reads each copy back through BLAKE3 before committing it, and
+`squirrel verify` re-checks its copies, so a local mirror may gate offload
+again. rclone mirrors and native sftp mirrors still may not.
 
 **Issue:** `sync: surface --shallow trade-off in logs and persist it on the runs row`
 → tracked in [#79](https://github.com/mbertschler/squirrel/issues/79),

@@ -30,8 +30,11 @@ run, not what a fresh walk of the disk finds. For each changed path it:
 
 1. streams the file into `.squirrel-staging/run-<id>/`, hashing the bytes as they
    go, and refuses the path if they no longer match the index;
-2. moves whatever the path holds into `.squirrel-history/run-<id>/`;
-3. renames the staged copy onto the path. The rename never replaces a file.
+2. on a `local` disk, reads the staged copy back through BLAKE3, past the page
+   cache where the system allows, and refuses the path if the disk returns
+   other bytes;
+3. moves whatever the path holds into `.squirrel-history/run-<id>/`;
+4. renames the staged copy onto the path. The rename never replaces a file.
 
 squirrel records each move before making it, so the next push finishes or
 withdraws whatever a crashed or unplugged push left half done. Every successful
@@ -67,21 +70,38 @@ Files removed locally remain at the destination.
 ## Verification
 
 A native mirror push hashes every file with BLAKE3 as it streams out and
-confirms each written path's size and mtime. Nothing reads the landed bytes back
-yet, so the run advances the destination's durability evidence under the
-`presence+size` method. `--shallow` is refused on a native mirror: there is no
-comparison to switch off.
+confirms each written path's size and mtime. What else backs it depends on
+where the mirror lives:
+
+- **On a `local` disk**, every copy is read back through BLAKE3 before it is
+  committed, and the match is recorded as the copy's fingerprint. Once every
+  file of the volume has such a copy, the run advances the destination's
+  durability evidence as `fingerprint-verified`. A local mirror can therefore be
+  named in [`offload_requires`](/squirrel/guides/offloading/).
+- **On sftp**, nothing is read back: a mirror's paths are your own file names,
+  and squirrel never puts them on a server command line to hash them there. The
+  run advances as `presence+size`, and an sftp mirror cannot gate offload. Use a
+  [content-addressed](/squirrel/layouts/content-addressed/) or
+  [packed](/squirrel/layouts/packed/) sftp destination for that.
+
+[`squirrel verify`](/squirrel/guides/verification/) re-checks a native mirror,
+on demand or on the agent's `verify_every` cadence. Each pass checks every copy
+squirrel stored — the live ones and those in `.squirrel-history` — by size and
+mtime. On a local disk it also re-reads the least recently checked copies, a
+tenth of the stored bytes per pass, so every byte is read again within about ten
+passes. A copy found gone or changed stops counting as evidence, raises the
+destination's alarm, and is written again by the next push while the index still
+holds that file.
+
+`--shallow` is refused on a native mirror: there is no comparison to switch off.
 
 An rclone mirror compares every file with its copy by checksum (rclone's
 `--checksum`), under the first hash both ends support — MD5 on S3, independent
 of the BLAKE3 in the index. A copy that fails the check after transfer is an
 error, so the run is not marked success, and the run advances the evidence under
-the `checksum` method.
-
-[`squirrel status`](/squirrel/reference/cli/) shows either method, but the
-offload gate accepts neither: a mirror cannot be named in
-[`offload_requires`](/squirrel/guides/offloading/). See
-[Syncing & first use](/squirrel/guides/syncing/).
+the `checksum` method. [`squirrel status`](/squirrel/reference/cli/) shows it,
+but the offload gate refuses it, and an rclone mirror cannot be named in
+`offload_requires`. See [Syncing & first use](/squirrel/guides/syncing/).
 
 ## Index snapshots
 
