@@ -45,8 +45,9 @@ Syncs are dispatched **per destination**, so a cloud target that has gone dark
 does not hold up local NAS→HTPC replication behind it. Two bounds keep a sick
 destination from occupying its own worker forever:
 
-- every automatic rclone transfer runs with connect and I/O timeouts, so a dead
-  endpoint fails rather than hanging;
+- every automatic transfer has a connect bound — rclone's connect and I/O
+  timeouts, or a one-minute connect and handshake limit on an sftp destination
+  squirrel writes itself — so a dead endpoint fails rather than hanging;
 - a **stall timeout** (10 minutes without progress by default) covers the case
   those miss — an endpoint that is live but stuck, accepting the connection and
   then never moving bytes.

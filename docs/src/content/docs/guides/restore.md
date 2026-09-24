@@ -34,11 +34,13 @@ Every restored file lands through a temporary file beside its path, which is
 flushed and then renamed over it, so a restore that stops halfway never leaves a
 truncated file behind.
 
-:::note[Encrypted destinations are always size+mtime]
-[Encrypted (`crypt`)](/squirrel/layouts/encrypted/) destinations cannot expose
+:::note[Encrypted mirrors are always size+mtime]
+An [encrypted (`crypt`)](/squirrel/layouts/encrypted/) mirror cannot expose
 content hashes through rclone, so restore from one falls back to a size+mtime
 comparison — recorded as shallow — **even without** `--shallow`, exactly as sync
-does. Passing `--shallow` changes nothing for these destinations.
+does. Passing `--shallow` changes nothing there. An encrypted content-addressed
+or packed destination is different: its restore re-hashes every file to BLAKE3,
+with or without crypt.
 :::
 
 ## Restoring in place
@@ -118,7 +120,7 @@ restore goes through the kopia CLI (`kopia snapshot restore`) instead.
 ## Restoring the index too
 
 For a full disaster-recovery scenario, remember that squirrel rides an
-[index snapshot](/squirrel/configuration/index-snapshots/) along to destination
-buckets under `.squirrel-index/`. A restore-from-cloud yields the data *and* the
-index that explains it — use [`squirrel db restore`](/squirrel/reference/cli/#squirrel-db)
+[index snapshot](/squirrel/configuration/index-snapshots/) along to its
+destinations under `.squirrel-index/`. A restore from a destination yields the
+data *and* the index that explains it — use [`squirrel db restore`](/squirrel/reference/cli/#squirrel-db)
 to swap that snapshot in as the live index.

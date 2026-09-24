@@ -74,9 +74,12 @@ Files failing the gate are skipped and reported per target — see
 
 ### How a component becomes content-verified
 
-Content-addressed and packed uploads are recorded as `presence+size` at write
-time — a crypt remote exposes no hash to compare, and a pack's members are not
-individually addressable at the destination. They are **upgraded** when a
+A content-addressed or packed push advances its component as
+`fingerprint-verified` when every object and pack it holds got a fingerprint as
+it landed: always on a local disk, on sftp when the server runs its hash
+command, from the provider's checksum on a bucket. Otherwise the component
+stays `presence+size` — a server that runs no programs, a crypt remote that
+exposes no hash to compare — and is **upgraded** when a
 [`squirrel verify`](/squirrel/guides/verification/) pass finds every underlying
 object and pack fingerprint-verified: the component is re-stamped as
 content-verified and relays to peers that way, so a hub's certified archive can
@@ -88,8 +91,9 @@ volume has such a copy, the push itself advances the component as
 `fingerprint-verified`. A copy a verify pass later finds gone or changed stops
 counting for its file until the next push writes it again.
 
-The practical consequence: on a cold-archive target, offload becomes possible
-after verification has run, not merely after the sync succeeded. Give
+The practical consequence: on a cold-archive target whose fingerprints stay
+pending, offload becomes possible after verification has run, not merely after
+the sync succeeded. Give
 `verify` [its own agent cadence](/squirrel/guides/agent/) and this happens
 unattended; run it by hand and offload waits on you.
 

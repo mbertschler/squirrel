@@ -1,12 +1,14 @@
 ---
 title: Offsite verification
-description: squirrel verify re-checks what squirrel stored — content-addressed and packed objects by their scan-back fingerprint, a native mirror's copies by size, mtime and BLAKE3.
+description: squirrel verify re-checks what squirrel stored — content-addressed and packed objects by their fingerprint, a native mirror's copies by size and mtime, and on a local disk by BLAKE3.
 ---
 
 Cold archive storage is exactly the copy you can't cheaply re-download and
 re-hash. [Content-addressed](/squirrel/layouts/content-addressed/) and
-[packed](/squirrel/layouts/packed/) destinations therefore get a metadata-only
-integrity check: the **scan-back fingerprint**.
+[packed](/squirrel/layouts/packed/) destinations on a bucket therefore get a
+metadata-only integrity check: the **scan-back fingerprint**. A destination
+squirrel writes itself — `local`, or `sftp` without crypt — is re-hashed in
+full instead (below).
 
 ## How the scan-back fingerprint works
 
@@ -17,7 +19,7 @@ from the remote and records it in the index next to the upload.
 Verification then re-fetches the same metadata later and compares **provider
 value then vs provider value now** — squirrel never recomputes a provider
 checksum, so provider-specific composite forms are handled as opaque strings, and
-**no object body is ever transferred**.
+on a bucket **no object body is ever transferred**.
 
 The read is done via a direct S3 `ListObjectsV2` for `s3`, `rclone lsjson
 --hash` for every other backend rclone writes, and squirrel's own transport for
@@ -42,9 +44,9 @@ a destination it writes itself (below).
   before it gets its name, and on every verify pass. Here the fingerprint is a
   content check too: an object's BLAKE3 must equal its name, a pack's its key.
 - **`sftp`** — the checksum computed server-side by the remote's hash command.
-  Content-addressed and packed sftp destinations default to **SHA-256**
-  (`hash_algo = "sha256"`); set `hash_algo` if your server only offers another
-  type. Without `crypt` squirrel runs the command itself — `md5sum`, `sha1sum`,
+  Content-addressed sftp destinations, and packed ones without crypt, default
+  to **SHA-256** (`hash_algo = "sha256"`); set `hash_algo` if your server only
+  offers another type. Without `crypt` squirrel runs the command itself — `md5sum`, `sha1sum`,
   `sha256sum` or `b3sum`, probed once per session — on the staged copy before it
   gets its name, and checks the answer against the bytes it sent. A server that
   runs no programs leaves every fingerprint pending, with a warning. The command
@@ -68,9 +70,10 @@ and every [native mirror](#native-mirrors) in config. An explicit destination
 must be one of those, else it errors: a mirror rclone writes records nothing to
 re-check.
 
-The pass lists the destination's `objects/` directory once (batched,
-metadata-only; on a `local` destination squirrel re-reads every recorded
-artifact), then per recorded object:
+The pass lists the destination's `objects/` directory once (batched, and
+metadata-only on a bucket; on a `local` destination squirrel re-reads every
+recorded artifact, on plain sftp the server re-hashes each one), then per
+recorded object:
 
 - a **match** stamps the object verified in the index;
 - an object **without a fingerprint yet** (uploaded before this feature, or whose
@@ -96,8 +99,12 @@ gate refuses that method. When a pass leaves every object and pack of a
 durability vector to a content-verified method** and re-attempts any advance that
 was held back, relaying the upgraded method to peers.
 
-So on a cold archive the sequence is sync → verify → offloadable, not sync →
-offloadable. Giving verify [its own agent cadence](/squirrel/guides/agent/)
+A push whose objects all got their fingerprint as they landed advances the
+vector content-verified by itself: squirrel reads each one back on a local disk,
+hashes it with the server's command on sftp, and scans it back right after the
+upload elsewhere. Where a fingerprint stays pending — a server that runs no
+programs, a backend that exposes none at upload — the sequence is sync → verify
+→ offloadable, not sync → offloadable. Giving verify [its own agent cadence](/squirrel/guides/agent/)
 (`verify_every`) keeps that unattended.
 
 ## A mismatch latches an alarm
@@ -163,7 +170,7 @@ mtime alone, and never gates offload.
 [destinations.archive]
 # ...
 hash_algo        = "sha256"  # sftp only: which server-side hash the fingerprint uses
-checkers         = 4         # cap rclone's concurrent checkers
+checkers         = 4         # rclone destinations only: cap rclone's concurrent checkers
 force_path_style = true      # s3 only: path-style bucket addressing for the ETag reader
 ```
 

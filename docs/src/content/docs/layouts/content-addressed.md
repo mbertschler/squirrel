@@ -4,8 +4,8 @@ description: An append-only, content-addressed layout for cold archive storage w
 ---
 
 By default a destination [mirrors](/squirrel/layouts/mirror/) the volume's tree.
-Any destination but kopia — a `local` disk, an `sftp` server, `s3`, `b2` or
-`gcs`, with or without a [`crypt`](/squirrel/layouts/encrypted/) block — can
+Any destination but kopia — a `local` disk, or an `sftp` server, `s3`, `b2` or
+`gcs` with or without a [`crypt`](/squirrel/layouts/encrypted/) block — can
 instead opt into an **append-only, content-addressed** layout, built for cold
 archive storage where objects should never be rewritten or moved.
 
@@ -69,7 +69,8 @@ rclone.
 Durability is **transactional per run**: the run only counts as successful — and
 only then feeds the durability evidence squirrel records per destination — once
 *both* all its content objects *and* its manifest segment are confirmed on the
-remote (each transfer's success plus a follow-up presence/size listing).
+remote: squirrel confirms each artifact it writes itself as it lands, and
+rclone's transfers are followed by a presence/size listing.
 
 A failed run may leave objects without a segment; they are harmless (nothing maps
 them) and the next run skips re-uploading anything already recorded, pushing only
@@ -101,8 +102,9 @@ what's missing.
 ## Offsite verification
 
 Cold archive storage is exactly the copy you can't cheaply re-download and
-re-hash. Content-addressed destinations therefore get a metadata-only integrity
-check — the **scan-back fingerprint** — that never transfers an object body. See
+re-hash. Content-addressed destinations on a bucket therefore get a
+metadata-only integrity check — the **scan-back fingerprint** — that never
+transfers an object body; one squirrel writes itself is re-hashed in full. See
 [Offsite verification](/squirrel/guides/verification/) for how it works per
 backend and how to run `squirrel verify`.
 

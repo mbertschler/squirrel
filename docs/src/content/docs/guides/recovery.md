@@ -17,11 +17,11 @@ the next sync treats the destination as fresh and re-uploads.
 
 Use it when a destination's recorded state no longer matches reality and a sync
 refuses to proceed. The classic case: after wiping a remote, or pointing an
-existing destination name at a fresh `root`, the
-[content-addressed](/squirrel/layouts/content-addressed/) or
-[packed](/squirrel/layouts/packed/) layout guard refuses — its recorded history
-under that destination name expects a manifest segment or placement map that is
-no longer there. An emptied root is refused too while its upload records remain:
+existing destination name at a fresh `root`, the layout guard refuses — its
+recorded history under that destination name expects a
+[content-addressed](/squirrel/layouts/content-addressed/) manifest segment, a
+[packed](/squirrel/layouts/packed/) placement map, or a native
+[mirror](/squirrel/layouts/mirror/)'s receipt that is no longer there. An emptied root is refused too while its upload records remain:
 a push would otherwise skip everything those records claim is still there.
 Before this verb, the only escape was hand-editing SQLite or
 renaming the destination across every machine's config.
@@ -66,7 +66,7 @@ recovery legible.
 When an edge machine dies (the most likely disaster), rebuild it from
 the hub with a **reverse peer push** — the same peer-sync mechanism the hub uses
 to feed a receive-only node every day. There is no separate restore verb for
-this: `squirrel restore` pulls from bucket destinations, not from peer nodes,
+this: `squirrel restore` pulls from destinations, not from peer nodes,
 and the machinery to push a volume to a node already exists.
 
 The story, using the [reference setup](/squirrel/reference/configuration/)
@@ -162,14 +162,15 @@ destination carries bytes but no catalog to recover the index from.
 
 For a [mirror](/squirrel/layouts/mirror/) destination (including an encrypted
 one), [`squirrel restore`](/squirrel/guides/restore/) pulls the volume back
-byte-for-byte, decrypting on the way down and comparing checksums where the
-destination exposes hashes.
+byte-for-byte. A native mirror checks every file against the index's BLAKE3, or
+against its receipts without an index; an rclone mirror decrypts on the way down
+and compares checksums where the backend exposes them.
 
 ### Recovering the index too
 
 squirrel rides an [index snapshot](/squirrel/configuration/index-snapshots/)
-along to destination buckets under `.squirrel-index/`. When the hub itself dies,
-a restore-from-cloud yields the data *and* the index that explains it — fetch
+along to its destinations under `.squirrel-index/`. When the hub itself dies,
+a restore from a destination yields the data *and* the index that explains it — fetch
 the ride-along snapshot and swap it in as the live index with
 [`squirrel db restore`](/squirrel/reference/cli/#squirrel-db). `runs` and `query`
 answer immediately against the recovered catalog.

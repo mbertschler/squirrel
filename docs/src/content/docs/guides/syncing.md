@@ -67,12 +67,16 @@ squirrel sync pictures --to mirror          # every time after
 
 - **`local`, `sftp`, `s3`, `b2`, `gcs`** — write a `.squirrel-volume` marker
   under the destination's volume directory, through the same path the transfer
-  takes: squirrel's own transport on a native mirror, rclone and its overlay
-  everywhere else. On a `local` destination whose root does not exist yet,
+  takes: squirrel's own transport on a destination it writes itself (`local`,
+  or `sftp` without crypt, in any layout), rclone and its overlay everywhere
+  else. On a `local` destination whose root does not exist yet,
   `--init` also creates the root. Every later sync **requires** that marker and refuses if it is
   missing (a missing marker after the fact almost always means the root is wrong
   — an unmounted disk, a typo, or an unreachable remote). A marker that names a
-  *different* volume is always refused, with or without `--init`. This holds
+  *different* volume is always refused, with or without `--init`. A native
+  mirror also refuses a volume's first push, `--init` or not, onto a volume
+  directory that already holds files squirrel has no record of writing (see
+  [mirror](/squirrel/layouts/mirror/#how-a-mirror-is-written)). This holds
   across the mirror, content-addressed, and packed layouts: the marker sits at
   the volume root regardless of layout, and is filtered out of every
   transfer, comparison, and restore.

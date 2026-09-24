@@ -1,11 +1,14 @@
 ---
 title: Encrypted (crypt)
-description: Any non-local destination can encrypt file contents client-side before upload via rclone's crypt overlay. On the append-only layouts the stored names are keyed too; verification falls back to size+mtime.
+description: An sftp, s3, b2 or gcs destination can encrypt file contents client-side before upload via rclone's crypt overlay. On the append-only layouts the stored names are keyed too; an encrypted mirror compares by size+mtime.
 ---
 
-Any non-`local` destination can add a `crypt` block to encrypt file contents
-client-side before upload, via rclone's [crypt](https://rclone.org/crypt/)
-overlay.
+An `sftp`, `s3`, `b2` or `gcs` destination can add a `crypt` block to encrypt
+file contents client-side before upload, via rclone's
+[crypt](https://rclone.org/crypt/) overlay. rclone writes every encrypted
+destination, so on sftp the crypt block also moves the server's host key check
+to rclone, which accepts whatever key the server presents unless
+`known_hosts_file` is set (see [sftp keys](/squirrel/reference/configuration/#sftp)).
 
 ```toml
 [destinations.offsite.crypt]
@@ -115,11 +118,11 @@ Losing the passwords costs you the ability to *locate* an artifact as well as to
 decrypt it.
 :::
 
-### Verification falls back to size+mtime
+### An encrypted mirror compares by size+mtime
 
 rclone crypt remotes cannot expose content hashes, so the checksum comparison
 (`--checksum`) cannot pass through the overlay. Transfers to and
-from an encrypted destination compare by **size+mtime** instead — the same
+from an encrypted mirror compare by **size+mtime** instead — the same
 comparison `--shallow` uses — and say so in the run output; the runs row records
 the transfer as shallow.
 

@@ -214,7 +214,7 @@ renders the same facts from the same query layer — see
 
 ## squirrel verify
 
-**Re-check what squirrel recorded storing on a destination: objects and packs against their upload fingerprints, a native mirror's copies by size, mtime and BLAKE3.**
+**Re-check what squirrel recorded storing on a destination: objects and packs against their upload fingerprints, a native mirror's copies by size and mtime, and on a local disk a rotating tenth of them by BLAKE3.**
 
 ```
 squirrel verify [<destination>]
@@ -315,7 +315,7 @@ Takes no arguments. Lists every kind of run — `index`, `sync`, `restore`,
 
 Under routine cadences most rows are no-ops (a pair checked, nothing to do).
 `--changes` keys on the count of files a run actually changed, so it folds away
-bucket pushes and index runs too, not just peer-sync no-ops. Runs recorded
+destination pushes and index runs too, not just peer-sync no-ops. Runs recorded
 before that count existed are shown rather than silently folded — their change
 count is genuinely unknown.
 
@@ -424,9 +424,10 @@ A [native mirror](/squirrel/guides/restore/#native-mirrors) restore needs no rcl
 with an index it checks each path against it, and without one it walks the mirror
 and checks each file against the mirror's receipts.
 
-Restore from an [encrypted (`crypt`)](/squirrel/layouts/encrypted/) destination
-is always a size+mtime comparison (recorded shallow) even without `--shallow`,
-because rclone crypt remotes don't expose content hashes.
+Restore from an [encrypted (`crypt`)](/squirrel/layouts/encrypted/) mirror is
+always a size+mtime comparison (recorded shallow) even without `--shallow`,
+because rclone crypt remotes don't expose content hashes. An encrypted
+content-addressed or packed restore re-hashes every file to BLAKE3.
 
 ---
 

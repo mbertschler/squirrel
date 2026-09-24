@@ -16,7 +16,7 @@ A tree shaped like the local volumes:
   pictures/
     2024/cat.jpg
     .squirrel-history/run-7/2024/cat.jpg     # prior content of cat.jpg
-    .squirrel-index/run-12                   # receipt for run 12 (local disks)
+    .squirrel-index/run-12                   # receipt for run 12 (native mirrors)
     .squirrel-index/index-20260604T120000.000Z-run-12.db   # global index snapshot (ride-along)
   docs/
     invoice.pdf
@@ -90,7 +90,7 @@ for user content:
 | `.squirrel-history/run-<id>/` | Prior bytes of the files a sync run replaced on a [mirror](/squirrel/layouts/mirror/). |
 | `.squirrel-index/` | Ride-along [index snapshots](/squirrel/configuration/index-snapshots/), and a native mirror's receipts. |
 | `.squirrel-restore-history/run-<id>/` | Files displaced by an [`--in-place` restore](/squirrel/guides/restore/). |
-| `.squirrel-staging/run-<id>/` | A native [mirror](/squirrel/layouts/mirror/)'s in-flight writes, renamed onto their paths once complete. |
+| `.squirrel-staging/run-<id>/` | In-flight writes on a destination squirrel writes itself, in any layout, renamed onto their names once confirmed. |
 
 One reserved **file** sits at the destination root rather than in a volume tree:
 `.squirrel-naming`, which records the artifact-naming scheme of an
