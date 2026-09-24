@@ -1,10 +1,12 @@
 package sync
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"os"
@@ -284,9 +286,10 @@ func (f *mirrorFixture) contentHashOf(t *testing.T, volID int64, r store.RemoteP
 
 // TestMirrorPushWithoutRclone: a local mirror pushes through the native
 // handler with no rclone wrapper, lands every present path with its bytes
-// and mtime, records each one live, writes the run's receipt, and advances
-// the vector as presence+size. An unchanged second push writes nothing and
-// still leaves a receipt.
+// and mtime, records each one live with the BLAKE3 its read-back
+// confirmed, writes the run's receipt, and advances the vector as
+// fingerprint-verified. An unchanged second push writes nothing and still
+// leaves a receipt.
 func TestMirrorPushWithoutRclone(t *testing.T) {
 	f := setupMirrorFixture(t)
 	f.write(t, "a.txt", "alpha")
@@ -310,6 +313,14 @@ func TestMirrorPushWithoutRclone(t *testing.T) {
 			t.Fatalf("%s rows = %v, want one live", rel, got)
 		}
 	}
+	for _, r := range f.rows(t) {
+		if r.Checksum.String != hex.EncodeToString(r.Blake3) || !r.VerifiedAtNs.Valid {
+			t.Fatalf("%s row = %+v, want the read-back BLAKE3 recorded", r.Path, r)
+		}
+	}
+	if rep.Fingerprints != 2 {
+		t.Fatalf("fingerprints = %d, want one read-back per path", rep.Fingerprints)
+	}
 	delta, err := f.store.ListPathDeltaSince(context.Background(), f.volumeID(t), 0)
 	if err != nil {
 		t.Fatal(err)
@@ -319,8 +330,8 @@ func TestMirrorPushWithoutRclone(t *testing.T) {
 		t.Fatalf("receipt = %q, want the delta's manifest segment %q", got, want)
 	}
 	comps := volumeComponents(t, f.store, "pics", "usb")
-	if len(comps) != 1 || comps[0].VerifyMethod != store.VerifyMethodPresenceSize {
-		t.Fatalf("vector = %+v, want one presence+size component", comps)
+	if len(comps) != 1 || comps[0].VerifyMethod != store.VerifyMethodFingerprint {
+		t.Fatalf("vector = %+v, want one fingerprint-verified component", comps)
 	}
 	run, err := f.store.GetRun(context.Background(), rep.RunID)
 	if err != nil || !run.Shallow.Valid || !run.Shallow.Bool {
@@ -850,6 +861,63 @@ func TestMirrorStallFailsThePush(t *testing.T) {
 	f.mustPush(t)
 	if f.readDest(t, "a.txt") != "alpha two" {
 		t.Fatal("the push after the stall cleared did not land")
+	}
+	f.checkInvariants(t, nil)
+}
+
+// corruptingTransport returns every staged file it reads with its first
+// byte flipped, as a disk that kept other bytes than it was given.
+type corruptingTransport struct{ transport }
+
+func (c corruptingTransport) Get(ctx context.Context, name string) (io.ReadCloser, error) {
+	rc, err := c.transport.Get(ctx, name)
+	if err != nil || !strings.Contains(name, "/"+StagingDirName+"/") {
+		return rc, err
+	}
+	defer func() { _ = rc.Close() }()
+	b, err := io.ReadAll(rc)
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > 0 {
+		b[0] ^= 0xff
+	}
+	return io.NopCloser(bytes.NewReader(b)), nil
+}
+
+// TestMirrorReadBackRefusesBytesTheDiskChanged: a staged copy that reads
+// back as other bytes than were sent is never committed. The path fails,
+// the run fails before its receipt, and the staged copy stays for the next
+// push's reconcile.
+func TestMirrorReadBackRefusesBytesTheDiskChanged(t *testing.T) {
+	f := setupMirrorFixture(t)
+	f.write(t, "a.txt", "alpha")
+	f.index(t)
+	h := f.handler(t)
+	h.openTransport = func(ctx context.Context, d *config.Destination) (transport, error) {
+		raw, err := openDestinationTransport(ctx, d)
+		return corruptingTransport{raw}, err
+	}
+	rep, err := h.Push(context.Background(), Options{})
+	if err == nil || rep.Status != store.RunStatusFailed {
+		t.Fatalf("push: status=%q err=%v, want a failed run", rep.Status, err)
+	}
+	if len(rep.RcloneResult.FailedFiles) != 1 || !strings.Contains(rep.RcloneResult.FailedFiles[0].Message, errReadBackMismatch.Error()) {
+		t.Fatalf("failed files = %+v, want a read-back mismatch", rep.RcloneResult.FailedFiles)
+	}
+	if _, err := os.Stat(f.dest("a.txt")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("a.txt was committed: %v", err)
+	}
+	if rows := f.rows(t); len(rows) != 0 {
+		t.Fatalf("rows = %+v, want none", rows)
+	}
+	staged := filepath.Join(f.dst, filepath.FromSlash(stagingName("pics", rep.RunID, stagingKey("a.txt"))))
+	if _, err := os.Stat(staged); err != nil {
+		t.Fatalf("staged copy: %v", err)
+	}
+	f.mustPush(t)
+	if _, err := os.Stat(staged); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the next push left the failed run's staging: %v", err)
 	}
 	f.checkInvariants(t, nil)
 }

@@ -15,7 +15,8 @@ import (
 // TestMirrorPushOverSFTP: a plain sftp mirror pushes natively with no
 // rclone wrapper. --init writes the marker through the transport, a
 // changed path moves its prior version into history, and every run
-// leaves its receipt.
+// leaves its receipt. Nothing is read back, so no row records a
+// fingerprint and the vector stays presence+size.
 func TestMirrorPushOverSFTP(t *testing.T) {
 	f := setupMirrorFixtureOn(t, sftpBackend)
 	if err := os.Remove(filepath.Join(f.dst, "pics", volmark.MarkerName)); err != nil {
@@ -51,6 +52,14 @@ func TestMirrorPushOverSFTP(t *testing.T) {
 		}
 	}
 	f.checkInvariants(t, nil)
+	for _, r := range f.rows(t) {
+		if r.Checksum.Valid || r.VerifiedAtNs.Valid {
+			t.Fatalf("%s row = %+v, want no fingerprint over sftp", r.Path, r)
+		}
+	}
+	if comps := volumeComponents(t, f.store, "pics", "usb"); len(comps) != 1 || comps[0].VerifyMethod != store.VerifyMethodPresenceSize {
+		t.Fatalf("vector = %+v, want one presence+size component", comps)
+	}
 }
 
 // TestMirrorOverSFTPRefusesAnUnknownHost: a server whose host key

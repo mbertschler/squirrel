@@ -18,7 +18,9 @@ import (
 // filesystem. os.Root confines every name to the root; on top of that each
 // operation checks its name's parent chain with Lstat and refuses a
 // symlink anywhere along it, because os.Root follows symlinks that stay
-// inside the root.
+// inside the root. Put and Get keep their pages out of the cache where
+// the platform allows (bypassCache), so reading back a file just written
+// reads what reached the disk.
 type localTransport struct {
 	root *os.Root
 }
@@ -80,7 +82,12 @@ func (t *localTransport) Get(_ context.Context, name string) (io.ReadCloser, err
 	if err := requireKind(name, kindFile, t.lstat); err != nil {
 		return nil, err
 	}
-	return t.root.Open(filepath.FromSlash(name))
+	f, err := t.root.Open(filepath.FromSlash(name))
+	if err != nil {
+		return nil, err
+	}
+	bypassCache(f)
+	return f, nil
 }
 
 func (t *localTransport) Put(ctx context.Context, name string, r io.Reader, mtime time.Time) error {
@@ -94,6 +101,7 @@ func (t *localTransport) Put(ctx context.Context, name string, r io.Reader, mtim
 	if err != nil {
 		return err
 	}
+	bypassCache(f)
 	if err := t.fill(ctx, f, name, r, mtime); err != nil {
 		_ = f.Close()
 		return err
@@ -115,6 +123,7 @@ func (t *localTransport) fill(ctx context.Context, f *os.File, name string, r io
 	if err := f.Sync(); err != nil {
 		return fmt.Errorf("sync %s: %w", name, err)
 	}
+	bypassCache(f)
 	return nil
 }
 

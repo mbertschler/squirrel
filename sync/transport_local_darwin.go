@@ -23,6 +23,13 @@ func renameNoReplace(root *os.Root, from, to string) error {
 	return nil
 }
 
+// bypassCache sets F_NOCACHE on f, so its reads and writes go to the
+// device and leave no pages in the cache behind: a read of a file written
+// that way returns what the disk holds.
+func bypassCache(f *os.File) {
+	_, _ = unix.FcntlInt(f.Fd(), unix.F_NOCACHE, 1)
+}
+
 // dirSyncUnsupported reports a filesystem that cannot flush a directory.
 func dirSyncUnsupported(err error) bool {
 	return errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOTSUP)

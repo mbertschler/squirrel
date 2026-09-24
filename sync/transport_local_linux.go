@@ -23,6 +23,12 @@ func renameNoReplace(root *os.Root, from, to string) error {
 	return nil
 }
 
+// bypassCache drops f's clean pages from the cache, so the next read of
+// what was synced comes from the device.
+func bypassCache(f *os.File) {
+	_ = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_DONTNEED)
+}
+
 // dirSyncUnsupported reports a filesystem that cannot flush a directory.
 func dirSyncUnsupported(err error) bool {
 	return errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOTSUP)

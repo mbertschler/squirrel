@@ -92,10 +92,20 @@ func (w *mirrorWriter) confirm(ctx context.Context, d store.PathDelta) (bool, er
 	return false, nil
 }
 
+// stagedVersion is one path's version in this run's staging, as the
+// destination confirmed it: its mtime, and on a disk squirrel reads back,
+// the hex BLAKE3 the read-back confirmed and when.
+type stagedVersion struct {
+	name         string
+	mtime        time.Time
+	checksum     string
+	verifiedAtNs int64
+}
+
 // write lands one path: stage the content while hashing it, clear the way
 // (displacing whatever the path and its parents hold), then commit.
 func (w *mirrorWriter) write(ctx context.Context, d store.PathDelta) error {
-	staged, mtime, err := w.stage(ctx, d)
+	staged, err := w.stage(ctx, d)
 	if err != nil {
 		return err
 	}
@@ -105,38 +115,59 @@ func (w *mirrorWriter) write(ctx context.Context, d store.PathDelta) error {
 	if err := w.displace(ctx, d.Path); err != nil {
 		return err
 	}
-	return w.commit(ctx, d, staged, mtime)
+	return w.commit(ctx, d, staged)
 }
 
 // stage streams the source into this run's staging and hashes the same
-// bytes. A source that drifted from its indexed hash fails the path with
-// errContentDrift; its staged file stays until the next push's reconcile
-// removes it with this run's staging.
-func (w *mirrorWriter) stage(ctx context.Context, d store.PathDelta) (string, time.Time, error) {
+// bytes, then confirms what landed: its size, and on a local disk its
+// bytes, read back. A source that drifted from its indexed hash fails the
+// path with errContentDrift; its staged file stays until the next push's
+// reconcile removes it with this run's staging.
+func (w *mirrorWriter) stage(ctx context.Context, d store.PathDelta) (stagedVersion, error) {
 	src := filepath.Join(w.h.vol.Path, filepath.FromSlash(d.Path))
 	f, err := os.Open(src)
 	if err != nil {
-		return "", time.Time{}, fmt.Errorf("open source %s: %w", src, err)
+		return stagedVersion{}, fmt.Errorf("open source %s: %w", src, err)
 	}
 	defer f.Close()
-	staged := stagingName(w.h.vol.Name, w.runID, stagingKey(d.Path))
+	staged := stagedVersion{name: stagingName(w.h.vol.Name, w.runID, stagingKey(d.Path))}
 	hasher := blake3.New()
 	counted := &countWriter{w: hasher}
-	if err := w.tr.Put(ctx, staged, io.TeeReader(f, counted), time.Unix(0, d.MtimeNs)); err != nil {
-		return "", time.Time{}, fmt.Errorf("stage %s: %w", d.Path, err)
+	if err := w.tr.Put(ctx, staged.name, io.TeeReader(f, counted), time.Unix(0, d.MtimeNs)); err != nil {
+		return stagedVersion{}, fmt.Errorf("stage %s: %w", d.Path, err)
 	}
 	if counted.n != d.SizeBytes || !bytes.Equal(hasher.Sum(nil), d.Blake3) {
-		return "", time.Time{}, fmt.Errorf("%w: %s sent %d bytes hashing to %s, indexed as %d bytes %s — run `squirrel index %s` and sync again",
+		return stagedVersion{}, fmt.Errorf("%w: %s sent %d bytes hashing to %s, indexed as %d bytes %s — run `squirrel index %s` and sync again",
 			errContentDrift, d.Path, counted.n, hex.EncodeToString(hasher.Sum(nil)), d.SizeBytes, hex.EncodeToString(d.Blake3), w.h.vol.Name)
 	}
-	e, err := w.tr.Stat(ctx, staged)
+	e, err := w.tr.Stat(ctx, staged.name)
 	if err != nil {
-		return "", time.Time{}, fmt.Errorf("confirm staged %s: %w", d.Path, err)
+		return stagedVersion{}, fmt.Errorf("confirm staged %s: %w", d.Path, err)
 	}
 	if e.size != d.SizeBytes {
-		return "", time.Time{}, fmt.Errorf("staged %s landed with size %d, want %d", d.Path, e.size, d.SizeBytes)
+		return stagedVersion{}, fmt.Errorf("staged %s landed with size %d, want %d", d.Path, e.size, d.SizeBytes)
 	}
-	return staged, e.mtime, nil
+	staged.mtime = e.mtime
+	if readsBack(w.h.dest) {
+		return staged, w.readBackStaged(ctx, d, &staged)
+	}
+	return staged, nil
+}
+
+// readBackStaged confirms the staged bytes are the content squirrel sent,
+// and records the fingerprint that earns.
+func (w *mirrorWriter) readBackStaged(ctx context.Context, d store.PathDelta, staged *stagedVersion) error {
+	sum, err := readBack(ctx, w.tr, staged.name)
+	if err != nil {
+		return fmt.Errorf("read back staged %s: %w", d.Path, err)
+	}
+	if !bytes.Equal(sum, d.Blake3) {
+		return fmt.Errorf("%w: staged %s hashes to %s, sent %s", errReadBackMismatch, d.Path, hex.EncodeToString(sum), hex.EncodeToString(d.Blake3))
+	}
+	staged.checksum = hex.EncodeToString(sum)
+	staged.verifiedAtNs = store.NowNs()
+	w.rep.Fingerprints++
+	return nil
 }
 
 // clearParents displaces the first parent of rel that is not a directory
@@ -264,26 +295,28 @@ func (w *mirrorWriter) noteUnrecordedMove(ctx context.Context, note string) erro
 // commit records the intent, renames the staged version onto rel, and
 // confirms. If the rename fails the row stays committing, and the next
 // push's reconcile withdraws it.
-func (w *mirrorWriter) commit(ctx context.Context, d store.PathDelta, staged string, mtime time.Time) error {
+func (w *mirrorWriter) commit(ctx context.Context, d store.PathDelta, staged stagedVersion) error {
 	id, err := w.h.store.BeginRemotePathCommit(ctx, store.RemotePathWrite{
-		Destination: w.h.dest.Name,
-		FolderID:    d.FolderID,
-		Name:        path.Base(d.Path),
-		ContentID:   d.ContentID,
-		RunID:       w.runID,
-		MtimeNs:     mtime.UnixNano(),
+		Destination:  w.h.dest.Name,
+		FolderID:     d.FolderID,
+		Name:         path.Base(d.Path),
+		ContentID:    d.ContentID,
+		RunID:        w.runID,
+		MtimeNs:      staged.mtime.UnixNano(),
+		Checksum:     staged.checksum,
+		VerifiedAtNs: staged.verifiedAtNs,
 	})
 	if err != nil {
 		return err
 	}
-	if err := w.tr.Rename(ctx, staged, w.h.liveName(d.Path)); err != nil {
+	if err := w.tr.Rename(ctx, staged.name, w.h.liveName(d.Path)); err != nil {
 		return fmt.Errorf("commit %s: %w", d.Path, err)
 	}
 	if err := w.h.store.ConfirmRemotePathsLive(ctx, id); err != nil {
 		return err
 	}
 	w.live[d.Path] = store.RemotePath{ID: id, ContentID: d.ContentID, WrittenRunID: w.runID, State: store.RemotePathLive,
-		MtimeNs: mtime.UnixNano(), Path: d.Path, SizeBytes: d.SizeBytes}
+		MtimeNs: staged.mtime.UnixNano(), Path: d.Path, SizeBytes: d.SizeBytes}
 	w.rep.RcloneResult.Transferred++
 	w.rep.RcloneResult.Bytes += d.SizeBytes
 	return nil

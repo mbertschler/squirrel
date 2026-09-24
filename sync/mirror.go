@@ -186,9 +186,22 @@ func (h *mirrorHandler) seal(ctx context.Context, _ *Report, runID int64, p push
 	return nil
 }
 
-// advanceMethod is presence+size: the push hashed every path's bytes as
-// they streamed out and confirmed each landed at its size.
-func (h *mirrorHandler) advanceMethod(context.Context, *Report, pushPlan) (string, error) {
+// advanceMethod is fingerprint-verified once every present content of the
+// volume has a copy on the destination whose read-back confirmed its
+// BLAKE3 (a local disk), and presence+size otherwise: the push hashed
+// every path's bytes as they streamed out and confirmed each landed at its
+// size, and an sftp mirror stays there.
+func (h *mirrorHandler) advanceMethod(ctx context.Context, _ *Report, p pushPlan) (string, error) {
+	if len(p.advance) == 0 {
+		return store.VerifyMethodPresenceSize, nil
+	}
+	pending, err := h.store.CountVolumeContentsPendingFingerprint(ctx, p.volumeID, h.dest.Name)
+	if err != nil {
+		return "", err
+	}
+	if pending == 0 {
+		return store.VerifyMethodFingerprint, nil
+	}
 	return store.VerifyMethodPresenceSize, nil
 }
 

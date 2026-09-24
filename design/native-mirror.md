@@ -531,14 +531,21 @@ for local mirrors.
 
 - **Read-back at write time, on local disks.** After staging and syncing,
   squirrel re-reads the staged file and hashes it with BLAKE3 before
-  committing. The read bypasses the cache (`POSIX_FADV_DONTNEED` on Linux,
-  `F_NOCACHE` on macOS). It is best effort: a USB bridge's own cache is out of
-  reach.
+  committing (`sync/readback.go`). The read bypasses the cache: on Linux the
+  synced pages are dropped (`POSIX_FADV_DONTNEED`) before the read, and on
+  macOS both the write and the read run with `F_NOCACHE`, because a read
+  there is still served from pages the write left cached. It is best
+  effort: a USB bridge's own cache is out of reach. A mismatch fails the
+  path before its commit, and the staged copy goes with the run's staging.
 
   A match records `checksum_algo = blake3` and `verified_at_ns` on the row.
   `CountVolumeContentsPendingFingerprint` and `ContentFingerprintVerified`
-  consult `remote_paths`. So a push can advance as `fingerprint-verified`
-  through the existing gate path, which requires a verify cadence.
+  consult `remote_paths` rows in the `live` and `displaced` states. So a push
+  advances as `fingerprint-verified` once no present content is pending, as
+  the content layouts do; the gate accepts that component through the
+  existing path, which requires a verify cadence or a per-content
+  fingerprint. Migration v33 indexes `remote_paths` by content for those
+  per-content reads.
 - **sftp mirrors stay non-gating.** An sftp push skips read-back, and mirror
   paths never go on a server command line, so their fingerprints stay
   pending.
