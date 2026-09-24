@@ -202,6 +202,58 @@ layout = "content-addressed"
 	}
 }
 
+// TestLoadConcurrency: every destination but kopia accepts a positive
+// concurrency, native and rclone-written alike, and it stays out of
+// rclone.conf.
+func TestLoadConcurrency(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+[destinations.usb]
+type        = "local"
+root        = "/mnt/usb"
+concurrency = 2
+
+[destinations.archive]
+type        = "sftp"
+host        = "host.example"
+user        = "u"
+root        = "/data"
+concurrency = 16
+
+[destinations.archive.crypt]
+password = "pw"
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Destinations["usb"].Concurrency; got != 2 {
+		t.Fatalf("usb Concurrency = %d, want 2", got)
+	}
+	archive := cfg.Destinations["archive"]
+	if archive.Concurrency != 16 {
+		t.Fatalf("archive Concurrency = %d, want 16", archive.Concurrency)
+	}
+	if strings.Contains(archive.RcloneSection(), "concurrency") {
+		t.Fatalf("concurrency leaked into rclone.conf (it is an invocation flag):\n%s", archive.RcloneSection())
+	}
+}
+
+func TestLoadRejectsBadConcurrency(t *testing.T) {
+	cases := []struct{ name, body string }{
+		{"zero", "type = \"local\"\nroot = \"/mnt/usb\"\nconcurrency = 0"},
+		{"negative", "type = \"local\"\nroot = \"/mnt/usb\"\nconcurrency = -1"},
+		{"string", "type = \"local\"\nroot = \"/mnt/usb\"\nconcurrency = \"4\""},
+		{"kopia", "type = \"kopia\"\nroot = \"/repo\"\npassword = \"pw\"\nconcurrency = 4"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, "[destinations.d]\n"+c.body+"\n"))
+			if err == nil || !strings.Contains(err.Error(), "concurrency") {
+				t.Fatalf("err = %v, want concurrency rejection", err)
+			}
+		})
+	}
+}
+
 func TestLoadForcePathStyle(t *testing.T) {
 	cfg, err := Load(writeConfig(t, `
 [destinations.bucket]

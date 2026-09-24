@@ -394,7 +394,7 @@ func readObjectChecksums(ctx context.Context, rcl *Rclone, dest *config.Destinat
 		}
 		return byName, nil
 	}
-	entries, err := rcl.listHashes(ctx, underlyingDirURI(dest, ObjectsDirName), verifyObjectHashTypes(dest, rows), checkersArgs(dest)...)
+	entries, err := rcl.listHashes(ctx, underlyingDirURI(dest, ObjectsDirName), verifyObjectHashTypes(dest, rows), concurrencyArgs(dest)...)
 	if err != nil {
 		return nil, err
 	}
@@ -510,7 +510,7 @@ func readPackChecksums(ctx context.Context, rcl *Rclone, dest *config.Destinatio
 		}
 		return byName, nil
 	}
-	entries, err := rcl.listHashes(ctx, underlyingDirURI(dest, PacksDirName), verifyPackHashTypes(dest, packs), checkersArgs(dest)...)
+	entries, err := rcl.listHashes(ctx, underlyingDirURI(dest, PacksDirName), verifyPackHashTypes(dest, packs), concurrencyArgs(dest)...)
 	if err != nil {
 		return nil, err
 	}

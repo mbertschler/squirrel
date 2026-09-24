@@ -142,7 +142,7 @@ func (h *rcloneArtifacts) checkNamingScheme(ctx context.Context) (namingStamp, e
 		return stampNone, nil
 	}
 	uri := remoteSubpathURI(h.dest, namingMarkerName)
-	present, err := h.rcl.statRemoteExists(ctx, uri, checkersArgs(h.dest)...)
+	present, err := h.rcl.statRemoteExists(ctx, uri, concurrencyArgs(h.dest)...)
 	if err != nil {
 		return stampNone, fmt.Errorf("destination %q: stat %s at %s: %w", h.dest.Name, namingMarkerName, uri, err)
 	}
@@ -160,7 +160,7 @@ func (h *rcloneArtifacts) checkNamingScheme(ctx context.Context) (namingStamp, e
 // what it always did.
 func (h *rcloneArtifacts) classifyUnmarkedRoot(ctx context.Context) (namingStamp, error) {
 	rootURI := underlyingDirURI(h.dest, "")
-	empty, err := h.rcl.remoteRootEmpty(ctx, rootURI, nil, checkersArgs(h.dest)...)
+	empty, err := h.rcl.remoteRootEmpty(ctx, rootURI, nil, concurrencyArgs(h.dest)...)
 	if err != nil {
 		return stampNone, fmt.Errorf("destination %q: list %s: %w", h.dest.Name, rootURI, err)
 	}
@@ -180,7 +180,7 @@ func (h *rcloneArtifacts) classifyUnmarkedRoot(ctx context.Context) (namingStamp
 
 func (h *rcloneArtifacts) holdsKeyedVolumeMarker(ctx context.Context) (bool, error) {
 	uri := remoteSubpathURI(h.dest, path.Join(h.names().volumeDir(h.vol.Name), volmark.MarkerName))
-	present, err := h.rcl.statRemoteExists(ctx, uri, checkersArgs(h.dest)...)
+	present, err := h.rcl.statRemoteExists(ctx, uri, concurrencyArgs(h.dest)...)
 	if err != nil {
 		return false, fmt.Errorf("destination %q: stat %s at %s: %w", h.dest.Name, volmark.MarkerName, uri, err)
 	}
@@ -190,7 +190,7 @@ func (h *rcloneArtifacts) holdsKeyedVolumeMarker(ctx context.Context) (bool, err
 // validateNamingScheme refuses the marker at uri when it will not parse or
 // records a scheme this binary does not write.
 func validateNamingScheme(ctx context.Context, rcl *Rclone, dest *config.Destination, uri string) error {
-	data, err := rcl.catRemote(ctx, uri, checkersArgs(dest)...)
+	data, err := rcl.catRemote(ctx, uri, concurrencyArgs(dest)...)
 	if err != nil {
 		return fmt.Errorf("destination %q: read %s at %s — a root written under other crypt passwords cannot be read with these: %w", dest.Name, namingMarkerName, uri, err)
 	}

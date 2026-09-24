@@ -155,6 +155,10 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 	if err != nil {
 		return nil, err
 	}
+	concurrency, err := resolveConcurrency(raw, typ)
+	if err != nil {
+		return nil, err
+	}
 	pathStyle, err := resolvePathStyle(raw, typ)
 	if err != nil {
 		return nil, err
@@ -173,7 +177,7 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 	}
 	return &Destination{
 		Name: name, Type: typ, Root: root, Layout: layout, Params: params,
-		Crypt: crypt, HashAlgo: hashAlgo, Checkers: checkers, PathStyle: pathStyle,
+		Crypt: crypt, HashAlgo: hashAlgo, Checkers: checkers, Concurrency: concurrency, PathStyle: pathStyle,
 		PackThreshold: pack.threshold, PackSize: pack.size, ZstdLevel: pack.zstdLevel,
 		VerifyEvery: verifyEvery,
 	}, nil
@@ -316,6 +320,24 @@ func resolveCheckers(raw map[string]any, typ string, native bool) (int, error) {
 	n, isInt := v.(int64)
 	if !isInt || n <= 0 {
 		return 0, errors.New("checkers must be a positive integer")
+	}
+	return int(n), nil
+}
+
+// resolveConcurrency validates the optional `concurrency` key: a positive
+// integer, how many files a push writes at once. Kopia drives its own
+// parallelism, so the key is rejected there.
+func resolveConcurrency(raw map[string]any, typ string) (int, error) {
+	v, ok := raw["concurrency"]
+	if !ok {
+		return 0, nil
+	}
+	if typ == "kopia" {
+		return 0, errors.New("concurrency sets how many files squirrel or rclone writes at once, and a kopia destination is written by kopia")
+	}
+	n, isInt := v.(int64)
+	if !isInt || n <= 0 {
+		return 0, errors.New("concurrency must be a positive integer")
 	}
 	return int(n), nil
 }
@@ -603,7 +625,7 @@ func validateCryptRemoteNames(dests map[string]*Destination) error {
 // unknown-field check that consumes them.
 var universalDestKeys = []string{
 	"type", "root", "crypt", "layout",
-	"hash_algo", "checkers", "force_path_style",
+	"hash_algo", "checkers", "concurrency", "force_path_style",
 	"pack_threshold", "pack_size", "zstd_level",
 	"verify_every",
 }

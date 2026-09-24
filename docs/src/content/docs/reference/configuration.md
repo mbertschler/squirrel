@@ -47,6 +47,7 @@ See [Hooks](/squirrel/guides/hooks/).
 | `type` | all | `local`, `sftp`, `s3`, `b2`, `gcs`, or `kopia`. |
 | `root` | all | Base path (or bucket sub-path) at the destination. |
 | `layout` | every type but kopia | `mirror` (default), `content-addressed`, or `packed`. |
+| `concurrency` | every type but kopia | How many files a push writes at once (optional; a positive integer). On a destination squirrel writes itself the default is `4` on `local` and `8` on `sftp`, where every file in flight shares one SSH connection; lower it for a slow disk or USB bridge, or a server that answers one request at a time. On a destination rclone writes (crypt, `s3`, `b2`, `gcs`) it caps rclone's concurrent transfers (`--transfers`), whose default applies otherwise. |
 
 ### `local`
 

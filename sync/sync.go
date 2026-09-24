@@ -653,7 +653,7 @@ func ensureRemoteDestinationMarker(ctx context.Context, s *store.Store, rcl *Rcl
 	// A stat that fails for any reason other than a definite absence
 	// refuses without writing — a reachability blip must never be read
 	// as a fresh root.
-	present, err := rcl.statRemoteExists(ctx, markerURI, checkersArgs(dest)...)
+	present, err := rcl.statRemoteExists(ctx, markerURI, concurrencyArgs(dest)...)
 	if err != nil {
 		return fmt.Errorf("destination %q: stat %s at %s: %w", dest.Name, volmark.MarkerName, markerURI, err)
 	}
@@ -665,7 +665,7 @@ func ensureRemoteDestinationMarker(ctx context.Context, s *store.Store, rcl *Rcl
 	}
 	// Present: read and validate. A volume mismatch or a corrupt/empty
 	// marker always refuses and is never overwritten, even under --init.
-	data, err := rcl.catRemote(ctx, markerURI, checkersArgs(dest)...)
+	data, err := rcl.catRemote(ctx, markerURI, concurrencyArgs(dest)...)
 	if err != nil {
 		return fmt.Errorf("destination %q: read %s at %s: %w", dest.Name, volmark.MarkerName, markerURI, err)
 	}
@@ -713,7 +713,7 @@ func writeRemoteMarker(ctx context.Context, s *store.Store, rcl *Rclone, dest *c
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("destination %q: stage marker: %w", dest.Name, err)
 	}
-	if err := rcl.copyTo(ctx, tmp.Name(), markerURI, checkersArgs(dest)...); err != nil {
+	if err := rcl.copyTo(ctx, tmp.Name(), markerURI, concurrencyArgs(dest)...); err != nil {
 		return fmt.Errorf("destination %q: write %s to %s: %w", dest.Name, volmark.MarkerName, markerURI, err)
 	}
 	return nil
@@ -791,7 +791,7 @@ func buildRcloneArgs(vol *config.Volume, dest *config.Destination, runID int64, 
 		// the name is reserved on every layout.
 		"--filter", "- /" + StagingDirName + "/**",
 	}
-	args = append(args, checkersArgs(dest)...)
+	args = append(args, concurrencyArgs(dest)...)
 	if !EffectiveShallow(dest, opts.Shallow) {
 		args = append(args, "--checksum")
 	}
@@ -1148,7 +1148,7 @@ func buildRestoreArgs(vol *config.Volume, dest *config.Destination, runID int64,
 		args = append(args, "--filter", "- /"+IndexDirName+"/**")
 		args = append(args, "--filter", "- /"+StagingDirName+"/**")
 	}
-	args = append(args, checkersArgs(dest)...)
+	args = append(args, concurrencyArgs(dest)...)
 	if !EffectiveShallow(dest, opts.Shallow) {
 		args = append(args, "--checksum")
 	}

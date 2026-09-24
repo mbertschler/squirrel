@@ -72,7 +72,7 @@ func restoreArchive(ctx context.Context, s *store.Store, rcl *Rclone, vol *confi
 func archiveFetcher(ctx context.Context, rcl *Rclone, dest *config.Destination, dryRun bool) (func(context.Context, string, string) error, func(), error) {
 	if !dest.Native() {
 		return func(ctx context.Context, name, localPath string) error {
-			return rcl.copyTo(ctx, remoteSubpathURI(dest, name), localPath, checkersArgs(dest)...)
+			return rcl.copyTo(ctx, remoteSubpathURI(dest, name), localPath, concurrencyArgs(dest)...)
 		}, func() {}, nil
 	}
 	if dryRun {

@@ -38,14 +38,14 @@ func (a *rcloneArtifacts) markers(ctx context.Context, opts Options) error {
 }
 
 func (a *rcloneArtifacts) exists(ctx context.Context, name string) (bool, error) {
-	return a.rcl.statRemoteExists(ctx, a.where(name), checkersArgs(a.dest)...)
+	return a.rcl.statRemoteExists(ctx, a.where(name), concurrencyArgs(a.dest)...)
 }
 
 // rootEmpty reports whether the destination root holds no files beyond
 // squirrel's markers — a wiped or repointed destination, or one whose
 // recorded state was cleared by `squirrel destination reset`.
 func (a *rcloneArtifacts) rootEmpty(ctx context.Context) (bool, error) {
-	return a.rcl.remoteRootEmpty(ctx, remoteSubpathURI(a.dest, ""), rootMarkerNames(a.dest), checkersArgs(a.dest)...)
+	return a.rcl.remoteRootEmpty(ctx, remoteSubpathURI(a.dest, ""), rootMarkerNames(a.dest), concurrencyArgs(a.dest)...)
 }
 
 // reconcile returns at once: rclone lands every artifact under its own
@@ -74,10 +74,10 @@ func (a *rcloneArtifacts) put(ctx context.Context, _ int64, name, src string, si
 		return nil, fmt.Errorf("%w: %s now hashes to %s, indexed as %s", errContentDrift, src, hex.EncodeToString(digest), hex.EncodeToString(sum))
 	}
 	uri := a.where(name)
-	if err := a.rcl.copyTo(ctx, src, uri, checkersArgs(a.dest)...); err != nil {
+	if err := a.rcl.copyTo(ctx, src, uri, concurrencyArgs(a.dest)...); err != nil {
 		return nil, err
 	}
-	landed, err := a.rcl.statRemote(ctx, uri, checkersArgs(a.dest)...)
+	landed, err := a.rcl.statRemote(ctx, uri, concurrencyArgs(a.dest)...)
 	if err != nil {
 		return nil, fmt.Errorf("confirm %s after upload: %w", uri, err)
 	}

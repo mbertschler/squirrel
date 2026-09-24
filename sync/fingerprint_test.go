@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -392,5 +393,25 @@ func TestListedNameCryptSuffix(t *testing.T) {
 	}
 	if got := listedRemoteName(plain, "abc"); got != "abc" {
 		t.Errorf("plain remote name = %q, want abc (untouched)", got)
+	}
+}
+
+// TestConcurrencyArgs: a destination rclone writes passes checkers and
+// concurrency to rclone as --checkers and --transfers, and neither when
+// unset, leaving rclone's defaults.
+func TestConcurrencyArgs(t *testing.T) {
+	cases := []struct {
+		dest config.Destination
+		want []string
+	}{
+		{config.Destination{}, nil},
+		{config.Destination{Checkers: 2}, []string{"--checkers", "2"}},
+		{config.Destination{Concurrency: 6}, []string{"--transfers", "6"}},
+		{config.Destination{Checkers: 2, Concurrency: 6}, []string{"--checkers", "2", "--transfers", "6"}},
+	}
+	for _, c := range cases {
+		if got := concurrencyArgs(&c.dest); !slices.Equal(got, c.want) {
+			t.Errorf("concurrencyArgs(%+v) = %v, want %v", c.dest, got, c.want)
+		}
 	}
 }

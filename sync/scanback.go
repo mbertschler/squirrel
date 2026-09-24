@@ -53,7 +53,7 @@ func (h *rcloneArtifacts) captureScanBackRclone(ctx context.Context, rep *Report
 	dirURI := underlyingDirURI(h.dest, dirName)
 	types := captureHashTypes(h.dest)
 	for batch := range slices.Chunk(targets, fingerprintBatchSize) {
-		extra := checkersArgs(h.dest)
+		extra := concurrencyArgs(h.dest)
 		for _, t := range batch {
 			extra = append(extra, "--include", listedRemoteName(h.dest, t.name))
 		}
