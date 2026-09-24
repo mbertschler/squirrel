@@ -10,7 +10,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 32
+const SchemaVersion = 33
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -75,6 +75,7 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 30, up: migrateV29ToV30},
 		{version: 31, up: migrateV30ToV31},
 		{version: 32, up: migrateV31ToV32},
+		{version: 33, up: migrateV32ToV33},
 	}
 }
 
@@ -2502,6 +2503,32 @@ func migrateV31ToV32(ctx context.Context, db *sql.DB) error {
 	for _, stmt := range stmts {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("migrate to schema v32: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// --- v32 → v33 ---
+
+// migrateV32ToV33 indexes remote_paths for the reads the mirror's evidence
+// adds: by content, for the offload gate's per-content fingerprint check
+// and the pending-fingerprint tally, and the lost rows of a destination,
+// which a push plans again as repairs. Additive.
+func migrateV32ToV33(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`CREATE INDEX idx_remote_paths_content ON remote_paths (content_id)`,
+		`CREATE INDEX idx_remote_paths_lost ON remote_paths (destination) WHERE state = 'lost'`,
+		`INSERT INTO schema_version (version) VALUES (33)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migrate to schema v33: %w", err)
 		}
 	}
 	return tx.Commit()

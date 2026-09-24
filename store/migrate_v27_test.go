@@ -150,7 +150,7 @@ func TestMigrateV26ToV27PreservesEveryRow(t *testing.T) {
 			t.Errorf("table %s missing after migration to v%d", table, SchemaVersion)
 		}
 	}
-	indexesAddedAfterV27 := []string{"idx_remote_paths_unsettled", "uniq_remote_paths_live"} // v32
+	indexesAddedAfterV27 := []string{"idx_remote_paths_unsettled", "uniq_remote_paths_live", "idx_remote_paths_content", "idx_remote_paths_lost"} // v32, v33
 	wantObjects := append(append([]string{}, objectsBefore...), indexesAddedAfterV27...)
 	sort.Strings(wantObjects)
 	if after := schemaObjectNames(t, s.db); !equalStrings(after, wantObjects) {

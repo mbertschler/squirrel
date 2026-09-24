@@ -202,3 +202,149 @@ func TestResetDestinationClearsRemotePaths(t *testing.T) {
 		t.Fatalf("DestinationHasUploadRecords after reset = %t, %v; want false", has, err)
 	}
 }
+
+// liveRemotePath commits d at runID on "usb" with checksum (empty for
+// none) and confirms it live.
+func liveRemotePath(t *testing.T, s *Store, d PathDelta, runID int64, checksum string) int64 {
+	t.Helper()
+	ctx := context.Background()
+	w := commitWrite(d, runID)
+	w.Checksum, w.VerifiedAtNs = checksum, 7
+	id, err := s.BeginRemotePathCommit(ctx, w)
+	if err != nil {
+		t.Fatalf("BeginRemotePathCommit: %v", err)
+	}
+	if err := s.ConfirmRemotePathsLive(ctx, id); err != nil {
+		t.Fatalf("ConfirmRemotePathsLive: %v", err)
+	}
+	return id
+}
+
+// TestMirrorFingerprintsGateOnlyWhileStored: a live or displaced mirror copy
+// whose read-back recorded its BLAKE3 counts as fingerprint-verified; one
+// without a checksum, or a lost one, does not.
+func TestMirrorFingerprintsGateOnlyWhileStored(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	d, vID, runID := remotePathFixture(t, s)
+	verified := func() bool {
+		t.Helper()
+		ok, err := s.ContentFingerprintVerified(ctx, d.ContentID, "usb")
+		if err != nil {
+			t.Fatal(err)
+		}
+		pending, err := s.CountVolumeContentsPendingFingerprint(ctx, vID, "usb")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok != (pending == 0) {
+			t.Fatalf("ContentFingerprintVerified = %t but %d content(s) pending", ok, pending)
+		}
+		return ok
+	}
+
+	unhashed := liveRemotePath(t, s, d, runID, "")
+	if verified() {
+		t.Fatal("a mirror copy without a checksum counts as verified")
+	}
+	if err := s.MarkRemotePathsLost(ctx, unhashed); err != nil {
+		t.Fatal(err)
+	}
+	id := liveRemotePath(t, s, d, runID, "abc")
+	if !verified() {
+		t.Fatal("a live mirror copy with a read-back checksum does not count as verified")
+	}
+	if err := s.BeginRemotePathsDisplace(ctx, runID, id); err != nil {
+		t.Fatal(err)
+	}
+	if verified() {
+		t.Fatal("a copy on its way into history counts as verified")
+	}
+	if err := s.ConfirmRemotePathsDisplaced(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if !verified() {
+		t.Fatal("a displaced copy with a read-back checksum does not count as verified")
+	}
+	if err := s.MarkRemotePathsLost(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if verified() {
+		t.Fatal("a lost copy counts as verified")
+	}
+}
+
+// TestListStoredRemotePathsRotatesByVerification: the verify listing holds
+// every live and displaced row, never-verified first, then oldest verified,
+// and a re-read moves a row to the back.
+func TestListStoredRemotePathsRotatesByVerification(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	d, _, runID := remotePathFixture(t, s)
+	first := liveRemotePath(t, s, d, runID, "abc")
+	if err := s.BeginRemotePathsDisplace(ctx, runID, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ConfirmRemotePathsDisplaced(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	second := liveRemotePath(t, s, d, runID, "")
+	ids := func() []int64 {
+		t.Helper()
+		rows, err := s.ListStoredRemotePaths(ctx, "usb")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []int64
+		for _, r := range rows {
+			if r.Volume != "v" || r.Path != "2024/cat.jpg" {
+				t.Fatalf("row = %+v, want volume v at 2024/cat.jpg", r)
+			}
+			out = append(out, r.ID)
+		}
+		return out
+	}
+	if got := ids(); len(got) != 2 || got[0] != second || got[1] != first {
+		t.Fatalf("order = %v, want the never-verified %d before %d", got, second, first)
+	}
+	if err := s.RecordRemotePathVerified(ctx, second, "abc", 9); err != nil {
+		t.Fatalf("RecordRemotePathVerified: %v", err)
+	}
+	if got := ids(); got[0] != first || got[1] != second {
+		t.Fatalf("order after re-reading %d = %v", second, got)
+	}
+	if err := s.RecordRemotePathVerified(ctx, second, "def", 10); err == nil {
+		t.Fatal("a read replaced the checksum it should re-confirm")
+	}
+}
+
+// TestListRemotePathRepairs: a present path whose current content the
+// destination lost is a repair until a new live row holds it again.
+func TestListRemotePathRepairs(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	d, vID, runID := remotePathFixture(t, s)
+	repairs := func() []PathDelta {
+		t.Helper()
+		out, err := s.ListRemotePathRepairs(ctx, "usb", vID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	id := liveRemotePath(t, s, d, runID, "")
+	if got := repairs(); len(got) != 0 {
+		t.Fatalf("repairs with a live copy = %+v", got)
+	}
+	if err := s.MarkRemotePathsLost(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	got := repairs()
+	if len(got) != 1 || got[0].Path != d.Path || got[0].ContentID != d.ContentID || got[0].Status != StatusPresent {
+		t.Fatalf("repairs after the copy was lost = %+v, want %s", got, d.Path)
+	}
+	liveRemotePath(t, s, d, runID, "")
+	if got := repairs(); len(got) != 0 {
+		t.Fatalf("repairs once a new copy is live = %+v", got)
+	}
+}

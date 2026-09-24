@@ -37,11 +37,11 @@ func (s *Store) ContentPresentOnDestination(ctx context.Context, contentID int64
 // contents of the volume that do NOT yet carry a verified provider
 // fingerprint on the destination — the whole-state "pending artifact"
 // tally the fingerprint-verified upgrade gates on. A content counts as
-// pending unless it has either a remote_objects row or a member pack's
-// remote_packs row on this destination with a non-NULL checksum and
-// verified_at_ns, so content not yet uploaded, uploaded but not yet
-// fingerprinted, or fingerprinted but not yet re-confirmed all keep the
-// tally above zero. Zero means every present content is fingerprint-
+// pending unless a remote_objects row, a member pack's remote_packs row, or
+// a live or displaced mirror copy's remote_paths row on this destination
+// carries a non-NULL checksum and verified_at_ns, so content not yet
+// uploaded, uploaded but not yet fingerprinted, or fingerprinted but not
+// yet re-confirmed all keep the tally above zero. Zero means every present content is fingerprint-
 // verified on the destination, so the vector may advance to
 // VerifyMethodFingerprint over the whole present set. The reserved sync
 // subtrees are excluded, matching PresentOriginMaxima — they never travel
@@ -67,24 +67,32 @@ func (s *Store) CountVolumeContentsPendingFingerprint(ctx context.Context, volum
 					WHERE pm.content_id = f.content_id AND rp.destination = ?
 					  AND rp.checksum IS NOT NULL AND rp.verified_at_ns IS NOT NULL
 				)
+				OR EXISTS (
+					SELECT 1 FROM remote_paths rpa
+					WHERE rpa.content_id = f.content_id AND rpa.destination = ?
+					  AND rpa.state IN ('live', 'displaced')
+					  AND rpa.checksum IS NOT NULL AND rpa.verified_at_ns IS NOT NULL
+				)
 			  )
 		)
-	`, volumeID, destination, destination).Scan(&pending)
+	`, volumeID, destination, destination, destination).Scan(&pending)
 	if err != nil {
 		return 0, fmt.Errorf("count pending fingerprints for volume %d on %q: %w", volumeID, destination, err)
 	}
 	return pending, nil
 }
 
-// ContentFingerprintVerified reports whether a verified provider
-// fingerprint backs the content on the destination via either layout: a
-// remote_objects row carrying a checksum and a verified_at_ns, or a
-// remote_packs row (for a pack this content belongs to) likewise
-// re-confirmed. The offload gate uses it to certify a presence+size
-// component — a coarse vector that only claims bytes-present — so packed
-// content gates exactly when its pack has a re-confirmed fingerprint, the
-// packed analogue of the per-object scan-back the content-addressed layout
-// requires. One verified pack vouches for every member.
+// ContentFingerprintVerified reports whether a verified fingerprint backs
+// the content on the destination in any layout: a remote_objects row
+// carrying a checksum and a verified_at_ns, a remote_packs row (for a pack
+// this content belongs to) likewise re-confirmed, or a live or displaced
+// mirror copy whose remote_paths row records the BLAKE3 a read of the
+// stored bytes confirmed. The offload gate uses it to certify a
+// presence+size component — a coarse vector that only claims bytes-present
+// — so packed content gates exactly when its pack has a re-confirmed
+// fingerprint, the packed analogue of the per-object scan-back the
+// content-addressed layout requires. One verified pack vouches for every
+// member.
 func (s *Store) ContentFingerprintVerified(ctx context.Context, contentID int64, destination string) (bool, error) {
 	var verified int
 	err := s.db.QueryRowContext(ctx, `
@@ -100,7 +108,12 @@ func (s *Store) ContentFingerprintVerified(ctx context.Context, contentID int64,
 				WHERE pm.content_id = ? AND rp.destination = ?
 				  AND rp.checksum IS NOT NULL AND rp.verified_at_ns IS NOT NULL
 			)
-	`, contentID, destination, contentID, destination).Scan(&verified)
+			OR EXISTS (
+				SELECT 1 FROM remote_paths
+				WHERE content_id = ? AND destination = ? AND state IN ('live', 'displaced')
+				  AND checksum IS NOT NULL AND verified_at_ns IS NOT NULL
+			)
+	`, contentID, destination, contentID, destination, contentID, destination).Scan(&verified)
 	if err != nil {
 		return false, fmt.Errorf("lookup content fingerprint on %q: %w", destination, err)
 	}

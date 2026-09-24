@@ -26,9 +26,11 @@ const (
 )
 
 // RemotePath is one version squirrel wrote at a mirror path on a
-// destination, keyed on the files row it came from. Path and SizeBytes are
-// read through that row's folder and content. MtimeNs is the mtime the
-// destination reported for the written version.
+// destination, keyed on the files row it came from. Path, SizeBytes and
+// Blake3 are read through that row's folder and content. MtimeNs is the
+// mtime the destination reported for the written version. Checksum is
+// the BLAKE3 a read of the stored bytes confirmed, NULL while none did,
+// and VerifiedAtNs when a read last confirmed it.
 type RemotePath struct {
 	ID             int64
 	ContentID      int64
@@ -36,20 +38,31 @@ type RemotePath struct {
 	State          string
 	DisplacedRunID sql.NullInt64
 	MtimeNs        int64
+	Checksum       sql.NullString
+	VerifiedAtNs   sql.NullInt64
 
 	Path      string
 	SizeBytes int64
+	Blake3    []byte
 }
 
 // RemotePathWrite is the intent to commit one version at a mirror path.
+// Checksum is the lowercase hex BLAKE3 a read-back of the staged version
+// confirmed at VerifiedAtNs, or empty when the destination offered none.
 type RemotePathWrite struct {
-	Destination string
-	FolderID    int64
-	Name        string
-	ContentID   int64
-	RunID       int64
-	MtimeNs     int64
+	Destination  string
+	FolderID     int64
+	Name         string
+	ContentID    int64
+	RunID        int64
+	MtimeNs      int64
+	Checksum     string
+	VerifiedAtNs int64
 }
+
+// ChecksumAlgoBlake3 is the checksum_algo of a fingerprint squirrel
+// computed itself, by reading the stored bytes back through BLAKE3.
+const ChecksumAlgoBlake3 = "blake3"
 
 // BeginRemotePathCommit records the intent to rename a staged version onto
 // its path, as a committing row. The path's previous live row must already
@@ -60,10 +73,18 @@ func (s *Store) BeginRemotePathCommit(ctx context.Context, w RemotePathWrite) (i
 	if w.Destination == "" {
 		return 0, fmt.Errorf("BeginRemotePathCommit: destination must be non-empty")
 	}
+	var algo, checksum sql.NullString
+	var verified sql.NullInt64
+	if w.Checksum != "" {
+		algo = sql.NullString{String: ChecksumAlgoBlake3, Valid: true}
+		checksum = sql.NullString{String: w.Checksum, Valid: true}
+		verified = sql.NullInt64{Int64: w.VerifiedAtNs, Valid: true}
+	}
 	res, err := s.db.ExecContext(ctx, `
-		INSERT INTO remote_paths (destination, folder_id, name, content_id, written_run_id, state, mtime_ns)
-		VALUES (?, ?, ?, ?, ?, 'committing', ?)
-	`, w.Destination, w.FolderID, w.Name, w.ContentID, w.RunID, w.MtimeNs)
+		INSERT INTO remote_paths (destination, folder_id, name, content_id, written_run_id, state, mtime_ns,
+		                          checksum_algo, checksum, verified_at_ns)
+		VALUES (?, ?, ?, ?, ?, 'committing', ?, ?, ?, ?)
+	`, w.Destination, w.FolderID, w.Name, w.ContentID, w.RunID, w.MtimeNs, algo, checksum, verified)
 	if err != nil {
 		return 0, fmt.Errorf("record commit of %q on %q: %w", w.Name, w.Destination, err)
 	}
@@ -139,12 +160,12 @@ func (s *Store) transitionRemotePaths(ctx context.Context, ids []int64, to, upda
 }
 
 // remotePathSelect reads remote_paths rows with their volume-relative path
-// and content size (table aliases rp, fo, c).
+// and content size and hash (table aliases rp, fo, c).
 const remotePathSelect = `
 	SELECT rp.id, rp.content_id, rp.written_run_id,
-	       rp.state, rp.displaced_run_id, rp.mtime_ns,
+	       rp.state, rp.displaced_run_id, rp.mtime_ns, rp.checksum, rp.verified_at_ns,
 	       CASE fo.path WHEN '' THEN rp.name ELSE fo.path || '/' || rp.name END,
-	       c.size_bytes
+	       c.size_bytes, c.blake3
 	FROM remote_paths rp
 	JOIN folders fo ON fo.id = rp.folder_id
 	JOIN contents c ON c.id = rp.content_id`
@@ -152,7 +173,8 @@ const remotePathSelect = `
 func scanRemotePath(s rowScanner) (RemotePath, error) {
 	var r RemotePath
 	err := s.Scan(&r.ID, &r.ContentID, &r.WrittenRunID,
-		&r.State, &r.DisplacedRunID, &r.MtimeNs, &r.Path, &r.SizeBytes)
+		&r.State, &r.DisplacedRunID, &r.MtimeNs, &r.Checksum, &r.VerifiedAtNs,
+		&r.Path, &r.SizeBytes, &r.Blake3)
 	return r, err
 }
 
@@ -162,7 +184,7 @@ func scanRemotePath(s rowScanner) (RemotePath, error) {
 func (s *Store) ListLiveRemotePaths(ctx context.Context, destination string, volumeID int64) ([]RemotePath, error) {
 	return queryRows(ctx, s.db, remotePathSelect+`
 		WHERE rp.destination = ? AND fo.volume_id = ? AND rp.state = 'live'
-		ORDER BY 7
+		ORDER BY 9
 	`, scanRemotePath, destination, volumeID)
 }
 
