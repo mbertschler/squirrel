@@ -336,7 +336,8 @@ type transport interface {
     server, and a relative one is passed as `./<root>` so it never reads as
     an option.
   - The transport probes for the command once per session, and a push opens
-    one session: it hashes a known input on the server and compares. On a
+    one session: it hashes a known input on the server and compares. The leaf
+    must be a regular file, so the command never follows a symlink. On a
     server that runs no programs, like the cloudbox shape, or whose command
     computes something else, fingerprints stay pending, as today.
   - Mirror paths are user filenames, so they never go on a command line.
@@ -628,11 +629,17 @@ gcs. Each artifact:
    and recorded, or the artifact fails. Squirrel never replaces it.
 
 `squirrel verify` reads these destinations through the transport too
-(`sync/verify_native.go`): it lists `objects/` and `packs/` and re-reads
-every recorded artifact — through BLAKE3, and through any other hash its row
-recorded, on a local disk; through the server's hash command on sftp. On a
+(`sync/verify_native.go`): once the marker of every volume that synced there
+is in place, it lists `objects/` and `packs/` and re-reads every recorded
+artifact — through BLAKE3, and through any other hash its row recorded, on a
+local disk; through the server's hash command on sftp. An artifact the
+server cannot hash this pass (no command, or a row recorded under another
+`hash_algo`) is counted unchecked: neither re-confirmed nor a finding. On a
 plain destination a BLAKE3 that differs from what the name says (an object's
 content hash, a pack's key) is a mismatch, whichever backend reported it.
+
+The probe runs once per session once the server has answered it; a session
+that could not start the command asks again next time.
 
 The staged copy of a failed artifact goes with the run's staging at the next
 push's reconcile. The content layouts' guard commits only onto artifact names

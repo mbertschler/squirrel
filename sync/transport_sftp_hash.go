@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/zeebo/blake3"
+	"golang.org/x/crypto/ssh"
 )
 
 // errNoServerHash marks a destination that offers squirrel no hash of its
@@ -69,6 +70,9 @@ func (t *sftpTransport) ServerHash(_ context.Context, name string) (remoteChecks
 	if err := t.checkName(name); err != nil {
 		return remoteChecksum{}, err
 	}
+	if err := requireKind(name, kindFile, t.lstat); err != nil {
+		return remoteChecksum{}, err
+	}
 	target, err := t.hashTarget(name)
 	if err != nil {
 		return remoteChecksum{}, err
@@ -103,31 +107,33 @@ func (t *sftpTransport) hashTarget(name string) (string, error) {
 	return full, nil
 }
 
-// probeServerHash asks the server, once, to hash a known input, and
-// remembers whether its command agreed with this machine.
+// probeServerHash asks the server to hash a known input, and remembers
+// whether its command agreed with this machine once the server has
+// answered: a session that could not even start the command is asked
+// again next time.
 func (t *sftpTransport) probeServerHash() error {
 	t.probeMu.Lock()
 	defer t.probeMu.Unlock()
 	if !t.probed {
-		t.probeErr = t.runProbe()
-		t.probed = true
+		t.probed, t.probeErr = t.runProbe()
 	}
 	return t.probeErr
 }
 
-func (t *sftpTransport) runProbe() error {
+func (t *sftpTransport) runProbe() (bool, error) {
 	h := newArtifactHash(t.hashAlgo)
 	h.Write([]byte(serverHashProbe))
 	command := serverHashCommands[t.hashAlgo]
 	out, err := t.runCommand(command, strings.NewReader(serverHashProbe))
 	if err != nil {
-		return fmt.Errorf("%w: %w", errNoServerHash, err)
+		_, answered := errors.AsType[*ssh.ExitError](err)
+		return answered, fmt.Errorf("%w: %w", errNoServerHash, err)
 	}
 	sum, err := parseHashOutput(out, h.Size())
 	if err != nil || sum != hex.EncodeToString(h.Sum(nil)) {
-		return fmt.Errorf("%w: %s on the server does not compute %s", errNoServerHash, command, t.hashAlgo)
+		return true, fmt.Errorf("%w: %s on the server does not compute %s", errNoServerHash, command, t.hashAlgo)
 	}
-	return nil
+	return true, nil
 }
 
 // runCommand runs cmd in a session of its own and returns what it printed.

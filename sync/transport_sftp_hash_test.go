@@ -74,6 +74,13 @@ func TestServerHashRefusesWhatItCannotTrust(t *testing.T) {
 		t.Fatalf("ServerHash of a user's file name = %v, want errNoServerHash", err)
 	}
 	tr.root += "/with space"
+	unsafe := filepath.Join(tr.root, ObjectsDirName)
+	if err := os.MkdirAll(unsafe, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(unsafe, strings.Repeat("ab", 32)), []byte("alpha"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := tr.ServerHash(ctx, ObjectsDirName+"/"+strings.Repeat("ab", 32)); !errors.Is(err, errNoServerHash) {
 		t.Fatalf("ServerHash under an unsafe root = %v, want errNoServerHash", err)
 	}

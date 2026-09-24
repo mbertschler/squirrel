@@ -26,7 +26,7 @@ type transportChecksums struct {
 	dest *config.Destination
 }
 
-func (c transportChecksums) objects(ctx context.Context, rows []store.RemoteObjectRecord) (map[string]map[string]string, error) {
+func (c transportChecksums) objects(ctx context.Context, rows []store.RemoteObjectRecord) (artifactChecksums, error) {
 	names := namerFor(c.dest)
 	want := make(map[string]string, len(rows))
 	for _, r := range rows {
@@ -35,7 +35,7 @@ func (c transportChecksums) objects(ctx context.Context, rows []store.RemoteObje
 	return c.read(ctx, ObjectsDirName, want)
 }
 
-func (c transportChecksums) packs(ctx context.Context, packs []store.RemotePackRecord) (map[string]map[string]string, error) {
+func (c transportChecksums) packs(ctx context.Context, packs []store.RemotePackRecord) (artifactChecksums, error) {
 	names := namerFor(c.dest)
 	want := make(map[string]string, len(packs))
 	for _, p := range packs {
@@ -47,42 +47,47 @@ func (c transportChecksums) packs(ctx context.Context, packs []store.RemotePackR
 // read lists dir and hashes each file a row recorded; want maps a
 // basename to the algo its row recorded, "" while pending. A dir that does
 // not exist holds nothing.
-func (c transportChecksums) read(ctx context.Context, dir string, want map[string]string) (map[string]map[string]string, error) {
+func (c transportChecksums) read(ctx context.Context, dir string, want map[string]string) (artifactChecksums, error) {
+	out := artifactChecksums{byName: map[string]map[string]string{}, unchecked: map[string]bool{}}
 	entries, err := c.tr.List(ctx, dir)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
+		return out, nil
 	}
 	if err != nil {
-		return nil, err
+		return artifactChecksums{}, err
 	}
-	out := make(map[string]map[string]string, len(entries))
 	for _, e := range entries {
 		if e.kind != kindFile {
 			continue
 		}
 		recorded, ok := want[e.name]
 		if !ok {
-			out[e.name] = nil
+			out.byName[e.name] = nil
 			continue
 		}
 		hashes, err := c.hash(ctx, path.Join(dir, e.name), recorded)
 		if err != nil {
-			return nil, fmt.Errorf("hash %s: %w", e.name, err)
+			return artifactChecksums{}, fmt.Errorf("hash %s: %w", e.name, err)
 		}
-		out[e.name] = hashes
+		out.byName[e.name] = hashes
+		out.unchecked[e.name] = hashes == nil
 	}
 	return out, nil
 }
 
 // hash is the checksums of the file at name: its BLAKE3, and the hash its
 // row recorded when this machine computes that one too, read back from a
-// local disk; the server's hash command's answer on sftp, none when the
-// server runs no command squirrel trusts.
+// local disk; the server's hash command's answer on sftp. It is nil when
+// the sftp server cannot answer for the row: no command squirrel trusts, or
+// a row recorded under another hash_algo.
 func (c transportChecksums) hash(ctx context.Context, name, recorded string) (map[string]string, error) {
 	if !readsBack(c.dest) {
+		if recorded != "" && recorded != c.dest.HashAlgo {
+			return nil, nil
+		}
 		cs, err := c.tr.ServerHash(ctx, name)
 		if errors.Is(err, errNoServerHash) {
-			return map[string]string{}, nil
+			return nil, nil
 		}
 		if err != nil {
 			return nil, err

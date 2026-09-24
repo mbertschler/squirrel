@@ -499,3 +499,41 @@ func (f *nativeContentFixture) flipPack(t *testing.T) {
 		}
 	}
 }
+
+// TestNativeContentVerifyWithoutAServerHash: over sftp, an artifact the
+// server cannot hash this pass — it lost its command, or the row records
+// another hash_algo — is neither re-confirmed nor a finding.
+func TestNativeContentVerifyWithoutAServerHash(t *testing.T) {
+	f := setupNativeContentFixture(t, sftpContent, config.LayoutContentAddressed)
+	f.write(t, "a.txt", "alpha")
+	f.index(t)
+	f.mustPush(t)
+	f.pair.Destination.HashAlgo = "sha1"
+	rep := f.verify(t)
+	if !rep.Clean() || rep.Unchecked != 1 || rep.Verified != 0 || rep.AlarmRaised {
+		t.Fatalf("rep = %+v, want the object left unchecked and no alarm", rep)
+	}
+}
+
+// TestNativeContentVerifyRefusesAnUnmountedRoot: a native content root
+// without its volume markers fails the pass instead of reporting every
+// object missing.
+func TestNativeContentVerifyRefusesAnUnmountedRoot(t *testing.T) {
+	f := setupNativeContentFixture(t, localContent, config.LayoutContentAddressed)
+	f.write(t, "a.txt", "alpha")
+	f.index(t)
+	f.mustPush(t)
+	entries, err := os.ReadDir(f.dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if err := os.RemoveAll(filepath.Join(f.dst, e.Name())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rep, err := VerifyRemote(context.Background(), f.store, nil, f.pair.Destination)
+	if err == nil || !strings.Contains(err.Error(), "nothing was checked") || rep.AlarmRaised {
+		t.Fatalf("VerifyRemote = %+v, %v; want the pass refused without an alarm", rep, err)
+	}
+}

@@ -38,6 +38,11 @@ type RemoteVerifyReport struct {
 	// remote listing.
 	Missing    []string
 	Mismatched []RemoteObjectMismatch
+	// Unchecked counts recorded objects and packs that are present but
+	// that the destination could not hash this pass (an sftp server
+	// without the hash command, or one recorded under another hash_algo):
+	// neither re-confirmed nor a finding.
+	Unchecked int
 
 	// Pack counters mirror the object ones for a packed destination's
 	// per-pack sweep — one fingerprint check per pack vouches for every
@@ -200,26 +205,61 @@ func upgradeFingerprintVectors(ctx context.Context, s *store.Store, destination 
 }
 
 // checksumSource reads the checksums a verify pass compares for a
-// destination's recorded objects and packs, keyed by basename then hash
-// name; a stored artifact nobody recorded maps to no hashes.
+// destination's recorded objects and packs.
 type checksumSource interface {
-	objects(ctx context.Context, rows []store.RemoteObjectRecord) (map[string]map[string]string, error)
-	packs(ctx context.Context, packs []store.RemotePackRecord) (map[string]map[string]string, error)
+	objects(ctx context.Context, rows []store.RemoteObjectRecord) (artifactChecksums, error)
+	packs(ctx context.Context, packs []store.RemotePackRecord) (artifactChecksums, error)
+}
+
+// artifactChecksums is what a pass read of a destination's artifacts: the
+// checksums of each stored one, keyed by basename then hash name (none for
+// one nobody recorded), and the recorded ones present but not hashed this
+// pass, which count neither as verified nor as a finding.
+type artifactChecksums struct {
+	byName    map[string]map[string]string
+	unchecked map[string]bool
 }
 
 // verifyThrough runs the sweeps against dest through squirrel's own
-// transport on a native destination, through rclone (and the S3 API)
-// otherwise.
+// transport on a native destination, once its volume markers show the
+// root is the right one, and through rclone (and the S3 API) otherwise.
 func verifyThrough(ctx context.Context, s *store.Store, rcl *Rclone, dest *config.Destination, rows []store.RemoteObjectRecord, packs []store.RemotePackRecord, rep *RemoteVerifyReport) error {
 	if !dest.Native() {
 		return verifyRecorded(ctx, s, rcloneChecksums{rcl: rcl, dest: dest}, dest, rows, packs, rep)
+	}
+	volumes, err := syncedVolumes(ctx, s, dest.Name)
+	if err != nil {
+		return err
 	}
 	tr, err := openReadOnly(ctx, dest)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tr.Close() }()
+	if err := requireVolumeMarkers(ctx, tr, dest, volumes); err != nil {
+		return err
+	}
 	return verifyRecorded(ctx, s, transportChecksums{tr: tr, dest: dest}, dest, rows, packs, rep)
+}
+
+// syncedVolumes names the volumes that have a successful sync to the
+// destination: those whose marker its root must hold.
+func syncedVolumes(ctx context.Context, s *store.Store, destination string) ([]string, error) {
+	all, err := s.ListVolumes(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list volumes: %w", err)
+	}
+	var out []string
+	for _, v := range all {
+		_, err := s.LatestSuccessfulSyncRun(ctx, v.ID, destination)
+		switch {
+		case err == nil:
+			out = append(out, v.Name)
+		case !store.IsNotFound(err):
+			return nil, fmt.Errorf("lookup last successful sync of %q to %q: %w", v.Name, destination, err)
+		}
+	}
+	return out, nil
 }
 
 // verifyRecorded sweeps a destination's recorded content objects (the
@@ -240,6 +280,17 @@ func verifyRecorded(ctx context.Context, s *store.Store, src checksumSource, des
 	return nil
 }
 
+// countUnchecked counts an artifact the destination could not hash this
+// pass: as unchecked when its row records a fingerprint, as still pending
+// when it records none.
+func countUnchecked(rep *RemoteVerifyReport, fingerprinted bool, pending *int) {
+	if fingerprinted {
+		rep.Unchecked++
+		return
+	}
+	*pending++
+}
+
 // contentMismatch is the finding when a plain destination reports the
 // BLAKE3 of an artifact whose name says what its BLAKE3 must be (an
 // object's content hash, a pack's key) and the two differ. It holds for
@@ -256,7 +307,7 @@ func contentMismatch(dest *config.Destination, hashes map[string]string, want []
 // verifyRecordedObjects compares the remote listing against the recorded
 // rows and applies the per-object outcome to the store and the report.
 func verifyRecordedObjects(ctx context.Context, s *store.Store, src checksumSource, dest *config.Destination, rows []store.RemoteObjectRecord, rep *RemoteVerifyReport) error {
-	byName, err := src.objects(ctx, rows)
+	got, err := src.objects(ctx, rows)
 	if err != nil {
 		return fmt.Errorf("read object checksums from %q: %w", dest.Name, err)
 	}
@@ -264,12 +315,16 @@ func verifyRecordedObjects(ctx context.Context, s *store.Store, src checksumSour
 	matched := 0
 	for _, row := range rows {
 		hash := hex.EncodeToString(row.Blake3)
-		hashes, ok := byName[names.object(row.Blake3)]
+		hashes, ok := got.byName[names.object(row.Blake3)]
 		if !ok {
 			rep.Missing = append(rep.Missing, hash)
 			continue
 		}
 		matched++
+		if got.unchecked[names.object(row.Blake3)] {
+			countUnchecked(rep, row.ChecksumAlgo.Valid, &rep.Pending)
+			continue
+		}
 		if m, bad := contentMismatch(dest, hashes, row.Blake3); bad {
 			rep.Mismatched = append(rep.Mismatched, m)
 			continue
@@ -295,7 +350,7 @@ func verifyRecordedObjects(ctx context.Context, s *store.Store, src checksumSour
 			Actual:   actual,
 		})
 	}
-	rep.Unrecorded = len(byName) - matched
+	rep.Unrecorded = len(got.byName) - matched
 	return nil
 }
 
@@ -306,12 +361,14 @@ type rcloneChecksums struct {
 	dest *config.Destination
 }
 
-func (c rcloneChecksums) objects(ctx context.Context, rows []store.RemoteObjectRecord) (map[string]map[string]string, error) {
-	return readObjectChecksums(ctx, c.rcl, c.dest, rows)
+func (c rcloneChecksums) objects(ctx context.Context, rows []store.RemoteObjectRecord) (artifactChecksums, error) {
+	byName, err := readObjectChecksums(ctx, c.rcl, c.dest, rows)
+	return artifactChecksums{byName: byName}, err
 }
 
-func (c rcloneChecksums) packs(ctx context.Context, packs []store.RemotePackRecord) (map[string]map[string]string, error) {
-	return readPackChecksums(ctx, c.rcl, c.dest, packs)
+func (c rcloneChecksums) packs(ctx context.Context, packs []store.RemotePackRecord) (artifactChecksums, error) {
+	byName, err := readPackChecksums(ctx, c.rcl, c.dest, packs)
+	return artifactChecksums{byName: byName}, err
 }
 
 // readObjectChecksums reads the provider checksums verification compares,
@@ -385,16 +442,20 @@ func verifyObjectHashTypes(dest *config.Destination, rows []store.RemoteObjectRe
 // check per pack vouches for every content it holds, so a packed
 // destination is swept per pack rather than per member.
 func verifyRecordedPacks(ctx context.Context, s *store.Store, src checksumSource, dest *config.Destination, packs []store.RemotePackRecord, rep *RemoteVerifyReport) error {
-	byName, err := src.packs(ctx, packs)
+	got, err := src.packs(ctx, packs)
 	if err != nil {
 		return fmt.Errorf("read pack checksums from %q: %w", dest.Name, err)
 	}
 	names := namerFor(dest)
 	for _, row := range packs {
 		key := hex.EncodeToString(row.PackKey)
-		hashes, ok := byName[names.pack(row.PackKey)]
+		hashes, ok := got.byName[names.pack(row.PackKey)]
 		if !ok {
 			rep.PacksMissing = append(rep.PacksMissing, key)
+			continue
+		}
+		if got.unchecked[names.pack(row.PackKey)] {
+			countUnchecked(rep, row.ChecksumAlgo.Valid, &rep.PacksPending)
 			continue
 		}
 		if m, bad := contentMismatch(dest, hashes, row.PackKey); bad {
@@ -526,10 +587,10 @@ func recordVerifyOutcome(ctx context.Context, s *store.Store, rep *RemoteVerifyR
 		status = store.RunStatusPartial
 		errMsg = fmt.Sprintf("%d object(s)/pack(s)/mirror copies failed verification on %q", rep.failures(), rep.Destination)
 	}
-	note := fmt.Sprintf("destination=%s objects=%d verified=%d fingerprinted=%d pending=%d mismatched=%d missing=%d unrecorded=%d packs=%d packs_verified=%d packs_fingerprinted=%d packs_pending=%d packs_mismatched=%d packs_missing=%d paths=%d paths_reread=%d paths_changed=%d paths_missing=%d",
+	note := fmt.Sprintf("destination=%s objects=%d verified=%d fingerprinted=%d pending=%d mismatched=%d missing=%d unrecorded=%d packs=%d packs_verified=%d packs_fingerprinted=%d packs_pending=%d packs_mismatched=%d packs_missing=%d unchecked=%d paths=%d paths_reread=%d paths_changed=%d paths_missing=%d",
 		rep.Destination, rep.Objects, rep.Verified, rep.Populated, rep.Pending, len(rep.Mismatched), len(rep.Missing), rep.Unrecorded,
 		rep.Packs, rep.PacksVerified, rep.PacksPopulated, rep.PacksPending, len(rep.PackMismatched), len(rep.PacksMissing),
-		rep.Paths, rep.PathsReread, len(rep.PathsChanged), len(rep.PathsMissing))
+		rep.Unchecked, rep.Paths, rep.PathsReread, len(rep.PathsChanged), len(rep.PathsMissing))
 	if err := s.AppendRunAudit(ctx, store.RunAuditEntry{
 		RunID: rep.RunID, Transition: store.TransitionVerifyDestination, Note: note,
 	}); err != nil {

@@ -140,11 +140,11 @@ func printVerifyReport(out, errOut io.Writer, rep sync.RemoteVerifyReport, runEr
 		fmt.Fprintf(out, "verify %s: nothing recorded to verify\n", rep.Destination)
 		return
 	}
-	fmt.Fprintf(out, "verify %s: run=%d objects=%d verified=%d fingerprinted=%d pending=%d mismatched=%d missing=%d unrecorded=%d packs=%d packs_verified=%d packs_fingerprinted=%d packs_pending=%d packs_mismatched=%d packs_missing=%d\n",
+	fmt.Fprintf(out, "verify %s: run=%d objects=%d verified=%d fingerprinted=%d pending=%d mismatched=%d missing=%d unrecorded=%d packs=%d packs_verified=%d packs_fingerprinted=%d packs_pending=%d packs_mismatched=%d packs_missing=%d unchecked=%d\n",
 		rep.Destination, rep.RunID, rep.Objects, rep.Verified, rep.Populated, rep.Pending,
 		len(rep.Mismatched), len(rep.Missing), rep.Unrecorded,
 		rep.Packs, rep.PacksVerified, rep.PacksPopulated, rep.PacksPending,
-		len(rep.PackMismatched), len(rep.PacksMissing))
+		len(rep.PackMismatched), len(rep.PacksMissing), rep.Unchecked)
 	printVerifyAlarmTransition(out, errOut, rep)
 }
 
