@@ -58,7 +58,10 @@ sftp`. Loopback hides what a real link costs per round trip, so a third
 destination reached the same server through a TCP proxy that delays every
 chunk by a fixed time each way, kept outside the repo. Restart `rclone serve
 sftp` after removing files under its root behind its back: its directory
-cache otherwise keeps answering for them.
+cache otherwise keeps answering for them. The 2026-09-25 rerun after
+decision 8 added the branch's binary from before the change as a third
+column, and gave every exFAT run a freshly created image: a sparse image's
+timings drift as it fills.
 
 Deliberately not simulated: Synology/QNAP packaging (below squirrel),
 b2/gcs (same shape as s3), real network partitions — a dead machine or

@@ -607,10 +607,15 @@ open error.
 target that can gate but the local mirror, which the same message's reason
 names.
 
-**F40 · S1 — native pushes that write are several times slower than
-rclone.** A first push took 116 s against rclone's 13 s on the exFAT image,
-and 432 s against 45 s over sftp at a 20 ms round trip; unchanged pushes are
-faster. Open: native-mirror.md, open question 2.
+**F40 · S1 — ~~native pushes that write are several times slower than
+rclone.~~ (fixed in #217)** A first push took 116 s against rclone's 13 s on
+the exFAT image, and 432 s against 45 s over sftp at a 20 ms round trip;
+unchanged pushes are faster. The cost was three full flushes per file on a
+local disk and 27 sequential requests per path over sftp. Decision 8 in
+native-mirror.md flushes once per batch and writes several paths at once
+(`concurrency`); rerun, the first push takes 42 s against rclone's 19–24 s
+on the exFAT image, where reading every byte back is the remaining cost,
+and 50 s against 47 s at a 20 ms round trip.
 
 Observed, by design: a copy corrupted in place on the local mirror, size and
 mtime kept, passed two verify passes because each re-reads only a tenth of
