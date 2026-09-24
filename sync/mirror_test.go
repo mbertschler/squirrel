@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -235,8 +236,15 @@ func (f *mirrorFixture) rowsAt(t *testing.T, rel string) []string {
 // root outside staging: what invariant 2 says only grows.
 func (f *mirrorFixture) contentHashes(t *testing.T) map[string]bool {
 	t.Helper()
+	return hashesOutsideStaging(t, f.dst)
+}
+
+// hashesOutsideStaging collects the BLAKE3 of every file under root that
+// is not in a .squirrel-staging directory.
+func hashesOutsideStaging(t *testing.T, root string) map[string]bool {
+	t.Helper()
 	out := map[string]bool{}
-	err := filepath.WalkDir(f.dst, func(p string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -268,40 +276,17 @@ func fileHash(t *testing.T, p string) string {
 // push, given the content the destination held before it.
 func (f *mirrorFixture) checkInvariants(t *testing.T, before map[string]bool) {
 	t.Helper()
-	ctx := context.Background()
-	volID := f.volumeID(t)
 	liveContent := map[string]int64{}
-	disk := diskFolding(t, f.dst)
-	fold := nameFolding{caseless: f.fold.caseless || disk.caseless, normless: f.fold.normless || disk.normless}
-	liveAt := map[string]string{}
-	for _, r := range f.rows(t) {
-		want := f.contentHashOf(t, volID, r)
+	for _, r := range f.checkRecordsVouch(t) {
 		switch r.State {
 		case store.RemotePathLive:
 			liveContent[r.Path] = r.ContentID
-			if other, ok := liveAt[fold.key(r.Path)]; ok {
-				t.Errorf("live %s and %s name the one entry the destination holds there", r.Path, other)
-			}
-			liveAt[fold.key(r.Path)] = r.Path
-			if got := fileHash(t, f.dest(r.Path)); got != want {
-				t.Errorf("live %s holds %s, want %s", r.Path, got, want)
-			}
-		case store.RemotePathDisplaced:
-			p := f.onDisk(historyName("pics", r.DisplacedRunID.Int64, r.Path))
-			if got := fileHash(t, p); got != want {
-				t.Errorf("displaced %s holds %s at %s, want %s", r.Path, got, p, want)
-			}
 		case store.RemotePathCommitting, store.RemotePathDisplacing:
 			t.Errorf("%s row %d is still %s after a clean push", r.Path, r.ID, r.State)
 		}
 	}
-	after := f.contentHashes(t)
-	for h := range before {
-		if !after[h] {
-			t.Errorf("content %s left the destination", h)
-		}
-	}
-	present, err := f.store.ListPresentContent(ctx, volID)
+	f.checkOnlyGrew(t, before)
+	present, err := f.store.ListPresentContent(context.Background(), f.volumeID(t))
 	if err != nil {
 		t.Fatalf("ListPresentContent: %v", err)
 	}
@@ -310,6 +295,72 @@ func (f *mirrorFixture) checkInvariants(t *testing.T, before map[string]bool) {
 			t.Errorf("present %s has no live row holding content %d", d.Path, d.ContentID)
 		}
 	}
+}
+
+// checkRecordsVouch asserts invariant 1, which holds at every point of a
+// push, a crashed one too: every live row's bytes are at its path, every
+// displaced row's at its history path, and no two live rows name the one
+// entry a folding destination holds. It returns the rows it checked.
+// Rows at a path in changed, which the test itself changed behind
+// squirrel's back, are left unchecked.
+func (f *mirrorFixture) checkRecordsVouch(t *testing.T, changed ...string) []store.RemotePath {
+	t.Helper()
+	volID := f.volumeID(t)
+	disk := diskFolding(t, f.dst)
+	fold := nameFolding{caseless: f.fold.caseless || disk.caseless, normless: f.fold.normless || disk.normless}
+	liveAt := map[string]string{}
+	rows := f.rows(t)
+	for _, r := range rows {
+		if slices.Contains(changed, r.Path) {
+			continue
+		}
+		var at string
+		switch r.State {
+		case store.RemotePathLive:
+			if other, ok := liveAt[fold.key(r.Path)]; ok {
+				t.Errorf("live %s and %s name the one entry the destination holds there", r.Path, other)
+			}
+			liveAt[fold.key(r.Path)] = r.Path
+			at = f.dest(r.Path)
+		case store.RemotePathDisplaced:
+			at = f.onDisk(historyName("pics", r.DisplacedRunID.Int64, r.Path))
+		default:
+			continue
+		}
+		if got, want := hashOnDisk(at), f.contentHashOf(t, volID, r); got != want {
+			t.Errorf("%s row for %s: %s holds %q, want %s", r.State, r.Path, at, got, want)
+		}
+	}
+	return rows
+}
+
+// checkOnlyGrew asserts invariant 2: every content the destination held
+// outside staging before is still there.
+func (f *mirrorFixture) checkOnlyGrew(t *testing.T, before map[string]bool) {
+	t.Helper()
+	after := f.contentHashes(t)
+	for h := range before {
+		if !after[h] {
+			t.Errorf("content %s left the destination", h)
+		}
+	}
+}
+
+// hashOnDisk is the hex BLAKE3 of the file at p, or why it has none.
+func hashOnDisk(p string) string {
+	fi, err := os.Lstat(p)
+	if err != nil {
+		return err.Error()
+	}
+	if !fi.Mode().IsRegular() {
+		return "not a file: " + fi.Mode().String()
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return err.Error()
+	}
+	sum := blake3.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 func (f *mirrorFixture) contentHashOf(t *testing.T, volID int64, r store.RemotePath) string {

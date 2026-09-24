@@ -121,9 +121,9 @@ func (f *nativeContentFixture) mustPush(t *testing.T) Report {
 	return rep
 }
 
-// pushCrashing runs one push whose transport crashes at the first call
-// crashAt selects.
-func (f *nativeContentFixture) pushCrashing(t *testing.T, crashAt func(transportCall) bool) (Report, error) {
+// pushCrashing runs one push whose transport crashes, as mode says, at the
+// first call crashAt selects.
+func (f *nativeContentFixture) pushCrashing(t *testing.T, crashAt func(transportCall) bool, mode crashMode) (Report, error) {
 	t.Helper()
 	h, err := HandlerFor(f.store, Tools{}, f.pair)
 	if err != nil {
@@ -142,7 +142,7 @@ func (f *nativeContentFixture) pushCrashing(t *testing.T, crashAt func(transport
 		if err != nil {
 			return nil, err
 		}
-		return &faultTransport{transport: raw, crashAt: crashAt, mode: crashAfter}, nil
+		return &faultTransport{transport: raw, crashAt: crashAt, mode: mode}, nil
 	}
 	return h.Push(context.Background(), Options{})
 }
@@ -262,7 +262,7 @@ func TestNativeContentAdoptsAnArtifactItAlreadyLanded(t *testing.T) {
 			f.index(t)
 			if _, err := f.pushCrashing(t, func(c transportCall) bool {
 				return c.op == "rename" && strings.HasPrefix(c.to, ObjectsDirName+"/")
-			}); err == nil {
+			}, crashAfter); err == nil {
 				t.Fatal("the crashing push succeeded")
 			}
 			if _, err := os.Stat(f.objectPath("alpha")); err != nil {
