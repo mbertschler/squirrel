@@ -83,7 +83,7 @@ func (t *schedulerTools) rebuild(ctx context.Context, cfg *config.Config) error 
 // anyVolumeNeedsScheduledSync reports whether a scheduled sync will
 // invoke rclone. Only rclone-backed destinations count: a peer node
 // streams its bytes over the sync API, a kopia destination drives its own
-// binary, and squirrel writes a native mirror itself, so a cadence naming
+// binary, and squirrel writes a native destination itself, so a cadence naming
 // only those runs its whole schedule on a host with no rclone installed.
 func anyVolumeNeedsScheduledSync(cfg *config.Config) bool {
 	for _, v := range cfg.Volumes {
@@ -118,7 +118,7 @@ func targetNeedsRclone(cfg *config.Config, target string) bool {
 // squirrel reaches through rclone has an effective verify cadence — its own
 // verify_every, or the [agent] verify_every default. Mirrors the scheduler's
 // own resolution so the rclone wiring lines up with what the scheduler will
-// actually fire; a native mirror is verified through squirrel's own
+// actually fire; a native destination is verified through squirrel's own
 // transport.
 func anyScheduledVerifyNeedsRclone(cfg *config.Config) bool {
 	agentDefault := cfg.AgentVerifyEvery() > 0

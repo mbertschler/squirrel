@@ -70,7 +70,7 @@ type recoverOptions struct {
 // before agreeing to its first step.
 type recoverPlan struct {
 	dest      *config.Destination
-	rcl       *sync.Rclone // nil for a native mirror, which squirrel reads itself
+	rcl       *sync.Rclone // nil for a native destination, which squirrel reads itself
 	volumes   []string
 	snapshots []sync.IndexSnapshot
 	chosen    sync.IndexSnapshot

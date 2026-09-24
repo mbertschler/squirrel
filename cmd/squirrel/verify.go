@@ -75,7 +75,7 @@ func runVerify(cmd *cobra.Command, destName string) error {
 }
 
 // verifyRclone locates rclone and renders its config when a target is
-// reached through it; a native mirror is verified without it.
+// reached through it; a native destination is verified without it.
 func verifyRclone(cmd *cobra.Command, cfg *config.Config, names []string) (*sync.Rclone, error) {
 	if !slices.ContainsFunc(names, func(name string) bool {
 		return sync.Pair{Destination: cfg.Destinations[name]}.DrivesRclone()

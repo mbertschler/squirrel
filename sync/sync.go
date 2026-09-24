@@ -935,11 +935,11 @@ func (p Pair) TargetName() string {
 func (p Pair) IsNode() bool { return p.Node != nil }
 
 // DrivesRclone reports whether syncing this pair invokes rclone. Every
-// destination does except kopia, which drives its own binary, and a
-// native mirror, which squirrel writes itself; a peer node streams its
-// bytes over the sync API.
+// destination does except kopia, which drives its own binary, and a native
+// one (local, or sftp without crypt, in any layout), which squirrel writes
+// itself; a peer node streams its bytes over the sync API.
 func (p Pair) DrivesRclone() bool {
-	return p.Destination != nil && p.Destination.Type != "kopia" && !p.Destination.NativeMirror()
+	return p.Destination != nil && p.Destination.Type != "kopia" && !p.Destination.Native()
 }
 
 // RestoreOptions shape one Restore invocation. ToPath overrides the local

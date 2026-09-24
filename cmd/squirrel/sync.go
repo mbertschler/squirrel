@@ -153,10 +153,10 @@ func rcloneConfigPathFor(cfg *config.Config) string {
 }
 
 // rcloneFor locates rclone and renders its config for reading dest. A
-// native mirror is read through squirrel's own transport, so it gets a nil
-// wrapper and no rclone preamble.
+// native destination is read through squirrel's own transport, so it gets
+// a nil wrapper and no rclone preamble.
 func rcloneFor(cmd *cobra.Command, cfg *config.Config, dest *config.Destination) (*sync.Rclone, error) {
-	if dest.NativeMirror() {
+	if dest.Native() {
 		return nil, nil
 	}
 	rcl, err := sync.Find(cmd.Context())
