@@ -250,8 +250,16 @@ type transport interface {
     finished (`.squirrel-staging/run-<id>/<row>`), and on ride-along snapshots
     (`.squirrel-index/index-*.db`, which rotation already deletes today).
     Anything else found in staging is reported and left alone;
-  - `Rename` only from staging to a live name (commit), or from a live name
-    to `.squirrel-history/run-<current run>/` (displacement).
+  - `Rename` only from this run's staging to a live name (commit) or to a
+    snapshot name (the ride-along), or from a live name to
+    `.squirrel-history/run-<current run>/` (displacement);
+  - under `--init`, before the push holds a run, the marker's own staging:
+    it is written to `.squirrel-staging/volume-marker` and renamed onto
+    `.squirrel-volume`, and a stale staged copy may be removed.
+
+  So the marker and the ride-along snapshot land whole or not at all, like
+  every path: a write that fails halfway leaves its partial copy in staging,
+  never at a name recovery or the marker gate reads.
 
   That function is the whole audit surface for destroying or moving bytes on
   a destination.

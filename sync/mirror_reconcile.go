@@ -139,6 +139,9 @@ func (h *mirrorHandler) clearFinishedStaging(ctx context.Context, rep *Report, t
 		return fmt.Errorf("list %s: %w", dir, err)
 	}
 	for _, e := range runs {
+		if e.name == markerStagingBase {
+			continue
+		}
 		runID, ok := stagingRunID(e)
 		if !ok {
 			h.warnForeignStaging(rep, path.Join(dir, e.name))

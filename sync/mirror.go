@@ -61,6 +61,11 @@ func (h *mirrorHandler) Push(ctx context.Context, opts Options) (Report, error) 
 // root is the destination root as a layout may hold it: guarded, so only
 // runID's own moves pass (none when runID is 0), and bounded by progress.
 func (h *mirrorHandler) root(ctx context.Context, runID int64) (transport, error) {
+	return h.guarded(ctx, nameGuard{volumeDir: h.vol.Name, runID: runID, finished: h.runFinished})
+}
+
+// guarded is the destination root behind guard, bounded by progress.
+func (h *mirrorHandler) guarded(ctx context.Context, guard nameGuard) (transport, error) {
 	if h.raw == nil {
 		raw, err := h.openTransport(ctx, h.dest)
 		if err != nil {
@@ -68,7 +73,6 @@ func (h *mirrorHandler) root(ctx context.Context, runID int64) (transport, error
 		}
 		h.raw = raw
 	}
-	guard := nameGuard{volumeDir: h.vol.Name, runID: runID, finished: h.runFinished}
 	return stallTransport{
 		transport: guardedTransport{transport: h.raw, guard: guard},
 		timeout:   h.stallTimeout,
@@ -192,8 +196,9 @@ func (h *mirrorHandler) advanceMethod(context.Context, *Report, pushPlan) (strin
 // guarded transport.
 func (h *mirrorHandler) shelf(runID int64) snapshotShelf {
 	return transportShelf{
-		open: func(ctx context.Context) (transport, error) { return h.root(ctx, runID) },
-		dir:  path.Join(h.vol.Name, IndexDirName),
+		open:   func(ctx context.Context) (transport, error) { return h.root(ctx, runID) },
+		volume: h.vol.Name,
+		runID:  runID,
 	}
 }
 

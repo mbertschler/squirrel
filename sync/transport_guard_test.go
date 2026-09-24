@@ -42,6 +42,12 @@ func TestNameGuardPermits(t *testing.T) {
 		{"remove a live file", opRemove, "pics/2024/cat.jpg", "", false},
 		{"remove history", opRemove, "pics/.squirrel-history/run-6/cat.jpg", "", false},
 		{"remove another volume's staging", opRemove, "docs/.squirrel-staging/run-6/" + key, "", false},
+		{"ride a snapshot along from this run's staging", opRename, "pics/.squirrel-staging/run-7/" + key, "pics/.squirrel-index/index-20260101T000000.000Z-run-7.db", true},
+		{"stage onto a receipt", opRename, "pics/.squirrel-staging/run-7/" + key, "pics/.squirrel-index/run-7", false},
+		{"ride a snapshot along from another run's staging", opRename, "pics/.squirrel-staging/run-6/" + key, "pics/.squirrel-index/index-20260101T000000.000Z-run-7.db", false},
+		{"move a live file onto a snapshot name", opRename, "pics/a.db", "pics/.squirrel-index/index-20260101T000000.000Z-run-7.db", false},
+		{"marker bootstrap without --init", opRename, "pics/.squirrel-staging/volume-marker", "pics/.squirrel-volume", false},
+		{"remove the staged marker without --init", opRemove, "pics/.squirrel-staging/volume-marker", "", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -54,6 +60,35 @@ func TestNameGuardPermits(t *testing.T) {
 			}
 			if err != nil && !errors.Is(err, errGuardRefused) {
 				t.Fatalf("refusal %v does not wrap errGuardRefused", err)
+			}
+		})
+	}
+}
+
+// TestNameGuardBootstrap: under --init the guard also lets the marker be
+// staged, renamed onto .squirrel-volume, and a stale staged copy removed —
+// run or not — and nothing more.
+func TestNameGuardBootstrap(t *testing.T) {
+	cases := []struct {
+		name     string
+		op       guardOp
+		from, to string
+		want     bool
+	}{
+		{"rename the staged marker onto the marker", opRename, "pics/.squirrel-staging/volume-marker", "pics/.squirrel-volume", true},
+		{"remove a stale staged marker", opRemove, "pics/.squirrel-staging/volume-marker", "", true},
+		{"rename the staged marker elsewhere", opRename, "pics/.squirrel-staging/volume-marker", "pics/a.txt", false},
+		{"rename something else onto the marker", opRename, "pics/a.txt", "pics/.squirrel-volume", false},
+		{"remove the marker", opRemove, "pics/.squirrel-volume", "", false},
+		{"another volume's staged marker", opRename, "docs/.squirrel-staging/volume-marker", "docs/.squirrel-volume", false},
+		{"remove a live file", opRemove, "pics/a.txt", "", false},
+	}
+	g := nameGuard{volumeDir: "pics", bootstrap: true}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := g.permit(c.op, c.from, c.to)
+			if got := err == nil; got != c.want {
+				t.Fatalf("permit = %v, want allowed=%t", err, c.want)
 			}
 		})
 	}

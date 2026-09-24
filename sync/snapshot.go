@@ -212,16 +212,20 @@ func (s rcloneShelf) remove(ctx context.Context, name string) error {
 	return s.rcl.deleteFile(ctx, s.dir+"/"+name)
 }
 
-// transportShelf is a native mirror's .squirrel-index/ directory, reached
-// through the transport open returns: for a push, its guarded transport,
-// whose name guard permits removing a snapshot there and nothing else.
+// transportShelf is a native mirror's <volume>/.squirrel-index/, reached
+// through runID's guarded transport, which open returns.
 type transportShelf struct {
-	open func(context.Context) (transport, error)
-	dir  string
+	open   func(context.Context) (transport, error)
+	volume string
+	runID  int64
 }
 
-// upload removes what a failed Put left behind, so recovery never offers
-// a truncated snapshot as the newest.
+func (s transportShelf) dir() string { return path.Join(s.volume, IndexDirName) }
+
+// upload stages the snapshot in runID's staging, then renames it onto
+// name, so an upload that fails halfway never leaves a truncated snapshot
+// for recovery to offer as the newest. A partial staged copy goes with the
+// run's staging at the next push.
 func (s transportShelf) upload(ctx context.Context, localPath, name string) error {
 	tr, err := s.open(ctx)
 	if err != nil {
@@ -236,12 +240,11 @@ func (s transportShelf) upload(ctx context.Context, localPath, name string) erro
 	if err != nil {
 		return err
 	}
-	dst := path.Join(s.dir, name)
-	err = tr.Put(ctx, dst, f, fi.ModTime())
-	if err != nil && !errors.Is(err, fs.ErrExist) {
-		_ = tr.Remove(ctx, dst)
+	staged := stagingName(s.volume, s.runID, stagingKey(path.Join(IndexDirName, name)))
+	if err := tr.Put(ctx, staged, f, fi.ModTime()); err != nil {
+		return err
 	}
-	return err
+	return tr.Rename(ctx, staged, path.Join(s.dir(), name))
 }
 
 func (s transportShelf) snapshots(ctx context.Context) ([]string, error) {
@@ -249,7 +252,7 @@ func (s transportShelf) snapshots(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return listSnapshotNames(ctx, tr, s.dir)
+	return listSnapshotNames(ctx, tr, s.dir())
 }
 
 // listSnapshotNames lists the snapshots in dir through tr; a dir that
@@ -276,7 +279,7 @@ func (s transportShelf) remove(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
-	return tr.Remove(ctx, path.Join(s.dir, name))
+	return tr.Remove(ctx, path.Join(s.dir(), name))
 }
 
 // indexDirURI returns the rclone URI of the per-volume .squirrel-index/

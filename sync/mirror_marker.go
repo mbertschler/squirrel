@@ -19,17 +19,17 @@ const maxMarkerBytes = 64 << 10
 
 // ensureMarker is a native mirror's gate against a wrong or unmounted
 // root: the destination's <volume>/.squirrel-volume must name this volume.
-// A missing marker is written only under init, through an exclusive Put,
-// and a marker naming another volume, or one that does not parse, is
-// always refused and never overwritten. A local root that does not exist
-// yet is created under init, so a first push can land on an empty disk.
+// A missing marker is written only under init, and a marker naming another
+// volume, or one that does not parse, is always refused and never
+// overwritten. A local root that does not exist yet is created under init,
+// so a first push can land on an empty disk.
 func (h *mirrorHandler) ensureMarker(ctx context.Context, init bool) error {
 	if init && h.dest.Type == "local" {
 		if err := os.MkdirAll(h.dest.Root, 0o755); err != nil {
 			return fmt.Errorf("destination %q: create root %s: %w", h.dest.Name, h.dest.Root, err)
 		}
 	}
-	tr, err := h.root(ctx, 0)
+	tr, err := h.guarded(ctx, nameGuard{volumeDir: h.vol.Name, bootstrap: init})
 	if err != nil {
 		return err
 	}
@@ -58,6 +58,9 @@ func (h *mirrorHandler) checkMarker(name string, data []byte) error {
 	return nil
 }
 
+// writeMarker stages the marker, then renames it onto name, so a write
+// that fails halfway never leaves a marker that does not parse. A copy an
+// earlier --init left staged is cleared first.
 func (h *mirrorHandler) writeMarker(ctx context.Context, tr transport, name string) error {
 	m, err := selfMarker(ctx, h.store, h.vol.Name)
 	if err != nil {
@@ -67,7 +70,14 @@ func (h *mirrorHandler) writeMarker(ctx context.Context, tr transport, name stri
 	if err != nil {
 		return fmt.Errorf("destination %q: %w", h.dest.Name, err)
 	}
-	if err := tr.Put(ctx, name, bytes.NewReader(data), time.Now()); err != nil {
+	staged := markerStagingName(h.vol.Name)
+	if err := tr.Remove(ctx, staged); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("destination %q: clear the staged marker %s: %w", h.dest.Name, h.where(staged), err)
+	}
+	if err := tr.Put(ctx, staged, bytes.NewReader(data), time.Now()); err != nil {
+		return fmt.Errorf("destination %q: write %s: %w", h.dest.Name, h.where(staged), err)
+	}
+	if err := tr.Rename(ctx, staged, name); err != nil {
 		return fmt.Errorf("destination %q: write %s: %w", h.dest.Name, h.where(name), err)
 	}
 	return nil

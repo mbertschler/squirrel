@@ -21,6 +21,9 @@ var errGuardRefused = errors.New("the name guard refuses this operation")
 type nameGuard struct {
 	volumeDir string // the volume's directory under the destination root
 	runID     int64  // the push holding the guard
+	// bootstrap lets a push under --init write the volume marker, before
+	// it holds a run.
+	bootstrap bool
 	// finished reports whether a run has ended, so its staging may go.
 	finished func(runID int64) bool
 }
@@ -33,17 +36,28 @@ const (
 )
 
 // permit is the whole audit surface for destroying or moving bytes on a
-// destination. A guard held by no run (runID 0, a dry run's reads) refuses
-// everything; otherwise it allows:
+// destination. A bootstrap guard allows, run or not:
+//
+//   - Remove of the staged marker, <volume>/.squirrel-staging/volume-marker,
+//     and its Rename onto <volume>/.squirrel-volume.
+//
+// Beyond that, a guard held by no run (runID 0, a dry run's reads)
+// refuses everything; otherwise it allows:
 //
 //   - Remove of a staging entry, or an emptied staging run directory,
 //     of a run that has finished: <volume>/.squirrel-staging/run-<id>[/<key>];
 //   - Remove of a ride-along snapshot: <volume>/.squirrel-index/index-*.db;
-//   - Rename from this run's staging onto a live name (a commit);
+//   - Rename from this run's staging onto a live name (a commit), or onto
+//     a snapshot name (the ride-along);
 //   - Rename of a live name to the same path under this run's history
 //     (a displacement): <volume>/.squirrel-history/run-<this run>/<path>.
+//
+// Every Rename lands on a name that does not exist yet: the transport
+// fails one onto an existing name.
 func (g nameGuard) permit(op guardOp, name, to string) error {
 	switch {
+	case g.bootstrap && name == markerStagingName(g.volumeDir) && (op == opRemove || to == path.Join(g.volumeDir, volmark.MarkerName)):
+		return nil
 	case g.runID == 0:
 	case op == opRemove:
 		if g.removable(name) {
@@ -53,16 +67,23 @@ func (g nameGuard) permit(op guardOp, name, to string) error {
 		if rel, ok := g.liveRel(name); ok && to == historyName(g.volumeDir, g.runID, rel) {
 			return nil
 		}
-		if _, ok := g.liveRel(to); ok && g.stagedByThisRun(name) {
+		if _, ok := g.liveRel(to); (ok || g.snapshot(to)) && g.stagedByThisRun(name) {
 			return nil
 		}
 	}
 	return fmt.Errorf("%w: %s %q → %q", errGuardRefused, [...]string{"remove", "rename"}[op], name, to)
 }
 
+// snapshot reports whether name is a ride-along snapshot of the volume:
+// <volume>/.squirrel-index/index-*.db.
+func (g nameGuard) snapshot(name string) bool {
+	rel, ok := strings.CutPrefix(name, g.volumeDir+"/"+IndexDirName+"/")
+	return ok && !strings.Contains(rel, "/") && isSnapshotName(rel)
+}
+
 func (g nameGuard) removable(name string) bool {
-	if rel, ok := strings.CutPrefix(name, g.volumeDir+"/"+IndexDirName+"/"); ok {
-		return !strings.Contains(rel, "/") && isSnapshotName(rel)
+	if g.snapshot(name) {
+		return true
 	}
 	runID, key, ok := g.stagingParts(name)
 	if !ok || runID == g.runID || !g.finished(runID) {
@@ -109,6 +130,16 @@ func (g nameGuard) liveRel(name string) (string, bool) {
 // path rel: <volume>/.squirrel-history/run-<runID>/<rel>.
 func historyName(volumeDir string, runID int64, rel string) string {
 	return path.Join(volumeDir, HistoryDirName, "run-"+strconv.FormatInt(runID, 10), rel)
+}
+
+// markerStagingBase is the staging name the volume marker is written to
+// before it is renamed onto .squirrel-volume.
+const markerStagingBase = "volume-marker"
+
+// markerStagingName is where a --init push stages the volume marker:
+// <volume>/.squirrel-staging/volume-marker.
+func markerStagingName(volumeDir string) string {
+	return path.Join(volumeDir, StagingDirName, markerStagingBase)
 }
 
 // stagingName is where runID stages the path whose key is key:

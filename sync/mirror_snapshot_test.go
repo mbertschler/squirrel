@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/mbertschler/squirrel/config"
+	"github.com/mbertschler/squirrel/store"
+	"github.com/mbertschler/squirrel/volmark"
 )
 
 // TestMirrorRideAlongThroughTheTransport: a native mirror's ride-along
@@ -102,18 +104,29 @@ func (p partialPuts) Put(ctx context.Context, name string, r io.Reader, mtime ti
 	return errors.New("the link dropped")
 }
 
+// withPartialPuts makes the fixture's handler land only one byte of every
+// Put whose name match selects.
+func (f *mirrorFixture) withPartialPuts(t *testing.T, match func(name string) bool) *mirrorHandler {
+	t.Helper()
+	h := f.handler(t)
+	h.openTransport = func(ctx context.Context, d *config.Destination) (transport, error) {
+		raw, err := openDestinationTransport(ctx, d)
+		return partialPuts{transport: raw, match: match}, err
+	}
+	return h
+}
+
 // TestMirrorRideAlongLeavesNoPartialSnapshot: a snapshot upload that fails
-// halfway is removed again, so recovery never offers a truncated snapshot
-// as the newest; the push itself still succeeds.
+// halfway leaves nothing in .squirrel-index/, so recovery never offers a
+// truncated snapshot as the newest — even when the link is gone and
+// nothing could be cleaned up. The push itself still succeeds, and the
+// partial copy goes with its run's staging at the next push.
 func TestMirrorRideAlongLeavesNoPartialSnapshot(t *testing.T) {
 	f := setupMirrorFixture(t)
 	f.write(t, "a.txt", "alpha")
 	f.index(t)
-	h := f.handler(t)
-	h.openTransport = func(ctx context.Context, d *config.Destination) (transport, error) {
-		raw, err := openDestinationTransport(ctx, d)
-		return partialPuts{transport: raw, match: func(name string) bool { return isSnapshotName(filepath.Base(name)) }}, err
-	}
+	f.mustPush(t)
+	h := f.withPartialPuts(t, func(name string) bool { return strings.Contains(name, StagingDirName+"/") })
 	sn := NewSnapshotter(f.store, SnapshotConfig{Dir: t.TempDir(), Keep: 7, Cloud: true, CloudKeep: 7})
 	rep, err := h.Push(context.Background(), Options{Snapshot: sn})
 	if err != nil || rep.SnapshotErr == nil {
@@ -125,7 +138,34 @@ func TestMirrorRideAlongLeavesNoPartialSnapshot(t *testing.T) {
 	}
 	for _, e := range entries {
 		if isSnapshotName(e.Name()) {
-			t.Fatalf("the partial snapshot %s stayed on the mirror", e.Name())
+			t.Fatalf("the partial snapshot %s reached .squirrel-index", e.Name())
 		}
+	}
+	clean := f.mustPush(t)
+	f.checkStagingEmpty(t, clean.RunID)
+}
+
+// TestMirrorMarkerWriteIsAllOrNothing: an --init whose marker write fails
+// halfway leaves no marker that does not parse, so the next --init
+// succeeds.
+func TestMirrorMarkerWriteIsAllOrNothing(t *testing.T) {
+	f := setupMirrorFixture(t)
+	if err := os.Remove(f.dest(volmark.MarkerName)); err != nil {
+		t.Fatal(err)
+	}
+	f.write(t, "a.txt", "alpha")
+	f.index(t)
+	h := f.withPartialPuts(t, func(name string) bool { return name == markerStagingName("pics") })
+	if _, err := h.Push(context.Background(), Options{Init: true}); err == nil {
+		t.Fatal("an --init whose marker write failed succeeded")
+	}
+	if _, err := os.Stat(f.dest(volmark.MarkerName)); !os.IsNotExist(err) {
+		t.Fatalf("a failed marker write left a marker behind: %v", err)
+	}
+	if rep, err := f.push(t, Options{Init: true}); err != nil || rep.Status != store.RunStatusSuccess {
+		t.Fatalf("the next --init: status=%q err=%v", rep.Status, err)
+	}
+	if err := volmark.Validate(f.dest(""), "pics"); err != nil {
+		t.Fatalf("marker after the retried --init: %v", err)
 	}
 }
