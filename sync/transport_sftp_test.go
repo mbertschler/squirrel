@@ -7,11 +7,14 @@ import (
 	"crypto/rsa"
 	"encoding/pem"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -35,6 +38,26 @@ type sftpTestServer struct {
 	// hung, once closed, makes the sftp subsystem stop reading requests,
 	// as a server whose disk hangs does.
 	hung chan struct{}
+
+	mu sync.Mutex
+	// commands maps each hash command the server runs to the hash it
+	// actually computes; a server with none runs no programs.
+	commands map[string]string
+}
+
+// runsHashCommands lets the server run the given sum commands, each
+// computing the hash its value names.
+func (s *sftpTestServer) runsHashCommands(commands map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.commands = commands
+}
+
+func (s *sftpTestServer) hashCommand(name string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	algo, ok := s.commands[name]
+	return algo, ok
 }
 
 func newKey(t *testing.T) (ed25519.PrivateKey, ssh.Signer) {
@@ -94,13 +117,13 @@ func startSFTPServer(t *testing.T, hostKeys ...ssh.Signer) *sftpTestServer {
 			if err != nil {
 				return
 			}
-			go serveSSH(c, cfg, srv.hung)
+			go serveSSH(c, cfg, srv)
 		}
 	}()
 	return srv
 }
 
-func serveSSH(c net.Conn, cfg *ssh.ServerConfig, hung chan struct{}) {
+func serveSSH(c net.Conn, cfg *ssh.ServerConfig, srv *sftpTestServer) {
 	defer func() { _ = c.Close() }()
 	_, chans, reqs, err := ssh.NewServerConn(c, cfg)
 	if err != nil {
@@ -118,14 +141,51 @@ func serveSSH(c net.Conn, cfg *ssh.ServerConfig, hung chan struct{}) {
 		}
 		go func() {
 			for r := range chReqs {
-				ok := r.Type == "subsystem" && len(r.Payload) > 4 && string(r.Payload[4:]) == "sftp"
-				_ = r.Reply(ok, nil)
-				if ok {
-					go serveSFTP(ch, hung)
+				switch {
+				case r.Type == "subsystem" && len(r.Payload) > 4 && string(r.Payload[4:]) == "sftp":
+					_ = r.Reply(true, nil)
+					go serveSFTP(ch, srv.hung)
+				case r.Type == "exec" && len(r.Payload) > 4:
+					_ = r.Reply(true, nil)
+					go srv.serveExec(ch, string(r.Payload[4:]))
+				default:
+					_ = r.Reply(false, nil)
 				}
 			}
 		}()
 	}
+}
+
+// serveExec runs a sum command the way coreutils does — over the named
+// file, or over stdin when none is named — and exits 127 for a command the
+// server does not have.
+func (s *sftpTestServer) serveExec(ch ssh.Channel, cmd string) {
+	defer func() { _ = ch.Close() }()
+	status := uint32(0)
+	defer func() { _, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{status})) }()
+	fields := strings.Fields(cmd)
+	algo, ok := s.hashCommand(fields[0])
+	if !ok || len(fields) > 2 {
+		status = 127
+		return
+	}
+	var in io.Reader = ch
+	name := "-"
+	if len(fields) == 2 {
+		f, err := os.Open(fields[1])
+		if err != nil {
+			status = 1
+			return
+		}
+		defer f.Close()
+		in, name = f, fields[1]
+	}
+	h := newArtifactHash(algo)
+	if _, err := io.Copy(h, in); err != nil {
+		status = 1
+		return
+	}
+	_, _ = fmt.Fprintf(ch, "%x  %s\n", h.Sum(nil), name)
 }
 
 func serveSFTP(ch ssh.Channel, hung chan struct{}) {

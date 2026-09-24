@@ -47,6 +47,7 @@ func dialSFTP(ctx context.Context, dest *config.Destination) (*sftpTransport, er
 		return nil, fmt.Errorf("destination %q: %w", dest.Name, err)
 	}
 	tr.root = dest.Root
+	tr.hashAlgo = dest.HashAlgo
 	return tr, nil
 }
 

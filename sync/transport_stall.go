@@ -125,6 +125,19 @@ func (s stallTransport) Remove(ctx context.Context, name string) error {
 	return err
 }
 
+// ServerHash allows the server the time its bytes take to read at the
+// slowest rate squirrel expects, beyond the usual allowance.
+func (s stallTransport) ServerHash(ctx context.Context, name string) (remoteChecksum, error) {
+	e, err := s.Stat(ctx, name)
+	if err != nil {
+		return remoteChecksum{}, err
+	}
+	return bounded(ctx, s, "hash "+name, func(ctx context.Context, progress func(time.Duration)) (remoteChecksum, error) {
+		progress(s.timeout + time.Duration(e.size/stallBytesPerSecond)*time.Second)
+		return s.transport.ServerHash(ctx, name)
+	})
+}
+
 // stallReader bounds each Read of a file Get opened. A Read runs into the
 // reader's own buffer, so one given up on can finish later without
 // touching the caller's; after that the reader only reports the stall.

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pkg/sftp"
@@ -28,6 +29,12 @@ type sftpTransport struct {
 	// fsync is whether the server offers fsync@openssh.com, which Put
 	// uses to flush a file to stable storage before it returns.
 	fsync bool
+	// hashAlgo is the destination's hash_algo: the hash command
+	// ServerHash runs, probed once (probed, probeErr).
+	hashAlgo string
+	probeMu  sync.Mutex
+	probed   bool
+	probeErr error
 }
 
 // Close drops the ssh connection first: the sftp client's own Close

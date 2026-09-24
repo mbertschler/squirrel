@@ -156,6 +156,12 @@ func (t *localTransport) Remove(_ context.Context, name string) error {
 	return t.root.Remove(filepath.FromSlash(name))
 }
 
+// ServerHash: a local disk runs no hash of its own; squirrel reads its
+// bytes back instead.
+func (t *localTransport) ServerHash(context.Context, string) (remoteChecksum, error) {
+	return remoteChecksum{}, errNoServerHash
+}
+
 // checkName refuses a name that is not a clean path below the root, or
 // whose parent chain crosses a symlink or a non-directory.
 func (t *localTransport) checkName(name string) error {

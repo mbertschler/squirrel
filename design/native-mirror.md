@@ -324,13 +324,21 @@ type transport interface {
   pinned one (`sync/transport_sftp_hostkey.go`).
 - **One optional server-side command: a hash.** Content-addressed and packed
   artifacts get their fingerprint confirmed, and re-confirmed, by a hash
-  command run on the server. That is `sha256sum` by default, chosen by
-  `hash_algo`, as rclone runs today.
-  - The command line is built only from the configured root and hex artifact
-    names. A root holding anything beyond letters, digits, `.`, `_`, `-` and
-    `/` is never hashed on the server.
-  - The transport probes for the command once per push. On a server that runs
-    no programs, like the cloudbox shape, fingerprints stay pending, as today.
+  command run on the server (`ServerHash`, `sync/transport_sftp_hash.go`).
+  That is `sha256sum` by default, chosen by `hash_algo`: `md5sum`,
+  `sha1sum`, `sha256sum` or `b3sum`, the hashes squirrel can also compute
+  itself to compare against.
+  - The command line is built only from the configured root and a name
+    whose last element is a lowercase hex artifact name: an object or pack,
+    or its staged copy `<volume>/.squirrel-staging/run-<id>/<hex>` (volume
+    names hold only letters, digits, `_` and `-`). A root holding anything
+    beyond letters, digits, `.`, `_`, `-` and `/` is never hashed on the
+    server, and a relative one is passed as `./<root>` so it never reads as
+    an option.
+  - The transport probes for the command once per session, and a push opens
+    one session: it hashes a known input on the server and compares. On a
+    server that runs no programs, like the cloudbox shape, or whose command
+    computes something else, fingerprints stay pending, as today.
   - Mirror paths are user filenames, so they never go on a command line.
 
 ## 4. The mirror layout

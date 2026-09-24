@@ -32,6 +32,10 @@ type transport interface {
 	Rename(ctx context.Context, from, to string) error
 	// Remove deletes the file or empty directory at name.
 	Remove(ctx context.Context, name string) error
+	// ServerHash is the destination's own hash of the file at name, run
+	// where the bytes are: an sftp server's hash command. errNoServerHash
+	// where there is none.
+	ServerHash(ctx context.Context, name string) (remoteChecksum, error)
 	Close() error
 }
 
