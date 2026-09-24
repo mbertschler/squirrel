@@ -49,13 +49,21 @@ var (
 	// sftpBackend serves the destination root from an in-process sftp
 	// server, so the fixture reads what landed straight off the disk.
 	sftpBackend = mirrorBackend{"sftp", func(t *testing.T, dst string) string {
-		srv := startSFTPServer(t)
-		host, port, _ := net.SplitHostPort(srv.addr)
-		return fmt.Sprintf("type = \"sftp\"\nroot = %q\nhost = %q\nport = %q\nuser = \"u\"\npassword = \"p\"\nknown_hosts_file = %q\n",
-			dst, host, port, srv.knownHosts(t, srv.hostKeys[0].PublicKey()))
+		return sftpSettings(t, dst, nil)
 	}}
 	mirrorBackends = []mirrorBackend{localBackend, sftpBackend}
 )
+
+// sftpSettings are the settings of a destination rooted at dst on a fresh
+// in-process sftp server that runs the given hash commands.
+func sftpSettings(t *testing.T, dst string, commands map[string]string) string {
+	t.Helper()
+	srv := startSFTPServer(t)
+	srv.runsHashCommands(commands)
+	host, port, _ := net.SplitHostPort(srv.addr)
+	return fmt.Sprintf("type = \"sftp\"\nroot = %q\nhost = %q\nport = %q\nuser = \"u\"\npassword = \"p\"\nknown_hosts_file = %q\n",
+		dst, host, port, srv.knownHosts(t, srv.hostKeys[0].PublicKey()))
+}
 
 func setupMirrorFixture(t *testing.T) *mirrorFixture {
 	t.Helper()

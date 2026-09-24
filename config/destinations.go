@@ -146,7 +146,7 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 	if err != nil {
 		return nil, err
 	}
-	native := nativeMirror(typ, layout, crypt != nil)
+	native := isNative(typ, crypt != nil)
 	hashAlgo, err := resolveHashAlgo(raw, typ, layout, native)
 	if err != nil {
 		return nil, err
@@ -163,7 +163,7 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 	if err != nil {
 		return nil, err
 	}
-	verifyEvery, err := resolveVerifyEvery(raw, verifiable(layout, native))
+	verifyEvery, err := resolveVerifyEvery(raw, verifiable(layout, native && isMirrorLayout(layout)))
 	if err != nil {
 		return nil, err
 	}
@@ -254,45 +254,54 @@ func resolveVerifyEvery(raw map[string]any, verifiable bool) (time.Duration, err
 }
 
 // sftpHashAlgos are the checksum types rclone's sftp backend can read
-// via a server-side sum command, the valid values for `hash_algo`.
+// via a server-side sum command, the valid values for `hash_algo` on an
+// sftp destination rclone writes.
 var sftpHashAlgos = map[string]bool{
 	"md5": true, "sha1": true, "sha256": true, "crc32": true,
 	"blake3": true, "xxh3": true, "xxh128": true,
 }
 
-// resolveHashAlgo validates the optional `hash_algo` key. sftp is the
-// one backend where rclone must be told which server-side hash command
-// to run; every other type exposes a fixed checksum, so the key is
-// rejected there, and so is it on a native sftp mirror, which runs no
-// command on the server. Content-addressed sftp destinations default to
-// "sha256" so scan-back fingerprints get a strong checksum without
-// relying on rclone's md5/sha1 preference.
+// nativeHashAlgos are the valid values for `hash_algo` on a content-
+// addressed or packed sftp destination squirrel writes itself: the hashes
+// whose server command (md5sum, sha1sum, sha256sum, b3sum) squirrel runs,
+// and which it computes itself to check the server's answer.
+var nativeHashAlgos = map[string]bool{"md5": true, "sha1": true, "sha256": true, "blake3": true}
+
+// resolveHashAlgo validates the optional `hash_algo` key: which hash
+// command the sftp server runs to fingerprint what squirrel stored. Every
+// other type exposes a fixed checksum, so the key is rejected there, and
+// so is it on a native sftp mirror, which runs no command on the server.
+// Content-addressed sftp destinations, and packed ones squirrel writes
+// itself, default to "sha256" so fingerprints get a strong checksum.
 func resolveHashAlgo(raw map[string]any, typ, layout string, native bool) (string, error) {
 	v, err := optionalString(raw, "hash_algo")
 	if err != nil {
 		return "", err
 	}
 	if v == "" {
-		if typ == "sftp" && layout == LayoutContentAddressed {
+		if typ == "sftp" && (layout == LayoutContentAddressed || (native && layout == LayoutPacked)) {
 			return "sha256", nil
 		}
 		return "", nil
 	}
-	if typ != "sftp" {
+	allowed := sftpHashAlgos
+	switch {
+	case typ != "sftp":
 		return "", fmt.Errorf(`hash_algo is only supported on type "sftp" destinations; type %q exposes a fixed checksum`, typ)
-	}
-	if native {
+	case native && isMirrorLayout(layout):
 		return "", errors.New("hash_algo names the hash command run on the sftp server, and a mirror without crypt runs none: squirrel writes it itself and hashes every file as it sends it")
+	case native:
+		allowed = nativeHashAlgos
 	}
-	if !sftpHashAlgos[v] {
-		return "", fmt.Errorf("unknown hash_algo %q (supported: %v)", v, sortedKeys(sftpHashAlgos))
+	if !allowed[v] {
+		return "", fmt.Errorf("unknown hash_algo %q (supported: %v)", v, sortedKeys(allowed))
 	}
 	return v, nil
 }
 
 // resolveCheckers validates the optional `checkers` key: a positive
 // integer cap on rclone's concurrent checkers for this destination. A
-// native mirror runs no rclone, so the key is rejected there.
+// native destination runs no rclone, so the key is rejected there.
 func resolveCheckers(raw map[string]any, typ string, native bool) (int, error) {
 	v, ok := raw["checkers"]
 	if !ok {
@@ -300,7 +309,7 @@ func resolveCheckers(raw map[string]any, typ string, native bool) (int, error) {
 	}
 	switch {
 	case native:
-		return 0, fmt.Errorf("checkers caps rclone's checkers, and a type %q mirror without crypt is written by squirrel itself, without rclone", typ)
+		return 0, fmt.Errorf("checkers caps rclone's checkers, and a type %q destination without crypt is written by squirrel itself, without rclone", typ)
 	case typ == "kopia":
 		return 0, fmt.Errorf("checkers requires an rclone-remote destination type, not %q", typ)
 	}
@@ -341,9 +350,8 @@ func sortedKeys(m map[string]bool) []string {
 
 // resolveLayout validates the optional `layout` key of a destination. An
 // absent key resolves to LayoutMirror. LayoutContentAddressed and
-// LayoutPacked drive squirrel's own rclone transfers, so both require an
-// rclone-remote type: type "local" is addressed by filesystem path, and
-// "kopia" repositories already use kopia's own content-addressed format.
+// LayoutPacked are squirrel's own formats, on any type but "kopia", whose
+// repositories already use kopia's own content-addressed format.
 func resolveLayout(raw map[string]any, typ string) (string, error) {
 	v, err := optionalString(raw, "layout")
 	if err != nil {
@@ -353,28 +361,13 @@ func resolveLayout(raw map[string]any, typ string) (string, error) {
 	case "", LayoutMirror:
 		return LayoutMirror, nil
 	case LayoutContentAddressed, LayoutPacked:
-		if err := requireRcloneRemote(v, typ); err != nil {
-			return "", err
+		if typ == "kopia" {
+			return "", fmt.Errorf(`layout %q does not apply to type "kopia": kopia repositories are content-addressed by kopia itself`, v)
 		}
 		return v, nil
 	default:
 		return "", fmt.Errorf("unknown layout %q (supported: %q, %q, %q)", v, LayoutMirror, LayoutContentAddressed, LayoutPacked)
 	}
-}
-
-// requireRcloneRemote rejects the two rclone-remote-only layouts on the
-// destination types that can't drive per-object squirrel transfers: type
-// "local" is a filesystem path, and "kopia" runs its own content-addressed
-// binary. Shared by the LayoutContentAddressed and LayoutPacked branches so
-// both give the same guardrail message.
-func requireRcloneRemote(layout, typ string) error {
-	switch typ {
-	case "local":
-		return fmt.Errorf(`layout %q requires an rclone-remote destination; type "local" is addressed by filesystem path`, layout)
-	case "kopia":
-		return fmt.Errorf(`layout %q requires an rclone-remote destination; type "kopia" repositories are content-addressed by kopia itself`, layout)
-	}
-	return nil
 }
 
 // Pack-layout knob defaults, applied when a LayoutPacked destination omits
@@ -833,16 +826,24 @@ func sortedSubset(in []string) []string {
 	return out
 }
 
-// NativeMirror reports whether squirrel writes this destination itself,
-// through its own transport: a mirror on a local disk, or on an sftp
-// server without crypt.
-func (d *Destination) NativeMirror() bool {
-	return nativeMirror(d.Type, d.Layout, d.Crypt != nil)
+// Native reports whether squirrel writes this destination itself, through
+// its own transport, in any layout: a local disk, or an sftp server without
+// crypt. rclone writes every other destination but kopia.
+func (d *Destination) Native() bool {
+	return isNative(d.Type, d.Crypt != nil)
 }
 
-func nativeMirror(typ, layout string, crypt bool) bool {
-	mirror := layout != LayoutContentAddressed && layout != LayoutPacked
-	return mirror && !crypt && (typ == "local" || typ == "sftp")
+func isNative(typ string, crypt bool) bool {
+	return !crypt && (typ == "local" || typ == "sftp")
+}
+
+// NativeMirror reports whether this is a mirror squirrel writes itself.
+func (d *Destination) NativeMirror() bool {
+	return d.Native() && isMirrorLayout(d.Layout)
+}
+
+func isMirrorLayout(layout string) bool {
+	return layout != LayoutContentAddressed && layout != LayoutPacked
 }
 
 // Verifiable reports whether `squirrel verify` re-checks this destination:

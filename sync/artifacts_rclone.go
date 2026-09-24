@@ -22,20 +22,14 @@ type rcloneArtifacts struct {
 // names is how the destination names its artifacts.
 func (a *rcloneArtifacts) names() namer { return namerFor(a.dest) }
 
-// markers gates a remote push on the root's naming scheme, then on the
+// markers gates the push on the root's naming scheme, then on the
 // destination's per-volume .squirrel-volume marker, exactly as the mirror
 // layout does (the marker sits at the volume root regardless of layout). A
-// dry run checks the naming scheme read-only and writes nothing. Local
-// content-addressed and packed destinations are left ungated here: they
-// carry no such gate today, so extending it to them is a separate parity
-// concern — this closes only the remote gap (#150).
+// dry run checks the naming scheme read-only and writes nothing.
 func (a *rcloneArtifacts) markers(ctx context.Context, opts Options) error {
 	if opts.DryRun {
 		_, err := a.checkNamingScheme(ctx)
 		return err
-	}
-	if a.dest.Type == "local" {
-		return nil
 	}
 	if err := a.ensureNamingScheme(ctx, opts.Init); err != nil {
 		return err

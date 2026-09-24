@@ -79,6 +79,35 @@ password = "pw"
 	}
 }
 
+// TestNativeContentLayoutsTakeTheirOwnHashes: a content-addressed or packed
+// sftp destination squirrel writes itself defaults to sha256, accepts the
+// hashes whose command squirrel runs and checks, refuses the ones only
+// rclone reads, and refuses checkers; one behind crypt keeps rclone's.
+func TestNativeContentLayoutsTakeTheirOwnHashes(t *testing.T) {
+	dest := func(extra string) string {
+		return "[destinations.archive]\ntype = \"sftp\"\nhost = \"h\"\nuser = \"u\"\nroot = \"/data\"\nlayout = \"packed\"\n" + extra
+	}
+	cfg, err := Load(writeConfig(t, dest("")))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Destinations["archive"].HashAlgo; got != "sha256" {
+		t.Fatalf("HashAlgo = %q, want the sha256 default on a native packed destination", got)
+	}
+	if _, err := Load(writeConfig(t, dest(`hash_algo = "blake3"`+"\n"))); err != nil {
+		t.Fatalf("blake3 on a native packed destination: %v", err)
+	}
+	for _, key := range []string{`hash_algo = "xxh3"`, "checkers = 4"} {
+		name, _, _ := strings.Cut(key, " ")
+		if _, err := Load(writeConfig(t, dest(key+"\n"))); err == nil || !strings.Contains(err.Error(), name) {
+			t.Fatalf("%s on a native packed destination: err = %v, want a rejection naming it", key, err)
+		}
+	}
+	if _, err := Load(writeConfig(t, dest(`hash_algo = "xxh3"`+"\n\n[destinations.archive.crypt]\npassword = \"pw\"\n"))); err != nil {
+		t.Fatalf("xxh3 behind crypt, which rclone writes: %v", err)
+	}
+}
+
 // TestLoadRejectsRcloneKeysOnNativeMirrors: squirrel writes a plain sftp
 // mirror itself, so the keys that only tune rclone are refused there.
 func TestLoadRejectsRcloneKeysOnNativeMirrors(t *testing.T) {
@@ -134,6 +163,9 @@ user     = "u"
 root     = "/data"
 layout   = "content-addressed"
 checkers = 4
+
+[destinations.archive.crypt]
+password = "pw"
 `))
 	if err != nil {
 		t.Fatalf("Load: %v", err)

@@ -125,15 +125,17 @@ func HandlerFor(s *store.Store, tools Tools, p Pair) (Handler, error) {
 		}
 		return &kopiaHandler{store: s, kopia: tools.Kopia, vol: p.Volume, dest: p.Destination}, nil
 	case p.Destination.Layout == config.LayoutPacked:
-		if tools.Rclone == nil {
-			return nil, fmt.Errorf("destination %q: rclone wrapper is required", p.Destination.Name)
+		pusher, err := contentPusherFor(s, tools, p)
+		if err != nil {
+			return nil, err
 		}
-		return &packedHandler{rcloneContentPusher(s, tools.Rclone, p)}, nil
+		return &packedHandler{pusher}, nil
 	case p.Destination.Layout == config.LayoutContentAddressed:
-		if tools.Rclone == nil {
-			return nil, fmt.Errorf("destination %q: rclone wrapper is required", p.Destination.Name)
+		pusher, err := contentPusherFor(s, tools, p)
+		if err != nil {
+			return nil, err
 		}
-		return &contentAddressedHandler{rcloneContentPusher(s, tools.Rclone, p)}, nil
+		return &contentAddressedHandler{pusher}, nil
 	case p.Destination.NativeMirror():
 		return &mirrorHandler{destinationRoot: newDestinationRoot(s, p.Destination, p.Volume.Name), vol: p.Volume}, nil
 	default:
@@ -144,10 +146,19 @@ func HandlerFor(s *store.Store, tools Tools, p Pair) (Handler, error) {
 	}
 }
 
-// rcloneContentPusher is a content layout's push through rclone.
-func rcloneContentPusher(s *store.Store, rcl *Rclone, p Pair) contentPusher {
-	art := &rcloneArtifacts{store: s, rcl: rcl, vol: p.Volume, dest: p.Destination}
-	return contentPusher{store: s, vol: p.Volume, dest: p.Destination, art: art}
+// contentPusherFor is a content layout's push: through squirrel's own
+// transport onto a native destination, through rclone onto any other.
+func contentPusherFor(s *store.Store, tools Tools, p Pair) (contentPusher, error) {
+	pusher := contentPusher{store: s, vol: p.Volume, dest: p.Destination}
+	switch {
+	case p.Destination.Native():
+		pusher.art = &transportArtifacts{destinationRoot: newDestinationRoot(s, p.Destination, p.Volume.Name)}
+	case tools.Rclone == nil:
+		return contentPusher{}, fmt.Errorf("destination %q: rclone wrapper is required", p.Destination.Name)
+	default:
+		pusher.art = &rcloneArtifacts{store: s, rcl: tools.Rclone, vol: p.Volume, dest: p.Destination}
+	}
+	return pusher, nil
 }
 
 // openDestinationTransport opens a native mirror's destination root: a

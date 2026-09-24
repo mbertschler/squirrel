@@ -83,15 +83,20 @@ root = "p"
 	}
 }
 
-func TestLoadRejectsPackedOnLocal(t *testing.T) {
-	_, err := Load(writeConfig(t, `
+// TestLoadPackedOnLocal: squirrel writes a packed destination on a local
+// disk itself, so the layout is valid there.
+func TestLoadPackedOnLocal(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
 [destinations.scratch]
 type   = "local"
 root   = "/tmp/dst"
 layout = "packed"
 `))
-	if err == nil || !strings.Contains(err.Error(), "rclone-remote") {
-		t.Fatalf("expected rclone-remote requirement error, got %v", err)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if d := cfg.Destinations["scratch"]; d.Layout != LayoutPacked || !d.Native() {
+		t.Fatalf("destination = %+v, want a native packed one", d)
 	}
 }
 

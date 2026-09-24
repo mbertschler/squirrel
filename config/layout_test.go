@@ -63,16 +63,20 @@ layout = "mirror"
 	}
 }
 
-func TestLoadRejectsContentAddressedOnLocal(t *testing.T) {
-	p := writeConfig(t, `
+// TestLoadContentAddressedOnLocal: squirrel writes a content-addressed
+// destination on a local disk itself, so the layout is valid there.
+func TestLoadContentAddressedOnLocal(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
 [destinations.scratch]
 type   = "local"
 root   = "/tmp/dst"
 layout = "content-addressed"
-`)
-	_, err := Load(p)
-	if err == nil || !strings.Contains(err.Error(), "rclone-remote") {
-		t.Fatalf("expected rclone-remote requirement error, got %v", err)
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if d := cfg.Destinations["scratch"]; d.Layout != LayoutContentAddressed || !d.Native() {
+		t.Fatalf("destination = %+v, want a native content-addressed one", d)
 	}
 }
 

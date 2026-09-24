@@ -97,7 +97,7 @@ type PackPreview struct {
 	SizeBand int64 // destination pack_size (target compressed pack size)
 }
 
-// packedHandler pushes a volume to a packed rclone destination. Content at
+// packedHandler pushes a volume to a packed destination. Content at
 // or above dest.PackThreshold lands as a per-hash object exactly as the
 // content-addressed layout does (reusing contentPusher's object path);
 // content below the threshold is bundled into immutable tar.zst packs. Each

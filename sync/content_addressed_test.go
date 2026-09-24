@@ -228,19 +228,6 @@ password = "obscured-pw"
 	return f
 }
 
-// setupPlainContentAddressedFixture is setupContentAddressedFixture
-// without the crypt block.
-func setupPlainContentAddressedFixture(t *testing.T) *caFixture {
-	t.Helper()
-	return setupCAFixture(t, `[destinations.offsite]
-type   = "sftp"
-host   = "remote.invalid"
-user   = "u"
-root   = "/data"
-layout = "content-addressed"
-`, "/data")
-}
-
 // setupCAFixture is the destination-configurable body of
 // setupContentAddressedFixture. destBlock declares the `offsite`
 // destination; strip is the destination root the shim removes from

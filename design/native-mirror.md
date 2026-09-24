@@ -595,6 +595,36 @@ for local mirrors.
   - the F21 entry in friction-log.md;
   - SAFETY-AUDIT.md.
 
+### The content layouts on the transport
+
+Content-addressed and packed destinations on `local`, and on `sftp` without
+`crypt`, are written through the transport too (`sync/artifacts_transport.go`).
+The layouts land every object, pack, placement map and manifest segment
+through one small interface, `artifactStore` (`sync/artifacts.go`), whose
+other implementation is rclone's, for crypt destinations and for s3, b2 and
+gcs. Each artifact:
+
+1. is streamed into `<volume>/.squirrel-staging/run-<id>/<key>` while BLAKE3
+   hashes the bytes sent — the drift check, over exactly those bytes — and, on
+   sftp, the hash the server's command computes;
+2. is confirmed before it gets its name: read back through BLAKE3 on a local
+   disk, hashed by the server's command on sftp. A match is the artifact's
+   fingerprint, recorded with its upload row at once; a mismatch fails the
+   artifact. A server without the command confirms nothing, and the
+   fingerprint stays pending, as it does under rclone for such a server;
+3. is renamed onto its name. If the name already holds a file — a crash
+   between landing and recording, or a failed run's orphan — that file is
+   confirmed instead (downloaded and hashed when the server runs no command)
+   and recorded, or the artifact fails. Squirrel never replaces it.
+
+The staged copy of a failed artifact goes with the run's staging at the next
+push's reconcile. The content layouts' guard commits only onto artifact names
+and displaces nothing (section 3). Both native content layouts are gated on
+the volume marker like a native mirror, `--init` creating a missing local
+root; a missing root is otherwise refused like a missing marker. Before this,
+config refused the content layouts on `local` outright, because rclone
+addressed local destinations by path; that restriction is gone.
+
 ## 6. Restore, ride-along, recover
 
 - **Mirror restore with an index** uses the archive restore pipeline
@@ -627,8 +657,11 @@ for local mirrors.
 
 ## 7. Configuration and dispatch
 
-- **Dispatch.** `HandlerFor` sends mirrors on `local`, and on `sftp` without
-  `crypt`, to the native handler. Every other pair is unchanged.
+- **Dispatch.** `HandlerFor` sends every destination on `local`, and on
+  `sftp` without `crypt`, through squirrel's own transport
+  (`Destination.Native`): mirrors to the native mirror handler, the content
+  layouts to their handlers with the transport's artifact store. Crypt
+  destinations and s3, b2 and gcs keep rclone.
 - **sftp settings.** `host`, `port`, `user`, `password`, `key_file`,
   `known_hosts_file` and `host_key_algorithms` map onto `ssh.ClientConfig`.
   When there is neither password nor key file, squirrel uses ssh-agent, as
@@ -641,7 +674,10 @@ for local mirrors.
 - **Rclone-only keys are rejected** on native destinations: `checkers`
   everywhere, and `hash_algo` on sftp mirrors. On content-addressed and packed
   sftp destinations, `hash_algo` still chooses the hash, which now names the
-  command the transport runs on the server. No key is added.
+  command the transport runs on the server: `md5`, `sha1`, `sha256` (the
+  default, now for packed as well) or `blake3`, the hashes squirrel also
+  computes to check the server's answer. rclone's other hashes (`crc32`,
+  `xxh3`, `xxh128`) stay valid behind crypt only. No key is added.
   Concurrency is fixed. On sftp each file goes out as concurrent write
   requests (`pkg/sftp`'s default of 64 in flight); paths are written one at a
   time on both transports. The testbed benchmark against rclone (section 8)

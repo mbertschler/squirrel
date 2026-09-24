@@ -124,15 +124,14 @@ func (h *contentPusher) target() pushTarget {
 	return pushTarget{store: h.store, vol: h.vol, dest: h.dest}
 }
 
-// contentAddressedHandler pushes a volume to a content-addressed rclone
-// destination: per-hash `rclone copyto` for each content object the
-// destination lacks, then the run's manifest segment. The landing is
+// contentAddressedHandler pushes a volume to a content-addressed
+// destination: one object for each content the destination lacks, then the
+// run's manifest segment, through the artifact store. The landing is
 // transactional from the durability gate's point of view — the runs row
 // reaches success and the destination vector advances only once both
 // the objects and the segment are confirmed present at the expected
 // size; any earlier failure leaves orphaned objects that are recorded
-// (or re-uploaded idempotently) and harmless without a segment mapping
-// them.
+// (or landed again) and harmless without a segment mapping them.
 type contentAddressedHandler struct {
 	contentPusher
 }

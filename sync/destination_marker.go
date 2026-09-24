@@ -22,12 +22,11 @@ const maxMarkerBytes = 64 << 10
 // A missing marker is written only under init, and a marker naming another
 // volume, or one that does not parse, is always refused and never
 // overwritten. A local root that does not exist yet is created under init,
-// so a first push can land on an empty disk.
+// so a first push can land on an empty disk, and refused like a missing
+// marker otherwise.
 func (h *destinationRoot) ensureMarker(ctx context.Context, init bool) error {
-	if init && h.dest.Type == "local" {
-		if err := os.MkdirAll(h.dest.Root, 0o755); err != nil {
-			return fmt.Errorf("destination %q: create root %s: %w", h.dest.Name, h.dest.Root, err)
-		}
+	if err := h.ensureLocalRoot(init); err != nil {
+		return err
 	}
 	tr, err := h.guarded(ctx, nameGuard{volumeDir: h.volumeDir, bootstrap: init})
 	if err != nil {
@@ -44,6 +43,23 @@ func (h *destinationRoot) ensureMarker(ctx context.Context, init bool) error {
 		return fmt.Errorf("destination %q has no %s at %s — re-run with --init to bootstrap (refusing in case the root is a typo or the disk is not mounted): %w", h.dest.Name, volmark.MarkerName, h.where(name), ErrRefused)
 	}
 	return h.writeMarker(ctx, tr, name)
+}
+
+func (h *destinationRoot) ensureLocalRoot(init bool) error {
+	if h.dest.Type != "local" {
+		return nil
+	}
+	_, err := os.Stat(h.dest.Root)
+	switch {
+	case !errors.Is(err, fs.ErrNotExist):
+		return nil
+	case init:
+		if err := os.MkdirAll(h.dest.Root, 0o755); err != nil {
+			return fmt.Errorf("destination %q: create root %s: %w", h.dest.Name, h.dest.Root, err)
+		}
+		return nil
+	}
+	return fmt.Errorf("destination %q has no root at %s — re-run with --init to create it (refusing in case the disk is not mounted): %w", h.dest.Name, h.dest.Root, ErrRefused)
 }
 
 func (h *destinationRoot) checkMarker(name string, data []byte) error {
