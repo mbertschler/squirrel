@@ -21,6 +21,10 @@ var errGuardRefused = errors.New("the name guard refuses this operation")
 type nameGuard struct {
 	volumeDir string // the volume's directory under the destination root
 	runID     int64  // the push holding the guard
+	// content marks a content-addressed or packed push: its commits land
+	// on artifact names instead of the mirrored tree, and it displaces
+	// nothing.
+	content bool
 	// bootstrap lets a push under --init write the volume marker, before
 	// it holds a run.
 	bootstrap bool
@@ -47,10 +51,12 @@ const (
 //   - Remove of a staging entry, or an emptied staging run directory,
 //     of a run that has finished: <volume>/.squirrel-staging/run-<id>[/<key>];
 //   - Remove of a ride-along snapshot: <volume>/.squirrel-index/index-*.db;
-//   - Rename from this run's staging onto a live name (a commit), or onto
-//     a snapshot name (the ride-along);
-//   - Rename of a live name to the same path under this run's history
-//     (a displacement): <volume>/.squirrel-history/run-<this run>/<path>.
+//   - Rename from this run's staging onto a snapshot name (the ride-along),
+//     or onto what the layout commits: a live name for a mirror, an
+//     artifact name for a content layout (see artifact);
+//   - for a mirror, Rename of a live name to the same path under this
+//     run's history (a displacement):
+//     <volume>/.squirrel-history/run-<this run>/<path>.
 //
 // Every Rename lands on a name that does not exist yet: the transport
 // fails one onto an existing name.
@@ -64,14 +70,41 @@ func (g nameGuard) permit(op guardOp, name, to string) error {
 			return nil
 		}
 	case op == opRename:
-		if rel, ok := g.liveRel(name); ok && to == historyName(g.volumeDir, g.runID, rel) {
+		if rel, ok := g.liveRel(name); ok && !g.content && to == historyName(g.volumeDir, g.runID, rel) {
 			return nil
 		}
-		if _, ok := g.liveRel(to); (ok || g.snapshot(to)) && g.stagedByThisRun(name) {
+		if g.stagedByThisRun(name) && (g.snapshot(to) || g.commitTarget(to)) {
 			return nil
 		}
 	}
 	return fmt.Errorf("%w: %s %q → %q", errGuardRefused, [...]string{"remove", "rename"}[op], name, to)
+}
+
+// commitTarget reports whether a staged file may be committed onto name.
+func (g nameGuard) commitTarget(name string) bool {
+	if g.content {
+		return g.artifact(name)
+	}
+	_, ok := g.liveRel(name)
+	return ok
+}
+
+// artifact reports whether name is one a content layout's run commits: a
+// content object, objects/<hex>; a pack, packs/<hex>; this run's placement
+// map, packs/map-<run>; or this run's manifest segment,
+// <volume>/index/run-<run>.
+func (g nameGuard) artifact(name string) bool {
+	dir, base := path.Split(name)
+	run := strconv.FormatInt(g.runID, 10)
+	switch dir {
+	case ObjectsDirName + "/":
+		return isStagingKey(base)
+	case PacksDirName + "/":
+		return isStagingKey(base) || base == packMapPrefix+run
+	case g.volumeDir + "/" + ManifestDirName + "/":
+		return base == "run-"+run
+	}
+	return false
 }
 
 // snapshot reports whether name is a ride-along snapshot of the volume:

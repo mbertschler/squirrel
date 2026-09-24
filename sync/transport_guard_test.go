@@ -65,6 +65,49 @@ func TestNameGuardPermits(t *testing.T) {
 	}
 }
 
+// TestNameGuardContentLayout: a content layout's guard commits this run's
+// staging onto artifact names alone, and displaces nothing.
+func TestNameGuardContentLayout(t *testing.T) {
+	key := strings.Repeat("ab", 32)
+	staged := "pics/.squirrel-staging/run-7/" + key
+	g := nameGuard{volumeDir: "pics", runID: 7, content: true, finished: func(id int64) bool { return id != 7 }}
+	cases := []struct {
+		name     string
+		op       guardOp
+		from, to string
+		want     bool
+	}{
+		{"commit an object", opRename, staged, "objects/" + key, true},
+		{"commit a pack", opRename, staged, "packs/" + key, true},
+		{"commit this run's placement map", opRename, staged, "packs/map-7", true},
+		{"commit another run's placement map", opRename, staged, "packs/map-6", false},
+		{"commit this run's segment", opRename, staged, "pics/index/run-7", true},
+		{"commit another run's segment", opRename, staged, "pics/index/run-6", false},
+		{"commit another volume's segment", opRename, staged, "docs/index/run-7", false},
+		{"commit an object from another run's staging", opRename, "pics/.squirrel-staging/run-6/" + key, "objects/" + key, false},
+		{"commit an object under a name that is no hash", opRename, staged, "objects/cat.jpg", false},
+		{"commit an object below objects", opRename, staged, "objects/ab/" + key, false},
+		{"commit onto the mirrored tree", opRename, staged, "pics/2024/cat.jpg", false},
+		{"ride a snapshot along", opRename, staged, "pics/.squirrel-index/index-20260101T000000.000Z-run-7.db", true},
+		{"displace a segment", opRename, "pics/index/run-6", "pics/.squirrel-history/run-7/index/run-6", false},
+		{"move an object", opRename, "objects/" + key, "packs/" + key, false},
+		{"remove an object", opRemove, "objects/" + key, "", false},
+		{"remove a finished run's staging", opRemove, "pics/.squirrel-staging/run-6/" + key, "", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := g.permit(c.op, c.from, c.to)
+			if got := err == nil; got != c.want {
+				t.Fatalf("permit = %v, want allowed=%t", err, c.want)
+			}
+		})
+	}
+	mirror := nameGuard{volumeDir: "pics", runID: 7}
+	if err := mirror.permit(opRename, staged, "objects/"+key); err == nil {
+		t.Fatal("a mirror's guard committed onto an object name")
+	}
+}
+
 // TestNameGuardBootstrap: under --init the guard also lets the marker be
 // staged, renamed onto .squirrel-volume, and a stale staged copy removed —
 // run or not — and nothing more.
