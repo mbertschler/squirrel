@@ -123,7 +123,7 @@ const (
 // always on a root proven to be keyed under this destination's key. A
 // fresh root without init is left untouched for the volume-marker gate to
 // refuse.
-func (h *contentPusher) ensureNamingScheme(ctx context.Context, init bool) error {
+func (h *rcloneArtifacts) ensureNamingScheme(ctx context.Context, init bool) error {
 	stamp, err := h.checkNamingScheme(ctx)
 	if err != nil {
 		return err
@@ -137,7 +137,7 @@ func (h *contentPusher) ensureNamingScheme(ctx context.Context, init bool) error
 // checkNamingScheme refuses a push to a root whose artifacts are named under
 // any other scheme, and reports what the root still needs stamped.
 // Read-only, so a dry run asks it too.
-func (h *contentPusher) checkNamingScheme(ctx context.Context) (namingStamp, error) {
+func (h *rcloneArtifacts) checkNamingScheme(ctx context.Context) (namingStamp, error) {
 	if !h.dest.HidesArtifactNames() {
 		return stampNone, nil
 	}
@@ -158,7 +158,7 @@ func (h *contentPusher) checkNamingScheme(ctx context.Context) (namingStamp, err
 // keyed directory was named some other way — or under other crypt
 // passwords — and adding keyed names beside it would leave it disclosing
 // what it always did.
-func (h *contentPusher) classifyUnmarkedRoot(ctx context.Context) (namingStamp, error) {
+func (h *rcloneArtifacts) classifyUnmarkedRoot(ctx context.Context) (namingStamp, error) {
 	rootURI := underlyingDirURI(h.dest, "")
 	empty, err := h.rcl.remoteRootEmpty(ctx, rootURI, nil, checkersArgs(h.dest)...)
 	if err != nil {
@@ -178,7 +178,7 @@ func (h *contentPusher) classifyUnmarkedRoot(ctx context.Context) (namingStamp, 
 		h.dest.Name, rootURI, namingMarkerName, h.vol.Name, h.dest.Name, ErrRefused)
 }
 
-func (h *contentPusher) holdsKeyedVolumeMarker(ctx context.Context) (bool, error) {
+func (h *rcloneArtifacts) holdsKeyedVolumeMarker(ctx context.Context) (bool, error) {
 	uri := remoteSubpathURI(h.dest, path.Join(h.names().volumeDir(h.vol.Name), volmark.MarkerName))
 	present, err := h.rcl.statRemoteExists(ctx, uri, checkersArgs(h.dest)...)
 	if err != nil {
@@ -206,7 +206,7 @@ func validateNamingScheme(ctx context.Context, rcl *Rclone, dest *config.Destina
 }
 
 // writeNamingMarker stamps the scheme on a fresh destination root.
-func (h *contentPusher) writeNamingMarker(ctx context.Context) error {
+func (h *rcloneArtifacts) writeNamingMarker(ctx context.Context) error {
 	body, err := json.Marshal(namingMarker{
 		Naming:    namingSchemeKeyed,
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
@@ -214,5 +214,5 @@ func (h *contentPusher) writeNamingMarker(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("encode %s: %w", namingMarkerName, err)
 	}
-	return h.uploadBytes(ctx, body, remoteSubpathURI(h.dest, namingMarkerName), namingMarkerName)
+	return putBytes(ctx, h, 0, namingMarkerName, body, namingMarkerName)
 }

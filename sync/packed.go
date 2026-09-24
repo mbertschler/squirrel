@@ -122,6 +122,7 @@ func (h *packedHandler) TargetName() string { return h.dest.Name }
 func (h *packedHandler) sealed() {}
 
 func (h *packedHandler) Push(ctx context.Context, opts Options) (Report, error) {
+	defer h.art.close()
 	if h.vol.Name == ObjectsDirName || h.vol.Name == PacksDirName {
 		rep := Report{Volume: h.vol.Name, Destination: h.dest.Name}
 		rep.Verification.Method = VerifyMethodPresenceSize
@@ -133,7 +134,7 @@ func (h *packedHandler) Push(ctx context.Context, opts Options) (Report, error) 
 // packedOps is the packed translation of a plan: the large content routed
 // to per-hash objects, the small content still to be packed (hash-sorted,
 // so assembly is deterministic), and how much small content an earlier
-// pack already holds. execute fills in the packs it assembled, which seal
+// pack already holds. execute fills in the packs it landed, which seal
 // records.
 type packedOps struct {
 	objects       objectUploads
@@ -141,8 +142,15 @@ type packedOps struct {
 	alreadyInPack int64
 	packSize      int64
 
-	writes     []store.PackWrite
+	packs      []landedPack
 	placements []PlacementEntry
+}
+
+// landedPack is one pack execute landed: the rows to record, and the
+// fingerprint the landing confirmed, nil while capture must read one.
+type landedPack struct {
+	write       store.PackWrite
+	fingerprint *remoteChecksum
 }
 
 // preview reports the object side on rep.RcloneResult, exactly as the
@@ -198,11 +206,11 @@ func (h *packedHandler) execute(ctx context.Context, rep *Report, runID int64, o
 	if err := h.uploadObjects(ctx, rep, runID, ops.objects); err != nil {
 		return err
 	}
-	writes, placements, err := h.assembleAndUploadPacks(ctx, rep, runID, ops.members)
+	packs, placements, err := h.assembleAndUploadPacks(ctx, rep, runID, ops.members)
 	if err != nil {
 		return err
 	}
-	ops.writes, ops.placements = writes, placements
+	ops.packs, ops.placements = packs, placements
 	return nil
 }
 
@@ -217,10 +225,14 @@ func (h *packedHandler) seal(ctx context.Context, rep *Report, runID int64, p pu
 	if err := h.uploadSegment(ctx, p.delta, runID); err != nil {
 		return err
 	}
-	if err := h.store.InsertPacks(ctx, ops.writes); err != nil {
+	writes := make([]store.PackWrite, len(ops.packs))
+	for i, lp := range ops.packs {
+		writes[i] = lp.write
+	}
+	if err := h.store.InsertPacks(ctx, writes); err != nil {
 		return fmt.Errorf("record packs for run %d: %w", runID, err)
 	}
-	h.capturePackFingerprints(ctx, rep, runID, ops.writes)
+	h.capturePackFingerprints(ctx, rep, runID, ops.packs)
 	return nil
 }
 
@@ -258,17 +270,19 @@ func (h *packedHandler) advanceMethod(ctx context.Context, rep *Report, p pushPl
 }
 
 // capturePackFingerprints records a per-destination upload row for each
-// landed pack and fills its scan-back fingerprint, reusing the shared
-// capture surface over the packs/ directory. Every pack exceeds the
-// multipart threshold, so on s3 the composite ETag is read from the S3 API
-// (never rclone's md5 slot, which is blank for a multipart object); other
-// backends read `rclone lsjson --hash`. A pack whose fingerprint could not
-// be read stays pending (checksum NULL) with a warning — never a fabricated
-// value. The whole-pair pending tally (CountVolumeContentsPendingFingerprint)
-// is what advanceMethod gates the vector advance on, so this returns nothing.
-func (h *packedHandler) capturePackFingerprints(ctx context.Context, rep *Report, runID int64, writes []store.PackWrite) {
-	targets := make([]captureTarget, 0, len(writes))
-	for _, w := range writes {
+// landed pack, with the fingerprint its landing confirmed or, failing
+// that, one read back over the shared capture surface on the packs/
+// directory. Every pack exceeds the multipart threshold, so on s3 the
+// composite ETag is read from the S3 API (never rclone's md5 slot, which
+// is blank for a multipart object); other rclone backends read `rclone
+// lsjson --hash`. A pack whose fingerprint could not be read stays pending
+// (checksum NULL) with a warning — never a fabricated value. The whole-pair
+// pending tally (CountVolumeContentsPendingFingerprint) is what
+// advanceMethod gates the vector advance on, so this returns nothing.
+func (h *packedHandler) capturePackFingerprints(ctx context.Context, rep *Report, runID int64, packs []landedPack) {
+	targets := make([]captureTarget, 0, len(packs))
+	for _, lp := range packs {
+		w := lp.write
 		pack, err := h.store.GetPackByKey(ctx, w.Pack.PackKey)
 		if err != nil {
 			rep.Warnings = append(rep.Warnings, fmt.Sprintf("look up recorded pack %s: %v", hex.EncodeToString(w.Pack.PackKey), err))
@@ -281,6 +295,14 @@ func (h *packedHandler) capturePackFingerprints(ctx context.Context, rep *Report
 			continue
 		}
 		packID := pack.ID
+		if cs := lp.fingerprint; cs != nil {
+			if err := h.store.SetRemotePackFingerprint(ctx, packID, h.dest.Name, cs.Algo, cs.Value, store.NowNs()); err != nil {
+				rep.Warnings = append(rep.Warnings, fmt.Sprintf("record fingerprint for pack %s: %v", hex.EncodeToString(w.Pack.PackKey), err))
+				continue
+			}
+			rep.Fingerprints++
+			continue
+		}
 		targets = append(targets, captureTarget{
 			name:  h.names().pack(w.Pack.PackKey),
 			label: "pack",
@@ -289,7 +311,9 @@ func (h *packedHandler) capturePackFingerprints(ctx context.Context, rep *Report
 			},
 		})
 	}
-	h.captureScanBackFingerprints(ctx, rep, PacksDirName, targets)
+	if len(targets) > 0 {
+		h.art.capture(ctx, rep, PacksDirName, targets)
+	}
 }
 
 // landed reports whether runID's placement map is at the destination.
@@ -298,11 +322,11 @@ func (h *packedHandler) capturePackFingerprints(ctx context.Context, rep *Report
 // layout — a mirror leaves no map, a content-addressed root leaves objects
 // and segments but no packs/ map — or a wiped root.
 func (h *packedHandler) landed(ctx context.Context, runID int64) (bool, error) {
-	return h.rcl.statRemoteExists(ctx, h.mapURI(runID), checkersArgs(h.dest)...)
+	return h.art.exists(ctx, mapName(runID))
 }
 
 func (h *packedHandler) foreignHistory(runID int64) error {
-	return fmt.Errorf("destination %q: the last successful sync (run %d) left no pack placement map at %s — its history is not packed (a mirror or content-addressed root); point the layout at a fresh destination or root, or (after wiping the remote root) run `squirrel destination reset %s`, instead of switching an existing one: %w", h.dest.Name, runID, h.mapURI(runID), h.dest.Name, ErrRefused)
+	return fmt.Errorf("destination %q: the last successful sync (run %d) left no pack placement map at %s — its history is not packed (a mirror or content-addressed root); point the layout at a fresh destination or root, or (after wiping the remote root) run `squirrel destination reset %s`, instead of switching an existing one: %w", h.dest.Name, runID, h.art.where(mapName(runID)), h.dest.Name, ErrRefused)
 }
 
 // routeBySize splits the planned uploads by dest.PackThreshold: content at
@@ -335,12 +359,12 @@ func (h *packedHandler) routeBySize(ctx context.Context, planned []store.PathDel
 
 // assembleAndUploadPacks bundles the sorted small content into tar.zst
 // packs, staging and uploading one pack at a time so memory and disk stay
-// bounded regardless of corpus size. It returns the pack rows to record
+// bounded regardless of corpus size. It returns the packs to record
 // locally and the placement entries for the run's map; nothing is recorded
 // in the store here (push does that only after the map and segment land).
-func (h *packedHandler) assembleAndUploadPacks(ctx context.Context, rep *Report, runID int64, small []store.PathDelta) ([]store.PackWrite, []PlacementEntry, error) {
+func (h *packedHandler) assembleAndUploadPacks(ctx context.Context, rep *Report, runID int64, small []store.PathDelta) ([]landedPack, []PlacementEntry, error) {
 	level := zstdEncoderLevel(h.dest.ZstdLevel)
-	var writes []store.PackWrite
+	var packs []landedPack
 	var placements []PlacementEntry
 	for i := 0; i < len(small); {
 		pack, next, err := h.buildOnePack(small, i, level)
@@ -348,15 +372,16 @@ func (h *packedHandler) assembleAndUploadPacks(ctx context.Context, rep *Report,
 			return nil, nil, err
 		}
 		i = next
-		if err := h.uploadPack(ctx, pack); err != nil {
+		fingerprint, err := h.uploadPack(ctx, runID, pack)
+		if err != nil {
 			return nil, nil, err
 		}
 		rep.RcloneResult.Transferred++
 		rep.RcloneResult.Bytes += pack.compressedSize
-		writes = append(writes, pack.toWrite(runID))
+		packs = append(packs, landedPack{write: pack.toWrite(runID), fingerprint: fingerprint})
 		placements = append(placements, pack.placements()...)
 	}
-	return writes, placements, nil
+	return packs, placements, nil
 }
 
 // buildOnePack assembles content from srcs starting at index start into a
@@ -406,25 +431,17 @@ func (h *packedHandler) buildOnePack(srcs []store.PathDelta, start int, level zs
 	return assembledPack{tmpPath: tmp.Name(), key: key, compressedSize: size, members: members}, i, nil
 }
 
-// uploadPack copies one staged pack to packs/<pack-key hex> through the
-// crypt overlay and confirms it landed at the compressed size, then removes
-// the temp file. Through a crypt overlay the reported size is the decrypted
-// length, which is the compressed pack, so it compares directly.
-func (h *packedHandler) uploadPack(ctx context.Context, pack assembledPack) error {
+// uploadPack lands one staged pack at packs/<pack-key hex>, confirmed at
+// its compressed size and its key — the BLAKE3 of those bytes — then
+// removes the temp file. Through a crypt overlay the reported size is the
+// decrypted length, which is the compressed pack, so it compares directly.
+func (h *packedHandler) uploadPack(ctx context.Context, runID int64, pack assembledPack) (*remoteChecksum, error) {
 	defer func() { _ = os.Remove(pack.tmpPath) }()
-	hexKey := hex.EncodeToString(pack.key)
-	uri := h.packURI(pack.key)
-	if err := h.rcl.copyTo(ctx, pack.tmpPath, uri, checkersArgs(h.dest)...); err != nil {
-		return fmt.Errorf("upload pack %s: %w", hexKey, err)
-	}
-	size, err := h.rcl.statRemote(ctx, uri, checkersArgs(h.dest)...)
+	fingerprint, err := h.art.put(ctx, runID, h.packName(pack.key), pack.tmpPath, pack.compressedSize, pack.key)
 	if err != nil {
-		return fmt.Errorf("confirm pack %s after upload: %w", hexKey, err)
+		return nil, fmt.Errorf("upload pack %s: %w", hex.EncodeToString(pack.key), err)
 	}
-	if size != pack.compressedSize {
-		return fmt.Errorf("pack %s landed with size %d, want %d", hexKey, size, pack.compressedSize)
-	}
-	return nil
+	return fingerprint, nil
 }
 
 // uploadPlacementMap writes the run's placement map and confirms it landed
@@ -436,49 +453,19 @@ func (h *packedHandler) uploadPlacementMap(ctx context.Context, placements []Pla
 	if err != nil {
 		return err
 	}
-	return h.uploadBytes(ctx, body, h.mapURI(runID), "placement map")
+	return putBytes(ctx, h.art, runID, mapName(runID), body, "placement map")
 }
 
-// uploadBytes stages body in a temp file, copies it to uri through the
-// crypt overlay, and confirms it landed at len(body). what names the
-// artifact in error messages.
-func (h *contentPusher) uploadBytes(ctx context.Context, body []byte, uri, what string) error {
-	tmp, err := os.CreateTemp("", "squirrel-meta-*")
-	if err != nil {
-		return fmt.Errorf("stage %s: %w", what, err)
-	}
-	defer func() { _ = os.Remove(tmp.Name()) }()
-	if _, err := tmp.Write(body); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("write %s: %w", what, err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close %s: %w", what, err)
-	}
-	if err := h.rcl.copyTo(ctx, tmp.Name(), uri, checkersArgs(h.dest)...); err != nil {
-		return fmt.Errorf("upload %s to %s: %w", what, uri, err)
-	}
-	size, err := h.rcl.statRemote(ctx, uri, checkersArgs(h.dest)...)
-	if err != nil {
-		return fmt.Errorf("confirm %s at %s: %w", what, uri, err)
-	}
-	if size != int64(len(body)) {
-		return fmt.Errorf("%s at %s landed with size %d, want %d", what, uri, size, len(body))
-	}
-	return nil
+// packName is one pack under the destination-root packs/ directory. The
+// basename is namer.pack's.
+func (h *packedHandler) packName(packKey []byte) string {
+	return path.Join(PacksDirName, h.names().pack(packKey))
 }
 
-// packURI addresses one pack under the destination-root packs/ directory,
-// through the crypt overlay when the destination has one. The basename is
-// namer.pack's.
-func (h *packedHandler) packURI(packKey []byte) string {
-	return remoteSubpathURI(h.dest, path.Join(PacksDirName, h.names().pack(packKey)))
-}
-
-// mapURI addresses one run's placement map under the destination-root
-// packs/ directory.
-func (h *packedHandler) mapURI(runID int64) string {
-	return remoteSubpathURI(h.dest, path.Join(PacksDirName, packMapPrefix+strconv.FormatInt(runID, 10)))
+// mapName is one run's placement map under the destination-root packs/
+// directory.
+func mapName(runID int64) string {
+	return path.Join(PacksDirName, packMapPrefix+strconv.FormatInt(runID, 10))
 }
 
 // zstdEncoderLevel maps the config's 1..4 zstd level onto klauspost's

@@ -340,7 +340,7 @@ func (f *caFixture) seedMarker(t *testing.T, volumes ...string) {
 // push established.
 func (f *caFixture) seedNamingMarker(t *testing.T) {
 	t.Helper()
-	h := &contentPusher{store: f.store, rcl: f.rcl, dest: f.cfg.Destinations["offsite"]}
+	h := &rcloneArtifacts{store: f.store, rcl: f.rcl, dest: f.cfg.Destinations["offsite"]}
 	if err := h.writeNamingMarker(context.Background()); err != nil {
 		t.Fatalf("seed %s: %v", namingMarkerName, err)
 	}

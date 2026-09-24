@@ -1,8 +1,8 @@
 package sync
 
 import (
-	"bytes"
 	"context"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -97,60 +97,28 @@ func encodeManifestSegment(delta []store.PathDelta) ([]byte, error) {
 // per-run manifest segment under <volume>/index/run-<id>, and fingerprint
 // freshly landed objects the same way. The content-addressed layout uses
 // this base directly; the packed layout embeds it and adds pack assembly
-// for content below its threshold.
+// for content below its threshold. art is where the artifacts land.
 type contentPusher struct {
 	store *store.Store
-	rcl   *Rclone
 	vol   *config.Volume
 	dest  *config.Destination
+	art   artifactStore
 }
 
 // names is how this push names the artifacts it writes.
 func (h *contentPusher) names() namer { return namerFor(h.dest) }
 
-// ensureMarkers gates a remote content-layout push on the root's naming
-// scheme, then on the destination's per-volume .squirrel-volume marker,
-// exactly as the mirror layout does (the marker sits at the volume root
-// regardless of layout). Local content-addressed and packed destinations
-// are intentionally left ungated here: they carry no such gate today, so
-// extending it to them is a separate parity concern — this closes only the
-// remote gap (#150).
-func (h *contentPusher) ensureMarkers(ctx context.Context, init bool) error {
-	if h.dest.Type == "local" {
-		return nil
-	}
-	if err := h.ensureNamingScheme(ctx, init); err != nil {
-		return err
-	}
-	return ensureRemoteDestinationMarker(ctx, h.store, h.rcl, h.dest, h.vol.Name, init)
-}
+func (h *contentPusher) shelf(runID int64) snapshotShelf { return h.art.shelf(runID) }
 
-// shelf is the destination's .squirrel-index/ directory, reached through
-// rclone like the rest of the push.
-func (h *contentPusher) shelf(int64) snapshotShelf {
-	return rcloneShelf{rcl: h.rcl, dir: indexDirURI(h.dest, h.vol.Name)}
-}
-
-// markers is the content layouts' marker gate. A dry run checks the naming
-// scheme read-only and writes nothing.
 func (h *contentPusher) markers(ctx context.Context, _ *Report, _ int64, opts Options) error {
-	if opts.DryRun {
-		_, err := h.checkNamingScheme(ctx)
-		return err
-	}
-	return h.ensureMarkers(ctx, opts.Init)
+	return h.art.markers(ctx, opts)
 }
 
-// rootEmpty reports whether the destination root holds no files beyond
-// squirrel's markers — a wiped or repointed destination, or one whose
-// recorded state was cleared by `squirrel destination reset`.
-func (h *contentPusher) rootEmpty(ctx context.Context) (bool, error) {
-	return h.rcl.remoteRootEmpty(ctx, remoteSubpathURI(h.dest, ""), rootMarkerNames(h.dest), checkersArgs(h.dest)...)
-}
+func (h *contentPusher) rootEmpty(ctx context.Context) (bool, error) { return h.art.rootEmpty(ctx) }
 
-// reconcile has nothing to settle: every content-layout artifact is
-// written once under its own name and recorded only after it landed.
-func (h *contentPusher) reconcile(context.Context, *Report, int64, int64) error { return nil }
+func (h *contentPusher) reconcile(ctx context.Context, rep *Report, _, runID int64) error {
+	return h.art.reconcile(ctx, rep, runID)
+}
 
 func (h *contentPusher) target() pushTarget {
 	return pushTarget{store: h.store, vol: h.vol, dest: h.dest}
@@ -172,6 +140,7 @@ type contentAddressedHandler struct {
 func (h *contentAddressedHandler) TargetName() string { return h.dest.Name }
 
 func (h *contentAddressedHandler) Push(ctx context.Context, opts Options) (Report, error) {
+	defer h.art.close()
 	if h.vol.Name == ObjectsDirName {
 		rep := Report{Volume: h.vol.Name, Destination: h.dest.Name}
 		rep.Verification.Method = VerifyMethodPresenceSize
@@ -223,11 +192,11 @@ func (h *contentAddressedHandler) advanceMethod(ctx context.Context, _ *Report, 
 // Every successful content-addressed run uploads one, so its absence means
 // the recorded history belongs to a different layout or a wiped root.
 func (h *contentAddressedHandler) landed(ctx context.Context, runID int64) (bool, error) {
-	return h.rcl.statRemoteExists(ctx, h.segmentURI(runID), checkersArgs(h.dest)...)
+	return h.art.exists(ctx, h.segmentName(runID))
 }
 
 func (h *contentAddressedHandler) foreignHistory(runID int64) error {
-	return fmt.Errorf("destination %q: the last successful sync (run %d) left no manifest segment at %s — its history does not look content-addressed; point the layout at a fresh destination or root, or (after wiping the remote root) run `squirrel destination reset %s`, instead of switching an existing one: %w", h.dest.Name, runID, h.segmentURI(runID), h.dest.Name, ErrRefused)
+	return fmt.Errorf("destination %q: the last successful sync (run %d) left no manifest segment at %s — its history does not look content-addressed; point the layout at a fresh destination or root, or (after wiping the remote root) run `squirrel destination reset %s`, instead of switching an existing one: %w", h.dest.Name, runID, h.art.where(h.segmentName(runID)), h.dest.Name, ErrRefused)
 }
 
 // objectUploads is the object side of a content push: the planned content
@@ -287,10 +256,11 @@ func (h *contentPusher) splitRecorded(ctx context.Context, planned []store.PathD
 // the drifted bytes ever being recorded under the hash.
 func (h *contentPusher) uploadObjects(ctx context.Context, rep *Report, runID int64, ops objectUploads) error {
 	rep.RcloneResult.Checked += ops.recorded
-	var confirmed []store.PathDelta
+	var pending []store.PathDelta
 	var drifted int
 	for _, d := range ops.needed {
-		if err := h.uploadOneObject(ctx, runID, d); err != nil {
+		fingerprinted, err := h.uploadOneObject(ctx, runID, d)
+		if err != nil {
 			if errors.Is(err, errContentDrift) {
 				drifted++
 				rep.Warnings = append(rep.Warnings, err.Error())
@@ -303,11 +273,15 @@ func (h *contentPusher) uploadObjects(ctx context.Context, rep *Report, runID in
 			}
 			continue
 		}
-		confirmed = append(confirmed, d)
+		if fingerprinted {
+			rep.Fingerprints++
+		} else {
+			pending = append(pending, d)
+		}
 		rep.RcloneResult.Transferred++
 		rep.RcloneResult.Bytes += d.SizeBytes
 	}
-	h.captureFingerprints(ctx, rep, confirmed)
+	h.captureFingerprints(ctx, rep, pending)
 	if rep.RcloneResult.Errors > 0 {
 		return fmt.Errorf("%d object(s) failed to land on %q; the manifest segment for run %d was not written and the durability vector did not advance", rep.RcloneResult.Errors, h.dest.Name, runID)
 	}
@@ -318,15 +292,17 @@ func (h *contentPusher) uploadObjects(ctx context.Context, rep *Report, runID in
 }
 
 // captureFingerprints fills the pending checksum pair of every object
-// confirmed during this run with the provider checksum read back from the
-// underlying remote's objects/ directory, over the shared scan-back capture
-// surface. That read-back is the first verification, so each object records
-// and stamps verified_at_ns in one write (SetRemoteObjectFingerprint) —
-// matching the packed layout; the later `squirrel verify` re-read re-stamps
-// it on each re-confirmation.
-func (h *contentPusher) captureFingerprints(ctx context.Context, rep *Report, confirmed []store.PathDelta) {
-	targets := make([]captureTarget, 0, len(confirmed))
-	for _, d := range confirmed {
+// confirmed during this run without one, read back from the destination's
+// objects/ directory (the scan-back capture over rclone). That read-back is
+// the first verification, so each object records and stamps verified_at_ns
+// in one write (SetRemoteObjectFingerprint) — matching the packed layout;
+// the later `squirrel verify` re-read re-stamps it on each re-confirmation.
+func (h *contentPusher) captureFingerprints(ctx context.Context, rep *Report, pending []store.PathDelta) {
+	if len(pending) == 0 {
+		return
+	}
+	targets := make([]captureTarget, 0, len(pending))
+	for _, d := range pending {
 		d := d
 		targets = append(targets, captureTarget{
 			name:  h.names().object(d.Blake3),
@@ -336,7 +312,7 @@ func (h *contentPusher) captureFingerprints(ctx context.Context, rep *Report, co
 			},
 		})
 	}
-	h.captureScanBackFingerprints(ctx, rep, ObjectsDirName, targets)
+	h.art.capture(ctx, rep, ObjectsDirName, targets)
 }
 
 // plannedUploads selects the delta rows that need a content object —
@@ -362,54 +338,34 @@ func plannedUploads(delta []store.PathDelta) []store.PathDelta {
 // the run so the watermark holds and the object is re-offered next run.
 var errContentDrift = errors.New("source content drifted from its indexed hash")
 
-// uploadOneObject lands one content object and records the upload. It
-// guards the content-addressed invariant — the bytes stored under a hash
-// must be the bytes that produced it — by re-hashing the source file
-// immediately before the transfer and refusing (errContentDrift) when the
-// digest no longer matches the indexed hash, catching a
-// size+mtime-preserving in-place edit that a metadata stat would pass.
-// The post-transfer stat confirms presence and size on the remote, and the
-// upload record is written only after that confirmation, so a recorded
-// hash is always a confirmed one; a crash in between re-uploads the same
-// bytes idempotently on the next run.
-//
-// Residual: rclone reads the file in a separate child process after the
-// re-hash, so a writer that edits the file in the window between the hash
-// and rclone's read could still upload drifted bytes. The window is the
-// fork/exec of one rclone invocation rather than the whole walk-to-push
-// span, and the scan-back fingerprint pass (#109) re-reads the landed
-// object to upgrade the durability vector, catching any byte that slipped
-// through before the object is treated as content-verified.
-func (h *contentPusher) uploadOneObject(ctx context.Context, runID int64, d store.PathDelta) error {
+// uploadOneObject lands one content object and records the upload, with
+// its fingerprint when the landing already confirmed one. It guards the
+// content-addressed invariant — the bytes stored under a hash must be the
+// bytes that produced it: the artifact store refuses a source that no
+// longer hashes to the indexed hash (errContentDrift), catching a
+// size+mtime-preserving in-place edit that a metadata stat would pass. The
+// upload record is written only after the landing was confirmed, so a
+// recorded hash is always a confirmed one; a crash in between lands the
+// same bytes again on the next run.
+func (h *contentPusher) uploadOneObject(ctx context.Context, runID int64, d store.PathDelta) (bool, error) {
 	src := filepath.Join(h.vol.Path, filepath.FromSlash(d.Path))
-	digest, err := hashLocalFile(src)
+	cs, err := h.art.put(ctx, runID, h.objectName(d.Blake3), src, d.SizeBytes, d.Blake3)
+	if errors.Is(err, errContentDrift) {
+		return false, fmt.Errorf("%s: %w — run `squirrel index %s` and sync again", d.Path, err, h.vol.Name)
+	}
 	if err != nil {
-		return fmt.Errorf("re-hash %s before upload: %w", src, err)
+		return false, err
 	}
-	if !bytes.Equal(digest, d.Blake3) {
-		return fmt.Errorf("%w: %s now hashes to %s, indexed as %s — run `squirrel index %s` and sync again",
-			errContentDrift, d.Path, hex.EncodeToString(digest), hex.EncodeToString(d.Blake3), h.vol.Name)
+	obj := store.RemoteObject{ContentID: d.ContentID, Destination: h.dest.Name, UploadedRunID: runID}
+	if cs != nil {
+		obj.ChecksumAlgo = sql.NullString{String: cs.Algo, Valid: true}
+		obj.Checksum = sql.NullString{String: cs.Value, Valid: true}
+		obj.VerifiedAtNs = sql.NullInt64{Int64: store.NowNs(), Valid: true}
 	}
-	hash := hex.EncodeToString(d.Blake3)
-	uri := h.objectURI(d.Blake3)
-	if err := h.rcl.copyTo(ctx, src, uri, checkersArgs(h.dest)...); err != nil {
-		return err
+	if err := h.store.InsertRemoteObject(ctx, obj); err != nil {
+		return false, fmt.Errorf("record upload of %s: %w", hex.EncodeToString(d.Blake3), err)
 	}
-	size, err := h.rcl.statRemote(ctx, uri, checkersArgs(h.dest)...)
-	if err != nil {
-		return fmt.Errorf("confirm object %s after upload: %w", hash, err)
-	}
-	if size != d.SizeBytes {
-		return fmt.Errorf("object %s landed with size %d, want %d", hash, size, d.SizeBytes)
-	}
-	if err := h.store.InsertRemoteObject(ctx, store.RemoteObject{
-		ContentID:     d.ContentID,
-		Destination:   h.dest.Name,
-		UploadedRunID: runID,
-	}); err != nil {
-		return fmt.Errorf("record upload of %s: %w", hash, err)
-	}
-	return nil
+	return cs != nil, nil
 }
 
 // hashLocalFile streams the file at path through BLAKE3 and returns the
@@ -436,20 +392,19 @@ func (h *contentPusher) uploadSegment(ctx context.Context, delta []store.PathDel
 	if err != nil {
 		return err
 	}
-	return h.uploadBytes(ctx, body, h.segmentURI(runID), "manifest segment")
+	return putBytes(ctx, h.art, runID, h.segmentName(runID), body, "manifest segment")
 }
 
-// objectURI addresses one content object under the destination-root
-// objects/ directory, through the crypt overlay when the destination
-// has one. The basename is namer.object's.
-func (h *contentPusher) objectURI(contentHash []byte) string {
-	return remoteSubpathURI(h.dest, path.Join(ObjectsDirName, h.names().object(contentHash)))
+// objectName is one content object under the destination-root objects/
+// directory. The basename is namer.object's.
+func (h *contentPusher) objectName(contentHash []byte) string {
+	return path.Join(ObjectsDirName, h.names().object(contentHash))
 }
 
-// segmentURI addresses one run's manifest segment under the
-// destination's per-volume index/ directory. The run id stays in clear:
-// replaying the segments in run order is what recovers a volume without
-// squirrel, and that ordering has to survive without the naming key.
-func (h *contentPusher) segmentURI(runID int64) string {
-	return remoteSubpathURI(h.dest, path.Join(h.names().volumeDir(h.vol.Name), ManifestDirName, "run-"+strconv.FormatInt(runID, 10)))
+// segmentName is one run's manifest segment under the destination's
+// per-volume index/ directory. The run id stays in clear: replaying the
+// segments in run order is what recovers a volume without squirrel, and
+// that ordering has to survive without the naming key.
+func (h *contentPusher) segmentName(runID int64) string {
+	return path.Join(h.names().volumeDir(h.vol.Name), ManifestDirName, "run-"+strconv.FormatInt(runID, 10))
 }

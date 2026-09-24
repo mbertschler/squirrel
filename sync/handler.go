@@ -128,12 +128,12 @@ func HandlerFor(s *store.Store, tools Tools, p Pair) (Handler, error) {
 		if tools.Rclone == nil {
 			return nil, fmt.Errorf("destination %q: rclone wrapper is required", p.Destination.Name)
 		}
-		return &packedHandler{contentPusher{store: s, rcl: tools.Rclone, vol: p.Volume, dest: p.Destination}}, nil
+		return &packedHandler{rcloneContentPusher(s, tools.Rclone, p)}, nil
 	case p.Destination.Layout == config.LayoutContentAddressed:
 		if tools.Rclone == nil {
 			return nil, fmt.Errorf("destination %q: rclone wrapper is required", p.Destination.Name)
 		}
-		return &contentAddressedHandler{contentPusher{store: s, rcl: tools.Rclone, vol: p.Volume, dest: p.Destination}}, nil
+		return &contentAddressedHandler{rcloneContentPusher(s, tools.Rclone, p)}, nil
 	case p.Destination.NativeMirror():
 		return &mirrorHandler{destinationRoot: newDestinationRoot(s, p.Destination, p.Volume.Name), vol: p.Volume}, nil
 	default:
@@ -142,6 +142,12 @@ func HandlerFor(s *store.Store, tools Tools, p Pair) (Handler, error) {
 		}
 		return &rcloneHandler{store: s, rcl: tools.Rclone, vol: p.Volume, dest: p.Destination}, nil
 	}
+}
+
+// rcloneContentPusher is a content layout's push through rclone.
+func rcloneContentPusher(s *store.Store, rcl *Rclone, p Pair) contentPusher {
+	art := &rcloneArtifacts{store: s, rcl: rcl, vol: p.Volume, dest: p.Destination}
+	return contentPusher{store: s, vol: p.Volume, dest: p.Destination, art: art}
 }
 
 // openDestinationTransport opens a native mirror's destination root: a
