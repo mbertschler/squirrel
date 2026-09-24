@@ -617,6 +617,13 @@ gcs. Each artifact:
    confirmed instead (downloaded and hashed when the server runs no command)
    and recorded, or the artifact fails. Squirrel never replaces it.
 
+`squirrel verify` reads these destinations through the transport too
+(`sync/verify_native.go`): it lists `objects/` and `packs/` and re-reads
+every recorded artifact — through BLAKE3, and through any other hash its row
+recorded, on a local disk; through the server's hash command on sftp. On a
+plain destination a BLAKE3 that differs from what the name says (an object's
+content hash, a pack's key) is a mismatch, whichever backend reported it.
+
 The staged copy of a failed artifact goes with the run's staging at the next
 push's reconcile. The content layouts' guard commits only onto artifact names
 and displaces nothing (section 3). Both native content layouts are gated on

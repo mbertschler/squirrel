@@ -114,10 +114,12 @@ func (r RemoteVerifyReport) failures() int {
 // against the fingerprints recorded at upload time. Matches stamp
 // verified_at_ns; objects with a pending fingerprint get one recorded;
 // mismatches and missing objects land loudly on the report. The pass
-// reads destination metadata and updates local verification state only.
+// reads the destination and updates local verification state only.
 //
-// A native mirror is checked through squirrel's own transport instead
-// (verifyMirror), so rcl may be nil for one.
+// A native destination is read through squirrel's own transport instead,
+// so rcl may be nil for one: a local disk's artifacts are read back through
+// BLAKE3, an sftp server's hashed by its hash command, and a native
+// mirror's copies are checked by verifyMirror.
 //
 // The pass is recorded as a kind='audit' run: success when every object
 // checked out, partial when objects mismatched or went missing, failed
@@ -155,7 +157,7 @@ func VerifyRemote(ctx context.Context, s *store.Store, rcl *Rclone, dest *config
 	}
 	rep.RunID = runID
 
-	verifyErr := verifyRecorded(ctx, s, rcl, dest, rows, packs, &rep)
+	verifyErr := verifyThrough(ctx, s, rcl, dest, rows, packs, &rep)
 	if err := recordVerifyOutcome(ctx, s, &rep, verifyErr); err != nil {
 		return rep, err
 	}
@@ -197,28 +199,64 @@ func upgradeFingerprintVectors(ctx context.Context, s *store.Store, destination 
 	return nil
 }
 
+// checksumSource reads the checksums a verify pass compares for a
+// destination's recorded objects and packs, keyed by basename then hash
+// name; a stored artifact nobody recorded maps to no hashes.
+type checksumSource interface {
+	objects(ctx context.Context, rows []store.RemoteObjectRecord) (map[string]map[string]string, error)
+	packs(ctx context.Context, packs []store.RemotePackRecord) (map[string]map[string]string, error)
+}
+
+// verifyThrough runs the sweeps against dest through squirrel's own
+// transport on a native destination, through rclone (and the S3 API)
+// otherwise.
+func verifyThrough(ctx context.Context, s *store.Store, rcl *Rclone, dest *config.Destination, rows []store.RemoteObjectRecord, packs []store.RemotePackRecord, rep *RemoteVerifyReport) error {
+	if !dest.Native() {
+		return verifyRecorded(ctx, s, rcloneChecksums{rcl: rcl, dest: dest}, dest, rows, packs, rep)
+	}
+	tr, err := openReadOnly(ctx, dest)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tr.Close() }()
+	return verifyRecorded(ctx, s, transportChecksums{tr: tr, dest: dest}, dest, rows, packs, rep)
+}
+
 // verifyRecorded sweeps a destination's recorded content objects (the
 // large-file per-object sweep, shared with content-addressed) and, for a
 // packed destination, its recorded packs — one fingerprint check per pack
 // vouching for all its members. Either sweep can be empty.
-func verifyRecorded(ctx context.Context, s *store.Store, rcl *Rclone, dest *config.Destination, rows []store.RemoteObjectRecord, packs []store.RemotePackRecord, rep *RemoteVerifyReport) error {
+func verifyRecorded(ctx context.Context, s *store.Store, src checksumSource, dest *config.Destination, rows []store.RemoteObjectRecord, packs []store.RemotePackRecord, rep *RemoteVerifyReport) error {
 	if len(rows) > 0 {
-		if err := verifyRecordedObjects(ctx, s, rcl, dest, rows, rep); err != nil {
+		if err := verifyRecordedObjects(ctx, s, src, dest, rows, rep); err != nil {
 			return err
 		}
 	}
 	if len(packs) > 0 {
-		if err := verifyRecordedPacks(ctx, s, rcl, dest, packs, rep); err != nil {
+		if err := verifyRecordedPacks(ctx, s, src, dest, packs, rep); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+// contentMismatch is the finding when a plain destination reports the
+// BLAKE3 of an artifact whose name says what its BLAKE3 must be (an
+// object's content hash, a pack's key) and the two differ. It holds for
+// any backend that exposes BLAKE3; behind crypt the stored bytes are
+// ciphertext, so it never applies there.
+func contentMismatch(dest *config.Destination, hashes map[string]string, want []byte) (RemoteObjectMismatch, bool) {
+	got := hashes[store.ChecksumAlgoBlake3]
+	if dest.Crypt != nil || got == "" || got == hex.EncodeToString(want) {
+		return RemoteObjectMismatch{}, false
+	}
+	return RemoteObjectMismatch{Hash: hex.EncodeToString(want), Algo: store.ChecksumAlgoBlake3, Recorded: hex.EncodeToString(want), Actual: got}, true
+}
+
 // verifyRecordedObjects compares the remote listing against the recorded
 // rows and applies the per-object outcome to the store and the report.
-func verifyRecordedObjects(ctx context.Context, s *store.Store, rcl *Rclone, dest *config.Destination, rows []store.RemoteObjectRecord, rep *RemoteVerifyReport) error {
-	byName, err := readObjectChecksums(ctx, rcl, dest, rows)
+func verifyRecordedObjects(ctx context.Context, s *store.Store, src checksumSource, dest *config.Destination, rows []store.RemoteObjectRecord, rep *RemoteVerifyReport) error {
+	byName, err := src.objects(ctx, rows)
 	if err != nil {
 		return fmt.Errorf("read object checksums from %q: %w", dest.Name, err)
 	}
@@ -232,6 +270,10 @@ func verifyRecordedObjects(ctx context.Context, s *store.Store, rcl *Rclone, des
 			continue
 		}
 		matched++
+		if m, bad := contentMismatch(dest, hashes, row.Blake3); bad {
+			rep.Mismatched = append(rep.Mismatched, m)
+			continue
+		}
 		if !row.ChecksumAlgo.Valid {
 			if err := populateFingerprint(ctx, s, dest, row, hashes, rep); err != nil {
 				return err
@@ -255,6 +297,21 @@ func verifyRecordedObjects(ctx context.Context, s *store.Store, rcl *Rclone, des
 	}
 	rep.Unrecorded = len(byName) - matched
 	return nil
+}
+
+// rcloneChecksums reads a destination's checksums through rclone, and
+// through the S3 API on s3.
+type rcloneChecksums struct {
+	rcl  *Rclone
+	dest *config.Destination
+}
+
+func (c rcloneChecksums) objects(ctx context.Context, rows []store.RemoteObjectRecord) (map[string]map[string]string, error) {
+	return readObjectChecksums(ctx, c.rcl, c.dest, rows)
+}
+
+func (c rcloneChecksums) packs(ctx context.Context, packs []store.RemotePackRecord) (map[string]map[string]string, error) {
+	return readPackChecksums(ctx, c.rcl, c.dest, packs)
 }
 
 // readObjectChecksums reads the provider checksums verification compares,
@@ -327,8 +384,8 @@ func verifyObjectHashTypes(dest *config.Destination, rows []store.RemoteObjectRe
 // recorded pack rows and applies the per-pack outcome. One fingerprint
 // check per pack vouches for every content it holds, so a packed
 // destination is swept per pack rather than per member.
-func verifyRecordedPacks(ctx context.Context, s *store.Store, rcl *Rclone, dest *config.Destination, packs []store.RemotePackRecord, rep *RemoteVerifyReport) error {
-	byName, err := readPackChecksums(ctx, rcl, dest, packs)
+func verifyRecordedPacks(ctx context.Context, s *store.Store, src checksumSource, dest *config.Destination, packs []store.RemotePackRecord, rep *RemoteVerifyReport) error {
+	byName, err := src.packs(ctx, packs)
 	if err != nil {
 		return fmt.Errorf("read pack checksums from %q: %w", dest.Name, err)
 	}
@@ -338,6 +395,10 @@ func verifyRecordedPacks(ctx context.Context, s *store.Store, rcl *Rclone, dest 
 		hashes, ok := byName[names.pack(row.PackKey)]
 		if !ok {
 			rep.PacksMissing = append(rep.PacksMissing, key)
+			continue
+		}
+		if m, bad := contentMismatch(dest, hashes, row.PackKey); bad {
+			rep.PackMismatched = append(rep.PackMismatched, m)
 			continue
 		}
 		if !row.ChecksumAlgo.Valid {

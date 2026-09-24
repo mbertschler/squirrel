@@ -426,3 +426,76 @@ func TestNativeContentRideAlongAndRecover(t *testing.T) {
 		})
 	}
 }
+
+func (f *nativeContentFixture) verify(t *testing.T) RemoteVerifyReport {
+	t.Helper()
+	rep, err := VerifyRemote(context.Background(), f.store, nil, f.pair.Destination)
+	if err != nil {
+		t.Fatalf("VerifyRemote: %v", err)
+	}
+	return rep
+}
+
+// TestNativeContentVerifyWithoutRclone: verify re-reads a native content
+// destination through the transport — BLAKE3 against the content hash or
+// pack key on a local disk, the server's hash command over sftp — and
+// finds an artifact changed in place or gone.
+func TestNativeContentVerifyWithoutRclone(t *testing.T) {
+	for _, b := range contentBackends {
+		for _, layout := range contentLayouts {
+			t.Run(b.name+"/"+layout, func(t *testing.T) {
+				f := setupNativeContentFixture(t, b, layout)
+				f.write(t, "a.txt", "alpha")
+				f.write(t, "big.txt", "a larger file")
+				f.write(t, "gone.txt", "gone, soon")
+				f.index(t)
+				f.mustPush(t)
+				rep := f.verify(t)
+				objects, packs := 3, 0
+				if layout == config.LayoutPacked {
+					objects, packs = 2, 1
+				}
+				if !rep.Clean() || rep.Verified != objects || rep.PacksVerified != packs {
+					t.Fatalf("rep = %+v, want a clean pass re-confirming every artifact", rep)
+				}
+
+				if err := os.WriteFile(f.objectPath("a larger file"), []byte("A LARGER FILE"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(f.objectPath("gone, soon")); err != nil {
+					t.Fatal(err)
+				}
+				if layout == config.LayoutPacked {
+					f.flipPack(t)
+				}
+				rep, err := VerifyRemote(context.Background(), f.store, nil, f.pair.Destination)
+				if err != nil || len(rep.Mismatched) != 1 || len(rep.Missing) != 1 || len(rep.PackMismatched) != packs || !rep.AlarmRaised {
+					t.Fatalf("rep = %+v, %v; want one object changed, one gone, every pack changed, and the alarm raised", rep, err)
+				}
+			})
+		}
+	}
+}
+
+// flipPack changes the first byte of every pack in place.
+func (f *nativeContentFixture) flipPack(t *testing.T) {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(f.dst, PacksDirName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), packMapPrefix) {
+			continue
+		}
+		p := filepath.Join(f.dst, PacksDirName, e.Name())
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b[0] ^= 0xff
+		if err := os.WriteFile(p, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
