@@ -15,7 +15,7 @@ machines are five processes on loopback ports.
 | cloudbox (pure SFTP, no programs) | `rclone serve sftp --user u123456 --pass …` on `127.0.0.1:2222`, serving an empty dir | Exactly the product shape: an SFTP endpoint you cannot run code on. Presents a real host key, so the `known_hosts_file` UX is exercised too |
 | s3archive | SeaweedFS `weed server -s3` on `127.0.0.1:8333` (same creds/config as `test/integration/s3config.json`) | Already the reference S3 endpoint for the integration tests; proven to produce the composite multipart ETags the fingerprint path depends on |
 | kopia-mirror | `kopia` binary + a repo directory | Same as production: squirrel drives the CLI |
-| usb disk | a plain directory; "unplugging" = renaming it | `local` destination + marker semantics don't care about hardware |
+| usb disk | a plain directory; "unplugging" = renaming it. On macOS, an exFAT disk image (`hdiutil create -fs ExFAT -type SPARSE`, attached with `-mountpoint`) is closer: it folds case, gets macOS's `._` companion files, and keeps rclone from cloning files on APFS; "unplugging" = `hdiutil detach` | `local` destination + marker semantics don't care about hardware |
 
 ### The sftp server and native mirrors
 
@@ -47,6 +47,18 @@ squirrel refuses the server until its host key is pinned; the first push's
 refusal prints the known_hosts line to add. Serve with `--key <file>` to keep
 the key stable across restarts (without it, rclone reuses keys it generated in
 its cache directory).
+
+### Benchmarking native against rclone
+
+The 2026-09-24 numbers ([native-mirror.md](native-mirror.md), section 8)
+came from `main`'s binary and the branch's, each installed with
+`GOBIN=<dir> go install ./cmd/squirrel` from its own tree, pushing
+`gendata` trees on fresh indexes to the exFAT image and to `rclone serve
+sftp`. Loopback hides what a real link costs per round trip, so a third
+destination reached the same server through a TCP proxy that delays every
+chunk by a fixed time each way, kept outside the repo. Restart `rclone serve
+sftp` after removing files under its root behind its back: its directory
+cache otherwise keeps answering for them.
 
 Deliberately not simulated: Synology/QNAP packaging (below squirrel),
 b2/gcs (same shape as s3), real network partitions — a dead machine or
