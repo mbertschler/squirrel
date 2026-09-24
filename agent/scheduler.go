@@ -113,15 +113,15 @@ func (s *scheduler) refresh() {
 	s.pullEvery = resolvePullCadences(cur.Nodes)
 }
 
-// resolveVerifyCadences maps each verifiable (content-addressed or packed)
-// destination to its effective verify cadence: the destination's own
+// resolveVerifyCadences maps each verifiable destination (content-addressed,
+// packed, or a native mirror) to its effective verify cadence: the destination's own
 // verify_every when set, otherwise the [agent] verify_every default. Only
 // destinations with a positive resulting cadence are included, so a config
 // with neither knob set yields an empty map and no verify activity.
 func resolveVerifyCadences(dests map[string]*config.Destination, def time.Duration) map[string]time.Duration {
 	out := make(map[string]time.Duration)
 	for name, d := range dests {
-		if d.Layout != config.LayoutContentAddressed && d.Layout != config.LayoutPacked {
+		if !d.Verifiable() {
 			continue
 		}
 		eff := d.VerifyEvery

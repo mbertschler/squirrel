@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 
 	"github.com/spf13/cobra"
@@ -53,12 +54,9 @@ func runVerify(cmd *cobra.Command, destName string) error {
 	}
 	defer s.Close()
 
-	rcl, err := sync.Find(cmd.Context())
-	if err != nil {
-		return err
-	}
 	out := cmd.OutOrStdout()
-	if err := writeRcloneConfigLogged(out, rcl, cfg); err != nil {
+	rcl, err := verifyRclone(cmd, cfg, names)
+	if err != nil {
 		return err
 	}
 
@@ -76,37 +74,49 @@ func runVerify(cmd *cobra.Command, destName string) error {
 	return nil
 }
 
+// verifyRclone locates rclone and renders its config when a target is
+// reached through it; a native mirror is verified without it.
+func verifyRclone(cmd *cobra.Command, cfg *config.Config, names []string) (*sync.Rclone, error) {
+	if !slices.ContainsFunc(names, func(name string) bool {
+		return sync.Pair{Destination: cfg.Destinations[name]}.DrivesRclone()
+	}) {
+		return nil, nil
+	}
+	rcl, err := sync.Find(cmd.Context())
+	if err != nil {
+		return nil, err
+	}
+	if err := writeRcloneConfigLogged(cmd.OutOrStdout(), rcl, cfg); err != nil {
+		return nil, err
+	}
+	return rcl, nil
+}
+
 // verifyTargetNames resolves the verification subjects in deterministic
-// order: an explicit destination (validated to exist and be
-// content-addressed or packed), or every such destination in config.
+// order: an explicit destination (validated to exist and be verifiable),
+// or every verifiable destination in config.
 func verifyTargetNames(cfg *config.Config, destName string) ([]string, error) {
 	if destName != "" {
 		d, ok := cfg.Destinations[destName]
 		if !ok {
 			return nil, fmt.Errorf("unknown destination %q (declare it in %s)", destName, cfg.Path)
 		}
-		if !verifiableLayout(d.Layout) {
-			return nil, fmt.Errorf("destination %q has layout %q — verify covers the recorded objects and packs of content-addressed and packed destinations", destName, d.Layout)
+		if !d.Verifiable() {
+			return nil, fmt.Errorf("destination %q is an rclone mirror — verify covers the recorded objects and packs of content-addressed and packed destinations, and the recorded copies of a mirror squirrel writes itself (local, or sftp without crypt)", destName)
 		}
 		return []string{destName}, nil
 	}
 	var names []string
 	for name, d := range cfg.Destinations {
-		if verifiableLayout(d.Layout) {
+		if d.Verifiable() {
 			names = append(names, name)
 		}
 	}
 	if len(names) == 0 {
-		return nil, fmt.Errorf("no content-addressed or packed destinations declared in %s", cfg.Path)
+		return nil, fmt.Errorf("no verifiable destinations declared in %s: verify covers content-addressed and packed destinations and native mirrors", cfg.Path)
 	}
 	sort.Strings(names)
 	return names, nil
-}
-
-// verifiableLayout reports whether a destination's layout keeps per-object
-// or per-pack fingerprints that `squirrel verify` re-checks.
-func verifiableLayout(layout string) bool {
-	return layout == config.LayoutContentAddressed || layout == config.LayoutPacked
 }
 
 // printVerifyReport renders one destination's pass: a loud stderr line
@@ -115,12 +125,19 @@ func verifiableLayout(layout string) bool {
 func printVerifyReport(out, errOut io.Writer, rep sync.RemoteVerifyReport, runErr error) {
 	printVerifyFailures(errOut, "object", rep.Destination, rep.Missing, rep.Mismatched)
 	printVerifyFailures(errOut, "pack", rep.Destination, rep.PacksMissing, rep.PackMismatched)
+	printMirrorFailures(errOut, rep)
 	if runErr != nil {
 		fmt.Fprintf(errOut, "verify %s: %v\n", rep.Destination, runErr)
 		return
 	}
+	if rep.Paths > 0 {
+		fmt.Fprintf(out, "verify %s: run=%d copies=%d reread=%d changed=%d missing=%d\n",
+			rep.Destination, rep.RunID, rep.Paths, rep.PathsReread, len(rep.PathsChanged), len(rep.PathsMissing))
+		printVerifyAlarmTransition(out, errOut, rep)
+		return
+	}
 	if rep.Objects == 0 && rep.Packs == 0 {
-		fmt.Fprintf(out, "verify %s: no recorded objects or packs\n", rep.Destination)
+		fmt.Fprintf(out, "verify %s: nothing recorded to verify\n", rep.Destination)
 		return
 	}
 	fmt.Fprintf(out, "verify %s: run=%d objects=%d verified=%d fingerprinted=%d pending=%d mismatched=%d missing=%d unrecorded=%d packs=%d packs_verified=%d packs_fingerprinted=%d packs_pending=%d packs_mismatched=%d packs_missing=%d\n",
@@ -141,6 +158,18 @@ func printVerifyAlarmTransition(out, errOut io.Writer, rep sync.RemoteVerifyRepo
 	}
 	if rep.AlarmCleared {
 		fmt.Fprintf(out, "verify %s: standing alarm cleared by this clean pass\n", rep.Destination)
+	}
+}
+
+// printMirrorFailures writes one stderr line per mirror copy the pass found
+// gone or changed; the next push writes each one again that the index still
+// holds.
+func printMirrorFailures(errOut io.Writer, rep sync.RemoteVerifyReport) {
+	for _, name := range rep.PathsMissing {
+		fmt.Fprintf(errOut, "error: copy %s on %q: recorded as stored but absent\n", name, rep.Destination)
+	}
+	for _, name := range rep.PathsChanged {
+		fmt.Fprintf(errOut, "error: copy %s on %q: its size, mtime or BLAKE3 no longer matches what squirrel stored — possible corruption or tampering\n", name, rep.Destination)
 	}
 }
 

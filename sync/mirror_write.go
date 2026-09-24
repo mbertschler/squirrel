@@ -46,6 +46,10 @@ func (h *mirrorHandler) execute(ctx context.Context, rep *Report, runID int64, o
 	}
 	w := &mirrorWriter{h: h, rep: rep, runID: runID, tr: tr, live: ops.live, progress: h.progress, total: len(ops.paths)}
 	rep.AlreadyCorrect = ops.inSync
+	if ops.repairs > 0 {
+		rep.Changed = knownChanged(rep.Changed.Int64 + ops.repairs)
+		rep.Warnings = append(rep.Warnings, fmt.Sprintf("destination %q lost %d path(s) the index still holds there (found gone or changed); they are written again", h.dest.Name, ops.repairs))
+	}
 	for _, p := range ops.paths {
 		if err := ctx.Err(); err != nil {
 			return err

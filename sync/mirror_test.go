@@ -358,11 +358,18 @@ func TestMirrorPushWithoutRclone(t *testing.T) {
 // record already holds its content is only confirmed.
 func TestMirrorTranslationRules(t *testing.T) {
 	f := setupMirrorFixture(t)
-	for _, rel := range []string{"same.txt", "changed.txt", "gone.txt", "offloaded.txt"} {
+	for _, rel := range []string{"same.txt", "changed.txt", "gone.txt", "offloaded.txt", "lost.txt"} {
 		f.write(t, rel, "v1 "+rel)
 	}
 	f.index(t)
 	f.mustPush(t)
+	for _, r := range f.rows(t) {
+		if r.Path == "lost.txt" {
+			if err := f.store.MarkRemotePathsLost(context.Background(), r.ID); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
 	f.write(t, "changed.txt", "v2 changed")
 	f.write(t, "new.txt", "new")
 	if err := os.Remove(filepath.Join(f.src, "gone.txt")); err != nil {
@@ -378,9 +385,15 @@ func TestMirrorTranslationRules(t *testing.T) {
 	if err := f.store.MarkOffloaded(ctx, volID, "offloaded.txt", off.ContentID, off.LastSeenRunID); err != nil {
 		t.Fatalf("MarkOffloaded: %v", err)
 	}
-	delta, err := f.store.ListPathDeltaSince(ctx, volID, 0)
+	full, err := f.store.ListPathDeltaSince(ctx, volID, 0)
 	if err != nil {
 		t.Fatal(err)
+	}
+	var delta []store.PathDelta
+	for _, d := range full {
+		if d.Path != "lost.txt" {
+			delta = append(delta, d)
+		}
 	}
 
 	ops, err := f.handler(t).translate(ctx, pushPlan{volumeID: volID, delta: delta})
@@ -395,6 +408,7 @@ func TestMirrorTranslationRules(t *testing.T) {
 		"same.txt":    "confirm", // present, live record holds C
 		"changed.txt": "write",   // present, live record holds other content
 		"new.txt":     "write",   // present, no live record
+		"lost.txt":    "write",   // repair: outside the delta, its record lost
 		// gone.txt (missing), offloaded.txt (offloaded) and changed.txt's
 		// superseded row produce nothing.
 	}

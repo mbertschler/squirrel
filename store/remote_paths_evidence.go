@@ -60,6 +60,24 @@ func (s *Store) RecordRemotePathVerified(ctx context.Context, id int64, checksum
 	return nil
 }
 
+// LoseStoredRemotePath marks a row lost that a verify pass found missing or
+// changed, provided it is still in state, the state the pass read it in.
+// It reports whether the row moved: a push may have moved it since, and
+// then the pass's finding describes a version that is no longer there.
+func (s *Store) LoseStoredRemotePath(ctx context.Context, id int64, state string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE remote_paths SET state = 'lost' WHERE id = ? AND state = ? AND state IN ('live', 'displaced')
+	`, id, state)
+	if err != nil {
+		return false, fmt.Errorf("mark remote path %d lost: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("mark remote path %d lost: %w", id, err)
+	}
+	return n == 1, nil
+}
+
 // ListRemotePathRepairs returns the volume's present paths the destination
 // lost: a lost row holds the path's current content, and no committing or
 // live row does. A push writes them again although the index did not change

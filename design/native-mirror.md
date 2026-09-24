@@ -192,17 +192,23 @@ was absent; only a later verify pass would have noticed. The planner now fails
 closed here (`DestinationHasUploadRecords`), because the mirror's records would
 repeat the same mistake.
 
-### Repairs: the planner's second input
+### Repairs: the mirror's second input
 
 This input arrives with the evidence step. A verify pass that finds a
-recorded artifact missing or changed marks that record `lost`. The next
-push then plans the record's content again, even though the index didn't
-change:
+recorded copy missing or changed marks that record `lost`. The next push
+then plans the record's content again, even though the index didn't change:
 
     work = delta since watermark ∪ records marked lost
 
-Today the content layouts only raise an alarm in this case. With repairs, the
-same push that raised the alarm also heals it.
+The mirror's translate reads them (`ListRemotePathRepairs`): present paths
+where a `lost` row holds the current content and no live row does. A
+withdrawn commit is one too, but its path is still in the delta. A push
+that writes repairs counts them as changed, so the runs fold shows it.
+
+The content layouts keep only raising the alarm. Their records have no
+`lost` state, and a changed object can't be healed in place: nothing
+replaces an existing name, so repairing one needs a displacement the
+content layouts don't have.
 
 ## 2. Layouts translate changes into operations
 
@@ -557,13 +563,19 @@ for local mirrors.
   - It checks the size and mtime of every `live` and `displaced` row with
     `Lstat`. Both states count as stored content, so both are checked. This is
     cheap and catches deletion, truncation and replacement.
-  - On local mirrors, it re-hashes a slice of rows, oldest `verified_at_ns` first, within a
-    budget per pass. So every byte is re-read within a known period. Kopia's
-    `verify_files_percent` is the precedent for sampled read-back.
+  - On local mirrors, it re-hashes a slice of rows, oldest `verified_at_ns`
+    first (never-verified first of all), until the slice covers a tenth of the
+    bytes the destination holds (`mirrorRereadShare`, `sync/verify_mirror.go`),
+    and always at least one row. So every byte is re-read within about ten
+    passes. Kopia's `verify_files_percent` is the precedent for sampled
+    read-back.
 
   Findings latch the existing destination alarm and mark the affected rows
-  `lost`. `lost` live rows whose content is still the index's current content
-  become the planner's repairs.
+  `lost` — only while the row is still in the state the pass read it in, since
+  a push may be moving it. `lost` rows whose content is still the index's
+  current content become the mirror's repairs. A clean pass re-attempts the
+  `fingerprint-verified` upgrade, as it does for the content layouts.
+  `squirrel verify` reaches the mirror through its transport, without rclone.
 - **Documents amended in the same PR:**
   - `CanEverGateOffload` becomes true for native local mirrors, and
     `offload_requires` accepts them. sftp mirrors keep refusing, and the

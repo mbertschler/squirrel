@@ -288,11 +288,13 @@ func TestVerifyRemoteNoRecordedObjects(t *testing.T) {
 	}
 }
 
-func TestVerifyRemoteRefusesMirrorDestination(t *testing.T) {
+// TestVerifyRemoteRefusesRcloneMirror: an rclone mirror records nothing a
+// pass could re-check.
+func TestVerifyRemoteRefusesRcloneMirror(t *testing.T) {
 	f := setupContentAddressedFixture(t)
-	dest := &config.Destination{Name: "mirror", Type: "sftp", Root: "/data", Layout: config.LayoutMirror}
+	dest := &config.Destination{Name: "mirror", Type: "sftp", Root: "/data", Layout: config.LayoutMirror, Crypt: &config.Crypt{Password: "x"}}
 	_, err := VerifyRemote(context.Background(), f.store, f.rcl, dest)
-	if err == nil || !strings.Contains(err.Error(), "content-addressed") {
-		t.Fatalf("err = %v, want content-addressed refusal", err)
+	if err == nil || !strings.Contains(err.Error(), "rclone mirror") {
+		t.Fatalf("err = %v, want an rclone-mirror refusal", err)
 	}
 }

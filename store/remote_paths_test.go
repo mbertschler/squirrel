@@ -348,3 +348,25 @@ func TestListRemotePathRepairs(t *testing.T) {
 		t.Fatalf("repairs once a new copy is live = %+v", got)
 	}
 }
+
+// TestLoseStoredRemotePathOnlyFromTheStateRead: a verify finding marks a
+// row lost only while it is still in the state the pass read, so a push
+// that moved the row in between keeps its record.
+func TestLoseStoredRemotePathOnlyFromTheStateRead(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	d, _, runID := remotePathFixture(t, s)
+	id := liveRemotePath(t, s, d, runID, "")
+	if err := s.BeginRemotePathsDisplace(ctx, runID, id); err != nil {
+		t.Fatal(err)
+	}
+	if moved, err := s.LoseStoredRemotePath(ctx, id, RemotePathLive); err != nil || moved {
+		t.Fatalf("lose a row read live that is now displacing = %t, %v; want untouched", moved, err)
+	}
+	if err := s.ConfirmRemotePathsDisplaced(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if moved, err := s.LoseStoredRemotePath(ctx, id, RemotePathDisplaced); err != nil || !moved {
+		t.Fatalf("lose a displaced row = %t, %v; want moved", moved, err)
+	}
+}

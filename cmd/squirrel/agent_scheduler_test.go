@@ -61,20 +61,26 @@ func TestAnyDestinationNeedsScheduledVerify(t *testing.T) {
 
 	cfg := base()
 	cfg.Destinations["m"] = &config.Destination{Layout: config.LayoutMirror, VerifyEvery: time.Hour}
-	if anyDestinationNeedsScheduledVerify(cfg) {
+	if anyScheduledVerifyNeedsRclone(cfg) {
 		t.Fatalf("mirror layout must never need scheduled verify")
 	}
 
 	cfg = base()
+	cfg.Destinations["usb"] = &config.Destination{Type: "local", Layout: config.LayoutMirror, VerifyEvery: time.Hour}
+	if anyScheduledVerifyNeedsRclone(cfg) {
+		t.Fatalf("a native mirror's scheduled verify must not need rclone")
+	}
+
+	cfg = base()
 	cfg.Destinations["p"] = &config.Destination{Layout: config.LayoutPacked, VerifyEvery: time.Hour}
-	if !anyDestinationNeedsScheduledVerify(cfg) {
+	if !anyScheduledVerifyNeedsRclone(cfg) {
 		t.Fatalf("packed destination with own cadence should need verify")
 	}
 
 	cfg = base()
 	cfg.Agent.VerifyEvery = time.Hour
 	cfg.Destinations["c"] = &config.Destination{Layout: config.LayoutContentAddressed}
-	if !anyDestinationNeedsScheduledVerify(cfg) {
+	if !anyScheduledVerifyNeedsRclone(cfg) {
 		t.Fatalf("agent default should cover a verifiable destination with no own cadence")
 	}
 }

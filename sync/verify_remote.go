@@ -12,9 +12,9 @@ import (
 )
 
 // RemoteVerifyReport summarises one verification pass over a
-// destination's recorded content-addressed objects. Every recorded
-// object lands in exactly one of Verified, Populated, Pending, Missing,
-// or Mismatched.
+// destination's recorded content-addressed objects and packs, or a native
+// mirror's recorded copies. Every recorded object lands in exactly one of
+// Verified, Populated, Pending, Missing, or Mismatched.
 type RemoteVerifyReport struct {
 	Destination string
 	RunID       int64
@@ -57,6 +57,19 @@ type RemoteVerifyReport struct {
 	// the recorded one (Hash holds the pack key hex).
 	PackMismatched []RemoteObjectMismatch
 
+	// Paths counts a native mirror's recorded copies, the live and the
+	// displaced ones; each is checked by size and mtime. Zero on the
+	// content layouts.
+	Paths int
+	// PathsReread counts the copies a re-read through BLAKE3 confirmed:
+	// on a local disk, the least recently verified share of them.
+	PathsReread int
+	// PathsMissing and PathsChanged name, relative to the destination root,
+	// the copies found gone and the ones found with another size, mtime or
+	// BLAKE3. Their records are marked lost.
+	PathsMissing []string
+	PathsChanged []string
+
 	// AlarmRaised is true when this pass latched a new standing alarm on
 	// the destination because it was not clean (#157, F30). A pass on an
 	// already-alarmed destination leaves it false (the latch was already
@@ -80,11 +93,19 @@ type RemoteObjectMismatch struct {
 	Actual string
 }
 
-// Clean reports whether every recorded object and pack was accounted for
-// without a mismatch.
+// Clean reports whether every recorded object, pack and mirror copy was
+// accounted for without a mismatch.
 func (r RemoteVerifyReport) Clean() bool {
 	return len(r.Missing) == 0 && len(r.Mismatched) == 0 &&
-		len(r.PacksMissing) == 0 && len(r.PackMismatched) == 0
+		len(r.PacksMissing) == 0 && len(r.PackMismatched) == 0 &&
+		len(r.PathsMissing) == 0 && len(r.PathsChanged) == 0
+}
+
+// failures counts the recorded artifacts this pass found missing or
+// changed.
+func (r RemoteVerifyReport) failures() int {
+	return len(r.Missing) + len(r.Mismatched) + len(r.PacksMissing) + len(r.PackMismatched) +
+		len(r.PathsMissing) + len(r.PathsChanged)
 }
 
 // VerifyRemote re-reads the provider checksums of every object recorded
@@ -95,14 +116,20 @@ func (r RemoteVerifyReport) Clean() bool {
 // mismatches and missing objects land loudly on the report. The pass
 // reads destination metadata and updates local verification state only.
 //
+// A native mirror is checked through squirrel's own transport instead
+// (verifyMirror), so rcl may be nil for one.
+//
 // The pass is recorded as a kind='audit' run: success when every object
 // checked out, partial when objects mismatched or went missing, failed
 // when the pass itself aborted. A 'verify-destination' runs_audit entry
 // carries the destination name and counters.
 func VerifyRemote(ctx context.Context, s *store.Store, rcl *Rclone, dest *config.Destination) (RemoteVerifyReport, error) {
 	rep := RemoteVerifyReport{Destination: dest.Name}
+	if dest.NativeMirror() {
+		return rep, verifyMirror(ctx, s, dest, &rep)
+	}
 	if dest.Layout != config.LayoutContentAddressed && dest.Layout != config.LayoutPacked {
-		return rep, fmt.Errorf("destination %q has layout %q — verify covers the recorded objects and packs of content-addressed and packed destinations", dest.Name, dest.Layout)
+		return rep, fmt.Errorf("destination %q is an rclone mirror — verify covers the recorded objects and packs of content-addressed and packed destinations, and the recorded copies of a mirror squirrel writes itself", dest.Name)
 	}
 	rows, err := s.ListRemoteObjects(ctx, dest.Name)
 	if err != nil {
@@ -436,12 +463,12 @@ func recordVerifyOutcome(ctx context.Context, s *store.Store, rep *RemoteVerifyR
 		errMsg = verifyErr.Error()
 	case !rep.Clean():
 		status = store.RunStatusPartial
-		failed := len(rep.Missing) + len(rep.Mismatched) + len(rep.PacksMissing) + len(rep.PackMismatched)
-		errMsg = fmt.Sprintf("%d object(s)/pack(s) failed verification on %q", failed, rep.Destination)
+		errMsg = fmt.Sprintf("%d object(s)/pack(s)/mirror copies failed verification on %q", rep.failures(), rep.Destination)
 	}
-	note := fmt.Sprintf("destination=%s objects=%d verified=%d fingerprinted=%d pending=%d mismatched=%d missing=%d unrecorded=%d packs=%d packs_verified=%d packs_fingerprinted=%d packs_pending=%d packs_mismatched=%d packs_missing=%d",
+	note := fmt.Sprintf("destination=%s objects=%d verified=%d fingerprinted=%d pending=%d mismatched=%d missing=%d unrecorded=%d packs=%d packs_verified=%d packs_fingerprinted=%d packs_pending=%d packs_mismatched=%d packs_missing=%d paths=%d paths_reread=%d paths_changed=%d paths_missing=%d",
 		rep.Destination, rep.Objects, rep.Verified, rep.Populated, rep.Pending, len(rep.Mismatched), len(rep.Missing), rep.Unrecorded,
-		rep.Packs, rep.PacksVerified, rep.PacksPopulated, rep.PacksPending, len(rep.PackMismatched), len(rep.PacksMissing))
+		rep.Packs, rep.PacksVerified, rep.PacksPopulated, rep.PacksPending, len(rep.PackMismatched), len(rep.PacksMissing),
+		rep.Paths, rep.PathsReread, len(rep.PathsChanged), len(rep.PathsMissing))
 	if err := s.AppendRunAudit(ctx, store.RunAuditEntry{
 		RunID: rep.RunID, Transition: store.TransitionVerifyDestination, Note: note,
 	}); err != nil {
@@ -454,7 +481,7 @@ func recordVerifyOutcome(ctx context.Context, s *store.Store, rep *RemoteVerifyR
 	// noise (#182). A pass that found a mismatch or a missing object is
 	// 'partial' or 'failed' and stays visible on status alone.
 	changed := int64(rep.Populated + rep.PacksPopulated)
-	if err := s.FinishRunChanged(ctx, rep.RunID, status, errMsg, int64(rep.Objects+rep.Packs), changed); err != nil {
+	if err := s.FinishRunChanged(ctx, rep.RunID, status, errMsg, int64(rep.Objects+rep.Packs+rep.Paths), changed); err != nil {
 		return fmt.Errorf("finish verify run %d: %w", rep.RunID, err)
 	}
 	return applyVerifyAlarm(ctx, s, rep, verifyErr)
@@ -472,8 +499,8 @@ func applyVerifyAlarm(ctx context.Context, s *store.Store, rep *RemoteVerifyRepo
 		return nil
 	}
 	if !rep.Clean() {
-		detail := fmt.Sprintf("objects mismatched=%d missing=%d, packs mismatched=%d missing=%d",
-			len(rep.Mismatched), len(rep.Missing), len(rep.PackMismatched), len(rep.PacksMissing))
+		detail := fmt.Sprintf("objects mismatched=%d missing=%d, packs mismatched=%d missing=%d, mirror copies changed=%d missing=%d",
+			len(rep.Mismatched), len(rep.Missing), len(rep.PackMismatched), len(rep.PacksMissing), len(rep.PathsChanged), len(rep.PathsMissing))
 		// AlarmRaised reflects only a *newly* created latch, taken from the
 		// atomic insert itself — so the CLI shouts on first detection but a
 		// concurrent second raise (which found the latch already there)
