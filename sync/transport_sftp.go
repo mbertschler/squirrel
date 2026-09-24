@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path"
+	"strings"
 	"time"
 
 	"github.com/pkg/sftp"
@@ -29,11 +30,11 @@ type sftpTransport struct {
 	fsync bool
 }
 
+// Close drops the ssh connection first: the sftp client's own Close
+// waits for the server to end the session, which a hung server never does.
 func (t *sftpTransport) Close() error {
-	err := t.client.Close()
-	if cerr := t.conn.Close(); err == nil {
-		err = cerr
-	}
+	err := t.conn.Close()
+	_ = t.client.Close()
 	return err
 }
 
@@ -65,10 +66,13 @@ func (t *sftpTransport) List(_ context.Context, dir string) ([]entry, error) {
 	}
 	out := make([]entry, 0, len(fis))
 	for _, fi := range fis {
-		if fi.Name() == "." || fi.Name() == ".." {
-			continue
+		switch name := fi.Name(); {
+		case name == "." || name == "..":
+		case !validName(name) || strings.Contains(name, "/"):
+			return nil, fmt.Errorf("list %s: the server listed %q: %w", dir, name, errInvalidName)
+		default:
+			out = append(out, entryOf(fi))
 		}
-		out = append(out, entryOf(fi))
 	}
 	return out, nil
 }

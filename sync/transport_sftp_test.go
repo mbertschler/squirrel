@@ -32,6 +32,9 @@ type sftpTestServer struct {
 	// clientKey is the private half of the one client key the server
 	// accepts.
 	clientKey ed25519.PrivateKey
+	// hung, once closed, makes the sftp subsystem stop reading requests,
+	// as a server whose disk hangs does.
+	hung chan struct{}
 }
 
 func newKey(t *testing.T) (ed25519.PrivateKey, ssh.Signer) {
@@ -61,7 +64,7 @@ func startSFTPServer(t *testing.T, hostKeys ...ssh.Signer) *sftpTestServer {
 		hostKeys = []ssh.Signer{newSigner(t)}
 	}
 	clientKey, clientSigner := newKey(t)
-	srv := &sftpTestServer{hostKeys: hostKeys, clientKey: clientKey}
+	srv := &sftpTestServer{hostKeys: hostKeys, clientKey: clientKey, hung: make(chan struct{})}
 	cfg := &ssh.ServerConfig{
 		PasswordCallback: func(c ssh.ConnMetadata, pw []byte) (*ssh.Permissions, error) {
 			if c.User() == "u" && string(pw) == "p" {
@@ -91,13 +94,13 @@ func startSFTPServer(t *testing.T, hostKeys ...ssh.Signer) *sftpTestServer {
 			if err != nil {
 				return
 			}
-			go serveSSH(c, cfg)
+			go serveSSH(c, cfg, srv.hung)
 		}
 	}()
 	return srv
 }
 
-func serveSSH(c net.Conn, cfg *ssh.ServerConfig) {
+func serveSSH(c net.Conn, cfg *ssh.ServerConfig, hung chan struct{}) {
 	defer func() { _ = c.Close() }()
 	_, chans, reqs, err := ssh.NewServerConn(c, cfg)
 	if err != nil {
@@ -118,20 +121,37 @@ func serveSSH(c net.Conn, cfg *ssh.ServerConfig) {
 				ok := r.Type == "subsystem" && len(r.Payload) > 4 && string(r.Payload[4:]) == "sftp"
 				_ = r.Reply(ok, nil)
 				if ok {
-					go serveSFTP(ch)
+					go serveSFTP(ch, hung)
 				}
 			}
 		}()
 	}
 }
 
-func serveSFTP(ch ssh.Channel) {
+func serveSFTP(ch ssh.Channel, hung chan struct{}) {
 	defer func() { _ = ch.Close() }()
-	s, err := sftp.NewServer(ch)
+	s, err := sftp.NewServer(hangingChannel{Channel: ch, hung: hung})
 	if err != nil {
 		return
 	}
 	_ = s.Serve()
+}
+
+// hangingChannel stops delivering requests, even the end of the session,
+// once hung is closed.
+type hangingChannel struct {
+	ssh.Channel
+	hung chan struct{}
+}
+
+func (h hangingChannel) Read(p []byte) (int, error) {
+	n, err := h.Channel.Read(p)
+	select {
+	case <-h.hung:
+		select {}
+	default:
+		return n, err
+	}
 }
 
 // knownHosts writes a known_hosts file pinning keys for the server.
@@ -212,6 +232,28 @@ func TestSFTPServersRenameOverAnExistingName(t *testing.T) {
 				t.Fatalf("y after the raw rename = %q, want from", got)
 			}
 		})
+	}
+}
+
+// TestSFTPHungServerReleasesTheTransport: a server that stops answering
+// neither wedges Close nor a dial past its deadline, so a push that gave
+// up on a stalled call can always end.
+func TestSFTPHungServerReleasesTheTransport(t *testing.T) {
+	srv := startSFTPServer(t)
+	tr := mustDialSFTP(t, srv.destination(t, t.TempDir()))
+	close(srv.hung)
+	closed := make(chan error, 1)
+	go func() { closed <- tr.Close() }()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close blocked on a hung server")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if _, err := dialSFTP(ctx, srv.destination(t, t.TempDir())); err == nil {
+		t.Fatal("dial of a server whose sftp subsystem never answers succeeded")
 	}
 }
 

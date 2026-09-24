@@ -41,18 +41,13 @@ func dialSFTP(ctx context.Context, dest *config.Destination) (*sftpTransport, er
 	if algos := dest.Params["host_key_algorithms"]; algos != "" {
 		cfg.HostKeyAlgorithms = strings.Fields(algos)
 	}
-	conn, err := dialSSH(ctx, sftpAddress(dest), cfg, keys)
+	tr, err := dialSession(ctx, sftpAddress(dest), cfg, keys)
 	release()
 	if err != nil {
 		return nil, fmt.Errorf("destination %q: %w", dest.Name, err)
 	}
-	client, err := sftp.NewClient(conn, sftp.UseConcurrentWrites(true))
-	if err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("destination %q: start sftp: %w", dest.Name, err)
-	}
-	data, ok := client.HasExtension(fsyncExtension)
-	return &sftpTransport{conn: conn, client: client, root: dest.Root, fsync: ok && data == "1"}, nil
+	tr.root = dest.Root
+	return tr, nil
 }
 
 // sftpAddress is the host:port dest's server listens on.
@@ -64,11 +59,12 @@ func sftpAddress(dest *config.Destination) string {
 	return net.JoinHostPort(dest.Params["host"], port)
 }
 
-// dialSSH connects to addr and completes the ssh handshake within
-// sftpConnectTimeout. Unless the config pins them, the host key
-// algorithms follow the keys known_hosts pins, settled once the peer's
-// address is known, since known_hosts may pin keys by address.
-func dialSSH(ctx context.Context, addr string, cfg *ssh.ClientConfig, keys hostKeys) (*ssh.Client, error) {
+// dialSession connects to addr, completes the ssh handshake and starts
+// the sftp session, all within sftpConnectTimeout. Unless the config pins
+// them, the host key algorithms follow the keys known_hosts pins, settled
+// once the peer's address is known, since known_hosts may pin keys by
+// address.
+func dialSession(ctx context.Context, addr string, cfg *ssh.ClientConfig, keys hostKeys) (*sftpTransport, error) {
 	ctx, cancel := context.WithTimeout(ctx, sftpConnectTimeout)
 	defer cancel()
 	var d net.Dialer
@@ -86,8 +82,15 @@ func dialSSH(ctx context.Context, addr string, cfg *ssh.ClientConfig, keys hostK
 		_ = tcp.Close()
 		return nil, fmt.Errorf("ssh to %s: %w", addr, err)
 	}
+	conn := ssh.NewClient(c, chans, reqs)
+	client, err := sftp.NewClient(conn, sftp.UseConcurrentWrites(true))
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("start sftp on %s: %w", addr, err)
+	}
 	_ = tcp.SetDeadline(time.Time{})
-	return ssh.NewClient(c, chans, reqs), nil
+	data, ok := client.HasExtension(fsyncExtension)
+	return &sftpTransport{conn: conn, client: client, fsync: ok && data == "1"}, nil
 }
 
 // sftpAuth is how squirrel logs in: with the key file and the password
