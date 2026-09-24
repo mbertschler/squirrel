@@ -158,7 +158,7 @@ Properties that differ from rclone destinations:
 
 ### Content-addressed destinations
 
-By default a destination mirrors the volume's tree (see [Destination layout](#destination-layout)). Any rclone-remote destination — with or without a `crypt` block — can instead opt into an **append-only, content-addressed** layout, built for cold archive storage where objects should never be rewritten or moved:
+By default a destination mirrors the volume's tree (see [Destination layout](#destination-layout)). Any destination but kopia — with or without a `crypt` block — can instead opt into an **append-only, content-addressed** layout, built for cold archive storage where objects should never be rewritten or moved. squirrel writes it itself on a `local` disk and on `sftp` without `crypt`: each object is staged, confirmed (read back through BLAKE3 locally, hashed by the server's `hash_algo` command on sftp) and only then renamed onto its name, never over a file already there. rclone writes the others:
 
 ```toml
 [destinations.archive]
@@ -182,7 +182,7 @@ Properties that differ from mirrored destinations:
 
 - **Verification is presence+size**, recorded as such: each object is re-hashed with BLAKE3 before upload and confirmed present at the expected size after it, but its stored bytes are not compared at transfer time (and `crypt` remotes expose no hashes at all), so the runs row is recorded shallow and the push never claims content verification. On top of that, each upload's provider-side ciphertext fingerprint is recorded in the index and re-checked by [`squirrel verify`](#offsite-verification-squirrel-verify).
 - **Pick the layout when the destination is first used.** Switching an existing mirrored destination to `content-addressed` (or back) is not supported — point the new layout at a fresh destination or root. The push detects a mirrored history (a recorded successful sync without its manifest segment) and refuses.
-- **`squirrel restore` restores the layout**: it resolves each present path to its content hash from the local index, fetches the per-hash object through the same rclone (`crypt`) read path the push uses, and re-hashes every fetched object before writing. When the *local index itself* is lost, the format is deliberately simple enough to recover without squirrel — see below.
+- **`squirrel restore` restores the layout**: it resolves each present path to its content hash from the local index, fetches the per-hash object through the same read path the push uses (squirrel's own on a `local` disk and plain `sftp`, rclone and its `crypt` overlay otherwise), and re-hashes every fetched object before writing. When the *local index itself* is lost, the format is deliberately simple enough to recover without squirrel — see below.
 - `--dry-run` is not supported yet on the push (it previews restore).
 
 #### Offsite verification (`squirrel verify`)
@@ -192,7 +192,8 @@ Cold archive storage is exactly the copy you can't cheaply re-download and re-ha
 What gets recorded depends on the backend type:
 
 - **`s3`** — the object **ETag**, recorded as `etag-md5` for a single-part upload's whole-object MD5, or `etag-md5-composite` for a multipart object's `<hex>-<parts>` value, stored verbatim either way. The ETag is read straight from the S3 API with a paginated `ListObjectsV2` over the `objects/` prefix, *not* through rclone: rclone funnels every hash read through `Object.Hash(MD5)`, which returns an empty string for a composite ETag, so a multipart (or client-encrypted, always-streamed) object would otherwise never expose a fingerprint at all. Listing is archive-tier-safe (no per-object `HEAD`, no restore), and the composite ETag is fixed at upload time and unaffected by later storage-class transitions or server-side encryption, so the recorded value stays stable for the life of the object. This read is the counterpart to the (deferred) write-side use of S3 additional checksums; capturing the ETag needs no upload-side change. For S3-compatible providers whose endpoint the client addresses wrongly, set `force_path_style = true` (see below).
-- **`sftp`** — the checksum computed server-side by the remote's hash command. Content-addressed sftp destinations default to **SHA-256** (`hash_algo = "sha256"`, rendered as rclone's sftp `hashes` option so the selection is explicit rather than rclone's md5/sha1 preference); set `hash_algo` if your server only offers another type.
+- **`local`** — the BLAKE3 of the stored bytes, read back by squirrel itself as each object lands and again on every verify pass; it must equal the object's name.
+- **`sftp`** — the checksum computed server-side by the remote's hash command. Content-addressed sftp destinations default to **SHA-256** (`hash_algo = "sha256"`); set `hash_algo` if your server only offers another type. Without `crypt` squirrel runs the command itself (`md5sum`, `sha1sum`, `sha256sum` or `b3sum`) and checks its answer against the bytes it sent; behind `crypt` rclone runs it, through its sftp `hashes` option.
 - **other backends** — whatever hash `rclone lsjson --hash` exposes, recorded under its rclone hash name (e.g. `sha1` on b2). A backend exposing no checksum leaves the fingerprint pending, with a warning in the sync output.
 
 Re-verify a destination (or all content-addressed destinations) at any time:

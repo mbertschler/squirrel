@@ -94,10 +94,11 @@ storage_class = "<provider archive tier>"   # archive tiers cost less to store, 
 
 ## Choosing a layout
 
-By default a destination **mirrors** the volume's tree. Any rclone-remote
-destination can instead opt into an append-only, content-addressed or packed
-layout, and any non-`local` destination can encrypt contents with a `crypt`
-block. See:
+By default a destination **mirrors** the volume's tree. Any destination but
+kopia can instead opt into an append-only, content-addressed or packed layout,
+and any non-`local` destination can encrypt contents with a `crypt` block.
+squirrel writes a `local` destination, and an `sftp` one without `crypt`, itself
+in every layout; rclone writes the others. See:
 
 - [Mirror (default)](/squirrel/layouts/mirror/)
 - [Encrypted (crypt)](/squirrel/layouts/encrypted/)

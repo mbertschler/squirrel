@@ -79,9 +79,11 @@ copy, so restore works from the **local index** instead:
 2. The bytes are located per content: a per-hash object under `objects/`, or a
    member of a `tar.zst` pack under `packs/` (`pack_members` carries its
    offset and length).
-3. Objects and packs are fetched through the same rclone (`crypt`) read path the
-   push uses. **Packs are fetched once** — one download serves every requested
-   member of that pack, never one fetch per file.
+3. Objects and packs are fetched through the same read path the push uses:
+   squirrel's own transport on a `local` disk and on `sftp` without crypt, with
+   no rclone involved, and rclone (and its `crypt` overlay) elsewhere. **Packs
+   are fetched once** — one download serves every requested member of that
+   pack, never one fetch per file.
 4. Every fetched object and extracted pack member is **re-hashed to BLAKE3 and
    compared** before it is written, so a misplaced or corrupted byte is refused
    rather than restored. (Because of this, `--shallow` does not weaken an

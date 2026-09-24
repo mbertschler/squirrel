@@ -19,8 +19,9 @@ value then vs provider value now** — squirrel never recomputes a provider
 checksum, so provider-specific composite forms are handled as opaque strings, and
 **no object body is ever transferred**.
 
-The read is done via a direct S3 `ListObjectsV2` for `s3`, or `rclone lsjson
---hash` for every other backend.
+The read is done via a direct S3 `ListObjectsV2` for `s3`, `rclone lsjson
+--hash` for every other backend rclone writes, and squirrel's own transport for
+a destination it writes itself (below).
 
 ## What gets recorded, by backend
 
@@ -36,9 +37,19 @@ The read is done via a direct S3 `ListObjectsV2` for `s3`, or `rclone lsjson
   storage-class transitions or server-side encryption. For S3-compatible
   providers whose endpoint the client addresses wrongly, set `force_path_style =
   true`.
+- **`local`** — the BLAKE3 of the stored bytes, which squirrel reads back itself,
+  past the page cache where the system allows: as each object or pack lands,
+  before it gets its name, and on every verify pass. Here the fingerprint is a
+  content check too: an object's BLAKE3 must equal its name, a pack's its key.
 - **`sftp`** — the checksum computed server-side by the remote's hash command.
-  Content-addressed sftp destinations default to **SHA-256** (`hash_algo =
-  "sha256"`); set `hash_algo` if your server only offers another type.
+  Content-addressed and packed sftp destinations default to **SHA-256**
+  (`hash_algo = "sha256"`); set `hash_algo` if your server only offers another
+  type. Without `crypt` squirrel runs the command itself — `md5sum`, `sha1sum`,
+  `sha256sum` or `b3sum`, probed once per session — on the staged copy before it
+  gets its name, and checks the answer against the bytes it sent. A server that
+  runs no programs leaves every fingerprint pending, with a warning. The command
+  line carries only the destination root and the artifact's hex name, and only
+  when both hold nothing but letters, digits, `.`, `_`, `-` and `/`.
 - **other backends** — whatever hash `rclone lsjson --hash` exposes, recorded
   under its rclone hash name (e.g. `sha1` on b2). A backend exposing no checksum
   leaves the fingerprint pending, with a warning in the sync output.
@@ -58,7 +69,8 @@ must be one of those, else it errors: a mirror rclone writes records nothing to
 re-check.
 
 The pass lists the destination's `objects/` directory once (batched,
-metadata-only), then per recorded object:
+metadata-only; on a `local` destination squirrel re-reads every recorded
+artifact), then per recorded object:
 
 - a **match** stamps the object verified in the index;
 - an object **without a fingerprint yet** (uploaded before this feature, or whose

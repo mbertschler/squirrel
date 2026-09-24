@@ -46,7 +46,7 @@ See [Hooks](/squirrel/guides/hooks/).
 |---|---|---|
 | `type` | all | `local`, `sftp`, `s3`, `b2`, `gcs`, or `kopia`. |
 | `root` | all | Base path (or bucket sub-path) at the destination. |
-| `layout` | rclone remotes | `mirror` (default), `content-addressed`, or `packed`. |
+| `layout` | every type but kopia | `mirror` (default), `content-addressed`, or `packed`. |
 
 ### `local`
 
@@ -151,8 +151,8 @@ For `layout = "content-addressed"` or `layout = "packed"` destinations. See
 
 | Key | Applies to | Default | Meaning |
 |---|---|---|---|
-| `hash_algo` | sftp, except a mirror without crypt | `sha256` | Which server-side hash the [scan-back fingerprint](/squirrel/guides/verification/) uses. A plain sftp mirror runs no command on the server, so the key is rejected there. |
-| `checkers` | rclone remotes | rclone default | Cap rclone's concurrent checkers (`--checkers`). Rejected on a `local` mirror and on an `sftp` mirror without crypt: squirrel writes those itself, without rclone. |
+| `hash_algo` | sftp, except a mirror without crypt | `sha256` | Which server-side hash the [fingerprint](/squirrel/guides/verification/) uses. On a content-addressed or packed destination without crypt it names the command squirrel runs on the server — `md5` (`md5sum`), `sha1` (`sha1sum`), `sha256` (`sha256sum`) or `blake3` (`b3sum`) — and squirrel checks its answer against the bytes it sent. Behind crypt rclone runs it, and `crc32`, `xxh3` and `xxh128` are valid too; there the default applies to content-addressed only. A plain sftp mirror runs no command on the server, so the key is rejected there. |
+| `checkers` | rclone remotes | rclone default | Cap rclone's concurrent checkers (`--checkers`). Rejected on every `local` destination and every `sftp` one without crypt: squirrel writes those itself, without rclone. |
 | `force_path_style` | s3 | `false` | Path-style bucket addressing for squirrel's own ETag reader (not the rclone transport). |
 | `pack_threshold` | packed | — | Files smaller than this are packed; at/above land as objects (e.g. `1MiB`). |
 | `pack_size` | packed | — | Target size of one pack before it is closed (e.g. `512MiB`). |

@@ -60,11 +60,15 @@ destination's durability evidence only once *all three* of its artifacts — eve
 pack, the run's `packs/map-<run>`, and its `index/run-<run>` segment — are
 confirmed on the remote **and** every pack has a verified scan-back fingerprint.
 
-A pack's fingerprint is read straight back from the provider after upload (one
-check per ~512 MB pack vouches for every file it holds — the packed analogue of
-the per-object scan-back). If that read is unavailable, the pack is left
-**pending** with a warning and the vector is *not* advanced, so unverified packed
-content is never counted durable.
+A pack's fingerprint is confirmed as it lands where squirrel writes the
+destination itself — read back through BLAKE3 on a `local` disk, hashed by the
+server's command on `sftp` (see
+[how it is written](/squirrel/layouts/content-addressed/#how-it-is-written)) —
+and read straight back from the provider after upload elsewhere. One check per
+~512 MB pack vouches for every file it holds, the packed analogue of the
+per-object fingerprint. If none is available, the pack is left **pending** with
+a warning and the vector is *not* advanced, so unverified packed content is
+never counted durable.
 [`squirrel verify`](/squirrel/guides/verification/) fills any pending pack
 fingerprint and re-confirms the rest, per pack.
 
@@ -72,6 +76,9 @@ fingerprint and re-confirms the rest, per pack.
 
 Properties match the content-addressed layout:
 
+- It is written by squirrel itself on a `local` disk and on `sftp` without
+  `crypt`, and by rclone elsewhere, in the
+  [same way](/squirrel/layouts/content-addressed/#how-it-is-written).
 - Verification is presence+size (recorded shallow).
 - The layout is chosen at first use and refuses to run against a
   differently-shaped history.
