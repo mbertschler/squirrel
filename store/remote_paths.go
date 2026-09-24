@@ -29,8 +29,7 @@ const (
 // destination, keyed on the files row it came from. Path, SizeBytes and
 // Blake3 are read through that row's folder and content. MtimeNs is the
 // mtime the destination reported for the written version. Checksum is
-// the BLAKE3 a read of the stored bytes confirmed, NULL while none did,
-// and VerifiedAtNs when a read last confirmed it.
+// the BLAKE3 a read of the stored bytes confirmed, NULL while none did.
 type RemotePath struct {
 	ID             int64
 	ContentID      int64
@@ -39,7 +38,6 @@ type RemotePath struct {
 	DisplacedRunID sql.NullInt64
 	MtimeNs        int64
 	Checksum       sql.NullString
-	VerifiedAtNs   sql.NullInt64
 
 	Path      string
 	SizeBytes int64
@@ -163,7 +161,7 @@ func (s *Store) transitionRemotePaths(ctx context.Context, ids []int64, to, upda
 // and content size and hash (table aliases rp, fo, c).
 const remotePathSelect = `
 	SELECT rp.id, rp.content_id, rp.written_run_id,
-	       rp.state, rp.displaced_run_id, rp.mtime_ns, rp.checksum, rp.verified_at_ns,
+	       rp.state, rp.displaced_run_id, rp.mtime_ns, rp.checksum,
 	       CASE fo.path WHEN '' THEN rp.name ELSE fo.path || '/' || rp.name END,
 	       c.size_bytes, c.blake3
 	FROM remote_paths rp
@@ -173,7 +171,7 @@ const remotePathSelect = `
 func scanRemotePath(s rowScanner) (RemotePath, error) {
 	var r RemotePath
 	err := s.Scan(&r.ID, &r.ContentID, &r.WrittenRunID,
-		&r.State, &r.DisplacedRunID, &r.MtimeNs, &r.Checksum, &r.VerifiedAtNs,
+		&r.State, &r.DisplacedRunID, &r.MtimeNs, &r.Checksum,
 		&r.Path, &r.SizeBytes, &r.Blake3)
 	return r, err
 }

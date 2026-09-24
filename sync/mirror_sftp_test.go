@@ -53,7 +53,7 @@ func TestMirrorPushOverSFTP(t *testing.T) {
 	}
 	f.checkInvariants(t, nil)
 	for _, r := range f.rows(t) {
-		if r.Checksum.Valid || r.VerifiedAtNs.Valid {
+		if r.Checksum.Valid {
 			t.Fatalf("%s row = %+v, want no fingerprint over sftp", r.Path, r)
 		}
 	}

@@ -580,9 +580,19 @@ for local mirrors.
     passes. Kopia's `verify_files_percent` is the precedent for sampled
     read-back.
 
-  Findings latch the existing destination alarm and mark the affected rows
-  `lost` — only while the row is still in the state the pass read it in, since
-  a push may be moving it. `lost` rows whose content is still the index's
+  A pass first reads every volume's `.squirrel-volume` through the transport
+  and fails, marking nothing, when one is missing or names another volume: an
+  unmounted disk or an emptied share must not read as every copy gone.
+
+  Findings latch the existing destination alarm, also when the pass aborts
+  after recording them, and mark the affected rows `lost` — only while the row
+  is still in the state the pass read it in, since a push may be moving it. A
+  finding also demotes the volume's locally advanced `fingerprint-verified`
+  components to `presence+size` (`DemoteFingerprintVerifiedVector`), at the
+  runs they cover. Without that, a gate with a verify cadence would still take
+  the component's word for a lost copy, and a peer pulling the vector would
+  too; demoted, the gate checks each content's own fingerprint, and the next
+  push that leaves nothing pending upgrades the component again. `lost` rows whose content is still the index's
   current content become the mirror's repairs. A clean pass re-attempts the
   `fingerprint-verified` upgrade, as it does for the content layouts.
   `squirrel verify` reaches the mirror through its transport, without rclone.

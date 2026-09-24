@@ -550,13 +550,15 @@ func recordVerifyOutcome(ctx context.Context, s *store.Store, rep *RemoteVerifyR
 
 // applyVerifyAlarm latches or clears the destination's standing alarm from
 // this pass's outcome (#157, F30). A pass that detected a mismatch or a
-// missing object/pack raises the alarm (idempotent — a re-detection keeps
-// the original "in alarm since"); a clean pass auto-clears any standing
-// alarm, recording the clear against this verify run. A pass that aborted
-// (verifyErr != nil) proves nothing about the destination's integrity, so
-// it neither raises nor clears — its failed run row is the record.
+// missing object/pack/copy raises the alarm (idempotent — a re-detection
+// keeps the original "in alarm since"), even when it aborted afterwards: a
+// mirror's findings are already recorded by then. A clean pass auto-clears
+// any standing alarm, recording the clear against this verify run. A pass
+// that aborted with no finding proves nothing about the destination's
+// integrity, so it neither raises nor clears — its failed run row is the
+// record.
 func applyVerifyAlarm(ctx context.Context, s *store.Store, rep *RemoteVerifyReport, verifyErr error) error {
-	if verifyErr != nil {
+	if verifyErr != nil && rep.Clean() {
 		return nil
 	}
 	if !rep.Clean() {

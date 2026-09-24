@@ -322,7 +322,7 @@ func TestMirrorPushWithoutRclone(t *testing.T) {
 		}
 	}
 	for _, r := range f.rows(t) {
-		if r.Checksum.String != hex.EncodeToString(r.Blake3) || !r.VerifiedAtNs.Valid {
+		if r.Checksum.String != hex.EncodeToString(r.Blake3) {
 			t.Fatalf("%s row = %+v, want the read-back BLAKE3 recorded", r.Path, r)
 		}
 	}

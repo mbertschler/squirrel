@@ -294,6 +294,31 @@ func (s *Store) UpgradeDestinationVectorToFingerprintVerified(ctx context.Contex
 	return true, nil
 }
 
+// DemoteFingerprintVerifiedVector re-stamps every locally advanced
+// fingerprint-verified component of the (volume, destination) vector as
+// presence+size, at the run and verification instant it already records:
+// a verify pass found content the destination held gone or changed, so its
+// vector no longer vouches for the volume as a whole. The offload gate then
+// checks each content's own fingerprint, and a peer pulling the vector sees
+// presence+size. The next push that leaves nothing pending upgrades it
+// again. Each demotion is logged in destination_run_ids_history.
+func (s *Store) DemoteFingerprintVerifiedVector(ctx context.Context, volumeID int64, destination string) error {
+	components, err := s.ListDestinationRunIDs(ctx, volumeID, destination)
+	if err != nil {
+		return err
+	}
+	for _, c := range components {
+		if c.VerifyMethod != VerifyMethodFingerprint || c.SourceNodeID.Valid {
+			continue
+		}
+		verifiedAt := c.VerifiedAtNs
+		if err := s.upsertDestinationRunID(ctx, volumeID, destination, c.OriginNodeID, c.OriginRunID, VerifyMethodPresenceSize, sql.NullInt64{}, &verifiedAt, false); err != nil {
+			return fmt.Errorf("demote vector of %q: %w", destination, err)
+		}
+	}
+	return nil
+}
+
 // recordPushFreshness overwrites the destination's push-freshness maxima
 // to exactly the supplied snapshot — the per-origin-node maxima of the
 // present set this push enumerated. Distinct from the monotonic vector

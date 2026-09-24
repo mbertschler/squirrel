@@ -5,12 +5,13 @@ import (
 	"fmt"
 )
 
-// StoredRemotePath is a live or displaced remote_paths row with the name of
-// the volume it belongs to: a version a mirror holds by squirrel's records,
-// at <volume>/<path> or in that volume's history.
+// StoredRemotePath is a live or displaced remote_paths row with the volume
+// it belongs to: a version a mirror holds by squirrel's records, at
+// <volume>/<path> or in that volume's history.
 type StoredRemotePath struct {
 	RemotePath
-	Volume string
+	VolumeID int64
+	Volume   string
 }
 
 // ListStoredRemotePaths returns every live and displaced row on the
@@ -20,9 +21,9 @@ type StoredRemotePath struct {
 func (s *Store) ListStoredRemotePaths(ctx context.Context, destination string) ([]StoredRemotePath, error) {
 	return queryRows(ctx, s.db, `
 		SELECT rp.id, rp.content_id, rp.written_run_id,
-		       rp.state, rp.displaced_run_id, rp.mtime_ns, rp.checksum, rp.verified_at_ns,
+		       rp.state, rp.displaced_run_id, rp.mtime_ns, rp.checksum,
 		       CASE fo.path WHEN '' THEN rp.name ELSE fo.path || '/' || rp.name END,
-		       c.size_bytes, c.blake3, v.name
+		       c.size_bytes, c.blake3, v.id, v.name
 		FROM remote_paths rp
 		JOIN folders fo ON fo.id = rp.folder_id
 		JOIN volumes v ON v.id = fo.volume_id
@@ -32,32 +33,30 @@ func (s *Store) ListStoredRemotePaths(ctx context.Context, destination string) (
 	`, func(sc rowScanner) (StoredRemotePath, error) {
 		var r StoredRemotePath
 		err := sc.Scan(&r.ID, &r.ContentID, &r.WrittenRunID,
-			&r.State, &r.DisplacedRunID, &r.MtimeNs, &r.Checksum, &r.VerifiedAtNs,
-			&r.Path, &r.SizeBytes, &r.Blake3, &r.Volume)
+			&r.State, &r.DisplacedRunID, &r.MtimeNs, &r.Checksum,
+			&r.Path, &r.SizeBytes, &r.Blake3, &r.VolumeID, &r.Volume)
 		return r, err
 	}, destination)
 }
 
 // RecordRemotePathVerified records that a read of a live or displaced
 // row's stored bytes just hashed to checksum, its content's BLAKE3 in
-// lowercase hex, at atNs. A row that already records a checksum must record
-// this one: a read never replaces the fingerprint it re-confirms.
-func (s *Store) RecordRemotePathVerified(ctx context.Context, id int64, checksum string, atNs int64) error {
+// lowercase hex, at atNs, and reports whether it did. A row that already
+// records a checksum must record this one — a read never replaces the
+// fingerprint it re-confirms — and a row a push moved since is left alone.
+func (s *Store) RecordRemotePathVerified(ctx context.Context, id int64, checksum string, atNs int64) (bool, error) {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE remote_paths SET checksum_algo = ?, checksum = ?, verified_at_ns = ?
 		WHERE id = ? AND state IN ('live', 'displaced') AND (checksum IS NULL OR checksum = ?)
 	`, ChecksumAlgoBlake3, checksum, atNs, id, checksum)
 	if err != nil {
-		return fmt.Errorf("record verification of remote path %d: %w", id, err)
+		return false, fmt.Errorf("record verification of remote path %d: %w", id, err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("record verification of remote path %d: %w", id, err)
+		return false, fmt.Errorf("record verification of remote path %d: %w", id, err)
 	}
-	if n != 1 {
-		return fmt.Errorf("record verification of remote path %d: the row is not stored, or records another checksum", id)
-	}
-	return nil
+	return n == 1, nil
 }
 
 // LoseStoredRemotePath marks a row lost that a verify pass found missing or

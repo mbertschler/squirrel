@@ -307,14 +307,14 @@ func TestListStoredRemotePathsRotatesByVerification(t *testing.T) {
 	if got := ids(); len(got) != 2 || got[0] != second || got[1] != first {
 		t.Fatalf("order = %v, want the never-verified %d before %d", got, second, first)
 	}
-	if err := s.RecordRemotePathVerified(ctx, second, "abc", 9); err != nil {
-		t.Fatalf("RecordRemotePathVerified: %v", err)
+	if stamped, err := s.RecordRemotePathVerified(ctx, second, "abc", 9); err != nil || !stamped {
+		t.Fatalf("RecordRemotePathVerified = %t, %v", stamped, err)
 	}
 	if got := ids(); got[0] != first || got[1] != second {
 		t.Fatalf("order after re-reading %d = %v", second, got)
 	}
-	if err := s.RecordRemotePathVerified(ctx, second, "def", 10); err == nil {
-		t.Fatal("a read replaced the checksum it should re-confirm")
+	if stamped, err := s.RecordRemotePathVerified(ctx, second, "def", 10); err != nil || stamped {
+		t.Fatalf("a read replaced the checksum it should re-confirm: %t, %v", stamped, err)
 	}
 }
 
@@ -368,5 +368,34 @@ func TestLoseStoredRemotePathOnlyFromTheStateRead(t *testing.T) {
 	}
 	if moved, err := s.LoseStoredRemotePath(ctx, id, RemotePathDisplaced); err != nil || !moved {
 		t.Fatalf("lose a displaced row = %t, %v; want moved", moved, err)
+	}
+}
+
+// TestDemoteFingerprintVerifiedVector: a demotion re-stamps only the
+// locally advanced fingerprint-verified components, keeping their runs, and
+// a later advance upgrades them again.
+func TestDemoteFingerprintVerifiedVector(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	_, vID, runID := remotePathFixture(t, s)
+	self, err := s.GetSelfNode(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertDestinationRunIDVerified(ctx, vID, "usb", self.ID, runID, VerifyMethodFingerprint, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DemoteFingerprintVerifiedVector(ctx, vID, "usb"); err != nil {
+		t.Fatalf("DemoteFingerprintVerifiedVector: %v", err)
+	}
+	comps, err := s.ListDestinationRunIDs(ctx, vID, "usb")
+	if err != nil || len(comps) != 1 || comps[0].VerifyMethod != VerifyMethodPresenceSize || comps[0].OriginRunID != runID {
+		t.Fatalf("vector = %+v, %v; want one presence+size component at run %d", comps, err, runID)
+	}
+	if err := s.UpsertDestinationRunIDVerified(ctx, vID, "usb", self.ID, runID, VerifyMethodFingerprint, false); err != nil {
+		t.Fatal(err)
+	}
+	if comps, _ := s.ListDestinationRunIDs(ctx, vID, "usb"); comps[0].VerifyMethod != VerifyMethodFingerprint {
+		t.Fatalf("vector after a later advance = %+v, want fingerprint-verified again", comps)
 	}
 }

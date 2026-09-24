@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/mbertschler/squirrel/store"
@@ -50,19 +51,19 @@ func TestVerifyMirrorRereadRotates(t *testing.T) {
 	}
 	f.index(t)
 	f.mustPush(t)
-	before := map[int64]int64{}
-	for _, r := range f.rows(t) {
-		before[r.ID] = r.VerifiedAtNs.Int64
-	}
+	reread := map[int64]bool{}
 	for range 4 {
+		next, err := f.store.ListStoredRemotePaths(context.Background(), "usb")
+		if err != nil {
+			t.Fatal(err)
+		}
 		if rep := f.verify(t); rep.PathsReread != 1 {
 			t.Fatalf("pass re-read %d copies, want the one a tenth of the bytes needs", rep.PathsReread)
 		}
+		reread[next[0].ID] = true
 	}
-	for _, r := range f.rows(t) {
-		if r.VerifiedAtNs.Int64 == before[r.ID] {
-			t.Fatalf("%s was never re-read in four passes", r.Path)
-		}
+	if len(reread) != 4 {
+		t.Fatalf("four passes re-read %d distinct copies, want all four in turn", len(reread))
 	}
 }
 
@@ -99,6 +100,9 @@ func TestVerifyMirrorFindingsMarkCopiesLost(t *testing.T) {
 	if got := f.lostPaths(t); len(got) != 3 {
 		t.Fatalf("lost = %v, want all three copies", got)
 	}
+	if comps := volumeComponents(t, f.store, "pics", "usb"); len(comps) != 1 || comps[0].VerifyMethod != store.VerifyMethodPresenceSize {
+		t.Fatalf("vector after the findings = %+v, want it demoted to presence+size", comps)
+	}
 
 	rep := f.mustPush(t)
 	if rep.RcloneResult.Transferred != 3 {
@@ -108,6 +112,9 @@ func TestVerifyMirrorFindingsMarkCopiesLost(t *testing.T) {
 		t.Fatal("the repair push did not restore the lost copies")
 	}
 	f.checkInvariants(t, nil)
+	if comps := volumeComponents(t, f.store, "pics", "usb"); comps[0].VerifyMethod != store.VerifyMethodFingerprint {
+		t.Fatalf("vector after the repair = %+v, want fingerprint-verified again", comps)
+	}
 	if rep := f.verify(t); !rep.Clean() {
 		t.Fatalf("pass after the repair = %+v, want clean", rep)
 	}
@@ -141,5 +148,25 @@ func TestVerifyMirrorOverSFTPChecksWithoutReading(t *testing.T) {
 	rep := f.verify(t)
 	if len(rep.PathsMissing) != 1 || rep.PathsMissing[0] != "pics/a.txt" {
 		t.Fatalf("missing = %v, want pics/a.txt", rep.PathsMissing)
+	}
+}
+
+// TestVerifyMirrorRefusesAnUnmountedRoot: a root emptied from under the
+// mirror — a disk that is not mounted — fails the pass on the missing
+// marker, and marks no copy lost.
+func TestVerifyMirrorRefusesAnUnmountedRoot(t *testing.T) {
+	f := setupMirrorFixture(t)
+	f.write(t, "a.txt", "alpha")
+	f.index(t)
+	f.mustPush(t)
+	if err := os.RemoveAll(filepath.Join(f.dst, "pics")); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := VerifyRemote(context.Background(), f.store, nil, f.pair.Destination)
+	if err == nil || !strings.Contains(err.Error(), "nothing was checked") {
+		t.Fatalf("VerifyRemote = %+v, %v; want the pass refused", rep, err)
+	}
+	if lost := f.lostPaths(t); len(lost) != 0 || rep.AlarmRaised {
+		t.Fatalf("lost = %v, alarm raised = %t; want no record touched", lost, rep.AlarmRaised)
 	}
 }

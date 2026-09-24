@@ -35,35 +35,40 @@ func pushNativeMirror(t *testing.T, s *store.Store, root, dst string) *config.De
 
 // TestOffloadGatesOnNativeLocalMirror: a native local mirror reads every
 // copy back through BLAKE3, so its push alone lets offload delete the local
-// bytes. Once a verify pass finds a copy gone, that copy stops vouching and
-// its file stays.
+// bytes, with or without a verify cadence. Once a verify pass finds a copy
+// gone, that copy stops vouching and its file stays.
 func TestOffloadGatesOnNativeLocalMirror(t *testing.T) {
-	root, dst := t.TempDir(), t.TempDir()
-	writeFile(t, filepath.Join(root, "a.txt"), "alpha")
-	writeFile(t, filepath.Join(root, "b.txt"), "bravo")
-	s := setupStore(t)
-	ctx := context.Background()
-	indexVolume(t, s, root)
-	dest := pushNativeMirror(t, s, root, dst)
+	for _, cadenced := range []bool{false, true} {
+		t.Run(map[bool]string{false: "no cadence", true: "verify cadence"}[cadenced], func(t *testing.T) {
+			root, dst := t.TempDir(), t.TempDir()
+			writeFile(t, filepath.Join(root, "a.txt"), "alpha")
+			writeFile(t, filepath.Join(root, "b.txt"), "bravo")
+			s := setupStore(t)
+			ctx := context.Background()
+			indexVolume(t, s, root)
+			dest := pushNativeMirror(t, s, root, dst)
 
-	if err := os.Remove(filepath.Join(dst, volName, "b.txt")); err != nil {
-		t.Fatal(err)
-	}
-	if rep, err := sync.VerifyRemote(ctx, s, nil, dest); err != nil || len(rep.PathsMissing) != 1 {
-		t.Fatalf("verify = %+v, %v; want b.txt found missing", rep, err)
-	}
+			if err := os.Remove(filepath.Join(dst, volName, "b.txt")); err != nil {
+				t.Fatal(err)
+			}
+			if rep, err := sync.VerifyRemote(ctx, s, nil, dest); err != nil || len(rep.PathsMissing) != 1 {
+				t.Fatalf("verify = %+v, %v; want b.txt found missing", rep, err)
+			}
 
-	rep, err := Offload(ctx, s, root, Options{
-		Name: volName, Paths: []string{"."}, Require: []string{"usb"},
-		RequireDests: map[string]*config.Destination{"usb": dest},
-	})
-	if err != nil {
-		t.Fatalf("Offload: %v", err)
+			rep, err := Offload(ctx, s, root, Options{
+				Name: volName, Paths: []string{"."}, Require: []string{"usb"},
+				RequireDests:   map[string]*config.Destination{"usb": dest},
+				VerifyCadenced: map[string]bool{"usb": cadenced},
+			})
+			if err != nil {
+				t.Fatalf("Offload: %v", err)
+			}
+			oneResult(t, rep, "a.txt", OutcomeOffloaded)
+			mustBeGone(t, filepath.Join(root, "a.txt"))
+			oneFailure(t, oneResult(t, rep, "b.txt", OutcomeNotDurable), "usb", FailureNotVerified)
+			mustExist(t, filepath.Join(root, "b.txt"))
+		})
 	}
-	oneResult(t, rep, "a.txt", OutcomeOffloaded)
-	mustBeGone(t, filepath.Join(root, "a.txt"))
-	oneFailure(t, oneResult(t, rep, "b.txt", OutcomeNotDurable), "usb", FailureNotVerified)
-	mustExist(t, filepath.Join(root, "b.txt"))
 }
 
 // TestOffloadRefusesNativeSFTPMirrorUpFront: a native sftp mirror reads
