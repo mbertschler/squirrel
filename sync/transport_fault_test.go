@@ -188,9 +188,9 @@ func followRenames(name string, renames []transportCall) string {
 	return name
 }
 
-func (f *faultTransport) Flush(ctx context.Context) error {
+func (f *faultTransport) Flush(ctx context.Context, dirs ...string) error {
 	return f.do(transportCall{op: "flush"}, func(bool) error {
-		return f.transport.Flush(ctx)
+		return f.transport.Flush(ctx, dirs...)
 	})
 }
 

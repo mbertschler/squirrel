@@ -251,9 +251,10 @@ type transport interface {
 	// The move is durable once a later Flush returns.
 	Rename(ctx context.Context, from, to string) error
 	Remove(ctx context.Context, name string) error
-	// Flush returns once every Put and Rename that returned before it is on
-	// stable storage.
-	Flush(ctx context.Context) error
+	// Flush returns once every Put and Rename that returned before it, and
+	// the entries of dirs, are on stable storage. dirs names directories an
+	// earlier process may have changed, which the caller is about to rely on.
+	Flush(ctx context.Context, dirs ...string) error
 	Close() error
 }
 ```
@@ -495,7 +496,8 @@ out of the batch, and the others go on.
    staged file stays until the next push's reconcile removes it with the
    finished run's staging: the name guard removes no running run's staging. That is the `errContentDrift` contract. Here the
    hash covers exactly the bytes sent, which closes the re-hash-then-read gap
-   noted on `uploadOneObject`. The batch's staged files are then flushed.
+   noted on the rclone artifact store's `put`. The batch's staged files are
+   then flushed.
 3. **Read back**, on a local disk: every staged file is read in full, past
    the cache, through BLAKE3 (section 5). A mismatch fails the path before it
    touches the live tree.
@@ -617,7 +619,10 @@ A power cut can also undo whatever the last flush didn't cover. Every row
 still finds its bytes at one of the two places the table checks: no row
 leaves `displacing` or `committing` before the flush that covers its move,
 and a staged file is flushed before it's renamed onto a path. The receipt is
-flushed before the run is sealed.
+flushed before the run is sealed. A push that stopped before its flush —
+cancelled, stalled, killed — leaves moves the disk may still take back, so
+reconcile flushes every directory along both places of each unsettled row
+before it records any settlement.
 
 `TestMirrorCrashTable` runs each row above; `TestMirrorTranslationRules` and
 `TestMirrorWriteDisplacesWhatThePathHolds` run the translation table.
@@ -636,9 +641,12 @@ usual:
   fault-injecting transport wrapper, then a clean push. The invariants below
   must hold afterwards. It writes one path at a time, so the calls come in
   the same order on every run; `Flush` is a call like any other.
-- **Power cuts.** The same wrapper can, at the crash, also undo every `Put`
-  and `Rename` since the last `Flush`: a put file vanishes or is cut short,
-  a rename is reversed. The invariants must hold after the next clean push.
+- **Power cuts.** The same wrapper can, at the crash, also take back what no
+  `Flush` covered: every `Put` and `Rename` since the last one undone (a put
+  file vanishes, a rename is reversed), or every name kept but none of those
+  files' bytes. The invariants must hold after the next clean push. A first
+  push, which displaces nothing, runs it too: there only the flush after
+  staging stands between a staged file's bytes and its commit.
 - **A model-based test.** It generates random index histories: add, modify,
   delete, re-add, file↔directory swaps, names that collide by case. It then
   pushes with several paths in flight and random crash points, some of them
@@ -684,7 +692,7 @@ Where each case lives:
 | Case | Tests |
 |---|---|
 | Crash at every call, then a clean push | `TestMirrorCrashAtEveryTransportCall`, `TestNativeContentCrashAtEveryTransportCall` (`sync/crash_every_call_test.go`) |
-| Power cuts at every call | `TestMirrorPowerCutAtEveryTransportCall`, `TestNativeContentPowerCutAtEveryTransportCall` (`sync/crash_every_call_test.go`) |
+| Power cuts at every call | `TestMirrorPowerCutAtEveryTransportCall`, `TestNativeContentPowerCutAtEveryTransportCall` (`sync/crash_every_call_test.go`), `TestMirrorFirstPushSurvivesAPowerCutAtEveryCall` |
 | Random histories against a model | `TestMirrorModel` (`sync/mirror_model_test.go`) |
 | File↔directory swaps | `TestMirrorFileDirectorySwap`, `TestMirrorNestedFileDirectorySwaps` |
 | Unrecorded and changed entries at a target | `TestMirrorWriteDisplacesWhatThePathHolds`, `TestMirrorRecordChangedBehindSquirrelsBack` |
@@ -793,7 +801,8 @@ gcs. Objects land in batches, like a mirror's paths: at most 64 or 256 MB,
    confirmed instead (downloaded and hashed when the server runs no command),
    or the artifact fails. Squirrel never replaces it;
 4. the batch is flushed, and only then is each landed artifact's upload row
-   recorded, with its fingerprint.
+   recorded, with its fingerprint. An artifact a stall or cancellation kept
+   from that flush fails, and the push stops after a batch that stalled.
 
 A pack, the placement map and the manifest segment land alone, through the
 same steps.
@@ -873,7 +882,7 @@ addressed local destinations by path; that restriction is gone.
   computes to check the server's answer. rclone's other hashes (`crc32`,
   `xxh3`, `xxh128`) stay valid behind crypt only.
 - **`concurrency`** is how many files a push writes at once, on every
-  destination type: 4 by default on a local disk, 8 on sftp. A storage
+  destination type but kopia: 4 by default on a local disk, 8 on sftp. A storage
   server that limits concurrent connections, or a slow disk or USB bridge,
   may want it lower. On a destination squirrel writes itself, the files share
   one SSH connection (section 3), and each file on sftp also goes out as up

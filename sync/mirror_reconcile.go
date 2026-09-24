@@ -5,13 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"path"
 
 	"github.com/mbertschler/squirrel/store"
 )
 
 // reconcile settles, once at push start, every move an earlier push
 // recorded but may not have finished, deciding each from where the bytes
-// actually are, then removes the staging finished runs left behind.
+// actually are, then removes the staging finished runs left behind. The
+// earlier push may have stopped before flushing its moves, so the
+// directories they touched are flushed before any settlement is recorded.
 func (h *mirrorHandler) reconcile(ctx context.Context, rep *Report, volumeID, runID int64) error {
 	tr, err := h.root(ctx, runID)
 	if err != nil {
@@ -21,12 +24,45 @@ func (h *mirrorHandler) reconcile(ctx context.Context, rep *Report, volumeID, ru
 	if err != nil {
 		return fmt.Errorf("list unsettled mirror paths on %q: %w", h.dest.Name, err)
 	}
-	for _, r := range rows {
-		if err := h.settle(ctx, tr, r); err != nil {
+	settlements := make([]settlement, len(rows))
+	var dirs []string
+	for i, r := range rows {
+		if settlements[i], err = h.settle(ctx, tr, r); err != nil {
+			return fmt.Errorf("reconcile %s on %q: %w", r.Path, h.dest.Name, err)
+		}
+		dirs = append(dirs, h.movedThrough(r)...)
+	}
+	if len(rows) > 0 {
+		if err := tr.Flush(ctx, dirs...); err != nil {
+			return fmt.Errorf("flush the moves an earlier push left in flight on %q: %w", h.dest.Name, err)
+		}
+	}
+	for i, r := range rows {
+		if err := h.recordSettlement(ctx, r, settlements[i]); err != nil {
 			return fmt.Errorf("reconcile %s on %q: %w", r.Path, h.dest.Name, err)
 		}
 	}
 	return h.clearFinishedStaging(ctx, rep, tr)
+}
+
+// movedThrough is every directory along the two places an unsettled
+// row's version can be: the rename that moved it may have moved a
+// directory above it.
+func (h *mirrorHandler) movedThrough(r store.RemotePath) []string {
+	other := stagingName(h.vol.Name, r.WrittenRunID, stagingKey(r.Path))
+	if r.State == store.RemotePathDisplacing {
+		other = historyName(h.vol.Name, r.DisplacedRunID.Int64, r.Path)
+	}
+	return append(ancestors(h.liveName(r.Path)), ancestors(other)...)
+}
+
+// ancestors is every directory above name, below the root.
+func ancestors(name string) []string {
+	var out []string
+	for d := path.Dir(name); d != "."; d = path.Dir(d) {
+		out = append(out, d)
+	}
+	return out
 }
 
 // settlement is how reconcile resolves one unsettled row.
@@ -36,33 +72,32 @@ const (
 	settleLive settlement = iota
 	settleDisplaced
 	settleLost
+	settleNothing
 )
 
 // settle looks at both places an unsettled row's version can be and
-// records where it is.
-func (h *mirrorHandler) settle(ctx context.Context, tr transport, r store.RemotePath) error {
+// decides where it is.
+func (h *mirrorHandler) settle(ctx context.Context, tr transport, r store.RemotePath) (settlement, error) {
 	at, err := statMatch(ctx, tr, h.liveName(r.Path), r)
 	if err != nil {
-		return err
+		return settleNothing, err
 	}
-	var s settlement
 	switch r.State {
 	case store.RemotePathCommitting:
 		staged, err := present(ctx, tr, stagingName(h.vol.Name, r.WrittenRunID, stagingKey(r.Path)))
 		if err != nil {
-			return err
+			return settleNothing, err
 		}
-		s = settleCommitting(staged, at)
+		return settleCommitting(staged, at), nil
 	case store.RemotePathDisplacing:
 		inHistory, err := statMatch(ctx, tr, historyName(h.vol.Name, r.DisplacedRunID.Int64, r.Path), r)
 		if err != nil {
-			return err
+			return settleNothing, err
 		}
-		s = settleDisplacing(inHistory, at)
+		return settleDisplacing(inHistory, at), nil
 	default:
-		return nil
+		return settleNothing, nil
 	}
-	return h.recordSettlement(ctx, r, s)
 }
 
 // settleCommitting decides a committing row: its version is live once the
@@ -92,6 +127,8 @@ func settleDisplacing(inHistory, atPath bool) settlement {
 
 func (h *mirrorHandler) recordSettlement(ctx context.Context, r store.RemotePath, s settlement) error {
 	switch {
+	case s == settleNothing:
+		return nil
 	case s == settleLost:
 		return h.store.MarkRemotePathsLost(ctx, r.ID)
 	case r.State == store.RemotePathCommitting:

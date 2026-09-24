@@ -31,6 +31,7 @@ type localTransport struct {
 	mu      sync.Mutex
 	pending []*os.File
 	dirty   map[string]bool
+	closed  bool
 }
 
 func openLocalTransport(dir string) (*localTransport, error) {
@@ -46,7 +47,7 @@ func (t *localTransport) Close() error {
 	for _, f := range t.pending {
 		_ = f.Close()
 	}
-	t.pending = nil
+	t.pending, t.closed = nil, true
 	t.mu.Unlock()
 	return t.root.Close()
 }
@@ -142,8 +143,11 @@ func (t *localTransport) settle(f *os.File, name string) error {
 		return nil
 	}
 	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return f.Close()
+	}
 	t.pending = append(t.pending, f)
-	t.mu.Unlock()
 	return nil
 }
 
@@ -171,18 +175,21 @@ func (t *localTransport) Rename(_ context.Context, from, to string) error {
 	if err := t.mkdirParents(to); err != nil {
 		return err
 	}
+	t.markDirty(path.Dir(to))
 	if err := renameNoReplace(t.root, from, to); err != nil {
 		return err
 	}
 	t.markDirty(path.Dir(from))
-	t.markDirty(path.Dir(to))
 	return nil
 }
 
-// Flush makes every file Put left open, and every directory a call
-// changed, durable, then releases the files.
-func (t *localTransport) Flush(context.Context) error {
+// Flush makes every file Put left open, every directory a call changed,
+// and dirs durable, then releases the files.
+func (t *localTransport) Flush(_ context.Context, dirs ...string) error {
 	t.mu.Lock()
+	for _, d := range dirs {
+		t.dirty[d] = true
+	}
 	files, dirty := t.pending, t.dirty
 	t.pending, t.dirty = nil, map[string]bool{}
 	t.mu.Unlock()
@@ -191,12 +198,12 @@ func (t *localTransport) Flush(context.Context) error {
 			_ = f.Close()
 		}
 	}()
-	dirs := make([]string, 0, len(dirty))
+	sorted := make([]string, 0, len(dirty))
 	for d := range dirty {
-		dirs = append(dirs, d)
+		sorted = append(sorted, d)
 	}
-	slices.Sort(dirs)
-	return flushLocal(t.root, files, dirs)
+	slices.Sort(sorted)
+	return flushLocal(t.root, files, sorted)
 }
 
 func (t *localTransport) Remove(_ context.Context, name string) error {

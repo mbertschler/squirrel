@@ -151,11 +151,7 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 	if err != nil {
 		return nil, err
 	}
-	checkers, err := resolveCheckers(raw, typ, native)
-	if err != nil {
-		return nil, err
-	}
-	concurrency, err := resolveConcurrency(raw, typ)
+	checkers, concurrency, err := resolveParallelism(raw, typ, native)
 	if err != nil {
 		return nil, err
 	}
@@ -322,6 +318,16 @@ func resolveCheckers(raw map[string]any, typ string, native bool) (int, error) {
 		return 0, errors.New("checkers must be a positive integer")
 	}
 	return int(n), nil
+}
+
+// resolveParallelism validates the keys that cap how much a push does at
+// once: `checkers` and `concurrency`.
+func resolveParallelism(raw map[string]any, typ string, native bool) (checkers, concurrency int, err error) {
+	if checkers, err = resolveCheckers(raw, typ, native); err != nil {
+		return 0, 0, err
+	}
+	concurrency, err = resolveConcurrency(raw, typ)
+	return checkers, concurrency, err
 }
 
 // resolveConcurrency validates the optional `concurrency` key: a positive

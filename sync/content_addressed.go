@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 
 	"github.com/zeebo/blake3"
@@ -266,7 +267,8 @@ func (h *contentPusher) uploadObjects(ctx context.Context, rep *Report, runID in
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		for i, res := range h.uploadBatch(ctx, runID, batch) {
+		results := h.uploadBatch(ctx, runID, batch)
+		for i, res := range results {
 			d := batch[i]
 			switch {
 			case errors.Is(res.err, errContentDrift):
@@ -287,6 +289,9 @@ func (h *contentPusher) uploadObjects(ctx context.Context, rep *Report, runID in
 			}
 			rep.RcloneResult.Transferred++
 			rep.RcloneResult.Bytes += d.SizeBytes
+		}
+		if slices.ContainsFunc(results, func(r artifactResult) bool { return errors.Is(r.err, errTransportStalled) }) {
+			break
 		}
 	}
 	h.captureFingerprints(ctx, rep, pending)

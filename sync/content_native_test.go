@@ -6,10 +6,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mbertschler/squirrel/config"
 	"github.com/mbertschler/squirrel/index"
@@ -256,6 +259,69 @@ func TestNativeContentPushWithoutRclone(t *testing.T) {
 // TestNativeContentWithoutServerHash: an sftp server that runs no programs
 // still takes every artifact, whole, but fingerprints nothing: the objects
 // stay pending with a warning and the vector stays presence+size.
+// stallingPuts holds the nth Put into staging, and every one after it,
+// until release is closed.
+type stallingPuts struct {
+	transport
+	n       int32
+	seen    *atomic.Int32
+	release chan struct{}
+}
+
+func (s stallingPuts) Put(ctx context.Context, name string, r io.Reader, mtime time.Time) error {
+	if strings.Contains(name, "/"+StagingDirName+"/run-") && s.seen.Add(1) >= s.n {
+		<-s.release
+	}
+	return s.transport.Put(ctx, name, r, mtime)
+}
+
+// TestNativeContentStallRecordsOnlyWhatLanded: a content-addressed push
+// whose transport stalls halfway through a batch records no object it did
+// not land and flush, so the push after the stall clears lands the rest.
+func TestNativeContentStallRecordsOnlyWhatLanded(t *testing.T) {
+	f := setupNativeContentFixture(t, contentBackends[0], config.LayoutContentAddressed)
+	f.oneAtATime()
+	bodies := []string{"one", "two", "three", "four", "five"}
+	for _, b := range bodies {
+		f.write(t, b+".txt", b)
+	}
+	f.index(t)
+	h, err := HandlerFor(f.store, Tools{}, f.pair)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := h.(*contentAddressedHandler).art.(*transportArtifacts).destinationRoot
+	release := make(chan struct{})
+	root.stallTimeout = 50 * time.Millisecond
+	root.openTransport = func(ctx context.Context, d *config.Destination) (transport, error) {
+		raw, err := openDestinationTransport(ctx, d)
+		return stallingPuts{transport: raw, n: 3, seen: new(atomic.Int32), release: release}, err
+	}
+	rep, err := h.Push(context.Background(), Options{})
+	if err == nil || len(rep.RcloneResult.FailedFiles) == 0 || !strings.Contains(rep.RcloneResult.FailedFiles[0].Message, errTransportStalled.Error()) {
+		t.Fatalf("stalled push = %v, failures %+v; want it failed on the stall", err, rep.RcloneResult.FailedFiles)
+	}
+	for _, b := range bodies {
+		if _, recorded := f.remoteObject(t, b); recorded {
+			if _, err := os.Stat(f.objectPath(b)); err != nil {
+				t.Errorf("object %q is recorded but not at its name: %v", b, err)
+			}
+		}
+	}
+	close(release)
+	deadline := time.Now().Add(5 * time.Second)
+	for stalledCounter("vault").Load() > 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	f.mustPush(t)
+	f.checkArtifactsVouch(t)
+	for _, b := range bodies {
+		if _, recorded := f.remoteObject(t, b); !recorded {
+			t.Errorf("object %q not recorded after the push that followed the stall", b)
+		}
+	}
+}
+
 func TestNativeContentWithoutServerHash(t *testing.T) {
 	f := setupNativeContentFixture(t, sftpContentNoPrograms, config.LayoutContentAddressed)
 	f.write(t, "a.txt", "alpha")

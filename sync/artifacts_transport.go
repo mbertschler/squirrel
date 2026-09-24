@@ -89,7 +89,8 @@ type artifactLanding struct {
 
 // putAll takes the artifacts through the steps of a landing, each for all
 // of them before the next: stage, flush, confirm, rename, flush. An
-// artifact whose step fails drops out.
+// artifact whose step fails drops out; one a stall or cancellation kept
+// from the final flush fails too, since only that flush lands it.
 func (a *transportArtifacts) putAll(ctx context.Context, runID int64, items []artifactPut) []artifactResult {
 	out := make([]artifactResult, len(items))
 	tr, err := a.root(ctx, runID)
@@ -105,10 +106,14 @@ func (a *transportArtifacts) putAll(ctx context.Context, runID int64, items []ar
 	}
 	b := artifactBatch{a: a, tr: tr, n: pushConcurrency(a.dest)}
 	b.each(ctx, ls, b.stage)
-	b.flush(ctx, ls, "flush the staged artifacts")
-	b.each(ctx, ls, b.confirmStaged)
-	b.each(ctx, ls, b.rename)
-	b.flush(ctx, ls, "flush the landed artifacts")
+	if b.flush(ctx, ls, "flush the staged artifacts") {
+		b.each(ctx, ls, b.confirmStaged)
+		b.each(ctx, ls, b.rename)
+		if b.flush(ctx, ls, "flush the landed artifacts") {
+			return out
+		}
+	}
+	b.abandon(ctx, ls)
 	return out
 }
 
@@ -133,17 +138,31 @@ func (b *artifactBatch) each(ctx context.Context, ls []*artifactLanding, step fu
 	})
 }
 
-// flush makes the batch's last step durable; a flush that fails fails
-// every artifact still on its way.
-func (b *artifactBatch) flush(ctx context.Context, ls []*artifactLanding, what string) {
+// flush makes the batch's last step durable and reports whether it did.
+// A flush that fails fails every artifact still on its way; a stalled or
+// cancelled batch goes no further.
+func (b *artifactBatch) flush(ctx context.Context, ls []*artifactLanding, what string) bool {
 	pending := pendingArtifacts(ls)
-	if len(pending) == 0 || b.stalled.Load() {
-		return
+	if len(pending) == 0 || b.stalled.Load() || ctx.Err() != nil {
+		return false
 	}
 	if err := b.tr.Flush(ctx); err != nil {
 		for _, l := range pending {
 			l.res.err = fmt.Errorf("%s: %w", what, err)
 		}
+		return false
+	}
+	return true
+}
+
+// abandon fails every artifact the batch stopped short of landing.
+func (b *artifactBatch) abandon(ctx context.Context, ls []*artifactLanding) {
+	why := ctx.Err()
+	if why == nil {
+		why = fmt.Errorf("%w: the batch stopped before the artifact landed", errTransportStalled)
+	}
+	for _, l := range pendingArtifacts(ls) {
+		l.res.err = why
 	}
 }
 

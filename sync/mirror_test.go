@@ -940,6 +940,48 @@ func TestMirrorProgressEvents(t *testing.T) {
 	}
 }
 
+// flushRecorder notes the directories each Flush was asked to cover.
+type flushRecorder struct {
+	transport
+	flushes *[][]string
+}
+
+func (r flushRecorder) Flush(ctx context.Context, dirs ...string) error {
+	*r.flushes = append(*r.flushes, dirs)
+	return r.transport.Flush(ctx, dirs...)
+}
+
+// TestMirrorReconcileFlushesWhatItSettles: a push that died after renaming
+// a staged file onto its path, before the flush that makes the rename
+// durable, leaves its row committing; the next push flushes the path's
+// directories and the staging directory before it records the row live.
+func TestMirrorReconcileFlushesWhatItSettles(t *testing.T) {
+	f := setupMirrorFixture(t)
+	f.oneAtATime()
+	f.write(t, "d/a.txt", "alpha")
+	f.index(t)
+	crash, err := f.pushCrashing(t, func(c transportCall) bool {
+		return c.op == "rename" && path.Base(c.to) == "a.txt"
+	}, crashAfter)
+	if !crashedOn(crash, err) {
+		t.Fatalf("crashing push = %v, want the injected crash", err)
+	}
+	if got := f.rowsAt(t, "d/a.txt"); len(got) != 1 || got[0] != store.RemotePathCommitting {
+		t.Fatalf("d/a.txt rows = %v, want one committing", got)
+	}
+	var flushes [][]string
+	if _, err := f.pushVia(t, Options{}, func(tr transport) transport { return flushRecorder{tr, &flushes} }); err != nil {
+		t.Fatal(err)
+	}
+	staging := path.Dir(stagingName("pics", crash.RunID, stagingKey("d/a.txt")))
+	if len(flushes) == 0 || !slices.Contains(flushes[0], "pics/d") || !slices.Contains(flushes[0], staging) {
+		t.Fatalf("first flush covered %v, want pics/d and %s", flushes, staging)
+	}
+	if got := f.rowsAt(t, "d/a.txt"); len(got) != 1 || got[0] != store.RemotePathLive {
+		t.Fatalf("d/a.txt rows = %v, want one live", got)
+	}
+}
+
 // blockingTransport holds every Stat until release is closed.
 type blockingTransport struct {
 	transport

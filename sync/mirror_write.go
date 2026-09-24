@@ -24,7 +24,7 @@ import (
 // mirrorWriter carries one run's execution: the guarded transport, the
 // live records it keeps current, and the tally for the report. Several
 // paths are in flight at once, so the records and the tally are shared
-// behind mu, which is never held across a transport call.
+// behind mu; transport calls run outside it.
 type mirrorWriter struct {
 	h        *mirrorHandler
 	rep      *Report
@@ -44,8 +44,10 @@ type mirrorWriter struct {
 	mu   gosync.Mutex
 	live map[string]store.RemotePath
 	// displacing is the rows this batch moved into history, which the
-	// batch's flush lets it record as displaced.
+	// batch's flush lets it record as displaced; movedAside counts every
+	// move into history, recorded or not.
 	displacing []int64
+	movedAside int
 	done       int
 	drifted    int
 	collided   int
@@ -244,19 +246,20 @@ func (w *mirrorWriter) displaceLanding(ctx context.Context, l *landing) error {
 	return w.displace(ctx, l.p.delta.Path)
 }
 
-// recordDisplaced flushes the batch's moves into history, then records
-// them as displaced. Until then their rows stay displacing, which the
-// next push's reconcile settles from where the bytes are.
+// recordDisplaced flushes the batch's moves into history, so they land
+// before any commit, then records the recorded ones as displaced. Until
+// then their rows stay displacing, which the next push's reconcile
+// settles from where the bytes are.
 func (w *mirrorWriter) recordDisplaced(ctx context.Context, ls []*landing) {
 	w.mu.Lock()
-	ids := w.displacing
-	w.displacing = nil
+	ids, moved := w.displacing, w.movedAside
+	w.displacing, w.movedAside = nil, 0
 	w.mu.Unlock()
-	if len(ids) == 0 {
+	if moved == 0 {
 		return
 	}
 	err := w.tr.Flush(ctx)
-	if err == nil {
+	if err == nil && len(ids) > 0 {
 		err = w.h.store.ConfirmRemotePathsDisplaced(ctx, ids...)
 	}
 	if err != nil {
@@ -512,6 +515,7 @@ func (w *mirrorWriter) moveRecorded(ctx context.Context, rel string, ids []int64
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.displacing = append(w.displacing, ids...)
+	w.movedAside++
 	for r := range w.live {
 		if r == rel || w.fold.under(r, rel) {
 			delete(w.live, r)
@@ -531,6 +535,9 @@ func (w *mirrorWriter) moveUnrecorded(ctx context.Context, rel string, e entry) 
 	if err := w.tr.Rename(ctx, w.h.liveName(rel), to); err != nil {
 		return fmt.Errorf("displace unrecorded %s: %w", rel, err)
 	}
+	w.mu.Lock()
+	w.movedAside++
+	w.mu.Unlock()
 	w.warn(fmt.Sprintf("destination %q: %s held bytes squirrel did not write (%d bytes); they are preserved at %s", w.h.dest.Name, rel, e.size, to))
 	return nil
 }

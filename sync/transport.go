@@ -31,9 +31,11 @@ type transport interface {
 	// Rename moves from to to, creating to's parents; fs.ErrExist if to
 	// exists.
 	Rename(ctx context.Context, from, to string) error
-	// Flush returns once every Put and Rename that returned before it is
-	// on stable storage, as far as the destination can make it so.
-	Flush(ctx context.Context) error
+	// Flush returns once every Put and Rename that returned before it, and
+	// the entries of every directory in dirs, are on stable storage, as far
+	// as the destination can make it so. dirs names directories an earlier
+	// process may have changed, which a caller is about to rely on.
+	Flush(ctx context.Context, dirs ...string) error
 	// Remove deletes the file or empty directory at name.
 	Remove(ctx context.Context, name string) error
 	// ServerHash is the destination's own hash of the file at name, run

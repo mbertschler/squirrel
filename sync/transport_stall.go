@@ -119,14 +119,14 @@ func (s stallTransport) Put(ctx context.Context, name string, r io.Reader, mtime
 	return err
 }
 
-func (s stallTransport) Flush(ctx context.Context) error {
+func (s stallTransport) Flush(ctx context.Context, dirs ...string) error {
 	var pending int64
 	if s.unflushed != nil {
 		pending = s.unflushed.Load()
 	}
 	_, err := bounded(ctx, s, "flush", func(ctx context.Context, progress func(time.Duration)) (struct{}, error) {
 		progress(s.timeout + time.Duration(pending/stallBytesPerSecond)*time.Second)
-		return struct{}{}, s.transport.Flush(ctx)
+		return struct{}{}, s.transport.Flush(ctx, dirs...)
 	})
 	if err == nil && s.unflushed != nil {
 		s.unflushed.Add(-pending)
