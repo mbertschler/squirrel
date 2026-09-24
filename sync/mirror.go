@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"path"
+	"slices"
 	"strconv"
 	"time"
 
@@ -90,7 +91,7 @@ func (h *mirrorHandler) landed(ctx context.Context, runID int64) (bool, error) {
 }
 
 // rootEmpty reports whether the destination root holds no file beyond
-// the volume markers, walking it until the first one.
+// the volume markers.
 func (h *mirrorHandler) rootEmpty(ctx context.Context) (bool, error) {
 	tr, err := h.root(ctx, 0)
 	if err != nil {
@@ -99,15 +100,20 @@ func (h *mirrorHandler) rootEmpty(ctx context.Context) (bool, error) {
 	return treeEmpty(ctx, tr, ".")
 }
 
-func treeEmpty(ctx context.Context, tr transport, dir string) (bool, error) {
+// treeEmpty reports whether dir holds no file beyond volume markers,
+// walking it until the first one. A directory skip names is not walked.
+func treeEmpty(ctx context.Context, tr transport, dir string, skip ...string) (bool, error) {
 	entries, err := tr.List(ctx, dir)
 	if err != nil {
 		return false, err
 	}
+	names := entryNames(entries)
 	for _, e := range entries {
 		switch {
+		case appleDouble(e.name, names):
+		case e.kind == kindDir && slices.Contains(skip, path.Join(dir, e.name)):
 		case e.kind == kindDir:
-			empty, err := treeEmpty(ctx, tr, path.Join(dir, e.name))
+			empty, err := treeEmpty(ctx, tr, path.Join(dir, e.name), skip...)
 			if err != nil || !empty {
 				return false, err
 			}
@@ -117,6 +123,31 @@ func treeEmpty(ctx context.Context, tr transport, dir string) (bool, error) {
 		}
 	}
 	return true, nil
+}
+
+// firstPush refuses to start a volume's mirror over a volume directory
+// that already holds files squirrel has no record of writing — a tree
+// rclone wrote, another layout's, or a native mirror whose index is gone:
+// a native mirror adopts no tree. A first push that crashed left records,
+// so its retry passes.
+func (h *mirrorHandler) firstPush(ctx context.Context, volumeID int64) error {
+	recorded, err := h.store.VolumeHasRemotePaths(ctx, h.dest.Name, volumeID)
+	if err != nil || recorded {
+		return err
+	}
+	tr, err := h.root(ctx, 0)
+	if err != nil {
+		return err
+	}
+	empty, err := treeEmpty(ctx, tr, h.vol.Name, path.Join(h.vol.Name, StagingDirName))
+	if errors.Is(err, fs.ErrNotExist) || empty {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("destination %q: check whether %s/ is empty: %w", h.dest.Name, h.vol.Name, err)
+	}
+	return fmt.Errorf("destination %q: %s/ already holds files, but squirrel has no record of syncing volume %q there; a native mirror does not adopt a tree it did not record writing: if squirrel wrote it, recover this index from it with `squirrel recover --from %s`; otherwise point the destination at a fresh root, or empty %s/ apart from its %s: %w",
+		h.dest.Name, h.vol.Name, h.vol.Name, h.dest.Name, h.vol.Name, volmark.MarkerName, ErrRefused)
 }
 
 func (h *mirrorHandler) foreignHistory(runID int64) error {

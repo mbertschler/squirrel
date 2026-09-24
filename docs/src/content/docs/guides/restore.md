@@ -66,7 +66,9 @@ involved.
   [receipts](/squirrel/layouts/mirror/#how-a-mirror-is-written) name the content
   each path last held, so every file a receipt names is checked against it and
   refused if it differs. A file no receipt names (one squirrel did not write) is
-  restored unchecked, and the run's warnings count them.
+  restored unchecked, and the run's warnings count them. The `._` files macOS
+  keeps beside each file on an exFAT or FAT disk hold that file's extended
+  attributes; restore leaves them out and counts them in one warning.
 
 ## Content-addressed and packed destinations
 

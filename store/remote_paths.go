@@ -204,6 +204,21 @@ func (s *Store) ListRemotePaths(ctx context.Context, destination string, volumeI
 	`, scanRemotePath, destination, volumeID)
 }
 
+// VolumeHasRemotePaths reports whether squirrel holds any row of the
+// volume on the destination, in any state.
+func (s *Store) VolumeHasRemotePaths(ctx context.Context, destination string, volumeID int64) (bool, error) {
+	var has int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM remote_paths rp JOIN folders fo ON fo.id = rp.folder_id
+			WHERE rp.destination = ? AND fo.volume_id = ?)
+	`, destination, volumeID).Scan(&has)
+	if err != nil {
+		return false, fmt.Errorf("lookup mirror records of volume %d on %q: %w", volumeID, destination, err)
+	}
+	return has != 0, nil
+}
+
 // CountInSyncRemotePaths counts the volume's live rows on the destination
 // whose files row is still present: paths the destination holds with
 // their current content by squirrel's records, the mirror's "already

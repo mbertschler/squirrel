@@ -116,6 +116,11 @@ func (h *contentPusher) markers(ctx context.Context, _ *Report, _ int64, opts Op
 
 func (h *contentPusher) rootEmpty(ctx context.Context) (bool, error) { return h.art.rootEmpty(ctx) }
 
+// firstPush lets a content layout start over whatever the destination
+// holds: an artifact already at its name is confirmed and adopted, never
+// replaced.
+func (h *contentPusher) firstPush(context.Context, int64) error { return nil }
+
 func (h *contentPusher) reconcile(ctx context.Context, rep *Report, _, runID int64) error {
 	return h.art.reconcile(ctx, rep, runID)
 }

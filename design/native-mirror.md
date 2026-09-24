@@ -149,7 +149,17 @@ closed as success; it now closes as failed, like content-addressed.
 This rule is shared by all three layouts:
 
 1. If there is no successful sync of this (volume, destination), the
-   watermark is 0.
+   watermark is 0, once the layout's first-push gate passes. The content
+   layouts pass it always: an artifact already at its name is confirmed and
+   adopted. A mirror refuses when squirrel holds no `remote_paths` row of the
+   volume there and the volume's directory holds files outside
+   `.squirrel-staging/` beyond its marker (`mirrorHandler.firstPush`): a
+   tree rclone wrote, or a native mirror whose index is gone, which
+   `squirrel recover --from` restores. Without the gate, a fresh index moved
+   the whole existing tree into history and wrote it again, doubling what
+   the disk holds. A first push that crashed left rows, so its retry passes,
+   and the check covers the volume's directory only, so a second volume
+   starts fresh beside the first.
 2. If the last success left its landing evidence at the destination, the
    watermark is that run's id.
 3. The watermark is also 0 (a fresh start) when all three of these hold:
@@ -523,6 +533,20 @@ stayed `live` over the other spelling's bytes, breaking invariant 1.
   under `Photos/`, as files no receipt names.
 - A dry run doesn't probe, so its preview doesn't show collisions.
 
+### AppleDouble companions
+
+On a filesystem without extended attributes (exFAT, FAT, some SMB shares),
+macOS keeps a file's attributes in a companion `._<name>` beside it, and
+moves and removes the companion with the file. Every file squirrel writes
+from a Mac gets one, since the system tags new files with an attribute. The
+testbed walk found them reported as foreign staging on every push, restored
+as unchecked files by an index-less restore, and counted as content by the
+emptiness checks. A `._X` whose `X` is in the same listing is now X's
+(`sync/appledouble.go`): skipped by the staging report and the emptiness
+checks, and left out of an index-less restore, counted in one warning,
+unless a receipt names it. A companion the system left behind is reported
+like any other foreign entry.
+
 ### Crash points
 
 | Crash after | Destination | Reconcile at the next push |
@@ -815,9 +839,10 @@ Decided on 2026-09-23:
    Configs that relied on rclone accepting any key must pin it first.
 3. **Read-back** runs on local disks only (section 5).
 4. **Existing mirror trees aren't adopted.** The watermark rule refuses an
-   rclone-era mirror: the tree isn't empty, and its runs left no receipts. A
-   native mirror needs a fresh or emptied root. Adoption gets built only if the
-   testbed shows that hurts.
+   rclone-era mirror: the tree isn't empty, and its runs left no receipts.
+   An index that never synced there is refused too, by the first-push gate
+   (rule 1). A native mirror needs a fresh or emptied root. Adoption gets
+   built only if the testbed shows that hurts.
 5. **Receipts** for mirrors live in `.squirrel-index/`. The content layouts
    keep their segments where they are.
 6. **Case-folding and normalization collisions** refuse only the colliding

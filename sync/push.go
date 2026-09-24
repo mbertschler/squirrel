@@ -40,6 +40,10 @@ type layout[O operations] interface {
 	// foreignHistory is the refusal for a last success at runID that left
 	// no landing evidence on a destination that is no fresh start.
 	foreignHistory(runID int64) error
+	// firstPush gates a push of a volume that never synced to the
+	// destination, from watermark 0, on what the destination already
+	// holds: nil, or the refusal.
+	firstPush(ctx context.Context, volumeID int64) error
 	// reconcile settles, once at push start, whatever an earlier push left
 	// in flight on the destination, so translate reads settled records.
 	reconcile(ctx context.Context, rep *Report, volumeID, runID int64) error
@@ -188,7 +192,8 @@ func planPush[O operations](ctx context.Context, t pushTarget, l layout[O], volI
 
 // pushWatermark applies the watermark rule every layout shares:
 //
-//  1. no successful sync of this (volume, destination): 0;
+//  1. no successful sync of this (volume, destination): 0, once the
+//     layout's firstPush gate passes;
 //  2. the last success left its landing evidence: that run's id;
 //  3. the evidence is absent but the destination is a fresh start
 //     (freshStart): 0;
@@ -197,7 +202,7 @@ func planPush[O operations](ctx context.Context, t pushTarget, l layout[O], volI
 func pushWatermark[O operations](ctx context.Context, t pushTarget, l layout[O], volID int64) (int64, error) {
 	last, err := t.store.LatestSuccessfulSyncRun(ctx, volID, t.dest.Name)
 	if store.IsNotFound(err) {
-		return 0, nil
+		return 0, l.firstPush(ctx, volID)
 	}
 	if err != nil {
 		return 0, fmt.Errorf("lookup last successful sync of %s: %w", t.dest.Name, err)

@@ -75,6 +75,30 @@ func TestRemotePathLifecycle(t *testing.T) {
 	}
 }
 
+// TestVolumeHasRemotePaths: a volume has mirror records on a destination
+// once any row of it is there, in any state, and only on that destination.
+func TestVolumeHasRemotePaths(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	d, vID, runID := remotePathFixture(t, s)
+	if has, err := s.VolumeHasRemotePaths(ctx, "usb", vID); err != nil || has {
+		t.Fatalf("before any write = %v, %v; want none", has, err)
+	}
+	id, err := s.BeginRemotePathCommit(ctx, commitWrite(d, runID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkRemotePathsLost(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if has, err := s.VolumeHasRemotePaths(ctx, "usb", vID); err != nil || !has {
+		t.Fatalf("with a lost row = %v, %v; want records", has, err)
+	}
+	if has, err := s.VolumeHasRemotePaths(ctx, "other", vID); err != nil || has {
+		t.Fatalf("on another destination = %v, %v; want none", has, err)
+	}
+}
+
 // TestRemotePathTransitionsNeedTheirSourceState: a move applies only to a
 // row in the state it starts from, and a batch with one wrong row changes
 // nothing, so a record never claims a move it did not witness.

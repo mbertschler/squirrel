@@ -42,8 +42,13 @@ push leaves a **receipt** at `.squirrel-index/run-<id>`: the run's changes in th
 [manifest segment format](/squirrel/reference/formats/), so the mirror can be
 checked without the index. A push that finds no receipt for the last success it
 recorded refuses, unless the root is empty and squirrel holds no records for it.
-So a native mirror starts on a fresh or emptied root: squirrel does not adopt a
-tree some other tool wrote, rclone included.
+A volume's first push refuses too when its directory already holds files
+squirrel has no record of writing. So a native mirror starts on a fresh or
+emptied root: squirrel does not adopt a tree some other tool wrote, rclone
+included. If the tree is a native mirror whose index you lost, recover the
+index from it with [`squirrel recover --from`](/squirrel/guides/recovery/)
+instead: the index snapshots and receipts on the mirror let the next push carry
+on where the last one stopped.
 
 ### Names a disk can't tell apart
 

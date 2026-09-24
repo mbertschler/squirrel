@@ -95,16 +95,23 @@ func (mr *mirrorRestore) restoreWalked(ctx context.Context, rep *Report) error {
 	if err != nil {
 		return err
 	}
-	unchecked := 0
-	err = mr.walk(ctx, rep, "", func(rel string, e entry) {
+	unchecked, companions := 0, 0
+	err = mr.walk(ctx, rep, "", func(rel string, e entry, companion bool) {
 		want, ok := receipts[rel]
-		if !ok {
+		switch {
+		case !ok && companion:
+			companions++
+			return
+		case !ok:
 			unchecked++
 		}
 		mr.restoreOne(ctx, rep, rel, e.size, want, e.mtime)
 	})
 	if unchecked > 0 {
 		rep.Warnings = append(rep.Warnings, fmt.Sprintf("%d file(s) on %q are named in no receipt, so their bytes could not be checked; they are restored unchecked", unchecked, mr.dest.Name))
+	}
+	if companions > 0 {
+		rep.Warnings = append(rep.Warnings, fmt.Sprintf("%d AppleDouble file(s) (._*) on %q, where macOS kept the extended attributes of the file beside each, are named in no receipt and not restored", companions, mr.dest.Name))
 	}
 	return err
 }
@@ -138,14 +145,16 @@ func (mr *mirrorRestore) restoreOne(ctx context.Context, rep *Report, rel string
 }
 
 // walk visits every file of the mirrored tree under dir, leaving out
-// squirrel's reserved entries at the volume root. An entry that is neither
-// a file nor a directory is reported and not restored.
-func (mr *mirrorRestore) walk(ctx context.Context, rep *Report, dir string, visit func(rel string, e entry)) error {
+// squirrel's reserved entries at the volume root, and tells visit whether
+// the file is the AppleDouble companion of an entry beside it. An entry
+// that is neither a file nor a directory is reported and not restored.
+func (mr *mirrorRestore) walk(ctx context.Context, rep *Report, dir string, visit func(rel string, e entry, companion bool)) error {
 	name := path.Join(mr.vol.Name, dir)
 	entries, err := mr.tr.List(ctx, name)
 	if err != nil {
 		return fmt.Errorf("list %s on %q: %w", name, mr.dest.Name, err)
 	}
+	names := entryNames(entries)
 	for _, e := range entries {
 		rel := path.Join(dir, e.name)
 		switch {
@@ -157,7 +166,7 @@ func (mr *mirrorRestore) walk(ctx context.Context, rep *Report, dir string, visi
 				return err
 			}
 		case e.kind == kindFile:
-			visit(rel, e)
+			visit(rel, e, appleDouble(e.name, names))
 		default:
 			rep.Warnings = append(rep.Warnings, fmt.Sprintf("%s on %q is neither a file nor a directory; it is not restored", rel, mr.dest.Name))
 		}

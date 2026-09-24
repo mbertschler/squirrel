@@ -78,8 +78,9 @@ func (h *destinationRoot) clearFinishedStaging(ctx context.Context, rep *Report,
 	if err != nil {
 		return fmt.Errorf("list %s: %w", dir, err)
 	}
+	names := entryNames(runs)
 	for _, e := range runs {
-		if e.name == markerStagingBase || isFoldProbe(e.name) {
+		if e.name == markerStagingBase || isFoldProbe(e.name) || appleDouble(e.name, names) {
 			continue
 		}
 		runID, ok := stagingRunID(e)
@@ -105,24 +106,41 @@ func (h *destinationRoot) clearFinishedStaging(ctx context.Context, rep *Report,
 	return nil
 }
 
+// clearStagingRun removes a finished run's staged copies, then the run's
+// staging directory once nothing else is left in it. An AppleDouble
+// companion goes with its staged copy; one the system left behind is
+// reported like anything else squirrel did not write.
 func (h *destinationRoot) clearStagingRun(ctx context.Context, rep *Report, tr transport, runDir string) error {
 	entries, err := tr.List(ctx, runDir)
 	if err != nil {
 		return fmt.Errorf("list %s: %w", runDir, err)
 	}
 	foreign := false
+	names := entryNames(entries)
 	for _, e := range entries {
 		name := path.Join(runDir, e.name)
-		if e.kind != kindFile || !isStagingKey(e.name) {
+		switch {
+		case appleDouble(e.name, names):
+		case e.kind != kindFile || !isStagingKey(e.name):
 			foreign = true
 			h.warnForeignStaging(rep, name)
-			continue
-		}
-		if err := tr.Remove(ctx, name); err != nil {
-			return fmt.Errorf("remove finished staging %s: %w", name, err)
+		default:
+			if err := tr.Remove(ctx, name); err != nil {
+				return fmt.Errorf("remove finished staging %s: %w", name, err)
+			}
 		}
 	}
 	if foreign {
+		return nil
+	}
+	left, err := tr.List(ctx, runDir)
+	if err != nil {
+		return fmt.Errorf("list %s: %w", runDir, err)
+	}
+	for _, e := range left {
+		h.warnForeignStaging(rep, path.Join(runDir, e.name))
+	}
+	if len(left) > 0 {
 		return nil
 	}
 	if err := tr.Remove(ctx, runDir); err != nil {
