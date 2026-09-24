@@ -125,6 +125,14 @@ func (f *nativeContentFixture) mustPush(t *testing.T) Report {
 // first call crashAt selects.
 func (f *nativeContentFixture) pushCrashing(t *testing.T, crashAt func(transportCall) bool, mode crashMode) (Report, error) {
 	t.Helper()
+	return f.pushVia(t, func(tr transport) transport {
+		return &faultTransport{transport: tr, crashAt: crashAt, mode: mode}
+	})
+}
+
+// pushVia runs one push through wrap's transport.
+func (f *nativeContentFixture) pushVia(t *testing.T, wrap func(transport) transport) (Report, error) {
+	t.Helper()
 	h, err := HandlerFor(f.store, Tools{}, f.pair)
 	if err != nil {
 		t.Fatalf("HandlerFor: %v", err)
@@ -142,7 +150,7 @@ func (f *nativeContentFixture) pushCrashing(t *testing.T, crashAt func(transport
 		if err != nil {
 			return nil, err
 		}
-		return &faultTransport{transport: raw, crashAt: crashAt, mode: mode}, nil
+		return wrap(raw), nil
 	}
 	return h.Push(context.Background(), Options{})
 }

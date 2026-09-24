@@ -239,14 +239,23 @@ func (w *mirrorWriter) clearParents(ctx context.Context, rel string) error {
 // whose size and mtime match its live record moves as that record; a
 // directory moves with every live record under it; anything else moves as
 // unrecorded bytes, and a record they contradict becomes lost, so a
-// record in history always vouches for the bytes there.
+// record in history always vouches for the bytes there. Where rel holds
+// no directory, every record under it is lost too.
 func (w *mirrorWriter) displace(ctx context.Context, rel string) error {
 	e, err := w.tr.Stat(ctx, w.h.liveName(rel))
 	if errors.Is(err, fs.ErrNotExist) {
+		if err := w.loseRecordsUnder(ctx, rel); err != nil {
+			return err
+		}
 		return w.loseRecordAt(ctx, rel, "is gone from the destination")
 	}
 	if err != nil {
 		return err
+	}
+	if e.kind != kindDir {
+		if err := w.loseRecordsUnder(ctx, rel); err != nil {
+			return err
+		}
 	}
 	if live, ok := w.live[rel]; ok {
 		if matchesRecord(e, live) {
@@ -367,6 +376,19 @@ func (w *mirrorWriter) commit(ctx context.Context, d store.PathDelta, staged sta
 	return nil
 }
 
+// loseRecordsUnder marks lost every live record below rel, whose
+// directory the destination no longer holds.
+func (w *mirrorWriter) loseRecordsUnder(ctx context.Context, rel string) error {
+	for r, live := range w.live {
+		if w.fold.under(r, rel) {
+			if err := w.loseRecord(ctx, live, "is gone: "+rel+" is not a directory on the destination"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // loseRecordAt marks the live record at rel lost, if there is one.
 func (w *mirrorWriter) loseRecordAt(ctx context.Context, rel, why string) error {
 	if live, ok := w.live[rel]; ok {
@@ -380,7 +402,7 @@ func (w *mirrorWriter) loseRecord(ctx context.Context, live store.RemotePath, wh
 		return err
 	}
 	delete(w.live, live.Path)
-	w.rep.Warnings = append(w.rep.Warnings, fmt.Sprintf("destination %q: %s %s — it was changed behind squirrel's back, so it is written again", w.h.dest.Name, live.Path, why))
+	w.rep.Warnings = append(w.rep.Warnings, fmt.Sprintf("destination %q: %s %s — it was changed behind squirrel's back, so its record no longer counts as a copy, and a push writes it again while the index holds it", w.h.dest.Name, live.Path, why))
 	return nil
 }
 

@@ -255,7 +255,8 @@ type transport interface {
   - `Remove` only on squirrel's own staging names from runs that have
     finished (`.squirrel-staging/run-<id>/<row>`), and on ride-along snapshots
     (`.squirrel-index/index-*.db`, which rotation already deletes today).
-    Anything else found in staging is reported and left alone;
+    Anything else found in staging, a run directory of a run the index
+    doesn't know included, is reported and left alone;
   - `Rename` only from this run's staging to a snapshot name (the
     ride-along) or to what the layout commits — a live name for a mirror; for
     a content layout `objects/<hex>`, `packs/<hex>`, `packs/map-<current run>`
@@ -463,6 +464,11 @@ is treated as changed behind squirrel's back: its row becomes `lost` and the pat
    - **It is a directory** a file replaced: every live row under it becomes
      `displacing`, the directory moves, and they become `displaced`; a row whose
      bytes changed becomes `lost` first.
+   - **It is not a directory, or nothing**, while live rows sit under the
+     path (a recorded directory replaced by a file or a symlink on the
+     destination, or removed): those rows become `lost`, since their bytes
+     can't be at their paths, and turn into repairs while the index holds
+     their content.
 4. **Commit:**
    1. insert the new row as `committing`;
    2. rename the staged file to the path;

@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -66,7 +67,8 @@ func (h *destinationRoot) runFinished(runID int64) bool {
 
 // clearFinishedStaging removes what finished runs left in staging:
 // partial files from a crash, and a drifted source's staged copy.
-// Anything in staging squirrel did not name is reported and left alone.
+// Anything in staging squirrel did not name, a run directory of a run the
+// index does not know included, is reported and left alone.
 func (h *destinationRoot) clearFinishedStaging(ctx context.Context, rep *Report, tr transport) error {
 	dir := path.Join(h.volumeDir, StagingDirName)
 	runs, err := tr.List(ctx, dir)
@@ -85,7 +87,15 @@ func (h *destinationRoot) clearFinishedStaging(ctx context.Context, rep *Report,
 			h.warnForeignStaging(rep, path.Join(dir, e.name))
 			continue
 		}
-		if !h.runFinished(runID) {
+		r, err := h.store.GetRun(ctx, runID)
+		if errors.Is(err, sql.ErrNoRows) {
+			h.warnForeignStaging(rep, path.Join(dir, e.name))
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("look up the run of %s: %w", path.Join(dir, e.name), err)
+		}
+		if r.Status == store.RunStatusRunning {
 			continue
 		}
 		if err := h.clearStagingRun(ctx, rep, tr, path.Join(dir, e.name)); err != nil {
