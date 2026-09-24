@@ -101,7 +101,7 @@ func (h *mirrorHandler) rootEmpty(ctx context.Context) (bool, error) {
 }
 
 // treeEmpty reports whether dir holds no file beyond volume markers,
-// walking it until the first one. A directory skip names is not walked.
+// walking it until the first one. The directories in skip are not walked.
 func treeEmpty(ctx context.Context, tr transport, dir string, skip ...string) (bool, error) {
 	entries, err := tr.List(ctx, dir)
 	if err != nil {

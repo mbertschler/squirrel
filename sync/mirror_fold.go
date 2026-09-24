@@ -162,7 +162,9 @@ func (w *mirrorWriter) planFolding(ctx context.Context, ops *mirrorOps) (foldPla
 		plan.refuse(entities)
 	}
 	for _, key := range candidates {
-		plan.displaceOthers(groups[key], isPresent)
+		if err := plan.displaceOthers(groups[key], isPresent); err != nil {
+			return foldPlan{}, err
+		}
 	}
 	return plan, nil
 }
@@ -315,12 +317,16 @@ func (p foldPlan) refuse(entities []foldEntity) {
 // displaceOthers plans, for every planned path that still lands at or
 // under one folded name, the move of each version recorded as a file there
 // under another spelling whose path is no longer present.
-func (p foldPlan) displaceOthers(members []foldMember, isPresent func(string) (bool, error)) {
+func (p foldPlan) displaceOthers(members []foldMember, isPresent func(string) (bool, error)) error {
 	for _, stale := range members {
 		if stale.dir || stale.planned || !stale.live {
 			continue
 		}
-		if present, err := isPresent(stale.path); err != nil || present {
+		present, err := isPresent(stale.path)
+		if err != nil {
+			return err
+		}
+		if present {
 			continue
 		}
 		for _, m := range members {
@@ -329,6 +335,7 @@ func (p foldPlan) displaceOthers(members []foldMember, isPresent func(string) (b
 			}
 		}
 	}
+	return nil
 }
 
 // presentAtSource reports whether a path is present in the volume's

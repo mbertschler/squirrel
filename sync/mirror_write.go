@@ -29,8 +29,8 @@ type mirrorWriter struct {
 	volumeID int64
 	tr       transport
 	live     map[string]store.RemotePath
-	// fold is how the destination compares names, and names the plan
-	// around the collisions that causes.
+	// fold is how the destination compares names; names plans the
+	// writes around the collisions its folding causes.
 	fold  nameFolding
 	names foldPlan
 
