@@ -245,11 +245,15 @@ type transport interface {
 	List(ctx context.Context, dir string) ([]entry, error)
 	Get(ctx context.Context, name string) (io.ReadCloser, error)
 	// Put creates name exclusively (fs.ErrExist if present), streams r into
-	// it, sets its mtime, and syncs it to stable storage before returning.
+	// it and sets its mtime. Its bytes are durable once a later Flush returns.
 	Put(ctx context.Context, name string, r io.Reader, mtime time.Time) error
 	// Rename moves from to to, creating to's parents; fs.ErrExist if to exists.
+	// The move is durable once a later Flush returns.
 	Rename(ctx context.Context, from, to string) error
 	Remove(ctx context.Context, name string) error
+	// Flush returns once every Put and Rename that returned before it is on
+	// stable storage.
+	Flush(ctx context.Context) error
 	Close() error
 }
 ```
@@ -284,6 +288,15 @@ type transport interface {
 
   That function is the whole audit surface for destroying or moving bytes on
   a destination.
+- **Durability comes from `Flush`, once per batch.** `Put` and `Rename`
+  return once their effect is visible; one `Flush` then makes everything
+  before it durable. A layout records a location as holding bytes (a `live`
+  or `displaced` row, an upload record, a receipt that seals a run) only
+  after a `Flush` that follows the call that put the bytes there. It also
+  flushes staged bytes before renaming them into place, because reconcile
+  trusts size and mtime at a name. A flush per batch of files instead of
+  several per file is what makes a push that writes affordable on a local
+  disk (section 8).
 - **Object stores implement everything except `Rename`.** S3 can create
   exclusively with a conditional put. That is enough for the
   content-addressed and packed layouts in step 3. A mirror needs `Rename`,
@@ -295,7 +308,10 @@ type transport interface {
   refuses to follow symlinks out of it. `os.Root` does follow symlinks that
   stay inside the root, so every call also checks its name's parent chain with
   `Lstat` and refuses a symlink anywhere along it (`sync/transport_local.go`).
-- `Put` opens with `O_CREATE|O_EXCL`, copies, sets the times, then syncs.
+- `Put` opens with `O_CREATE|O_EXCL`, copies, and sets the times. The file
+  stays open until the next `Flush`, and every directory whose entries a call
+  changed is remembered: a new file's, both sides of a rename, and the parent
+  of every directory a call created.
 - `Rename` avoids replacing its target in one of two ways:
   - **Preferred:** the platform's no-replace rename (`renameat2` with
     `RENAME_NOREPLACE` on Linux, `renamex_np` with `RENAME_EXCL` on macOS),
@@ -306,10 +322,21 @@ type transport interface {
     writer from outside squirrel could still slip in between the check and
     the rename. Squirrel can't collide with itself here, because the run guard
     and the volume marker already exclude a second squirrel writer.
-- After a rename, the parent directories are synced.
+- `Flush` makes the remembered files and directories durable in one go:
+  - **macOS:** each file is `fsync`ed as its `Put` ends and each directory at
+    the flush, then one `F_FULLFSYNC` flushes the drive's cache. The `fcntl`
+    manual page guarantees that this also persists everything `fsync`ed on
+    the device before it. That is one full flush per batch instead of three
+    per file.
+  - **Linux:** `fsync` itself flushes the drive, so the flush `fsync`s every
+    remembered file and directory together, and the filesystem's journal
+    commits them at once.
+  - **Elsewhere:** each file is flushed as its `Put` ends, and directories
+    are flushed where the platform can.
 - **Every call is bounded by progress.** A call that makes none for
   `DefaultStallTimeout` (a `Put` progresses with every chunk it reads) fails the
-  push. A local call blocked in the kernel can't be interrupted and may still
+  push. A `Flush` is also allowed the time the bytes put since the last one
+  take at 1 MiB/s. A local call blocked in the kernel can't be interrupted and may still
   finish a move later, so a push refuses while a call an earlier push gave up
   on is still outstanding (`sync/transport_stall.go`).
 
@@ -318,8 +345,14 @@ type transport interface {
 - Built on `golang.org/x/crypto/ssh`, already a dependency, and
   `github.com/pkg/sftp`, which is new (`sync/transport_sftp.go`).
 - `Put` opens with `SSH_FXF_CREAT|SSH_FXF_EXCL` and uses concurrent writes, so
-  high latency doesn't cap throughput. It syncs through `fsync@openssh.com`
-  when the server offers it.
+  high latency doesn't cap throughput. It flushes its file through
+  `fsync@openssh.com` when the server offers it. The protocol can't flush a
+  directory, so `Flush` has nothing left to do.
+- **Paths in flight share one connection.** Every file a push writes at once
+  (`concurrency`, section 7) goes over the same SSH connection and sftp
+  session, which interleaves their requests. A server's cap on concurrent
+  connections is never the limit; one that serves a session's requests one
+  at a time, as OpenSSH's does, still hides the network's round trips.
 - **mtime is whole seconds.** Protocol version 3 carries only seconds, so the
   records store the mtime the server reports.
 - **`Put` and `Rename` check first.** The protocol's rename fails when the
@@ -445,26 +478,35 @@ is treated as changed behind squirrel's back: its row becomes `lost` and the pat
 
 ### Writing one path
 
+Execute writes the planned paths in batches of at most 64 paths or 256 MB,
+several paths at a time: `concurrency` of them (section 7). Each step below
+runs for the whole batch before the next begins. A path whose step fails drops
+out of the batch, and the others go on.
+
 1. **Reconcile** (once, at push start). Squirrel settles every `committing`
    and `displacing` row for this destination by checking both locations
    (next table). Staging left by finished runs is removed.
 2. **Stage.** The source is streamed into
    `.squirrel-staging/run-<id>/<path key>`, and BLAKE3 is computed over the same
    bytes. The path key is the lowercase hex BLAKE3 of the volume-relative path:
-   the row doesn't exist yet (step 4 inserts it), and hex stays unique on a
+   the row doesn't exist yet (step 5 inserts it), and hex stays unique on a
    destination that folds case. If the hash doesn't match the indexed hash, the
    path fails and the run fails before its seal, so the watermark stays put. The
    staged file stays until the next push's reconcile removes it with the
    finished run's staging: the name guard removes no running run's staging. That is the `errContentDrift` contract. Here the
    hash covers exactly the bytes sent, which closes the re-hash-then-read gap
-   noted on `uploadOneObject`.
-3. **Displace.** First any parent of the path that isn't a directory (a
-   file↔directory swap, a symlink) is displaced the same way. Then, if `Lstat`
-   finds an entry at the path:
+   noted on `uploadOneObject`. The batch's staged files are then flushed.
+3. **Read back**, on a local disk: every staged file is read in full, past
+   the cache, through BLAKE3 (section 5). A mismatch fails the path before it
+   touches the live tree.
+4. **Displace.** First any parent of a path that isn't a directory (a
+   file↔directory swap, a symlink) is displaced the same way, once per
+   directory, in path order. Then, for each path, if `Lstat` finds an entry
+   there:
    - **The entry's size and mtime match the live row:**
      1. mark the row `displacing` with this run;
      2. rename the entry to `.squirrel-history/run-<id>/<path>`;
-     3. mark the row `displaced`.
+     3. after the batch's flush, mark the row `displaced`.
    - **They don't match** (the file changed behind squirrel's back):
      1. mark the row `lost`;
      2. displace the entry as unrecorded bytes, which a warning and a
@@ -472,24 +514,37 @@ is treated as changed behind squirrel's back: its row becomes `lost` and the pat
 
      A record never claims history holds bytes it doesn't.
    - **It is a directory** a file replaced: every live row under it becomes
-     `displacing`, the directory moves, and they become `displaced`; a row whose
-     bytes changed becomes `lost` first.
+     `displacing`, the directory moves, and they become `displaced` after the
+     flush; a row whose bytes changed becomes `lost` first.
    - **It is not a directory, or nothing**, while live rows sit under the
      path (a recorded directory replaced by a file or a symlink on the
      destination, or removed): those rows become `lost`, since their bytes
      can't be at their paths, and turn into repairs while the index holds
      their content.
-4. **Commit:**
+5. **Commit:**
    1. insert the new row as `committing`;
    2. rename the staged file to the path;
-   3. mark the row `live`.
+   3. after the batch's flush, mark the row `live`.
 
 Each move is recorded before it happens. Reconcile then finishes the record or
 withdraws it, based on where the bytes actually are. The destination never
 lacks a copy of something it held. Displaced bytes reach history before the
 new version is committed, and the new version stays in staging until then.
-Between steps 3 and 4 the live path is briefly empty. That costs availability
-until the next push, never content.
+Between steps 4 and 5 the live path is briefly empty, for up to a batch. That
+costs availability until the next push, never content.
+
+Each path still passes through the same states as a push that wrote one path
+at a time: all of a batch's displacements are marked `displaced` before any of
+its commits begins, so a path never holds a `displacing` and a `committing` row
+at once. Only the step that confirms a move waits for the flush.
+
+**Paths in flight.** Within a step the batch's paths run `concurrency` at a
+time. They can't collide: each stages under its own key, a path's displacement
+moves only what sits at its own name, and both a parent in the way and a
+version recorded under another spelling of the name (next section) are
+displaced in the sequential pass that opens step 4. The writer's own
+bookkeeping, the live records it keeps current and the report, is shared
+behind one lock.
 
 ### Names the destination folds
 
@@ -558,6 +613,12 @@ like any other foreign entry.
 | commit rename | new version at the path | staging gone and path present, so the row becomes `live` |
 | every write, before the seal | tree complete, no receipt | the watermark holds, and the next push translates every path to "already correct" |
 
+A power cut can also undo whatever the last flush didn't cover. Every row
+still finds its bytes at one of the two places the table checks: no row
+leaves `displacing` or `committing` before the flush that covers its move,
+and a staged file is flushed before it's renamed onto a path. The receipt is
+flushed before the run is sealed.
+
 `TestMirrorCrashTable` runs each row above; `TestMirrorTranslationRules` and
 `TestMirrorWriteDisplacesWhatThePathHolds` run the translation table.
 
@@ -573,11 +634,15 @@ usual:
 
 - **Crash injection at every transport call** of a push, using a
   fault-injecting transport wrapper, then a clean push. The invariants below
-  must hold afterwards.
+  must hold afterwards. It writes one path at a time, so the calls come in
+  the same order on every run; `Flush` is a call like any other.
+- **Power cuts.** The same wrapper can, at the crash, also undo every `Put`
+  and `Rename` since the last `Flush`: a put file vanishes or is cut short,
+  a rename is reversed. The invariants must hold after the next clean push.
 - **A model-based test.** It generates random index histories: add, modify,
   delete, re-add, file↔directory swaps, names that collide by case. It then
-  pushes with random crash points and compares the results against a
-  reference model.
+  pushes with several paths in flight and random crash points, some of them
+  power cuts, and compares the results against a reference model.
 - **File↔directory swaps**, in both directions and nested.
 - **Unexpected entries at a target:**
   - an unrecorded file (a foreign write, or a tree rclone wrote);
@@ -619,6 +684,7 @@ Where each case lives:
 | Case | Tests |
 |---|---|
 | Crash at every call, then a clean push | `TestMirrorCrashAtEveryTransportCall`, `TestNativeContentCrashAtEveryTransportCall` (`sync/crash_every_call_test.go`) |
+| Power cuts at every call | `TestMirrorPowerCutAtEveryTransportCall`, `TestNativeContentPowerCutAtEveryTransportCall` (`sync/crash_every_call_test.go`) |
 | Random histories against a model | `TestMirrorModel` (`sync/mirror_model_test.go`) |
 | File↔directory swaps | `TestMirrorFileDirectorySwap`, `TestMirrorNestedFileDirectorySwaps` |
 | Unrecorded and changed entries at a target | `TestMirrorWriteDisplacesWhatThePathHolds`, `TestMirrorRecordChangedBehindSquirrelsBack` |
@@ -640,9 +706,11 @@ Every fingerprint stays pending, so the mirror still can't gate offload.
 That's the same as today, only the method name changes. This step changes it
 for local mirrors.
 
-- **Read-back at write time, on local disks.** After staging and syncing,
-  squirrel re-reads the staged file and hashes it with BLAKE3 before
-  committing (`sync/readback.go`). The read bypasses the cache: on Linux the
+- **Read-back at write time, on local disks.** Once a batch's staged files
+  are flushed to stable storage, squirrel re-reads each one in full and
+  hashes it with BLAKE3 before committing it (`sync/readback.go`). So every
+  fingerprint comes from reading bytes the disk has already reported
+  persisted; a copy never read back that way never counts for offload. The read bypasses the cache: on Linux the
   synced pages are dropped (`POSIX_FADV_DONTNEED`) before the read, and on
   macOS both the write and the read run with `F_NOCACHE`, because a read
   there is still served from pages the write left cached. It is best
@@ -661,8 +729,9 @@ for local mirrors.
   paths never go on a server command line, so their fingerprints stay
   pending.
 - **Cost.** Read-back is a safety property, so it's always on for local
-  disks. Every written byte is read once more, roughly 1.5 to 2 times the push
-  time on a USB disk.
+  disks. Every written byte is read once more: about 2 ms for a 230 KB file
+  on the testbed's exFAT image, a tenth of what a push per file cost before
+  flushes were batched (section 8).
 - **Verify pass for mirrors.** `verify_every` becomes valid on native mirrors.
   Each pass does two things:
   - It checks the size and mtime of every `live` and `displaced` row with
@@ -707,20 +776,27 @@ Content-addressed and packed destinations on `local`, and on `sftp` without
 The layouts land every object, pack, placement map and manifest segment
 through one small interface, `artifactStore` (`sync/artifacts.go`), whose
 other implementation is rclone's, for crypt destinations and for s3, b2 and
-gcs. Each artifact:
+gcs. Objects land in batches, like a mirror's paths: at most 64 or 256 MB,
+`concurrency` at a time. Each step runs for the whole batch before the next:
 
-1. is streamed into `<volume>/.squirrel-staging/run-<id>/<key>` while BLAKE3
-   hashes the bytes sent — the drift check, over exactly those bytes — and, on
-   sftp, the hash the server's command computes;
-2. is confirmed before it gets its name: read back through BLAKE3 on a local
-   disk, hashed by the server's command on sftp. A match is the artifact's
-   fingerprint, recorded with its upload row at once; a mismatch fails the
-   artifact. A server without the command confirms nothing, and the
-   fingerprint stays pending, as it does under rclone for such a server;
-3. is renamed onto its name. If the name already holds a file — a crash
+1. every artifact is streamed into `<volume>/.squirrel-staging/run-<id>/<key>`
+   while BLAKE3 hashes the bytes sent — the drift check, over exactly those
+   bytes — and, on sftp, the hash the server's command computes; then the
+   batch is flushed;
+2. each is confirmed before it gets its name: read back through BLAKE3 on a
+   local disk, hashed by the server's command on sftp. A match is the
+   artifact's fingerprint; a mismatch fails the artifact. A server without
+   the command confirms nothing, and the fingerprint stays pending, as it
+   does under rclone for such a server;
+3. each is renamed onto its name. If the name already holds a file — a crash
    between landing and recording, or a failed run's orphan — that file is
-   confirmed instead (downloaded and hashed when the server runs no command)
-   and recorded, or the artifact fails. Squirrel never replaces it.
+   confirmed instead (downloaded and hashed when the server runs no command),
+   or the artifact fails. Squirrel never replaces it;
+4. the batch is flushed, and only then is each landed artifact's upload row
+   recorded, with its fingerprint.
+
+A pack, the placement map and the manifest segment land alone, through the
+same steps.
 
 `squirrel verify` reads these destinations through the transport too
 (`sync/verify_native.go`): once the marker of every volume that synced there
@@ -795,12 +871,15 @@ addressed local destinations by path; that restriction is gone.
   command the transport runs on the server: `md5`, `sha1`, `sha256` (the
   default, now for packed as well) or `blake3`, the hashes squirrel also
   computes to check the server's answer. rclone's other hashes (`crc32`,
-  `xxh3`, `xxh128`) stay valid behind crypt only. No key is added.
-  Concurrency is fixed. On sftp each file goes out as concurrent write
-  requests (`pkg/sftp`'s default of 64 in flight); paths are written one at a
-  time on both transports. The testbed benchmark against rclone (section 8)
-  was to decide whether several paths in flight are worth their bookkeeping;
-  it says they are, over sftp at any latency (open question 2).
+  `xxh3`, `xxh128`) stay valid behind crypt only.
+- **`concurrency`** is how many files a push writes at once, on every
+  destination type: 4 by default on a local disk, 8 on sftp. A storage
+  server that limits concurrent connections, or a slow disk or USB bridge,
+  may want it lower. On a destination squirrel writes itself, the files share
+  one SSH connection (section 3), and each file on sftp also goes out as up
+  to 64 concurrent write requests (`pkg/sftp`'s default). On a destination
+  rclone writes, it becomes rclone's `--transfers`; together with
+  `checkers` it caps the connections rclone opens.
 
 ## 8. What we give up
 
@@ -814,8 +893,9 @@ addressed local destinations by path; that restriction is gone.
   - Decision 7 keeps a cheap mitigation as a candidate.
 - **Rclone's tuning and backend know-how.** Rclone brings parallel transfers,
   multi-threaded streams, and years of workarounds for sftp servers. The
-  switch should wait for a benchmark on the testbed against rclone: it ran on
-  2026-09-24 (below), and native pushes that write are several times slower.
+  switch waited for a benchmark on the testbed against rclone: it ran on
+  2026-09-24 (below). Native pushes that wrote were several times slower,
+  and the fix is decided (open question 2, now decision 8).
 
 ### The benchmark
 
@@ -839,21 +919,52 @@ files and adds 150 (30 and 30 on `trip`). Wall time in seconds:
 
 A native first push to APFS on the internal disk took 86.4 s.
 
-- **Local disks pay for durability.** Every written file is synced to stable
-  storage — on macOS a full flush of the drive's cache — read back past the
-  cache, and after its rename both parent directories are synced; rclone
-  syncs nothing. That is about 18 ms per file on the internal SSD, and 25 ms
-  on the exFAT image.
-- **sftp pays in round trips.** A written path costs about 30 sequential
+That build wrote one path at a time:
+
+- **Local disks paid for durability.** Every written file was synced to
+  stable storage — on macOS a full flush of the drive's cache — read back
+  past the cache, and after its rename both parent directories were synced;
+  rclone syncs nothing. That was about 18 ms per file on the internal SSD,
+  and 25 ms on the exFAT image.
+- **sftp paid in round trips.** A written path cost about 30 sequential
   requests: `Put` checks its target and each parent with `Lstat`, then
   creates, writes, closes and sets the mtime; the staged copy, the path's
   parents and the path are each looked up again, and the rename checks both
-  parent chains. At a 20 ms round trip that is about 0.7 s per path, against
+  parent chains. At a 20 ms round trip that was about 0.7 s per path, against
   rclone's four transfers in flight.
 - **Unchanged pushes are faster natively** everywhere: they read squirrel's
   records instead of listing both trees.
 
-What to change is open question 2.
+**Where the time went.** A push instrumented call by call, 1000 files of
+231 MB shaped like the photo tree, on the same laptop:
+
+| per file | internal APFS disk | exFAT image |
+|---|---|---|
+| whole push | 19.0 ms | 26.2 ms |
+| the three full flushes: the file, then both directories after the commit rename | about 13 ms | 11.5 ms, and they slow the calls after them |
+| read-back | 2.0 ms | 1.7 ms |
+| each call's parent-chain check for symlinks | 0.5 ms | 0.3 ms |
+| the same push with a plain `fsync` in place of each full flush | 2.2 ms | 6.3–8.7 ms |
+
+So the cost was the number of full flushes, not reading back.
+Several paths in flight, each still flushing on its own, took a stripped-down
+reproduction only from 22 to 16 ms per file on the exFAT image (15.5 to 9.4 on
+APFS); sharing each flush among the paths in flight reached 11 and 3.0; one
+flush per step for a batch of 64 reached 3–6 and 0.7. On the exFAT image the
+rest is that filesystem's slow file calls (create 0.8, set mtime 1.1, rename
+1.7 ms) and the evidence itself: writing past the cache and reading back take
+about 3 ms per file, which rclone doesn't spend.
+
+Over sftp a new path at depth two cost 27 requests, each waiting for the one
+before: 20 `Lstat`s (14 re-checking parent chains, 6 the target), 2 lookups
+while creating parents, open, write, set mtime, close and rename. At a 20 ms
+round trip that measured 632 ms per path, 73% of it in `Lstat`. Several paths
+in flight over the one connection scale linearly, with every check kept: 608,
+152, 76 and 39 ms per path at 1, 4, 8 and 16 in flight. At 8 that is rclone's
+time for the 608-file tree (45 s); rclone itself checks no parent chain and
+writes through a symlinked directory (rclone 1.74.1 against the in-process
+server).
+
 - **A new dependency:** `github.com/pkg/sftp`.
 
 ## 9. Order of work
@@ -910,17 +1021,26 @@ Decided on 2026-09-23:
    periodic check would compare a plain directory walk with the index's
    present set, which would restore some independence for every layout.
 
+Decided on 2026-09-24:
+
+8. **Throughput of pushes that write** (section 8). Three changes, on this
+   branch before the switch:
+   - **One flush per batch.** `Put` and `Rename` stop flushing, and
+     `Transport.Flush` makes a batch durable (section 3). A mirror and a
+     content-addressed push write batches of at most 64 files or 256 MB, and
+     every record waits for the flush that covers its bytes (section 4). The
+     full read-back runs after the batch's staged files are flushed
+     (section 5).
+   - **Several paths in flight**, set per destination by `concurrency`
+     (section 7), on both transports.
+   - **Every per-call check stays.** Checking each parent chain once per push
+     would have cut the sftp round trips by half, but it trusts a directory
+     for the rest of the push; paths in flight reach rclone's speed without
+     it.
+
 Open:
 
 1. **Crypt byte-compatibility with rclone.** This blocks cloudbox only, and is
    to be discussed separately.
-2. **Throughput of pushes that write** (section 8). Candidates, each with its
-   own cost: several paths in flight, which multiplies sftp throughput by
-   the concurrency and overlaps local syncs, at the price of concurrent
-   bookkeeping in the writer; checking each parent chain once per push
-   instead of once per call, which halves the sftp round trips but trusts a
-   directory for the rest of the push; syncing a batch of staged files
-   together before their renames, which keeps every copy durable before it
-   is committed but costs a second pass over staging. Whether the branch
-   switches `local` and plain `sftp` destinations before any of them lands
-   is the maintainer's call.
+2. ~~**Throughput of pushes that write.**~~ Decided on 2026-09-24:
+   decision 8.
