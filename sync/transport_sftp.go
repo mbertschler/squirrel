@@ -162,6 +162,11 @@ func (t *sftpTransport) Rename(_ context.Context, from, to string) error {
 	return nil
 }
 
+// Flush has nothing left to do: each Put flushed its file through
+// fsync@openssh.com where the server offers it, and the protocol cannot
+// flush a directory.
+func (t *sftpTransport) Flush(context.Context) error { return nil }
+
 func (t *sftpTransport) Remove(_ context.Context, name string) error {
 	if err := t.checkName(name); err != nil {
 		return err

@@ -95,8 +95,9 @@ func (h *destinationRoot) checkMarker(name string, data []byte) error {
 }
 
 // writeMarker stages the marker, then renames it onto name, so a write
-// that fails halfway never leaves a marker that does not parse. A copy an
-// earlier --init left staged is cleared first.
+// that fails halfway never leaves a marker that does not parse; its bytes
+// are flushed before the rename and the rename before it returns. A copy
+// an earlier --init left staged is cleared first.
 func (h *destinationRoot) writeMarker(ctx context.Context, tr transport, name string) error {
 	m, err := selfMarker(ctx, h.store, h.volumeDir)
 	if err != nil {
@@ -113,10 +114,23 @@ func (h *destinationRoot) writeMarker(ctx context.Context, tr transport, name st
 	if err := tr.Put(ctx, staged, bytes.NewReader(data), time.Now()); err != nil {
 		return fmt.Errorf("destination %q: write %s: %w", h.dest.Name, h.where(staged), err)
 	}
-	if err := tr.Rename(ctx, staged, name); err != nil {
+	if err := landStaged(ctx, tr, staged, name); err != nil {
 		return fmt.Errorf("destination %q: write %s: %w", h.dest.Name, h.where(name), err)
 	}
 	return nil
+}
+
+// landStaged renames a staged file onto name, flushing its bytes before
+// the rename and the rename after it, so neither a crash nor a power cut
+// leaves name holding anything but the whole file.
+func landStaged(ctx context.Context, tr transport, staged, name string) error {
+	if err := tr.Flush(ctx); err != nil {
+		return err
+	}
+	if err := tr.Rename(ctx, staged, name); err != nil {
+		return err
+	}
+	return tr.Flush(ctx)
 }
 
 // where names a destination-relative name for a message: the path on a

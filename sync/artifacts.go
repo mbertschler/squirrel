@@ -24,11 +24,13 @@ type artifactStore interface {
 	// reconcile clears what finished pushes left in flight, once at push
 	// start.
 	reconcile(ctx context.Context, rep *Report, runID int64) error
-	// put lands the local file src at name whole, and confirms it landed:
-	// its size, and bytes whose BLAKE3 is sum — errContentDrift when src
-	// no longer hashes to sum. It returns the fingerprint the landing
-	// already confirmed, or nil when capture must read one later.
-	put(ctx context.Context, runID int64, name, src string, size int64, sum []byte) (*remoteChecksum, error)
+	// putAll lands every artifact whole, confirms each landed — its size,
+	// and bytes whose BLAKE3 is its sum: errContentDrift when its source
+	// no longer hashes to it — and returns once each has landed durably or
+	// failed, so the caller may record what landed. Each result carries
+	// the fingerprint the landing already confirmed, or nil when capture
+	// must read one later; results follow items.
+	putAll(ctx context.Context, runID int64, items []artifactPut) []artifactResult
 	// capture fills the fingerprints put left pending for this run's
 	// artifacts under dir (ObjectsDirName or PacksDirName).
 	capture(ctx context.Context, rep *Report, dir string, targets []captureTarget)
@@ -39,6 +41,27 @@ type artifactStore interface {
 	where(name string) string
 	// close releases the destination once the push returns.
 	close()
+}
+
+// artifactPut is one artifact to land: the local file src at name, size
+// bytes whose BLAKE3 is sum.
+type artifactPut struct {
+	name, src string
+	size      int64
+	sum       []byte
+}
+
+// artifactResult is how one artifact landed: the fingerprint the landing
+// confirmed, if any, or why it failed.
+type artifactResult struct {
+	fingerprint *remoteChecksum
+	err         error
+}
+
+// putArtifact lands one artifact through art.
+func putArtifact(ctx context.Context, art artifactStore, runID int64, item artifactPut) (*remoteChecksum, error) {
+	r := art.putAll(ctx, runID, []artifactPut{item})[0]
+	return r.fingerprint, r.err
 }
 
 // putBytes lands body at name through art, staged in a temporary file.
@@ -57,7 +80,7 @@ func putBytes(ctx context.Context, art artifactStore, runID int64, name string, 
 		return fmt.Errorf("close %s: %w", what, err)
 	}
 	sum := blake3.Sum256(body)
-	if _, err := art.put(ctx, runID, name, tmp.Name(), int64(len(body)), sum[:]); err != nil {
+	if _, err := putArtifact(ctx, art, runID, artifactPut{name: name, src: tmp.Name(), size: int64(len(body)), sum: sum[:]}); err != nil {
 		return fmt.Errorf("upload %s to %s: %w", what, art.where(name), err)
 	}
 	return nil

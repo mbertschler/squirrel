@@ -15,6 +15,8 @@ import (
 // slash-separated and relative to the root, and a name whose path crosses
 // a symlink is refused. Put creates exclusively and Rename fails on an
 // existing target, so every call leaves bytes already there in place.
+// Their effects are durable once a later Flush returns: a caller records
+// a location as holding bytes only after that.
 type transport interface {
 	// Stat describes name itself, a symlink as a symlink; fs.ErrNotExist
 	// when absent.
@@ -24,12 +26,14 @@ type transport interface {
 	// Get opens the regular file at name for reading.
 	Get(ctx context.Context, name string) (io.ReadCloser, error)
 	// Put creates name exclusively (fs.ErrExist if present), creating its
-	// parents, streams r into it, sets its mtime, and syncs it to stable
-	// storage before returning.
+	// parents, streams r into it, and sets its mtime.
 	Put(ctx context.Context, name string, r io.Reader, mtime time.Time) error
 	// Rename moves from to to, creating to's parents; fs.ErrExist if to
 	// exists.
 	Rename(ctx context.Context, from, to string) error
+	// Flush returns once every Put and Rename that returned before it is
+	// on stable storage, as far as the destination can make it so.
+	Flush(ctx context.Context) error
 	// Remove deletes the file or empty directory at name.
 	Remove(ctx context.Context, name string) error
 	// ServerHash is the destination's own hash of the file at name, run

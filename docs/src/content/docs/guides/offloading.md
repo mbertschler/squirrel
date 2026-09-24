@@ -86,9 +86,9 @@ content-verified and relays to peers that way, so a hub's certified archive can
 open an edge machine's gate.
 
 A mirror on a `local` disk earns the same upgrade at push time: every copy is
-read back through BLAKE3 before it is committed, so once every file of the
-volume has such a copy, the push itself advances the component as
-`fingerprint-verified`. A copy a verify pass later finds gone or changed stops
+flushed to the disk, then read back through BLAKE3 before it is committed, so
+once every file of the volume has such a copy, the push itself advances the
+component as `fingerprint-verified`. A copy a verify pass later finds gone or changed stops
 counting for its file until the next push writes it again.
 
 The practical consequence: on a cold-archive target whose fingerprints stay

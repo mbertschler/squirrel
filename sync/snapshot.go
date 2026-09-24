@@ -244,7 +244,7 @@ func (s transportShelf) upload(ctx context.Context, localPath, name string) erro
 	if err := tr.Put(ctx, staged, f, fi.ModTime()); err != nil {
 		return err
 	}
-	return tr.Rename(ctx, staged, path.Join(s.dir(), name))
+	return landStaged(ctx, tr, staged, path.Join(s.dir(), name))
 }
 
 func (s transportShelf) snapshots(ctx context.Context) ([]string, error) {

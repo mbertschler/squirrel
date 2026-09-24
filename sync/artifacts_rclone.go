@@ -52,6 +52,15 @@ func (a *rcloneArtifacts) rootEmpty(ctx context.Context) (bool, error) {
 // name, and squirrel records it only after it landed.
 func (a *rcloneArtifacts) reconcile(context.Context, *Report, int64) error { return nil }
 
+// putAll copies the artifacts one after another.
+func (a *rcloneArtifacts) putAll(ctx context.Context, _ int64, items []artifactPut) []artifactResult {
+	out := make([]artifactResult, len(items))
+	for i, it := range items {
+		out[i].err = a.put(ctx, it.name, it.src, it.size, it.sum)
+	}
+	return out
+}
+
 // put re-hashes src immediately before the transfer and refuses
 // (errContentDrift) when the digest no longer matches sum, catching a
 // size+mtime-preserving in-place edit that a metadata stat would pass. The
@@ -65,26 +74,26 @@ func (a *rcloneArtifacts) reconcile(context.Context, *Report, int64) error { ret
 // span, and the scan-back fingerprint pass (#109) re-reads the landed
 // object to upgrade the durability vector, catching any byte that slipped
 // through before the object is treated as content-verified.
-func (a *rcloneArtifacts) put(ctx context.Context, _ int64, name, src string, size int64, sum []byte) (*remoteChecksum, error) {
+func (a *rcloneArtifacts) put(ctx context.Context, name, src string, size int64, sum []byte) error {
 	digest, err := hashLocalFile(src)
 	if err != nil {
-		return nil, fmt.Errorf("re-hash %s before upload: %w", src, err)
+		return fmt.Errorf("re-hash %s before upload: %w", src, err)
 	}
 	if !bytes.Equal(digest, sum) {
-		return nil, fmt.Errorf("%w: %s now hashes to %s, indexed as %s", errContentDrift, src, hex.EncodeToString(digest), hex.EncodeToString(sum))
+		return fmt.Errorf("%w: %s now hashes to %s, indexed as %s", errContentDrift, src, hex.EncodeToString(digest), hex.EncodeToString(sum))
 	}
 	uri := a.where(name)
 	if err := a.rcl.copyTo(ctx, src, uri, concurrencyArgs(a.dest)...); err != nil {
-		return nil, err
+		return err
 	}
 	landed, err := a.rcl.statRemote(ctx, uri, concurrencyArgs(a.dest)...)
 	if err != nil {
-		return nil, fmt.Errorf("confirm %s after upload: %w", uri, err)
+		return fmt.Errorf("confirm %s after upload: %w", uri, err)
 	}
 	if landed != size {
-		return nil, fmt.Errorf("%s landed with size %d, want %d", uri, landed, size)
+		return fmt.Errorf("%s landed with size %d, want %d", uri, landed, size)
 	}
-	return nil, nil
+	return nil
 }
 
 func (a *rcloneArtifacts) capture(ctx context.Context, rep *Report, dir string, targets []captureTarget) {

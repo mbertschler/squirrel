@@ -32,11 +32,14 @@ const stallBytesPerSecond = 1 << 20
 
 // stallTransport bounds every call of the transport it wraps by progress
 // rather than wall-clock: a call that makes none for timeout fails with
-// errTransportStalled. A Put makes progress with every chunk it reads.
+// errTransportStalled. A Put makes progress with every chunk it reads; a
+// Flush is also allowed the time the bytes put since the last one take at
+// stallBytesPerSecond, counted in unflushed where the push keeps a count.
 type stallTransport struct {
 	transport
-	timeout time.Duration
-	stalled *atomic.Int64
+	timeout   time.Duration
+	stalled   *atomic.Int64
+	unflushed *atomic.Int64
 }
 
 // bounded runs call on its own goroutine and returns its result, or
@@ -105,9 +108,29 @@ func (s stallTransport) Get(ctx context.Context, name string) (io.ReadCloser, er
 }
 
 func (s stallTransport) Put(ctx context.Context, name string, r io.Reader, mtime time.Time) error {
+	body := &progressingReader{timeout: s.timeout}
 	_, err := bounded(ctx, s, "put "+name, func(ctx context.Context, progress func(time.Duration)) (struct{}, error) {
-		return struct{}{}, s.transport.Put(ctx, name, &progressingReader{r: r, timeout: s.timeout, progress: progress}, mtime)
+		body.r, body.progress = r, progress
+		return struct{}{}, s.transport.Put(ctx, name, body, mtime)
 	})
+	if s.unflushed != nil {
+		s.unflushed.Add(body.read())
+	}
+	return err
+}
+
+func (s stallTransport) Flush(ctx context.Context) error {
+	var pending int64
+	if s.unflushed != nil {
+		pending = s.unflushed.Load()
+	}
+	_, err := bounded(ctx, s, "flush", func(ctx context.Context, progress func(time.Duration)) (struct{}, error) {
+		progress(s.timeout + time.Duration(pending/stallBytesPerSecond)*time.Second)
+		return struct{}{}, s.transport.Flush(ctx)
+	})
+	if err == nil && s.unflushed != nil {
+		s.unflushed.Add(-pending)
+	}
 	return err
 }
 
@@ -177,22 +200,25 @@ func (r *stallReader) Close() error {
 }
 
 // progressingReader reports each chunk it reads as progress, and at the
-// end of the body allows the final sync time to flush what it read.
+// end of the body allows the time to settle what it read. A Put given up
+// on may still be reading, so the count is atomic.
 type progressingReader struct {
 	r        io.Reader
 	timeout  time.Duration
 	progress func(time.Duration)
-	n        int64
+	n        atomic.Int64
 }
 
 func (p *progressingReader) Read(b []byte) (int, error) {
 	n, err := p.r.Read(b)
-	p.n += int64(n)
+	total := p.n.Add(int64(n))
 	switch {
 	case errors.Is(err, io.EOF):
-		p.progress(p.timeout + time.Duration(p.n/stallBytesPerSecond)*time.Second)
+		p.progress(p.timeout + time.Duration(total/stallBytesPerSecond)*time.Second)
 	case n > 0:
 		p.progress(p.timeout)
 	}
 	return n, err
 }
+
+func (p *progressingReader) read() int64 { return p.n.Load() }

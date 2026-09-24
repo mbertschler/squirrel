@@ -154,8 +154,9 @@ func (h *mirrorHandler) foreignHistory(runID int64) error {
 	return fmt.Errorf("destination %q: the last successful sync (run %d) left no receipt at %s, so the root holds a tree this mirror did not write (by rclone, or another layout) or was emptied while squirrel still records uploads to it; a native mirror does not adopt an existing tree: point the destination at a fresh or emptied root, and after emptying it run `squirrel destination reset %s`: %w", h.dest.Name, runID, h.receiptName(runID), h.dest.Name, ErrRefused)
 }
 
-// seal writes the run's receipt, the manifest segment of its delta, and
-// confirms it landed at its size.
+// seal writes the run's receipt, the manifest segment of its delta,
+// confirms it landed at its size, and flushes it: the run succeeds only on
+// a receipt a power cut cannot take back.
 func (h *mirrorHandler) seal(ctx context.Context, _ *Report, runID int64, p pushPlan, _ *mirrorOps) error {
 	body, err := encodeManifestSegment(p.delta)
 	if err != nil {
@@ -175,6 +176,9 @@ func (h *mirrorHandler) seal(ctx context.Context, _ *Report, runID int64, p push
 	}
 	if e.size != int64(len(body)) {
 		return fmt.Errorf("receipt %s landed with size %d, want %d", name, e.size, len(body))
+	}
+	if err := tr.Flush(ctx); err != nil {
+		return fmt.Errorf("flush receipt %s: %w", name, err)
 	}
 	return nil
 }

@@ -262,28 +262,32 @@ func (h *contentPusher) uploadObjects(ctx context.Context, rep *Report, runID in
 	rep.RcloneResult.Checked += ops.recorded
 	var pending []store.PathDelta
 	var drifted int
-	for _, d := range ops.needed {
-		fingerprinted, err := h.uploadOneObject(ctx, runID, d)
-		if err != nil {
-			if errors.Is(err, errContentDrift) {
+	for _, batch := range batches(ops.needed, func(d store.PathDelta) int64 { return d.SizeBytes }) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		for i, res := range h.uploadBatch(ctx, runID, batch) {
+			d := batch[i]
+			switch {
+			case errors.Is(res.err, errContentDrift):
 				drifted++
-				rep.Warnings = append(rep.Warnings, err.Error())
+				rep.Warnings = append(rep.Warnings, res.err.Error())
 				continue
+			case res.err != nil:
+				rep.RcloneResult.Errors++
+				if int64(len(rep.RcloneResult.FailedFiles)) < maxFailedFiles {
+					rep.RcloneResult.FailedFiles = append(rep.RcloneResult.FailedFiles,
+						FailedFile{Object: d.Path, Message: res.err.Error()})
+				}
+				continue
+			case res.fingerprint != nil:
+				rep.Fingerprints++
+			default:
+				pending = append(pending, d)
 			}
-			rep.RcloneResult.Errors++
-			if int64(len(rep.RcloneResult.FailedFiles)) < maxFailedFiles {
-				rep.RcloneResult.FailedFiles = append(rep.RcloneResult.FailedFiles,
-					FailedFile{Object: d.Path, Message: err.Error()})
-			}
-			continue
+			rep.RcloneResult.Transferred++
+			rep.RcloneResult.Bytes += d.SizeBytes
 		}
-		if fingerprinted {
-			rep.Fingerprints++
-		} else {
-			pending = append(pending, d)
-		}
-		rep.RcloneResult.Transferred++
-		rep.RcloneResult.Bytes += d.SizeBytes
 	}
 	h.captureFingerprints(ctx, rep, pending)
 	if rep.RcloneResult.Errors > 0 {
@@ -342,24 +346,36 @@ func plannedUploads(delta []store.PathDelta) []store.PathDelta {
 // the run so the watermark holds and the object is re-offered next run.
 var errContentDrift = errors.New("source content drifted from its indexed hash")
 
-// uploadOneObject lands one content object and records the upload, with
-// its fingerprint when the landing already confirmed one. It guards the
-// content-addressed invariant — the bytes stored under a hash must be the
-// bytes that produced it: the artifact store refuses a source that no
-// longer hashes to the indexed hash (errContentDrift), catching a
-// size+mtime-preserving in-place edit that a metadata stat would pass. The
-// upload record is written only after the landing was confirmed, so a
-// recorded hash is always a confirmed one; a crash in between lands the
-// same bytes again on the next run.
-func (h *contentPusher) uploadOneObject(ctx context.Context, runID int64, d store.PathDelta) (bool, error) {
-	src := filepath.Join(h.vol.Path, filepath.FromSlash(d.Path))
-	cs, err := h.art.put(ctx, runID, h.objectName(d.Blake3), src, d.SizeBytes, d.Blake3)
-	if errors.Is(err, errContentDrift) {
-		return false, fmt.Errorf("%s: %w — run `squirrel index %s` and sync again", d.Path, err, h.vol.Name)
+// uploadBatch lands one batch of content objects and records each upload
+// that landed, with its fingerprint when the landing already confirmed
+// one. It guards the content-addressed invariant — the bytes stored under
+// a hash must be the bytes that produced it: the artifact store refuses a
+// source that no longer hashes to the indexed hash (errContentDrift),
+// catching a size+mtime-preserving in-place edit that a metadata stat
+// would pass. An upload is recorded only once the store returned its
+// landing confirmed and durable, so a recorded hash is always a confirmed
+// one; a crash in between lands the same bytes again on the next run.
+func (h *contentPusher) uploadBatch(ctx context.Context, runID int64, batch []store.PathDelta) []artifactResult {
+	items := make([]artifactPut, len(batch))
+	for i, d := range batch {
+		items[i] = artifactPut{name: h.objectName(d.Blake3), src: filepath.Join(h.vol.Path, filepath.FromSlash(d.Path)), size: d.SizeBytes, sum: d.Blake3}
 	}
-	if err != nil {
-		return false, err
+	results := h.art.putAll(ctx, runID, items)
+	for i, d := range batch {
+		res := &results[i]
+		if errors.Is(res.err, errContentDrift) {
+			res.err = fmt.Errorf("%s: %w — run `squirrel index %s` and sync again", d.Path, res.err, h.vol.Name)
+		}
+		if res.err == nil {
+			res.err = h.recordObject(ctx, runID, d, res.fingerprint)
+		}
 	}
+	return results
+}
+
+// recordObject records the upload of d's content, with the fingerprint
+// its landing confirmed, if any.
+func (h *contentPusher) recordObject(ctx context.Context, runID int64, d store.PathDelta, cs *remoteChecksum) error {
 	obj := store.RemoteObject{ContentID: d.ContentID, Destination: h.dest.Name, UploadedRunID: runID}
 	if cs != nil {
 		obj.ChecksumAlgo = sql.NullString{String: cs.Algo, Valid: true}
@@ -367,9 +383,9 @@ func (h *contentPusher) uploadOneObject(ctx context.Context, runID int64, d stor
 		obj.VerifiedAtNs = sql.NullInt64{Int64: store.NowNs(), Valid: true}
 	}
 	if err := h.store.InsertRemoteObject(ctx, obj); err != nil {
-		return false, fmt.Errorf("record upload of %s: %w", hex.EncodeToString(d.Blake3), err)
+		return fmt.Errorf("record upload of %s: %w", hex.EncodeToString(d.Blake3), err)
 	}
-	return cs != nil, nil
+	return nil
 }
 
 // hashLocalFile streams the file at path through BLAKE3 and returns the

@@ -44,16 +44,20 @@ uploads once.
 ## How it is written
 
 On a `local` disk, and on an `sftp` server without `crypt`, squirrel writes the
-destination itself, without rclone. Each object, and each manifest segment:
+destination itself, without rclone. Objects land in batches of up to 64,
+several at once ([`concurrency`](/squirrel/reference/configuration/#common-keys));
+a manifest segment lands alone. Each:
 
 1. streams into `<volume>/.squirrel-staging/run-<id>/` while BLAKE3 hashes the
-   bytes sent, and is refused if they no longer match the index;
+   bytes sent, and is refused if they no longer match the index; the batch is
+   then flushed to stable storage;
 2. is confirmed before it gets its name: read back through BLAKE3 on a local
    disk, hashed by the server's `hash_algo` command (`sha256sum` by default) on
-   sftp. A match is recorded as the object's fingerprint right away;
+   sftp. A match becomes the object's fingerprint;
 3. is renamed onto its name. A file already at that name is never replaced:
-   squirrel checks that it holds the right bytes and records it, or fails the
-   object.
+   squirrel checks that it holds the right bytes, or fails the object;
+4. is recorded, with its fingerprint, once a second flush has made the batch's
+   renames durable.
 
 A server that runs no programs takes every object all the same, but
 fingerprints nothing: those objects stay pending, with a warning, and the

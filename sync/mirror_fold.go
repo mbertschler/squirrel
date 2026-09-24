@@ -359,13 +359,15 @@ func (w *mirrorWriter) presentAtSource(ctx context.Context) func(string) (bool, 
 // spelling of a planned path's name, unless an earlier path of this push
 // already did.
 func (w *mirrorWriter) displaceSpelling(ctx context.Context, rel string) error {
-	if _, ok := w.live[rel]; !ok {
+	if _, ok := w.liveAt(rel); !ok {
 		return nil
 	}
 	return w.displace(ctx, rel)
 }
 
 func (w *mirrorWriter) refuseCollision(rel, other string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.collided++
 	w.rep.Warnings = append(w.rep.Warnings, fmt.Sprintf("destination %q: %s is not written: the destination cannot tell its name apart from %s (it ignores case or Unicode normalization); rename one of them at the source",
 		w.h.dest.Name, rel, other))

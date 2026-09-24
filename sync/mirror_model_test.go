@@ -78,10 +78,11 @@ var sourceFolding = caseAndNormFolding
 
 // TestMirrorModel runs random histories — adds, changes, deletes, re-adds,
 // file↔directory swaps, nested, renames that change only case, and on a
-// folding destination names that collide — through a native mirror, each
-// push preceded now and then by one that crashes at a random transport
-// call. After every clean push the destination's live records and its tree
-// match the reference model, and the three invariants hold.
+// folding destination names that collide — through a native mirror
+// writing several paths at once, each push preceded now and then by one
+// that crashes or loses power at a random transport call. After every
+// clean push the destination's live records and its tree match the
+// reference model, and the three invariants hold.
 func TestMirrorModel(t *testing.T) {
 	for _, b := range mirrorBackends {
 		for _, fold := range []nameFolding{{}, caseAndNormFolding} {
@@ -262,8 +263,7 @@ func (r *modelRun) push() {
 		}
 	}
 	if r.rng.IntN(3) == 0 {
-		mode := []crashMode{crashBefore, crashAfter, crashMidway}[r.rng.IntN(3)]
-		_, _ = f.pushCrashing(t, crashAtCall(r.rng.IntN(60)), mode)
+		r.crashingPush()
 		f.checkRecordsVouch(t)
 		f.checkOnlyGrew(t, before)
 	}
@@ -274,6 +274,21 @@ func (r *modelRun) push() {
 	r.m.push(nil)
 	f.checkInvariants(t, before)
 	r.checkAgainstModel()
+}
+
+// crashingPush pushes once with a crash at a random transport call: the
+// process dies, or half the time the power goes, keeping a random oldest
+// part of what no Flush covered.
+func (r *modelRun) crashingPush() {
+	at := crashAtCall(r.rng.IntN(60))
+	if r.rng.IntN(2) == 0 {
+		mode := []crashMode{crashBefore, crashAfter, crashMidway}[r.rng.IntN(3)]
+		_, _ = r.f.pushCrashing(r.t, at, mode)
+		return
+	}
+	seed := r.rng.Uint64()
+	keep := func(n int) int { return rand.New(rand.NewPCG(seed, seed)).IntN(n + 1) }
+	_, _ = r.f.pushCuttingPower(r.t, at, powerCutModes[r.rng.IntN(2)], keep)
 }
 
 // collide records another spelling of a file the destination holds as

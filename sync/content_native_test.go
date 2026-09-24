@@ -130,6 +130,20 @@ func (f *nativeContentFixture) pushCrashing(t *testing.T, crashAt func(transport
 	})
 }
 
+// pushCuttingPower runs one push that loses power at the first call
+// crashAt selects, before or after it as mode says, keeping the oldest
+// keep(n) of the n calls no Flush covered.
+func (f *nativeContentFixture) pushCuttingPower(t *testing.T, crashAt func(transportCall) bool, mode crashMode, keep func(int) int) (Report, error) {
+	t.Helper()
+	return f.pushVia(t, func(tr transport) transport {
+		return &faultTransport{transport: tr, crashAt: crashAt, mode: mode, powerCut: true, keep: keep}
+	})
+}
+
+// oneAtATime makes the fixture's pushes land one artifact at a time, so
+// their transport calls come in the same order on every push.
+func (f *nativeContentFixture) oneAtATime() { f.pair.Destination.Concurrency = 1 }
+
 // pushVia runs one push through wrap's transport.
 func (f *nativeContentFixture) pushVia(t *testing.T, wrap func(transport) transport) (Report, error) {
 	t.Helper()

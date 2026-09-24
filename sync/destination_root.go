@@ -9,6 +9,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/mbertschler/squirrel/config"
@@ -27,6 +28,9 @@ type destinationRoot struct {
 	openTransport func(context.Context, *config.Destination) (transport, error)
 	// stallTimeout bounds every transport call by progress.
 	stallTimeout time.Duration
+	// unflushed counts the bytes put since the last Flush, which the
+	// Flush is allowed the time to write.
+	unflushed atomic.Int64
 
 	raw transport // opened on first use, closed by close
 }
@@ -48,6 +52,7 @@ func (h *destinationRoot) guarded(ctx context.Context, guard nameGuard) (transpo
 		transport: guardedTransport{transport: h.raw, guard: guard},
 		timeout:   h.stallTimeout,
 		stalled:   stalledCounter(h.dest.Name),
+		unflushed: &h.unflushed,
 	}, nil
 }
 

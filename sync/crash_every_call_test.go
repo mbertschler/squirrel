@@ -77,6 +77,7 @@ func recordMirrorCalls(t *testing.T, b mirrorBackend, fold nameFolding) []transp
 	t.Helper()
 	f := setupMirrorFixtureOn(t, b)
 	f.fold = fold
+	f.oneAtATime()
 	mirrorCrashScenario(t, f)
 	var rec *faultTransport
 	rep, err := f.pushVia(t, Options{}, func(tr transport) transport {
@@ -104,7 +105,9 @@ func TestMirrorCrashAtEveryTransportCall(t *testing.T) {
 					for _, mode := range crashModesFor(c) {
 						t.Run(fmt.Sprintf("%03d-%s-%s-%s", i, c.op, path.Base(c.name), crashModeNames[mode]), func(t *testing.T) {
 							t.Parallel()
-							runMirrorCrashAt(t, b, fold, i, mode)
+							runMirrorCrashAt(t, b, fold, func(f *mirrorFixture) (Report, error) {
+								return f.pushCrashing(t, crashAtCall(i), mode)
+							})
 						})
 					}
 				}
@@ -113,12 +116,57 @@ func TestMirrorCrashAtEveryTransportCall(t *testing.T) {
 	}
 }
 
-func runMirrorCrashAt(t *testing.T, b mirrorBackend, fold nameFolding, i int, mode crashMode) {
+// powerCutModes are the two moments a power cut can strike around a call:
+// before it, after every record written since the call before, and after
+// it.
+var powerCutModes = []crashMode{crashBefore, crashAfter}
+
+// powerCut is one way a power cut can leave the disk: every call no Flush
+// covered taken back, or every name kept but none of those calls' bytes.
+type powerCut struct {
+	name string
+	mode crashMode
+	keep func(n int) int
+}
+
+var powerCuts = []powerCut{
+	{"before", crashBefore, nil},
+	{"after", crashAfter, nil},
+	{"names-kept", crashBefore, func(n int) int { return n }},
+}
+
+// TestMirrorPowerCutAtEveryTransportCall: a push that loses power around
+// any one of its transport calls, taking back every call no Flush covered
+// or keeping their names without their bytes, still leaves every record
+// vouching for its bytes, because no record claims bytes before the flush
+// that covers them and no staged file is renamed before its bytes are
+// flushed; the next clean push settles the rest.
+func TestMirrorPowerCutAtEveryTransportCall(t *testing.T) {
+	for _, b := range mirrorBackends {
+		for _, fold := range []nameFolding{{}, caseAndNormFolding} {
+			t.Run(fmt.Sprintf("%s/folds=%v", b.name, fold.folds()), func(t *testing.T) {
+				for i, c := range recordMirrorCalls(t, b, fold) {
+					for _, cut := range powerCuts {
+						t.Run(fmt.Sprintf("%03d-%s-%s-%s", i, c.op, path.Base(c.name), cut.name), func(t *testing.T) {
+							t.Parallel()
+							runMirrorCrashAt(t, b, fold, func(f *mirrorFixture) (Report, error) {
+								return f.pushCuttingPower(t, crashAtCall(i), cut.mode, cut.keep)
+							})
+						})
+					}
+				}
+			})
+		}
+	}
+}
+
+func runMirrorCrashAt(t *testing.T, b mirrorBackend, fold nameFolding, crash func(*mirrorFixture) (Report, error)) {
 	f := setupMirrorFixtureOn(t, b)
 	f.fold = fold
+	f.oneAtATime()
 	mirrorCrashScenario(t, f)
 	before := f.contentHashes(t)
-	if rep, err := f.pushCrashing(t, crashAtCall(i), mode); !crashedOn(rep, err) {
+	if rep, err := crash(f); !crashedOn(rep, err) {
 		t.Fatalf("crashing push: status=%q err=%v failures=%+v, want the injected crash", rep.Status, err, rep.RcloneResult.FailedFiles)
 	}
 	f.checkRecordsVouch(t, "tampered.txt")
@@ -160,6 +208,7 @@ func contentCrashScenario(t *testing.T, f *nativeContentFixture) {
 func recordContentCalls(t *testing.T, b contentBackend, layout string) []transportCall {
 	t.Helper()
 	f := setupNativeContentFixture(t, b, layout)
+	f.oneAtATime()
 	contentCrashScenario(t, f)
 	var calls []transportCall
 	rep, err := f.pushCrashing(t, func(c transportCall) bool {
@@ -185,7 +234,9 @@ func TestNativeContentCrashAtEveryTransportCall(t *testing.T) {
 					for _, mode := range crashModesFor(c) {
 						t.Run(fmt.Sprintf("%03d-%s-%s-%s", i, c.op, path.Base(c.name), crashModeNames[mode]), func(t *testing.T) {
 							t.Parallel()
-							runContentCrashAt(t, b, layout, i, mode)
+							runContentCrashAt(t, b, layout, func(f *nativeContentFixture) (Report, error) {
+								return f.pushCrashing(t, crashAtCall(i), mode)
+							})
 						})
 					}
 				}
@@ -194,11 +245,36 @@ func TestNativeContentCrashAtEveryTransportCall(t *testing.T) {
 	}
 }
 
-func runContentCrashAt(t *testing.T, b contentBackend, layout string, i int, mode crashMode) {
+// TestNativeContentPowerCutAtEveryTransportCall: a content push that loses
+// power around any one of its transport calls, taking back every call no
+// Flush covered or keeping their names without their bytes, records no
+// artifact the destination does not hold; the next clean push lands the
+// rest.
+func TestNativeContentPowerCutAtEveryTransportCall(t *testing.T) {
+	for _, b := range contentBackends {
+		for _, layout := range contentLayouts {
+			t.Run(b.name+"/"+layout, func(t *testing.T) {
+				for i, c := range recordContentCalls(t, b, layout) {
+					for _, cut := range powerCuts {
+						t.Run(fmt.Sprintf("%03d-%s-%s-%s", i, c.op, path.Base(c.name), cut.name), func(t *testing.T) {
+							t.Parallel()
+							runContentCrashAt(t, b, layout, func(f *nativeContentFixture) (Report, error) {
+								return f.pushCuttingPower(t, crashAtCall(i), cut.mode, cut.keep)
+							})
+						})
+					}
+				}
+			})
+		}
+	}
+}
+
+func runContentCrashAt(t *testing.T, b contentBackend, layout string, crash func(*nativeContentFixture) (Report, error)) {
 	f := setupNativeContentFixture(t, b, layout)
+	f.oneAtATime()
 	contentCrashScenario(t, f)
 	before := hashesOutsideStaging(t, f.dst)
-	if rep, err := f.pushCrashing(t, crashAtCall(i), mode); !crashedOn(rep, err) {
+	if rep, err := crash(f); !crashedOn(rep, err) {
 		t.Fatalf("crashing push: status=%q err=%v failures=%+v, want the injected crash", rep.Status, err, rep.RcloneResult.FailedFiles)
 	}
 	f.checkArtifactsVouch(t)

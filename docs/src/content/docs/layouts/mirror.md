@@ -26,18 +26,23 @@ On a `local` destination, and on an `sftp` destination without
 [crypt](/squirrel/layouts/encrypted/), squirrel writes the mirror itself: a
 *native* mirror. A push plans from
 the index: it sends the changes recorded since the destination's last confirmed
-run, not what a fresh walk of the disk finds. For each changed path it:
+run, not what a fresh walk of the disk finds. It writes the changed paths in
+batches of up to 64 files, several at once
+([`concurrency`](/squirrel/reference/configuration/#common-keys)). For each
+batch it:
 
-1. streams the file into `.squirrel-staging/run-<id>/`, hashing the bytes as they
-   go, and refuses the path if they no longer match the index;
-2. on a `local` disk, reads the staged copy back through BLAKE3, past the page
-   cache where the system allows, and refuses the path if the disk returns
+1. streams every file into `.squirrel-staging/run-<id>/`, hashing the bytes as
+   they go, and refuses a path if they no longer match the index; then it
+   flushes the batch to stable storage;
+2. on a `local` disk, reads every staged copy back through BLAKE3, past the
+   page cache where the system allows, and refuses a path if the disk returns
    other bytes;
-3. moves whatever the path holds into `.squirrel-history/run-<id>/`;
-4. renames the staged copy onto the path. The rename never replaces a file.
+3. moves whatever each path holds into `.squirrel-history/run-<id>/`;
+4. renames each staged copy onto its path. The rename never replaces a file.
 
-squirrel records each move before making it, so the next push finishes or
-withdraws whatever a crashed or unplugged push left half done. Every successful
+squirrel records each move before making it, and confirms it only once a flush
+has made it durable, so the next push finishes or withdraws whatever a crashed
+or unplugged push, or a power cut, left half done. Every successful
 push leaves a **receipt** at `.squirrel-index/run-<id>`: the run's changes in the
 [manifest segment format](/squirrel/reference/formats/), so the mirror can be
 checked without the index. A push that finds no receipt for the last success it
@@ -96,8 +101,9 @@ A native mirror push hashes every file with BLAKE3 as it streams out and
 confirms each written path's size and mtime. What else backs it depends on
 where the mirror lives:
 
-- **On a `local` disk**, every copy is read back through BLAKE3 before it is
-  committed, and the match is recorded as the copy's fingerprint. Once every
+- **On a `local` disk**, every copy is flushed to the disk, then read back in
+  full through BLAKE3 before it is committed, and the match is recorded as the
+  copy's fingerprint. Once every
   file of the volume has such a copy, the run advances the destination's
   durability evidence as `fingerprint-verified`. A local mirror can therefore be
   named in [`offload_requires`](/squirrel/guides/offloading/).

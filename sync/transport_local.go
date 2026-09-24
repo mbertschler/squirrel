@@ -10,7 +10,9 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -20,9 +22,15 @@ import (
 // symlink anywhere along it, because os.Root follows symlinks that stay
 // inside the root. Put and Get keep their pages out of the cache where
 // the platform allows (bypassCache), so reading back a file just written
-// reads what reached the disk.
+// reads what reached the disk. Flush makes durable in one go every file
+// Put left open and every directory whose entries changed since the last
+// one (flushLocal).
 type localTransport struct {
 	root *os.Root
+
+	mu      sync.Mutex
+	pending []*os.File
+	dirty   map[string]bool
 }
 
 func openLocalTransport(dir string) (*localTransport, error) {
@@ -30,10 +38,18 @@ func openLocalTransport(dir string) (*localTransport, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open destination root %s: %w", dir, err)
 	}
-	return &localTransport{root: root}, nil
+	return &localTransport{root: root, dirty: map[string]bool{}}, nil
 }
 
-func (t *localTransport) Close() error { return t.root.Close() }
+func (t *localTransport) Close() error {
+	t.mu.Lock()
+	for _, f := range t.pending {
+		_ = f.Close()
+	}
+	t.pending = nil
+	t.mu.Unlock()
+	return t.root.Close()
+}
 
 func (t *localTransport) Stat(_ context.Context, name string) (entry, error) {
 	if err := t.checkName(name); err != nil {
@@ -102,17 +118,36 @@ func (t *localTransport) Put(ctx context.Context, name string, r io.Reader, mtim
 		return err
 	}
 	bypassCache(f)
+	t.markDirty(path.Dir(name))
 	if err := t.fill(ctx, f, name, r, mtime); err != nil {
 		_ = f.Close()
 		return err
 	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("close %s: %w", name, err)
-	}
-	return t.syncDir(path.Dir(name))
+	return t.settle(f, name)
 }
 
-// fill streams r into the freshly created f, stamps mtime, and syncs.
+// settle moves a filled file toward the disk as the platform does it
+// (settleFile), and holds it open for the next Flush where that flush
+// needs it.
+func (t *localTransport) settle(f *os.File, name string) error {
+	keep, err := settleFile(f)
+	if err != nil {
+		_ = f.Close()
+		return fmt.Errorf("sync %s: %w", name, err)
+	}
+	if !keep {
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("close %s: %w", name, err)
+		}
+		return nil
+	}
+	t.mu.Lock()
+	t.pending = append(t.pending, f)
+	t.mu.Unlock()
+	return nil
+}
+
+// fill streams r into the freshly created f and stamps mtime.
 func (t *localTransport) fill(ctx context.Context, f *os.File, name string, r io.Reader, mtime time.Time) error {
 	if _, err := io.Copy(f, ctxReader{ctx: ctx, r: r}); err != nil {
 		return fmt.Errorf("write %s: %w", name, err)
@@ -120,10 +155,6 @@ func (t *localTransport) fill(ctx context.Context, f *os.File, name string, r io
 	if err := t.root.Chtimes(filepath.FromSlash(name), mtime, mtime); err != nil {
 		return fmt.Errorf("set mtime of %s: %w", name, err)
 	}
-	if err := f.Sync(); err != nil {
-		return fmt.Errorf("sync %s: %w", name, err)
-	}
-	bypassCache(f)
 	return nil
 }
 
@@ -143,10 +174,29 @@ func (t *localTransport) Rename(_ context.Context, from, to string) error {
 	if err := renameNoReplace(t.root, from, to); err != nil {
 		return err
 	}
-	if err := t.syncDir(path.Dir(from)); err != nil {
-		return err
+	t.markDirty(path.Dir(from))
+	t.markDirty(path.Dir(to))
+	return nil
+}
+
+// Flush makes every file Put left open, and every directory a call
+// changed, durable, then releases the files.
+func (t *localTransport) Flush(context.Context) error {
+	t.mu.Lock()
+	files, dirty := t.pending, t.dirty
+	t.pending, t.dirty = nil, map[string]bool{}
+	t.mu.Unlock()
+	defer func() {
+		for _, f := range files {
+			_ = f.Close()
+		}
+	}()
+	dirs := make([]string, 0, len(dirty))
+	for d := range dirty {
+		dirs = append(dirs, d)
 	}
-	return t.syncDir(path.Dir(to))
+	slices.Sort(dirs)
+	return flushLocal(t.root, files, dirs)
 }
 
 func (t *localTransport) Remove(_ context.Context, name string) error {
@@ -175,26 +225,47 @@ func (t *localTransport) lstat(name string) (fs.FileInfo, error) {
 	return t.root.Lstat(filepath.FromSlash(name))
 }
 
+// mkdirParents creates name's missing parents, one at a time, so the
+// directory holding each new one is flushed with the next Flush.
 func (t *localTransport) mkdirParents(name string) error {
 	dir := path.Dir(name)
 	if dir == "." {
 		return nil
 	}
-	if err := t.root.MkdirAll(filepath.FromSlash(dir), 0o755); err != nil {
-		return fmt.Errorf("create %s: %w", dir, err)
+	if fi, err := t.lstat(dir); err == nil && fi.IsDir() {
+		return nil
+	}
+	parts := strings.Split(dir, "/")
+	for i := range parts {
+		p := strings.Join(parts[:i+1], "/")
+		err := t.root.Mkdir(filepath.FromSlash(p), 0o755)
+		switch {
+		case err == nil:
+			t.markDirty(path.Dir(p))
+		case !errors.Is(err, fs.ErrExist):
+			return fmt.Errorf("create %s: %w", dir, err)
+		}
 	}
 	return nil
 }
 
-// syncDir flushes a directory, so a name created or moved in it survives
-// a power cut.
-func (t *localTransport) syncDir(dir string) error {
-	f, err := t.root.Open(filepath.FromSlash(dir))
+func (t *localTransport) markDirty(dir string) {
+	t.mu.Lock()
+	t.dirty[dir] = true
+	t.mu.Unlock()
+}
+
+// syncDir flushes a directory's entries where the filesystem can.
+func syncDir(root *os.Root, dir string, flush func(*os.File) error) error {
+	f, err := root.Open(filepath.FromSlash(dir))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("open %s to sync it: %w", dir, err)
 	}
 	defer f.Close()
-	if err := f.Sync(); err != nil && !dirSyncUnsupported(err) {
+	if err := flush(f); err != nil && !dirSyncUnsupported(err) {
 		return fmt.Errorf("sync %s: %w", dir, err)
 	}
 	return nil

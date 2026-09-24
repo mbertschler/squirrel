@@ -14,6 +14,20 @@ func renameNoReplace(root *os.Root, from, to string) error {
 // read may be served from it.
 func bypassCache(*os.File) {}
 
+// settleFile flushes f as its Put ends: this platform offers squirrel no
+// flush that covers several files.
+func settleFile(f *os.File) (bool, error) { return false, f.Sync() }
+
+// flushLocal flushes every changed directory where the platform can.
+func flushLocal(root *os.Root, _ []*os.File, dirs []string) error {
+	for _, d := range dirs {
+		if err := syncDir(root, d, (*os.File).Sync); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // dirSyncUnsupported: a directory cannot be flushed through a handle on
 // this platform, so the sync is best effort.
 func dirSyncUnsupported(error) bool { return true }

@@ -2,6 +2,7 @@ package sync
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -99,6 +100,52 @@ func TestMirrorRetriesAFirstPushThatCrashed(t *testing.T) {
 			f.checkInvariants(t, nil)
 		})
 	}
+}
+
+// TestMirrorFirstPushSurvivesAPowerCutAtEveryCall: a first push displaces
+// nothing, so only the flush after staging stands between a staged file's
+// bytes and the rename that commits it. A power cut around any call, even
+// one that keeps every name but loses the bytes no Flush covered, leaves
+// every record vouching for its bytes, and the retry lands the rest.
+func TestMirrorFirstPushSurvivesAPowerCutAtEveryCall(t *testing.T) {
+	for _, b := range mirrorBackends {
+		t.Run(b.name, func(t *testing.T) {
+			var rec *faultTransport
+			if _, err := firstPushFixture(t, b).pushVia(t, Options{}, func(tr transport) transport {
+				rec = &faultTransport{transport: tr}
+				return rec
+			}); err != nil {
+				t.Fatal(err)
+			}
+			for i := range rec.calls {
+				for _, cut := range powerCuts {
+					t.Run(fmt.Sprintf("%03d-%s", i, cut.name), func(t *testing.T) {
+						t.Parallel()
+						f := firstPushFixture(t, b)
+						if rep, err := f.pushCuttingPower(t, crashAtCall(i), cut.mode, cut.keep); !crashedOn(rep, err) {
+							t.Fatalf("push cut short = %v, want the injected crash", err)
+						}
+						f.checkRecordsVouch(t)
+						f.mustPush(t)
+						f.checkInvariants(t, nil)
+					})
+				}
+			}
+		})
+	}
+}
+
+// firstPushFixture is a fixture about to push three files for the first
+// time, one path at a time.
+func firstPushFixture(t *testing.T, b mirrorBackend) *mirrorFixture {
+	t.Helper()
+	f := setupMirrorFixtureOn(t, b)
+	f.oneAtATime()
+	f.write(t, "a.txt", "alpha")
+	f.write(t, "b.txt", "beta")
+	f.write(t, "d/c.txt", "gamma")
+	f.index(t)
+	return f
 }
 
 // TestMirrorLeavesAppleDoubleCompanionsToTheSystem: the "._X" files macOS

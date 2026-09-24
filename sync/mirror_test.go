@@ -170,6 +170,20 @@ func (f *mirrorFixture) pushCrashing(t *testing.T, crashAt func(transportCall) b
 	})
 }
 
+// pushCuttingPower runs one push that loses power at the first call
+// crashAt selects, before or after it as mode says, keeping the oldest
+// keep(n) of the n calls no Flush covered.
+func (f *mirrorFixture) pushCuttingPower(t *testing.T, crashAt func(transportCall) bool, mode crashMode, keep func(int) int) (Report, error) {
+	t.Helper()
+	return f.pushVia(t, Options{}, func(tr transport) transport {
+		return &faultTransport{transport: tr, crashAt: crashAt, mode: mode, powerCut: true, keep: keep}
+	})
+}
+
+// oneAtATime makes the fixture's pushes write one path at a time, so
+// their transport calls come in the same order on every push.
+func (f *mirrorFixture) oneAtATime() { f.pair.Destination.Concurrency = 1 }
+
 func (f *mirrorFixture) handler(t *testing.T) *mirrorHandler {
 	t.Helper()
 	h, err := HandlerFor(f.store, Tools{}, f.pair)

@@ -437,7 +437,7 @@ func (h *packedHandler) buildOnePack(srcs []store.PathDelta, start int, level zs
 // decrypted length, which is the compressed pack, so it compares directly.
 func (h *packedHandler) uploadPack(ctx context.Context, runID int64, pack assembledPack) (*remoteChecksum, error) {
 	defer func() { _ = os.Remove(pack.tmpPath) }()
-	fingerprint, err := h.art.put(ctx, runID, h.packName(pack.key), pack.tmpPath, pack.compressedSize, pack.key)
+	fingerprint, err := putArtifact(ctx, h.art, runID, artifactPut{name: h.packName(pack.key), src: pack.tmpPath, size: pack.compressedSize, sum: pack.key})
 	if err != nil {
 		return nil, fmt.Errorf("upload pack %s: %w", hex.EncodeToString(pack.key), err)
 	}

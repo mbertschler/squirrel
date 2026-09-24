@@ -160,8 +160,8 @@ file's own copy until the next push writes the lost one again. The next push wri
 there, with a warning; the copy that was found keeps its place in history if the
 push has to move it aside.
 
-A local mirror earns its fingerprints at push time: every copy is read back
-through BLAKE3 before it is committed. An sftp mirror is checked by size and
+A local mirror earns its fingerprints at push time: every copy is flushed to the
+disk, then read back through BLAKE3 before it is committed. An sftp mirror is checked by size and
 mtime alone, and never gates offload.
 
 ## Related knobs

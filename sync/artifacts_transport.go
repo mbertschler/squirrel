@@ -10,6 +10,8 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	gosync "sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/zeebo/blake3"
@@ -20,11 +22,14 @@ import (
 // transportArtifacts is an artifact store squirrel writes itself: a
 // content-addressed or packed destination on a local disk, or on an sftp
 // server without crypt. Each artifact is staged in the volume's
-// .squirrel-staging/run-<id>/ while BLAKE3 hashes the bytes sent, read
-// back — through BLAKE3 on a local disk, through the server's hash command
-// on sftp — and renamed onto its name, so it lands whole or not at all.
+// .squirrel-staging/run-<id>/ while BLAKE3 hashes the bytes sent, flushed,
+// read back — through BLAKE3 on a local disk, through the server's hash
+// command on sftp — and renamed onto its name, so it lands whole or not at
+// all. Artifacts land a batch at a time, several in flight.
 type transportArtifacts struct {
 	*destinationRoot
+
+	mu gosync.Mutex
 	// noServerHash is why the sftp server fingerprinted nothing this push,
 	// once a landing found out.
 	noServerHash error
@@ -73,25 +78,107 @@ func (a *transportArtifacts) reconcile(ctx context.Context, rep *Report, runID i
 	return a.clearFinishedStaging(ctx, rep, tr)
 }
 
-func (a *transportArtifacts) put(ctx context.Context, runID int64, name, src string, size int64, sum []byte) (*remoteChecksum, error) {
+// artifactLanding is one artifact on its way through putAll.
+type artifactLanding struct {
+	artifactPut
+	staged string
+	// sent is the server-side hash of the bytes sent, "" without one.
+	sent string
+	res  *artifactResult
+}
+
+// putAll takes the artifacts through the steps of a landing, each for all
+// of them before the next: stage, flush, confirm, rename, flush. An
+// artifact whose step fails drops out.
+func (a *transportArtifacts) putAll(ctx context.Context, runID int64, items []artifactPut) []artifactResult {
+	out := make([]artifactResult, len(items))
 	tr, err := a.root(ctx, runID)
 	if err != nil {
-		return nil, err
+		for i := range out {
+			out[i].err = err
+		}
+		return out
 	}
-	staged := stagingName(a.volumeDir, runID, stagingKey(name))
-	sent, err := a.stage(ctx, tr, staged, src, size, sum)
-	if err != nil {
-		return nil, err
+	ls := make([]*artifactLanding, len(items))
+	for i, it := range items {
+		ls[i] = &artifactLanding{artifactPut: it, staged: stagingName(a.volumeDir, runID, stagingKey(it.name)), res: &out[i]}
 	}
-	fingerprint, err := a.confirm(ctx, tr, staged, sum, sent, true)
-	if err != nil {
-		return nil, err
+	b := artifactBatch{a: a, tr: tr, n: pushConcurrency(a.dest)}
+	b.each(ctx, ls, b.stage)
+	b.flush(ctx, ls, "flush the staged artifacts")
+	b.each(ctx, ls, b.confirmStaged)
+	b.each(ctx, ls, b.rename)
+	b.flush(ctx, ls, "flush the landed artifacts")
+	return out
+}
+
+// artifactBatch runs the steps of putAll over one batch.
+type artifactBatch struct {
+	a       *transportArtifacts
+	tr      transport
+	n       int
+	stalled atomic.Bool
+}
+
+// each runs step for every artifact still on its way, n in flight; an
+// artifact whose step fails drops out, and a stall starts no more.
+func (b *artifactBatch) each(ctx context.Context, ls []*artifactLanding, step func(context.Context, *artifactLanding) error) {
+	inFlight(ctx, b.n, pendingArtifacts(ls), b.stalled.Load, func(l *artifactLanding) {
+		if err := step(ctx, l); err != nil {
+			l.res.err = err
+			if errors.Is(err, errTransportStalled) {
+				b.stalled.Store(true)
+			}
+		}
+	})
+}
+
+// flush makes the batch's last step durable; a flush that fails fails
+// every artifact still on its way.
+func (b *artifactBatch) flush(ctx context.Context, ls []*artifactLanding, what string) {
+	pending := pendingArtifacts(ls)
+	if len(pending) == 0 || b.stalled.Load() {
+		return
 	}
-	err = tr.Rename(ctx, staged, name)
-	if errors.Is(err, fs.ErrExist) {
-		return a.confirm(ctx, tr, name, sum, sent, false)
+	if err := b.tr.Flush(ctx); err != nil {
+		for _, l := range pending {
+			l.res.err = fmt.Errorf("%s: %w", what, err)
+		}
 	}
-	return fingerprint, err
+}
+
+func pendingArtifacts(ls []*artifactLanding) []*artifactLanding {
+	var out []*artifactLanding
+	for _, l := range ls {
+		if l.res.err == nil {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func (b *artifactBatch) stage(ctx context.Context, l *artifactLanding) error {
+	sent, err := b.a.stage(ctx, b.tr, l.staged, l.src, l.size, l.sum)
+	l.sent = sent
+	return err
+}
+
+func (b *artifactBatch) confirmStaged(ctx context.Context, l *artifactLanding) error {
+	fingerprint, err := b.a.confirm(ctx, b.tr, l.staged, l.sum, l.sent, true)
+	l.res.fingerprint = fingerprint
+	return err
+}
+
+// rename moves the staged artifact onto its name. A name that already
+// holds a file is confirmed instead, and never replaced.
+func (b *artifactBatch) rename(ctx context.Context, l *artifactLanding) error {
+	err := b.tr.Rename(ctx, l.staged, l.name)
+	if !errors.Is(err, fs.ErrExist) {
+		return err
+	}
+	fingerprint, err := b.a.confirm(ctx, b.tr, l.name, l.sum, l.sent, false)
+	l.res.fingerprint = fingerprint
+	return err
 }
 
 // stage streams src into staged, hashing the bytes sent with BLAKE3 and,
@@ -145,7 +232,9 @@ func (a *transportArtifacts) confirm(ctx context.Context, tr transport, name str
 		case !errors.Is(err, errNoServerHash):
 			return nil, fmt.Errorf("hash %s on the server: %w", name, err)
 		}
+		a.mu.Lock()
 		a.noServerHash = err
+		a.mu.Unlock()
 		if staged {
 			return nil, nil
 		}
