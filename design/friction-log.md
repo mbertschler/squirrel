@@ -613,7 +613,7 @@ and 432 s against 45 s over sftp at a 20 ms round trip; unchanged pushes are
 faster. Open: native-mirror.md, open question 2.
 
 Observed, by design: a copy corrupted in place on the local mirror, size and
-mtime kept, passed three verify passes because each re-reads only a tenth of
+mtime kept, passed two verify passes because each re-reads only a tenth of
 the bytes; the restore's BLAKE3 refused it. Until its turn in the rotation,
 the offload gate would count it.
 
