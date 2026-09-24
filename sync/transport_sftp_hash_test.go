@@ -12,8 +12,8 @@ import (
 )
 
 // hashFixture serves root from a test server that runs commands, and
-// plants one artifact, objects/<key>, holding body.
-func hashFixture(t *testing.T, commands map[string]string, body string) (*sftpTransport, string) {
+// plants one artifact, objects/<key>, holding "alpha".
+func hashFixture(t *testing.T, commands map[string]string) (*sftpTransport, string) {
 	t.Helper()
 	srv := startSFTPServer(t)
 	srv.runsHashCommands(commands)
@@ -22,7 +22,7 @@ func hashFixture(t *testing.T, commands map[string]string, body string) (*sftpTr
 	if err := os.MkdirAll(filepath.Join(root, ObjectsDirName), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, ObjectsDirName, key), []byte(body), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, ObjectsDirName, key), []byte("alpha"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	dest := srv.destination(t, root)
@@ -35,7 +35,7 @@ func hashFixture(t *testing.T, commands map[string]string, body string) (*sftpTr
 // TestServerHashRunsTheCommand: a server with the command hashes an
 // artifact where it lies, and the value is what this machine computes.
 func TestServerHashRunsTheCommand(t *testing.T) {
-	tr, name := hashFixture(t, map[string]string{"sha256sum": "sha256"}, "alpha")
+	tr, name := hashFixture(t, map[string]string{"sha256sum": "sha256"})
 	got, err := tr.ServerHash(context.Background(), name)
 	if err != nil {
 		t.Fatalf("ServerHash: %v", err)
@@ -60,13 +60,13 @@ func TestServerHashRefusesWhatItCannotTrust(t *testing.T) {
 		{"a command computing another hash", map[string]string{"sha256sum": "blake3"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			tr, name := hashFixture(t, c.commands, "alpha")
+			tr, name := hashFixture(t, c.commands)
 			if _, err := tr.ServerHash(ctx, name); !errors.Is(err, errNoServerHash) {
 				t.Fatalf("ServerHash = %v, want errNoServerHash", err)
 			}
 		})
 	}
-	tr, _ := hashFixture(t, map[string]string{"sha256sum": "sha256"}, "alpha")
+	tr, _ := hashFixture(t, map[string]string{"sha256sum": "sha256"})
 	if err := os.WriteFile(filepath.Join(tr.root, "cat; rm -rf x.jpg"), []byte("meow"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestServerHashRefusesWhatItCannotTrust(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer local.Close()
+	defer func() { _ = local.Close() }()
 	if _, err := local.ServerHash(ctx, "objects/x"); !errors.Is(err, errNoServerHash) {
 		t.Fatalf("local ServerHash = %v, want errNoServerHash", err)
 	}
@@ -91,7 +91,7 @@ func TestServerHashRefusesWhatItCannotTrust(t *testing.T) {
 // that stops running the command afterwards fails the hash itself.
 func TestServerHashProbesOnce(t *testing.T) {
 	srvCommands := map[string]string{"sha256sum": "sha256"}
-	tr, name := hashFixture(t, srvCommands, "alpha")
+	tr, name := hashFixture(t, srvCommands)
 	ctx := context.Background()
 	if _, err := tr.ServerHash(ctx, name); err != nil {
 		t.Fatalf("first ServerHash: %v", err)

@@ -121,7 +121,7 @@ func (t *sftpTransport) runProbe() error {
 	command := serverHashCommands[t.hashAlgo]
 	out, err := t.runCommand(command, strings.NewReader(serverHashProbe))
 	if err != nil {
-		return fmt.Errorf("%w: %v", errNoServerHash, err)
+		return fmt.Errorf("%w: %w", errNoServerHash, err)
 	}
 	sum, err := parseHashOutput(out, h.Size())
 	if err != nil || sum != hex.EncodeToString(h.Sum(nil)) {
