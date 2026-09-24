@@ -1,6 +1,6 @@
 ---
 title: Destinations & secrets
-description: Declare rclone-backed and kopia destinations, resolve secrets from environment variables, and let squirrel own rclone.conf.
+description: Declare local, sftp, bucket and kopia destinations, resolve secrets from environment variables, and let squirrel own rclone.conf.
 ---
 
 A **destination** is a named remote (or local directory) that volumes sync to.
@@ -27,10 +27,10 @@ root              = "/squirrel"
 
 ## Supported types
 
-| Type | Backing | Notes |
+| Type | Written by | Notes |
 |---|---|---|
-| `local` | rclone | A local directory; requires a `.squirrel-volume` marker (see [first use](/squirrel/guides/syncing/)). |
-| `sftp` | rclone | Add `known_hosts_file` to validate the server host key. |
+| `local` | squirrel | A local directory; requires a `.squirrel-volume` marker (see [first use](/squirrel/guides/syncing/)). |
+| `sftp` | squirrel; rclone with `crypt` | The server's host key must be in `known_hosts_file` or `~/.ssh/known_hosts`. |
 | `s3` | rclone | Set `provider`, `region`, `bucket`; optional `storage_class`. |
 | `b2` | rclone | Backblaze B2. |
 | `gcs` | rclone | Google Cloud Storage. |
@@ -46,12 +46,13 @@ password = { env = "NAS_PASSWORD" }
 ```
 
 An unset environment variable is a hard error at config load — squirrel will not
-invoke rclone with a misconfigured destination.
+start a transfer to a misconfigured destination.
 
 :::caution[Never hand-edit rclone.conf]
-Squirrel writes its own `rclone.conf` next to the config file
-(`~/.squirrel/rclone.conf`, mode `0600`) on every sync invocation. You do not
-run `rclone config` and you should not edit `rclone.conf` by hand.
+For the destinations rclone writes, squirrel writes its own `rclone.conf` next
+to the config file (`~/.squirrel/rclone.conf`, mode `0600`) on every sync
+invocation. You do not run `rclone config` and you should not edit `rclone.conf`
+by hand.
 :::
 
 ## Backend-specific parameters
@@ -61,9 +62,13 @@ field) on the others.
 
 ### SFTP host-key validation
 
-Without `known_hosts_file`, **rclone does not validate the server's host key**
-and will connect to whatever host answers. Set it so a redirected or
-impersonated server is rejected.
+squirrel checks the host key of every sftp destination it writes — every one
+without `crypt` — against `known_hosts_file`, or `~/.ssh/known_hosts` when that
+is unset, and refuses a server the file does not hold; the refusal prints the
+line that trusts it. On an encrypted sftp destination rclone checks it, and
+**without `known_hosts_file` rclone does not validate the server's host key**:
+it connects to whatever host answers. Set it so a redirected or impersonated
+server is rejected.
 
 ```toml
 [destinations.nas]
@@ -76,7 +81,8 @@ known_hosts_file    = "~/.ssh/known_hosts"      # validate the server host key (
 host_key_algorithms = "ssh-ed25519 ssh-rsa"     # optional: pin accepted host-key algorithms
 ```
 
-Both map to the rclone sftp options of the same name.
+On an encrypted destination both map to the rclone sftp options of the same
+name.
 
 ### S3 storage class
 

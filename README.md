@@ -16,7 +16,7 @@ Squirrel works the same at any size: one machine backing up to one destination, 
 
 ## Under the hood
 
-Squirrel indexes a local file tree by BLAKE3 content hash and syncs it to one or more remote destinations (NAS, S3, B2, GCS, SFTP, …) via rclone. Peer syncs are BLAKE3-verified end-to-end; every other destination is checked by the strongest comparison it supports, and the index records which one ran. Destinations are append-only: an overwrite at the destination moves the prior bytes into `.squirrel-history/run-<id>/`, never deletes them.
+Squirrel indexes a local file tree by BLAKE3 content hash and syncs it to one or more destinations (a local disk, a NAS, SFTP, S3, B2, GCS, …): it writes local disks and plain SFTP servers itself, and reaches buckets and encrypted destinations through rclone. Peer syncs are BLAKE3-verified end-to-end; every other destination is checked by the strongest comparison it supports, and the index records which one ran. Destinations are append-only: an overwrite at the destination moves the prior bytes into `.squirrel-history/run-<id>/`, never deletes them.
 
 ## Principle
 
@@ -49,7 +49,7 @@ go install github.com/mbertschler/squirrel/cmd/squirrel@latest
 
 A source build reports its version as `0.0.0-dev` — the version is only stamped into the released binaries at build time.
 
-You will also need [rclone](https://rclone.org) ≥ 1.71 on `PATH` to sync or restore against a **bucket destination** (1.71 added the sftp `hashes` option that [`hash_algo`](#offsite-verification-squirrel-verify) sets). Syncing to a **peer node** does not use it — those bytes stream over the peer's own sync API — so a machine whose only targets are peers needs no rclone at all:
+You will also need [rclone](https://rclone.org) ≥ 1.71 on `PATH` to sync or restore against a **bucket destination** (`s3`, `b2`, `gcs`) or an **encrypted** one (1.71 added the sftp `hashes` option that [`hash_algo`](#offsite-verification-squirrel-verify) sets there). A `local` disk and a plain `sftp` server need no rclone — squirrel writes them itself — and neither does a **peer node**, whose bytes stream over the peer's own sync API, so a machine whose only targets are those needs no rclone at all:
 
 ```
 brew install rclone     # macOS
@@ -88,11 +88,11 @@ bucket            = "squirrel-backup"
 root              = "/squirrel"
 ```
 
-Supported destination types: `local`, `sftp`, `s3`, `b2`, `gcs` (rclone-backed), and `kopia` (see [kopia destinations](#kopia-destinations)). Secrets accept either a literal string or an inline `{ env = "VAR_NAME" }` table that is resolved at load time. Unknown fields, missing required fields, and unset env vars are rejected immediately — squirrel will not invoke rclone with a misconfigured destination.
+Supported destination types: `local`, `sftp`, `s3`, `b2`, `gcs`, and `kopia` (see [kopia destinations](#kopia-destinations)). squirrel writes `local` and `sftp` destinations itself, and rclone writes `s3`, `b2`, `gcs` and every encrypted destination. Secrets accept either a literal string or an inline `{ env = "VAR_NAME" }` table that is resolved at load time. Unknown fields, missing required fields, and unset env vars are rejected immediately — squirrel will not start a transfer to a misconfigured destination.
 
 Some optional params are specific to one backend type and rejected on the others (as an unknown field):
 
-- **`sftp` host-key validation** — `known_hosts_file` points rclone at a known_hosts file so it validates the server's host key before transferring; `host_key_algorithms` is rclone's space-separated list pinning the accepted host-key algorithms. Both map to the rclone sftp options of the same name. **Without `known_hosts_file`, rclone does not validate the server's host key** and will connect to whatever host answers — set it (recommended) so a redirected or impersonated server is rejected.
+- **`sftp` host-key validation** — `known_hosts_file` names a known_hosts file holding the server's host key; `host_key_algorithms` is a space-separated list pinning the accepted host-key algorithms. squirrel checks the key of every sftp destination it writes — every one without `crypt` — against `known_hosts_file`, or `~/.ssh/known_hosts` when unset, and refuses a server the file does not hold. On an encrypted sftp destination both map to the rclone sftp options of the same name, and **without `known_hosts_file`, rclone does not validate the server's host key** and will connect to whatever host answers — set it so a redirected or impersonated server is rejected.
 
   ```toml
   [destinations.nas]
@@ -114,7 +114,7 @@ Some optional params are specific to one backend type and rejected on the others
   storage_class = "<provider archive tier>"   # archive tiers cost less to store, more to read
   ```
 
-Squirrel writes its own `rclone.conf` next to the config (`~/.squirrel/rclone.conf`, mode 0600) on every sync invocation. You do not run `rclone config` and you should not edit `rclone.conf` by hand.
+For the destinations rclone writes, squirrel writes its own `rclone.conf` next to the config (`~/.squirrel/rclone.conf`, mode 0600) on every sync invocation. You do not run `rclone config` and you should not edit `rclone.conf` by hand.
 
 ### Encrypted destinations
 

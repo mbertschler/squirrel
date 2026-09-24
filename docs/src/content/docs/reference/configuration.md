@@ -70,19 +70,19 @@ See [Hooks](/squirrel/guides/hooks/).
 With neither `password` nor `key_file` set, squirrel logs in with the keys of the
 running ssh-agent (`SSH_AUTH_SOCK`).
 
-A mirror without [crypt](/squirrel/layouts/encrypted/) is a
-[native mirror](/squirrel/layouts/mirror/#how-a-mirror-is-written): squirrel
-connects to the server itself, and **always checks its host key**, against
-`known_hosts_file` or `~/.ssh/known_hosts` when that is unset. A server whose key
-the file does not hold is refused; the message gives the key's fingerprint and
-the known_hosts line that trusts it, to add once you have confirmed it. A key
-that differs from the pinned one is refused too. Unless `host_key_algorithms` is
-set, squirrel asks the server for the key types the file holds for it. `checkers`
-and `hash_algo` tune rclone, so a native mirror rejects them.
+An sftp destination without [crypt](/squirrel/layouts/encrypted/), in any
+layout, is written by squirrel itself: it connects to the server, and **always
+checks its host key**, against `known_hosts_file` or `~/.ssh/known_hosts` when
+that is unset. A server whose key the file does not hold is refused; the message
+gives the key's fingerprint and the known_hosts line that trusts it, to add once
+you have confirmed it. A key that differs from the pinned one is refused too.
+Unless `host_key_algorithms` is set, squirrel asks the server for the key types
+the file holds for it. `checkers` tunes rclone, so these destinations reject it,
+and a mirror rejects `hash_algo`, since it runs no command on the server.
 
-Every other sftp destination — an encrypted mirror, or the content-addressed and
-packed layouts — is written by rclone, which checks the host key against
-`known_hosts_file` and accepts whatever key the server presents when it is unset.
+An encrypted sftp destination is written by rclone, which checks the host key
+against `known_hosts_file` and accepts whatever key the server presents when it
+is unset.
 
 ### `s3`
 

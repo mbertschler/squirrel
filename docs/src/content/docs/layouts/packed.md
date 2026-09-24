@@ -82,7 +82,8 @@ Properties match the content-addressed layout:
 - Verification is presence+size (recorded shallow).
 - The layout is chosen at first use and refuses to run against a
   differently-shaped history.
-- `--dry-run` is not supported yet on the push.
+- `--dry-run` previews the push: the objects and pack members it would upload,
+  written nowhere.
 - [`squirrel restore`](/squirrel/guides/restore/) **restores the layout**: it
   resolves each present path to its content in the local index, fetches each
   pack once to serve all its members, and re-hashes every extracted member

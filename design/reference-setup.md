@@ -53,8 +53,12 @@ run programs, so it is a dumb **destination**; the NAS can, so it is a
    ▲                      │
    └──── durability evidence flows back out to the edges ────┘
 
- homepc ──rclone──▶ usb (local destination, .squirrel-volume marker)
+ homepc ──native──▶ usb (local mirror, .squirrel-volume marker)
 ```
+
+`native` is squirrel's own transport ([native-mirror.md](native-mirror.md)):
+every `local` destination and every `sftp` one without crypt, in any layout.
+`rclone` carries the encrypted destinations and the buckets.
 
 Initiation direction follows availability: the intermittently-awake
 machines (laptop, homepc) initiate toward the always-on nas; the nas
@@ -113,6 +117,16 @@ depend on squirrel being correct — a disjoint implementation walking
 the same disk, with its own end-to-end verification (`snapshot
 verify`) on every sync, recorded in squirrel's runs table like any
 other destination.
+
+For usb the shared walker is literal: a native mirror plans from the
+index, as the content layouts always did, so a file the indexer misses
+never reaches it. An rclone mirror walked the source itself, which let a missed file
+still reach it; of the household's copies only cloudbox keeps that until
+crypt moves to the native transport, and then none does. What an
+independent walk covered is kopia-mirror's job alone, and it covers only
+photos and docs. A periodic check comparing a plain directory walk with
+the index is the candidate that would give every layout some of that
+back (native-mirror.md, decision 7).
 
 Because its purpose is *implementation* redundancy, not geo redundancy
 (cloudbox and s3archive cover that twice), living on the nas's second

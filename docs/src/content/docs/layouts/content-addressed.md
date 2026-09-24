@@ -95,7 +95,8 @@ what's missing.
   own, or rclone and its `crypt` overlay — and re-hashes it before writing. When the local index itself is lost, the
   format is deliberately simple enough to
   [recover without squirrel](/squirrel/reference/formats/#disaster-recovery-without-squirrel).
-- **`--dry-run` is not supported yet on the push** (it previews restore).
+- **`--dry-run` previews the push**: the objects it would upload and their
+  bytes, written nowhere.
 
 ## Offsite verification
 
