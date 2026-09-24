@@ -46,15 +46,15 @@ func (s IndexSnapshot) Age(now time.Time) (time.Duration, bool) {
 // DiscoverIndexSnapshots lists the ride-along index snapshots a destination
 // holds for each named volume, newest first, then by volume. It is
 // read-only: it lists, it does not fetch, so an operator can be told what
-// is recoverable before anything is touched. A native mirror is listed
-// through squirrel's own transport, so rcl may be nil for one.
+// is recoverable before anything is touched. A native destination is
+// listed through squirrel's own transport, so rcl may be nil for one.
 //
 // A volume directory that does not exist yields no snapshots rather than an
 // error — a destination that has simply never carried a given volume is a
 // normal answer to "what do you have", not a failure.
 func DiscoverIndexSnapshots(ctx context.Context, rcl *Rclone, dest *config.Destination, volumes []string) ([]IndexSnapshot, error) {
 	list := func(vol string) ([]string, error) { return listSnapshotsStrict(ctx, rcl, indexDirURI(dest, vol)) }
-	if dest.NativeMirror() {
+	if dest.Native() {
 		tr, err := openReadOnly(ctx, dest)
 		if err != nil {
 			return nil, err
@@ -145,10 +145,10 @@ func parseSnapshotName(volume, name string) IndexSnapshot {
 // exist yet. It only moves the file; validating that the bytes are a
 // usable index at this binary's schema version is
 // store.PreflightCheckSnapshot's job, and the caller runs it before letting
-// the file near the live database. rcl may be nil for a native mirror.
+// the file near the live database. rcl may be nil for a native destination.
 func FetchIndexSnapshot(ctx context.Context, rcl *Rclone, dest *config.Destination, snap IndexSnapshot, localPath string) error {
 	var err error
-	if dest.NativeMirror() {
+	if dest.Native() {
 		err = fetchThroughTransport(ctx, dest, path.Join(snap.Volume, IndexDirName, snap.Name), localPath)
 	} else {
 		err = rcl.copyTo(ctx, indexDirURI(dest, snap.Volume)+"/"+snap.Name, localPath)
@@ -165,18 +165,24 @@ func fetchThroughTransport(ctx context.Context, dest *config.Destination, name, 
 		return err
 	}
 	defer func() { _ = tr.Close() }()
+	f, err := os.OpenFile(localPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := copyOut(ctx, tr, name, f); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// copyOut streams the file at name on tr into w.
+func copyOut(ctx context.Context, tr transport, name string, w io.Writer) error {
 	rc, err := tr.Get(ctx, name)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = rc.Close() }()
-	f, err := os.OpenFile(localPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return err
-	}
-	if _, err := io.CopyBuffer(f, ctxReader{ctx: ctx, r: rc}, make([]byte, copyBufferSize)); err != nil {
-		_ = f.Close()
-		return err
-	}
-	return f.Close()
+	_, err = io.CopyBuffer(w, ctxReader{ctx: ctx, r: rc}, make([]byte, copyBufferSize))
+	return err
 }

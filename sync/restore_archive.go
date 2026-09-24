@@ -25,18 +25,22 @@ import (
 // destination. It resolves each requested path to a content hash from the
 // local index, locates the bytes (a per-hash object under objects/, or a
 // member inside a tar.zst pack under packs/), fetches through the same
-// rclone (crypt) read path sync uses, and re-hashes every extracted
-// content to BLAKE3 before writing — the misplacement/corruption check the
-// offset/length pack slicing needs. Packs are fetched once per pack and
-// every requested member is extracted from that single stream.
+// read path sync writes through — squirrel's own transport on a native
+// destination, rclone (and its crypt overlay) otherwise — and re-hashes
+// every extracted content to BLAKE3 before writing: the
+// misplacement/corruption check the offset/length pack slicing needs.
+// Packs are fetched once per pack and every requested member is extracted
+// from that single stream.
 type archiveRestore struct {
-	store  *store.Store
-	rcl    *Rclone
-	vol    *config.Volume
-	dest   *config.Destination
-	volID  int64
-	placer restorePlacer
-	dryRun bool
+	store *store.Store
+	// fetchTo copies one destination-root artifact over the local file at
+	// localPath.
+	fetchTo func(ctx context.Context, name, localPath string) error
+	vol     *config.Volume
+	dest    *config.Destination
+	volID   int64
+	placer  restorePlacer
+	dryRun  bool
 }
 
 // restoreArchive orchestrates one content-addressed or packed restore: it
@@ -46,13 +50,50 @@ type archiveRestore struct {
 // reason. Read-only against the index and destination throughout.
 func restoreArchive(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, dest *config.Destination, volID, runID int64, targetInPlace bool, opts RestoreOptions, rep *Report) error {
 	rep.RunID = runID
+	fetchTo, release, err := archiveFetcher(ctx, rcl, dest, opts.DryRun)
+	if err != nil {
+		finishRestore(ctx, s, opts.DryRun, runID, rep, err)
+		return err
+	}
+	defer release()
 	ar := &archiveRestore{
-		store: s, rcl: rcl, vol: vol, dest: dest, volID: volID,
+		store: s, fetchTo: fetchTo, vol: vol, dest: dest, volID: volID,
 		placer: newRestorePlacer(vol, runID, targetInPlace, opts), dryRun: opts.DryRun,
 	}
 	runErr := ar.run(ctx, rep, opts.IncludeFromFile)
 	finishRestore(ctx, s, opts.DryRun, runID, rep, runErr)
 	return runErr
+}
+
+// archiveFetcher is how a restore reads dest's artifacts: through one
+// read-only transport for the whole restore on a native destination,
+// through rclone otherwise. A dry run fetches nothing, so it opens nothing.
+// release closes what it opened.
+func archiveFetcher(ctx context.Context, rcl *Rclone, dest *config.Destination, dryRun bool) (func(context.Context, string, string) error, func(), error) {
+	if !dest.Native() {
+		return func(ctx context.Context, name, localPath string) error {
+			return rcl.copyTo(ctx, remoteSubpathURI(dest, name), localPath, checkersArgs(dest)...)
+		}, func() {}, nil
+	}
+	if dryRun {
+		return nil, func() {}, nil
+	}
+	tr, err := openReadOnly(ctx, dest)
+	if err != nil {
+		return nil, nil, err
+	}
+	fetch := func(ctx context.Context, name, localPath string) error {
+		f, err := os.OpenFile(localPath, os.O_WRONLY|os.O_TRUNC, 0)
+		if err != nil {
+			return err
+		}
+		if err := copyOut(ctx, tr, name, f); err != nil {
+			_ = f.Close()
+			return err
+		}
+		return f.Close()
+	}
+	return fetch, func() { _ = tr.Close() }, nil
 }
 
 // newRestorePlacer targets the volume's path, or --to. It preserves what
@@ -330,9 +371,8 @@ func (ar *archiveRestore) readMember(r io.Reader, length int64) (string, []byte,
 }
 
 // fetch pulls one destination-root subpath (objects/<hash> or
-// packs/<key>) to a local temp file through the same rclone read path —
-// crypt overlay included — the push uses, and returns the temp path. The
-// caller removes it.
+// packs/<key>) to a local temp file through the same read path the push
+// writes through, and returns the temp path. The caller removes it.
 func (ar *archiveRestore) fetch(ctx context.Context, subpath string) (string, error) {
 	tmp, err := os.CreateTemp("", "squirrel-restore-*")
 	if err != nil {
@@ -342,8 +382,7 @@ func (ar *archiveRestore) fetch(ctx context.Context, subpath string) (string, er
 		_ = os.Remove(tmp.Name())
 		return "", fmt.Errorf("stage download: %w", err)
 	}
-	uri := remoteSubpathURI(ar.dest, subpath)
-	if err := ar.rcl.copyTo(ctx, uri, tmp.Name(), checkersArgs(ar.dest)...); err != nil {
+	if err := ar.fetchTo(ctx, subpath, tmp.Name()); err != nil {
 		_ = os.Remove(tmp.Name())
 		return "", fmt.Errorf("fetch %s: %w", subpath, err)
 	}

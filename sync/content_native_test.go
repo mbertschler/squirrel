@@ -372,3 +372,57 @@ func TestNativeContentDriftLeavesNothingAtTheName(t *testing.T) {
 		t.Fatalf("the drifted run's staging is still there: %v", err)
 	}
 }
+
+// TestNativeContentRestoreWithoutRclone: both content layouts restore from
+// a local disk and from an sftp server with no rclone wrapper, every byte
+// re-hashed on the way down.
+func TestNativeContentRestoreWithoutRclone(t *testing.T) {
+	for _, b := range contentBackends {
+		for _, layout := range contentLayouts {
+			t.Run(b.name+"/"+layout, func(t *testing.T) {
+				f := setupNativeContentFixture(t, b, layout)
+				f.write(t, "a.txt", "alpha")
+				f.write(t, "2024/big.txt", "a larger file")
+				f.index(t)
+				f.mustPush(t)
+				to := t.TempDir()
+				rep, err := Restore(context.Background(), f.store, nil, f.pair.Volume, f.pair.Destination, RestoreOptions{ToPath: to})
+				if err != nil || rep.Status != store.RunStatusSuccess {
+					t.Fatalf("restore: status=%q err=%v", rep.Status, err)
+				}
+				for rel, want := range map[string]string{"a.txt": "alpha", "2024/big.txt": "a larger file"} {
+					if got, err := os.ReadFile(filepath.Join(to, filepath.FromSlash(rel))); err != nil || string(got) != want {
+						t.Fatalf("%s = %q, %v; want %q", rel, got, err, want)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestNativeContentRideAlongAndRecover: a native content push rides the
+// index snapshot along through the transport, and recover's discovery lists
+// and fetches it without rclone.
+func TestNativeContentRideAlongAndRecover(t *testing.T) {
+	for _, b := range contentBackends {
+		t.Run(b.name, func(t *testing.T) {
+			f := setupNativeContentFixture(t, b, config.LayoutContentAddressed)
+			f.write(t, "a.txt", "alpha")
+			f.index(t)
+			sn := NewSnapshotter(f.store, SnapshotConfig{Dir: t.TempDir(), Keep: 7, Cloud: true, CloudKeep: 7})
+			rep, err := f.push(t, Options{Snapshot: sn})
+			if err != nil || rep.SnapshotErr != nil {
+				t.Fatalf("push: err=%v snapshot=%v", err, rep.SnapshotErr)
+			}
+			ctx := context.Background()
+			snaps, err := DiscoverIndexSnapshots(ctx, nil, f.pair.Destination, []string{"pics"})
+			if err != nil || len(snaps) != 1 || snaps[0].RunID != rep.RunID {
+				t.Fatalf("snapshots = %+v, %v; want run %d's", snaps, err, rep.RunID)
+			}
+			local := filepath.Join(t.TempDir(), "index.db")
+			if err := FetchIndexSnapshot(ctx, nil, f.pair.Destination, snaps[0], local); err != nil {
+				t.Fatalf("FetchIndexSnapshot: %v", err)
+			}
+		})
+	}
+}

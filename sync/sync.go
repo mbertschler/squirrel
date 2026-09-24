@@ -1006,7 +1006,7 @@ func Restore(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volum
 	// --shallow or a crypt overlay; an rclone mirror pull records rclone's
 	// effective comparison instead.
 	archive := dest.Layout == config.LayoutContentAddressed || dest.Layout == config.LayoutPacked
-	shallow := EffectiveShallow(dest, opts.Shallow) && !archive && !dest.NativeMirror()
+	shallow := EffectiveShallow(dest, opts.Shallow) && !archive && !dest.Native()
 	runID, err := beginRestoreRun(ctx, s, opts.DryRun, v.ID, dest.Name, shallow)
 	if err != nil {
 		return rep, err
