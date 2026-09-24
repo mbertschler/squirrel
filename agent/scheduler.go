@@ -252,10 +252,12 @@ func (s *scheduler) tick(ctx context.Context) {
 	}
 	// The verify and durability-pull cadences key on destinations and peer
 	// nodes rather than volumes, so they run after the per-volume loop as
-	// their own phases. Both are read-only / metadata-only and take no
-	// volume lock: verify touches only the remote-object bookkeeping, and a
-	// durability pull only merges peer-supplied vectors — neither races the
-	// per-volume index/sync/audit work the loop above coordinates.
+	// their own phases. Both only read the destination and take no volume
+	// lock: verify updates only squirrel's records of what the destination
+	// holds, a mirror copy's only while its row is still where the pass
+	// read it, and a durability pull only merges peer-supplied vectors — so
+	// neither is confused by the per-volume index/sync/audit work the loop
+	// above coordinates.
 	s.evaluateVerify(ctx)
 	s.evaluateDurabilityPulls(ctx)
 }

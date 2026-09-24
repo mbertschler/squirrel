@@ -36,9 +36,9 @@ func (a *transportArtifacts) root(ctx context.Context, runID int64) (transport, 
 	return a.guarded(ctx, nameGuard{volumeDir: a.volumeDir, runID: runID, content: true, finished: a.runFinished})
 }
 
-// markers gates the push on the volume marker, as a native mirror does:
-// written under --init, which also creates a missing local root, and
-// refused otherwise. A dry run checks nothing.
+// markers gates a push that writes on the volume marker, as a native
+// mirror does: written under --init, which also creates a missing local
+// root, and refused otherwise.
 func (a *transportArtifacts) markers(ctx context.Context, opts Options) error {
 	if opts.DryRun {
 		return nil

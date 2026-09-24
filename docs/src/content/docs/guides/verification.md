@@ -75,6 +75,9 @@ artifact), then per recorded object:
 - a **match** stamps the object verified in the index;
 - an object **without a fingerprint yet** (uploaded before this feature, or whose
   capture failed) gets one recorded and is counted separately;
+- an object an sftp server **cannot hash this pass** — its hash command is
+  gone, or the object was fingerprinted under another `hash_algo` — is counted
+  as `unchecked`: neither re-confirmed nor a finding;
 - a **mismatch or missing object** prints one loud line per object and exits
   non-zero — that is potential offsite corruption or tampering, and squirrel
   deliberately leaves both the destination and the recorded fingerprint untouched
@@ -141,9 +144,12 @@ transport, without rclone. Each pass:
   BLAKE3, until it has read a tenth of the stored bytes, so every byte is read
   again within about ten passes.
 
-A copy found gone or changed prints one loud line, latches the
+A pass first reads every volume's `.squirrel-volume` marker and stops, checking
+nothing, when one is missing: an unmounted disk must not read as every copy
+gone. A copy found gone or changed prints one loud line, latches the
 [alarm](#a-mismatch-latches-an-alarm), and stops counting as evidence for its
-file. The next push writes it again as long as the index still holds that file
+file: the volume's evidence drops to `presence+size`, so offload checks each
+file's own copy until the next push writes the lost one again. The next push writes it again as long as the index still holds that file
 there, with a warning; the copy that was found keeps its place in history if the
 push has to move it aside.
 

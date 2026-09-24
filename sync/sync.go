@@ -50,11 +50,12 @@ const RestoreHistoryDirName = ".squirrel-restore-history"
 // and from peer-sync so a snapshot is never mistaken for user content.
 const IndexDirName = ".squirrel-index"
 
-// StagingDirName is the per-volume directory at a native mirror destination
-// that holds in-flight writes: <dest.root>/<volume>/.squirrel-staging/
-// run-<id>/<path key>. A version is staged there, hashed while it streams,
-// and renamed onto its path only once its predecessor is in history. Like
-// the other reserved directories it never travels as user content.
+// StagingDirName is the per-volume directory at a native destination that
+// holds in-flight writes: <dest.root>/<volume>/.squirrel-staging/
+// run-<id>/<key>. A mirror version or a content artifact is staged there,
+// hashed while it streams, and renamed onto its name once confirmed — a
+// mirror version once its predecessor is in history. Like the other
+// reserved directories it never travels as user content.
 const StagingDirName = ".squirrel-staging"
 
 // ErrRefused marks a preflight safety refusal: a gate that declined to
@@ -973,14 +974,14 @@ type RestoreOptions struct {
 }
 
 // Restore reverses Sync back to the local filesystem, recording a
-// kind='restore' runs row. A native mirror (local, or sftp without crypt)
-// is read through squirrel's own transport and every file is placed
-// through a temporary file beside its path, checked against the index —
-// or, on a fresh machine, against the mirror's receipts; rcl may be nil
-// for one. An rclone mirror is copied down with rclone. The
-// content-addressed and packed layouts (which have no mirrored tree)
-// resolve each present path to its content hash in the local index, fetch
-// the per-hash object or pack member, and re-hash it before writing.
+// kind='restore' runs row. A native destination (local, or sftp without
+// crypt) is read through squirrel's own transport, so rcl may be nil for
+// one. A native mirror's every file is placed through a temporary file
+// beside its path, checked against the index — or, on a fresh machine,
+// against the mirror's receipts. An rclone mirror is copied down with
+// rclone. The content-addressed and packed layouts (which have no mirrored
+// tree) resolve each present path to its content hash in the local index,
+// fetch the per-hash object or pack member, and re-hash it before writing.
 // Restore is read-only against both the index and the destination — it
 // never uploads, never mutates content rows. An in-place restore without
 // InPlace is refused on a non-empty volume, and with it every file it

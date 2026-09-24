@@ -67,7 +67,7 @@ func restoreArchive(ctx context.Context, s *store.Store, rcl *Rclone, vol *confi
 
 // archiveFetcher is how a restore reads dest's artifacts: through one
 // read-only transport for the whole restore on a native destination,
-// through rclone otherwise. A dry run fetches nothing, so it opens nothing.
+// through rclone otherwise. A dry run only counts, so it gets a nil fetcher.
 // release closes what it opened.
 func archiveFetcher(ctx context.Context, rcl *Rclone, dest *config.Destination, dryRun bool) (func(context.Context, string, string) error, func(), error) {
 	if !dest.Native() {

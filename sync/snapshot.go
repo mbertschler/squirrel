@@ -212,7 +212,7 @@ func (s rcloneShelf) remove(ctx context.Context, name string) error {
 	return s.rcl.deleteFile(ctx, s.dir+"/"+name)
 }
 
-// transportShelf is a native mirror's <volume>/.squirrel-index/, reached
+// transportShelf is a native destination's <volume>/.squirrel-index/, reached
 // through runID's guarded transport, which open returns.
 type transportShelf struct {
 	open   func(context.Context) (transport, error)

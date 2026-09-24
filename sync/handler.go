@@ -161,8 +161,8 @@ func contentPusherFor(s *store.Store, tools Tools, p Pair) (contentPusher, error
 	return pusher, nil
 }
 
-// openDestinationTransport opens a native mirror's destination root: a
-// directory on this machine, or on an sftp server.
+// openDestinationTransport opens a native destination's root: a directory
+// on this machine, or on an sftp server.
 func openDestinationTransport(ctx context.Context, dest *config.Destination) (transport, error) {
 	if dest.Type == "sftp" {
 		return dialSFTP(ctx, dest)
@@ -170,7 +170,7 @@ func openDestinationTransport(ctx context.Context, dest *config.Destination) (tr
 	return openLocalTransport(dest.Root)
 }
 
-// openReadOnly opens a native mirror's root for reading alone: the name
+// openReadOnly opens a native destination's root for reading alone: the name
 // guard, held by no run, refuses every move and removal, and every call is
 // bounded by progress.
 func openReadOnly(ctx context.Context, dest *config.Destination) (transport, error) {

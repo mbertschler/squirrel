@@ -156,8 +156,8 @@ func (t *localTransport) Remove(_ context.Context, name string) error {
 	return t.root.Remove(filepath.FromSlash(name))
 }
 
-// ServerHash: a local disk runs no hash of its own; squirrel reads its
-// bytes back instead.
+// ServerHash is errNoServerHash on a local disk: squirrel reads its bytes
+// back itself (readBack).
 func (t *localTransport) ServerHash(context.Context, string) (remoteChecksum, error) {
 	return remoteChecksum{}, errNoServerHash
 }

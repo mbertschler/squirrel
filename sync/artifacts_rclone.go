@@ -48,8 +48,8 @@ func (a *rcloneArtifacts) rootEmpty(ctx context.Context) (bool, error) {
 	return a.rcl.remoteRootEmpty(ctx, remoteSubpathURI(a.dest, ""), rootMarkerNames(a.dest), checkersArgs(a.dest)...)
 }
 
-// reconcile has nothing to settle: rclone lands every artifact under its
-// own name, and squirrel records it only after it landed.
+// reconcile returns at once: rclone lands every artifact under its own
+// name, and squirrel records it only after it landed.
 func (a *rcloneArtifacts) reconcile(context.Context, *Report, int64) error { return nil }
 
 // put re-hashes src immediately before the transfer and refuses

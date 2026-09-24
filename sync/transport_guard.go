@@ -21,9 +21,8 @@ var errGuardRefused = errors.New("the name guard refuses this operation")
 type nameGuard struct {
 	volumeDir string // the volume's directory under the destination root
 	runID     int64  // the push holding the guard
-	// content marks a content-addressed or packed push: its commits land
-	// on artifact names instead of the mirrored tree, and it displaces
-	// nothing.
+	// content marks a content-addressed or packed push, whose commits land
+	// on artifact names (see artifact); displacement is a mirror's alone.
 	content bool
 	// bootstrap lets a push under --init write the volume marker, before
 	// it holds a run.

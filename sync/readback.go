@@ -15,8 +15,9 @@ import (
 var errReadBackMismatch = errors.New("the stored bytes read back differently from the bytes sent")
 
 // readsBack reports whether dest is a disk squirrel reads back, BLAKE3 over
-// what it just stored, before trusting it: a local destination. An sftp
-// server's bytes are read back only through its hash command.
+// what it just stored, before trusting it: a local destination. On sftp
+// squirrel asks the server's hash command instead, and downloads a file
+// only to confirm one it finds already at an artifact's name.
 func readsBack(dest *config.Destination) bool {
 	return dest.Type == "local"
 }
