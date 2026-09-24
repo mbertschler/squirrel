@@ -568,6 +568,55 @@ must configure `[agent] listen` + auth token anyway, because the
 scheduler lives inside the agent. A listener that exists to be unused
 is config noise and attack surface.
 
+## Native mirror walk (2026-09-24, #217)
+
+A second, shorter walk: the native mirror's lifecycle on `homepc`'s seat —
+bootstrap, steady state, changes, verify, an unplugged disk, restore with
+and without the index, recover, the offload gate — against an exFAT disk
+image on macOS and a plain sftp destination on `rclone serve sftp`, plus a
+benchmark against `main`'s rclone mirrors
+([native-mirror.md](native-mirror.md), section 8). The bootstrap refusals,
+the host-key refusal (it prints the known_hosts line to add), repairs of a
+copy verify found gone, and a rename that changed only case all behaved.
+
+**F36 · S1 — ~~a fresh index took over a tree it never wrote.~~ (fixed in
+#217)** With no sync of the volume in the index, a push to a native mirror
+started from nothing over whatever the volume's directory held: pointed at
+a tree rclone wrote, it moved all 4690 files into history and wrote them
+again, doubling what the disk holds, where the design refuses existing
+trees. A volume's first push now refuses a directory that holds files
+squirrel has no record of writing, and points at `squirrel recover --from`
+for a native mirror whose index is gone.
+
+**F37 · S2 — ~~macOS's `._` files read as foreign.~~ (fixed in #217)** On
+exFAT, macOS keeps every file's extended attributes in a `._<name>`
+companion. Every push warned about the last run's `._run-<id>` in staging,
+and an index-less restore brought back 619 `._` files as unchecked,
+including those of `.squirrel-history` and the marker. A `._X` beside `X`
+is now `X`'s.
+
+**F38 · S2 — ~~an unplugged disk was told to re-run with `--init`.~~ (fixed
+in #217)** The refusal for a missing root or marker led with `--init` even
+for a disk the volume had synced to, where `--init` would bootstrap an empty
+destination on the bare mountpoint. It now says the disk is most likely not
+mounted; `squirrel verify` on a missing root says the same instead of a raw
+open error.
+
+**F39 · S4 — ~~the unsatisfiable-gate refusal forgot the local mirror.~~
+(fixed in #217)** Rejecting an sftp mirror in `offload_requires` listed every
+target that can gate but the local mirror, which the same message's reason
+names.
+
+**F40 · S1 — native pushes that write are several times slower than
+rclone.** A first push took 116 s against rclone's 13 s on the exFAT image,
+and 432 s against 45 s over sftp at a 20 ms round trip; unchanged pushes are
+faster. Open: native-mirror.md, open question 2.
+
+Observed, by design: a copy corrupted in place on the local mirror, size and
+mtime kept, passed three verify passes because each re-reads only a tenth of
+the bytes; the restore's BLAKE3 refused it. Until its turn in the rotation,
+the offload gate would count it.
+
 ## Summary and priority
 
 *The verdict below is the walk's own, kept as written that night; the
