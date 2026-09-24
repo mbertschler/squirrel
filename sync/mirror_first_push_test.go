@@ -153,3 +153,26 @@ func TestMirrorLeavesAppleDoubleCompanionsToTheSystem(t *testing.T) {
 		})
 	}
 }
+
+// TestMarkerRefusalOfADestinationSyncedBefore: a destination the volume
+// synced to before that has lost its root or its marker is refused as a
+// disk that is most likely not mounted; the refusal does not steer toward
+// --init, which would bootstrap an empty destination in its place.
+func TestMarkerRefusalOfADestinationSyncedBefore(t *testing.T) {
+	f := setupMirrorFixture(t)
+	f.write(t, "a.txt", "alpha")
+	f.index(t)
+	f.mustPush(t)
+	for _, gone := range []string{f.dest(volmark.MarkerName), f.dst} {
+		if err := os.RemoveAll(gone); err != nil {
+			t.Fatal(err)
+		}
+		_, err := f.push(t, Options{})
+		if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "most likely not mounted") || strings.Contains(err.Error(), "re-run with --init") {
+			t.Fatalf("push with %s gone = %v, want a refusal naming an unmounted disk", gone, err)
+		}
+	}
+	if _, err := VerifyRemote(t.Context(), f.store, nil, f.pair.Destination); err == nil || !strings.Contains(err.Error(), "may not be mounted") {
+		t.Fatalf("verify with the root gone = %v, want it named as a disk that may not be mounted", err)
+	}
+}

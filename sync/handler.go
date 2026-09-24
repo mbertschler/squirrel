@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"path/filepath"
 
 	"github.com/mbertschler/squirrel/config"
@@ -175,6 +176,9 @@ func openDestinationTransport(ctx context.Context, dest *config.Destination) (tr
 // bounded by progress.
 func openReadOnly(ctx context.Context, dest *config.Destination) (transport, error) {
 	raw, err := openDestinationTransport(ctx, dest)
+	if dest.Type == "local" && errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("destination %q has no root at %s — the disk may not be mounted, or the root is wrong: %w", dest.Name, dest.Root, err)
+	}
 	if err != nil {
 		return nil, err
 	}

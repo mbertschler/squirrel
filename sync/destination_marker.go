@@ -25,7 +25,7 @@ const maxMarkerBytes = 64 << 10
 // so a first push can land on an empty disk, and refused like a missing
 // marker otherwise.
 func (h *destinationRoot) ensureMarker(ctx context.Context, init bool) error {
-	if err := h.ensureLocalRoot(init); err != nil {
+	if err := h.ensureLocalRoot(ctx, init); err != nil {
 		return err
 	}
 	tr, err := h.guarded(ctx, nameGuard{volumeDir: h.volumeDir, bootstrap: init})
@@ -40,12 +40,12 @@ func (h *destinationRoot) ensureMarker(ctx context.Context, init bool) error {
 	case !errors.Is(err, fs.ErrNotExist):
 		return fmt.Errorf("destination %q: read %s: %w", h.dest.Name, name, err)
 	case !init:
-		return fmt.Errorf("destination %q has no %s at %s — re-run with --init to bootstrap (refusing in case the root is a typo or the disk is not mounted): %w", h.dest.Name, volmark.MarkerName, h.where(name), ErrRefused)
+		return fmt.Errorf("destination %q has no %s at %s — %s: %w", h.dest.Name, volmark.MarkerName, h.where(name), h.bootstrapHint(ctx), ErrRefused)
 	}
 	return h.writeMarker(ctx, tr, name)
 }
 
-func (h *destinationRoot) ensureLocalRoot(init bool) error {
+func (h *destinationRoot) ensureLocalRoot(ctx context.Context, init bool) error {
 	if h.dest.Type != "local" {
 		return nil
 	}
@@ -59,7 +59,27 @@ func (h *destinationRoot) ensureLocalRoot(init bool) error {
 		}
 		return nil
 	}
-	return fmt.Errorf("destination %q has no root at %s — re-run with --init to create it (refusing in case the disk is not mounted): %w", h.dest.Name, h.dest.Root, ErrRefused)
+	return fmt.Errorf("destination %q has no root at %s — %s: %w", h.dest.Name, h.dest.Root, h.bootstrapHint(ctx), ErrRefused)
+}
+
+// bootstrapHint is what a refusal over a missing root or marker asks for.
+// A volume that synced to the destination before points at an unmounted
+// disk or a moved root, not at --init, which would bootstrap a new, empty
+// destination in its place.
+func (h *destinationRoot) bootstrapHint(ctx context.Context) string {
+	if h.volumeSyncedBefore(ctx) {
+		return fmt.Sprintf("volume %q has synced to it before, so the disk is most likely not mounted or the root moved; mount it and sync again (--init is only for a new, empty destination)", h.volumeDir)
+	}
+	return "re-run with --init to bootstrap (refusing in case the root is a typo or the disk is not mounted)"
+}
+
+func (h *destinationRoot) volumeSyncedBefore(ctx context.Context) bool {
+	v, err := h.store.GetVolumeByName(ctx, h.volumeDir)
+	if err != nil {
+		return false
+	}
+	_, err = h.store.LatestSuccessfulSyncRun(ctx, v.ID, h.dest.Name)
+	return err == nil
 }
 
 func (h *destinationRoot) checkMarker(name string, data []byte) error {
