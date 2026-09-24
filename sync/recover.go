@@ -174,7 +174,7 @@ func fetchThroughTransport(ctx context.Context, dest *config.Destination, name, 
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(f, ctxReader{ctx: ctx, r: rc}); err != nil {
+	if _, err := io.CopyBuffer(f, ctxReader{ctx: ctx, r: rc}, make([]byte, copyBufferSize)); err != nil {
 		_ = f.Close()
 		return err
 	}

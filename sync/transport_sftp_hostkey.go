@@ -81,9 +81,9 @@ func (h hostKeys) check(host string, remote net.Addr, key ssh.PublicKey) error {
 }
 
 // algorithms lists the host key algorithms of the keys known_hosts pins
-// for host, so the handshake asks the server for a key squirrel can check
-// instead of one it has never seen. It returns nil, the client's
-// defaults, when known_hosts pins nothing for host.
+// for host, so the handshake asks the server for a key squirrel can check.
+// It returns nil, the client's defaults, when known_hosts pins nothing for
+// host.
 func (h hostKeys) algorithms(host string, remote net.Addr) []string {
 	probe, err := probeKey()
 	if err != nil {

@@ -134,6 +134,12 @@ func entryOf(fi fs.FileInfo) entry {
 	return entry{name: fi.Name(), kind: kindOf(fi.Mode()), size: fi.Size(), mtime: fi.ModTime()}
 }
 
+// copyBufferSize is the buffer a copy out of a transport reads with. A
+// read this large lets the sftp client split it into concurrent requests,
+// so a high-latency link does not cap a download at one round trip per
+// 32 KiB.
+const copyBufferSize = 1 << 20
+
 // ctxReader stops a streaming copy once its context is done.
 type ctxReader struct {
 	ctx context.Context

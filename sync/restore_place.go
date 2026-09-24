@@ -73,7 +73,7 @@ func stageRestored(dst string, r io.Reader, want []byte, mtime time.Time) (strin
 		return "", 0, err
 	}
 	h := blake3.New()
-	n, err := io.Copy(io.MultiWriter(f, h), r)
+	n, err := io.CopyBuffer(io.MultiWriter(f, h), r, make([]byte, copyBufferSize))
 	if err == nil && want != nil && !bytes.Equal(h.Sum(nil), want) {
 		err = fmt.Errorf("the bytes hash to %s, want %s", hex.EncodeToString(h.Sum(nil)), hex.EncodeToString(want))
 	}
@@ -129,10 +129,9 @@ func (pl restorePlacer) backupExisting(rel, dst string) error {
 }
 
 // refuseNonRegularTarget refuses to write when the destination already
-// exists as anything other than a regular file. A symlink, device, fifo,
-// socket, or directory is a hard refusal, not a silent skip: squirrel
-// never replaces what it does not understand. An absent path or a plain
-// regular file is allowed.
+// exists as anything other than a regular file — a symlink, device, fifo,
+// socket, or directory — and reports it: squirrel replaces only a plain
+// file it can preserve. An absent path or a regular file is allowed.
 func refuseNonRegularTarget(rel, dst string) error {
 	info, err := os.Lstat(dst)
 	if errors.Is(err, os.ErrNotExist) {

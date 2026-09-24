@@ -834,8 +834,8 @@ func sortedSubset(in []string) []string {
 }
 
 // NativeMirror reports whether squirrel writes this destination itself,
-// through its own transport, instead of driving rclone: a mirror on a
-// local disk, or on an sftp server without crypt.
+// through its own transport: a mirror on a local disk, or on an sftp
+// server without crypt.
 func (d *Destination) NativeMirror() bool {
 	return nativeMirror(d.Type, d.Layout, d.Crypt != nil)
 }

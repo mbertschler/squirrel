@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"path"
 	"slices"
 	"strconv"
@@ -148,6 +149,8 @@ func (mr *mirrorRestore) walk(ctx context.Context, rep *Report, dir string, visi
 	for _, e := range entries {
 		rel := path.Join(dir, e.name)
 		switch {
+		case !validName(rel) || path.Base(rel) != e.name:
+			return fmt.Errorf("list %s on %q: %w: %q", name, mr.dest.Name, errInvalidName, e.name)
 		case dir == "" && (isReservedFolderPath(e.name) || e.name == volmark.MarkerName):
 		case e.kind == kindDir:
 			if err := mr.walk(ctx, rep, rel, visit); err != nil {
@@ -185,9 +188,12 @@ func (mr *mirrorRestore) readReceipts(ctx context.Context, rep *Report) (map[str
 	out := map[string][]byte{}
 	for _, id := range runs {
 		name := path.Join(dir, "run-"+strconv.FormatInt(id, 10))
-		if err := foldReceipt(ctx, mr.tr, name, out); err != nil {
+		entries, err := readReceipt(ctx, mr.tr, name)
+		if err != nil {
 			rep.Warnings = append(rep.Warnings, fmt.Sprintf("receipt %s on %q could not be read (%v); the files it names are checked against older receipts", name, mr.dest.Name, err))
+			continue
 		}
+		maps.Copy(out, entries)
 	}
 	return out, nil
 }
@@ -202,29 +208,30 @@ func receiptRunID(e entry) (int64, bool) {
 	return id, err == nil && id > 0 && strconv.FormatInt(id, 10) == idText
 }
 
-// foldReceipt records into the content of every present path the receipt
-// at name lists.
-func foldReceipt(ctx context.Context, tr transport, name string, into map[string][]byte) error {
+// readReceipt maps every present path the receipt at name lists to its
+// BLAKE3.
+func readReceipt(ctx context.Context, tr transport, name string) (map[string][]byte, error) {
 	rc, err := tr.Get(ctx, name)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() { _ = rc.Close() }()
+	out := map[string][]byte{}
 	sc := bufio.NewScanner(ctxReader{ctx: ctx, r: rc})
 	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
 	for sc.Scan() {
 		var e ManifestEntry
 		if err := json.Unmarshal(sc.Bytes(), &e); err != nil {
-			return err
+			return nil, err
 		}
 		if e.Status != store.StatusPresent {
 			continue
 		}
 		sum, err := hex.DecodeString(e.Blake3)
 		if err != nil || len(sum) != 32 {
-			return fmt.Errorf("%s: blake3 %q is not a 32-byte hex hash", e.Path, e.Blake3)
+			return nil, fmt.Errorf("%s: blake3 %q is not a 32-byte hex hash", e.Path, e.Blake3)
 		}
-		into[e.Path] = sum
+		out[e.Path] = sum
 	}
-	return sc.Err()
+	return out, sc.Err()
 }

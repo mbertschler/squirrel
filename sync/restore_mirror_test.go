@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -137,5 +138,72 @@ func TestMirrorRestoreInPlacePreservesWhatItReplaces(t *testing.T) {
 	history := filepath.Join(RestoreHistoryDirName, "run-"+strconv.FormatInt(rep.RunID, 10), "b.txt")
 	if got := scratchFile(t, f.src, history); got != "local edit" {
 		t.Fatalf("restore history holds %q, want the replaced local edit", got)
+	}
+}
+
+// escapingListing lists one extra file whose name climbs out of its
+// directory, as a hostile or broken server might.
+type escapingListing struct{ transport }
+
+func (e escapingListing) List(ctx context.Context, dir string) ([]entry, error) {
+	entries, err := e.transport.List(ctx, dir)
+	return append(entries, entry{name: "../escaped", kind: kindFile, size: 1}), err
+}
+
+// TestMirrorRestoreRefusesAnEscapingName: a walked name that is not a
+// single path element stops the restore before anything lands outside
+// the target.
+func TestMirrorRestoreRefusesAnEscapingName(t *testing.T) {
+	f := setupMirrorFixture(t)
+	f.write(t, "a.txt", "alpha")
+	f.index(t)
+	f.mustPush(t)
+	raw, err := openLocalTransport(f.dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	parent := t.TempDir()
+	target := filepath.Join(parent, "target")
+	mr := &mirrorRestore{store: f.store, vol: f.pair.Volume, dest: f.pair.Destination,
+		tr: escapingListing{raw}, placer: restorePlacer{target: target}}
+	var rep Report
+	if err := mr.restoreWalked(context.Background(), &rep); !errors.Is(err, errInvalidName) {
+		t.Fatalf("walk over an escaping name = %v, want errInvalidName", err)
+	}
+	if _, err := os.Stat(filepath.Join(parent, "escaped")); !os.IsNotExist(err) {
+		t.Fatalf("a file landed outside the target: %v", err)
+	}
+}
+
+// TestMirrorRestoreSkipsABrokenReceiptWhole: a receipt that does not
+// parse contributes nothing, not even its readable lines, so the files it
+// names are checked against the receipts before it.
+func TestMirrorRestoreSkipsABrokenReceiptWhole(t *testing.T) {
+	f := setupMirrorFixture(t)
+	f.write(t, "a.txt", "v1")
+	f.index(t)
+	f.mustPush(t)
+	f.write(t, "a.txt", "v2")
+	f.index(t)
+	second := f.mustPush(t)
+	receipt := f.dest(IndexDirName + "/run-" + strconv.FormatInt(second.RunID, 10))
+	file, err := os.OpenFile(receipt, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("{not json\n"); err != nil {
+		t.Fatal(err)
+	}
+	_ = file.Close()
+
+	fresh, err := store.Open(filepath.Join(t.TempDir(), "fresh.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { fresh.Close() })
+	rep, err := f.restore(t, fresh, RestoreOptions{ToPath: t.TempDir()})
+	if err == nil || rep.RcloneResult.Errors != 1 || !warned(rep, "could not be read") {
+		t.Fatalf("restore = %v, errors=%d warnings=%v; want the broken receipt reported and a.txt checked against the older one", err, rep.RcloneResult.Errors, rep.Warnings)
 	}
 }

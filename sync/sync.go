@@ -313,9 +313,9 @@ func Sync(ctx context.Context, s *store.Store, rcl *Rclone, vol *config.Volume, 
 	}
 
 	// Marker gate, read and (with --init) written through the same
-	// overlay the transfer uses. The dry-run path skips: it never writes, and refusing a dry-run on
-	// an uninitialised destination would prevent the "preview what would
-	// happen" workflow.
+	// overlay the transfer uses. The dry-run path skips: it never writes,
+	// and refusing a dry-run on an uninitialised destination would
+	// prevent the "preview what would happen" workflow.
 	if !opts.DryRun {
 		if merr := ensureRemoteDestinationMarker(ctx, s, rcl, dest, vol.Name, opts.Init); merr != nil {
 			// A marker refusal fires before the sync run is allocated, so
@@ -633,10 +633,10 @@ func validateLocalVolumeMarker(vol *config.Volume) error {
 // mirrors on s3/b2/gcs, and the content layouts). It validates (or, with
 // init, writes) the .squirrel-volume marker at the per-volume root: a
 // matching marker passes, a missing one is bootstrapped only under init,
-// and one naming a different volume is always refused. It probes the marker at the per-volume
-// root through remoteSubpathURI — the same overlay the layout's
-// transfers use, so a crypt destination's marker rides the encrypted
-// path too — and applies the identical rules as the local gate.
+// and one naming a different volume is always refused. It probes the
+// marker through remoteSubpathURI — the same overlay the layout's
+// transfers use, so a crypt destination's marker rides the encrypted path
+// too — and applies the same rules as a native mirror's gate.
 // Presence is decided by a stat (statRemoteExists), not by the read:
 // only a definite absence is eligible for an --init bootstrap, a present
 // marker is read and validated (a mismatch is always refused and never
