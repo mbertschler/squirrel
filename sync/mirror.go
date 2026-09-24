@@ -27,16 +27,8 @@ import (
 // in remote_paths. Each run leaves a receipt, the same manifest segment the
 // content layouts write, at <volume>/.squirrel-index/run-<id>.
 type mirrorHandler struct {
-	store *store.Store
-	vol   *config.Volume
-	dest  *config.Destination
-	// openTransport opens the destination root; tests wrap it to inject
-	// faults.
-	openTransport func(context.Context, *config.Destination) (transport, error)
-	// stallTimeout bounds every transport call by progress.
-	stallTimeout time.Duration
-
-	raw      transport                // opened by root on first use, closed when Push returns
+	*destinationRoot
+	vol      *config.Volume
 	progress func(runevents.Progress) // this push's Options.Progress
 }
 
@@ -54,7 +46,7 @@ func (h *mirrorHandler) Push(ctx context.Context, opts Options) (Report, error) 
 		return rep, fmt.Errorf("destination %q: %d transport call(s) an earlier push gave up on have not returned — the disk or server may be hung; wait, or restart squirrel once it is reachable again", h.dest.Name, n)
 	}
 	h.progress = opts.Progress
-	defer h.closeRoot()
+	defer h.close()
 	return pushThrough(ctx, pushTarget{store: h.store, vol: h.vol, dest: h.dest}, h, opts)
 }
 
@@ -62,36 +54,6 @@ func (h *mirrorHandler) Push(ctx context.Context, opts Options) (Report, error) 
 // runID's own moves pass (none when runID is 0), and bounded by progress.
 func (h *mirrorHandler) root(ctx context.Context, runID int64) (transport, error) {
 	return h.guarded(ctx, nameGuard{volumeDir: h.vol.Name, runID: runID, finished: h.runFinished})
-}
-
-// guarded is the destination root behind guard, bounded by progress.
-func (h *mirrorHandler) guarded(ctx context.Context, guard nameGuard) (transport, error) {
-	if h.raw == nil {
-		raw, err := h.openTransport(ctx, h.dest)
-		if err != nil {
-			return nil, err
-		}
-		h.raw = raw
-	}
-	return stallTransport{
-		transport: guardedTransport{transport: h.raw, guard: guard},
-		timeout:   h.stallTimeout,
-		stalled:   stalledCounter(h.dest.Name),
-	}, nil
-}
-
-func (h *mirrorHandler) closeRoot() {
-	if h.raw != nil {
-		_ = h.raw.Close()
-		h.raw = nil
-	}
-}
-
-// runFinished reports whether runID has ended, so its staging may be
-// removed. A run squirrel cannot look up is left alone.
-func (h *mirrorHandler) runFinished(runID int64) bool {
-	r, err := h.store.GetRun(context.Background(), runID)
-	return err == nil && r.Status != store.RunStatusRunning
 }
 
 // markers gates the push on the per-volume .squirrel-volume marker, the

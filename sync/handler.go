@@ -135,7 +135,7 @@ func HandlerFor(s *store.Store, tools Tools, p Pair) (Handler, error) {
 		}
 		return &contentAddressedHandler{contentPusher{store: s, rcl: tools.Rclone, vol: p.Volume, dest: p.Destination}}, nil
 	case p.Destination.NativeMirror():
-		return &mirrorHandler{store: s, vol: p.Volume, dest: p.Destination, openTransport: openDestinationTransport, stallTimeout: DefaultStallTimeout}, nil
+		return &mirrorHandler{destinationRoot: newDestinationRoot(s, p.Destination, p.Volume.Name), vol: p.Volume}, nil
 	default:
 		if tools.Rclone == nil {
 			return nil, fmt.Errorf("destination %q: rclone wrapper is required", p.Destination.Name)
