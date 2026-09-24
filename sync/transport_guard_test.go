@@ -48,6 +48,10 @@ func TestNameGuardPermits(t *testing.T) {
 		{"move a live file onto a snapshot name", opRename, "pics/a.db", "pics/.squirrel-index/index-20260101T000000.000Z-run-7.db", false},
 		{"marker bootstrap without --init", opRename, "pics/.squirrel-staging/volume-marker", "pics/.squirrel-volume", false},
 		{"remove the staged marker without --init", opRemove, "pics/.squirrel-staging/volume-marker", "", false},
+		{"remove the name probe", opRemove, foldProbeName("pics"), "", true},
+		{"remove the name probe decomposed", opRemove, "pics/.squirrel-staging/" + foldProbeNorm, "", false},
+		{"remove another volume's name probe", opRemove, foldProbeName("docs"), "", false},
+		{"commit the name probe", opRename, foldProbeName("pics"), "pics/a.txt", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -93,6 +97,7 @@ func TestNameGuardContentLayout(t *testing.T) {
 		{"move an object", opRename, "objects/" + key, "packs/" + key, false},
 		{"remove an object", opRemove, "objects/" + key, "", false},
 		{"remove a finished run's staging", opRemove, "pics/.squirrel-staging/run-6/" + key, "", true},
+		{"remove a mirror's name probe", opRemove, foldProbeName("pics"), "", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

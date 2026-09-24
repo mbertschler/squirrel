@@ -23,16 +23,22 @@ import (
 // mirrorWriter carries one run's execution: the guarded transport, the
 // live records it keeps current, and the tally for the report.
 type mirrorWriter struct {
-	h     *mirrorHandler
-	rep   *Report
-	runID int64
-	tr    transport
-	live  map[string]store.RemotePath
+	h        *mirrorHandler
+	rep      *Report
+	runID    int64
+	volumeID int64
+	tr       transport
+	live     map[string]store.RemotePath
+	// fold is how the destination compares names, and names the plan
+	// around the collisions that causes.
+	fold  nameFolding
+	names foldPlan
 
 	progress func(runevents.Progress)
 	total    int
 	done     int
 	drifted  int
+	collided int
 }
 
 // execute confirms or writes every planned path. A failure on one path
@@ -44,26 +50,55 @@ func (h *mirrorHandler) execute(ctx context.Context, rep *Report, runID int64, o
 	if err != nil {
 		return err
 	}
-	w := &mirrorWriter{h: h, rep: rep, runID: runID, tr: tr, live: ops.live, progress: h.progress, total: len(ops.paths)}
+	w := &mirrorWriter{h: h, rep: rep, runID: runID, volumeID: ops.volumeID, tr: tr, live: ops.live, progress: h.progress, total: len(ops.paths)}
 	rep.AlreadyCorrect = ops.inSync
 	if ops.repairs > 0 {
 		rep.Changed = knownChanged(rep.Changed.Int64 + ops.repairs)
 		rep.Warnings = append(rep.Warnings, fmt.Sprintf("destination %q lost %d path(s) the index still holds there (found gone or changed); they are written again", h.dest.Name, ops.repairs))
 	}
+	if err := w.learnNames(ctx, ops); err != nil {
+		return err
+	}
 	for _, p := range ops.paths {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := w.apply(ctx, p); err != nil {
-			w.fail(p.delta.Path, err)
-			if errors.Is(err, errTransportStalled) {
-				break
-			}
+		if stalled := w.land(ctx, p); stalled {
+			break
 		}
 		w.done++
 		w.emitProgress()
 	}
 	return w.result()
+}
+
+// learnNames probes how the destination compares names before the first
+// path lands, and on a destination that folds them plans around the
+// collisions that causes.
+func (w *mirrorWriter) learnNames(ctx context.Context, ops *mirrorOps) error {
+	if len(ops.paths) == 0 {
+		return nil
+	}
+	var err error
+	if w.fold, err = w.probeFolding(ctx); err != nil || !w.fold.folds() {
+		return err
+	}
+	w.names, err = w.planFolding(ctx, ops)
+	return err
+}
+
+// land confirms or writes one planned path, or refuses it when its name
+// collides with another's; it reports whether the transport stalled.
+func (w *mirrorWriter) land(ctx context.Context, p mirrorPath) bool {
+	if other, ok := w.names.refused[p.delta.Path]; ok {
+		w.refuseCollision(p.delta.Path, other)
+		return false
+	}
+	if err := w.apply(ctx, p); err != nil {
+		w.fail(p.delta.Path, err)
+		return errors.Is(err, errTransportStalled)
+	}
+	return false
 }
 
 func (w *mirrorWriter) apply(ctx context.Context, p mirrorPath) error {
@@ -107,11 +142,17 @@ type stagedVersion struct {
 }
 
 // write lands one path: stage the content while hashing it, clear the way
-// (displacing whatever the path and its parents hold), then commit.
+// (displacing whatever the path and its parents hold, under any spelling
+// the destination resolves to them), then commit.
 func (w *mirrorWriter) write(ctx context.Context, d store.PathDelta) error {
 	staged, err := w.stage(ctx, d)
 	if err != nil {
 		return err
+	}
+	for _, other := range w.names.displace[d.Path] {
+		if err := w.displaceSpelling(ctx, other); err != nil {
+			return err
+		}
 	}
 	if err := w.clearParents(ctx, d.Path); err != nil {
 		return err
@@ -226,7 +267,7 @@ func (w *mirrorWriter) displace(ctx context.Context, rel string) error {
 func (w *mirrorWriter) displaceDir(ctx context.Context, dir string) error {
 	var ids []int64
 	for rel, live := range w.live {
-		if !strings.HasPrefix(rel, dir+"/") {
+		if !w.fold.under(rel, dir) {
 			continue
 		}
 		e, err := w.tr.Stat(ctx, w.h.liveName(rel))
@@ -266,7 +307,7 @@ func (w *mirrorWriter) moveRecorded(ctx context.Context, rel string, ids []int64
 		return err
 	}
 	for r := range w.live {
-		if r == rel || strings.HasPrefix(r, rel+"/") {
+		if r == rel || w.fold.under(r, rel) {
 			delete(w.live, r)
 		}
 	}
@@ -365,6 +406,9 @@ func (w *mirrorWriter) result() error {
 	}
 	if w.drifted > 0 {
 		return fmt.Errorf("%d path(s) on %q were refused for drifting from their indexed hash; re-index the volume and sync again — the receipt for run %d was not written and the durability vector did not advance", w.drifted, w.h.dest.Name, w.runID)
+	}
+	if w.collided > 0 {
+		return fmt.Errorf("%d path(s) on %q were refused because the destination cannot tell their names apart from another path's; rename one of each pair at the source, index, and sync again — the receipt for run %d was not written and the durability vector did not advance", w.collided, w.h.dest.Name, w.runID)
 	}
 	return nil
 }

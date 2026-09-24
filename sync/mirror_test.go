@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -33,6 +34,9 @@ type mirrorFixture struct {
 	pair  Pair
 	src   string // the volume's source directory
 	dst   string // the destination root
+	// fold, when it folds, makes the destination resolve names as a disk
+	// that folds them does, whatever this machine's disk does.
+	fold nameFolding
 }
 
 // mirrorBackend is where a mirror fixture's destination lives: its name,
@@ -123,7 +127,28 @@ func (f *mirrorFixture) index(t *testing.T) {
 // push runs one push with no rclone wrapper at all.
 func (f *mirrorFixture) push(t *testing.T, opts Options) (Report, error) {
 	t.Helper()
-	return RunPair(context.Background(), f.store, Tools{}, f.pair, opts)
+	if !f.fold.folds() {
+		return RunPair(context.Background(), f.store, Tools{}, f.pair, opts)
+	}
+	return f.pushVia(t, opts, func(tr transport) transport { return tr })
+}
+
+// pushVia runs one push through wrap's transport, on top of the folding
+// the fixture sets.
+func (f *mirrorFixture) pushVia(t *testing.T, opts Options, wrap func(transport) transport) (Report, error) {
+	t.Helper()
+	h := f.handler(t)
+	h.openTransport = func(ctx context.Context, d *config.Destination) (transport, error) {
+		raw, err := openDestinationTransport(ctx, d)
+		if err != nil {
+			return nil, err
+		}
+		if f.fold.folds() {
+			raw = foldingTransport{transport: raw, disk: f.dst, fold: f.fold}
+		}
+		return wrap(raw), nil
+	}
+	return h.Push(context.Background(), opts)
 }
 
 func (f *mirrorFixture) mustPush(t *testing.T) Report {
@@ -139,15 +164,9 @@ func (f *mirrorFixture) mustPush(t *testing.T) Report {
 // crashAt selects.
 func (f *mirrorFixture) pushCrashing(t *testing.T, crashAt func(transportCall) bool, mode crashMode) (Report, error) {
 	t.Helper()
-	h := f.handler(t)
-	h.openTransport = func(ctx context.Context, d *config.Destination) (transport, error) {
-		raw, err := openDestinationTransport(ctx, d)
-		if err != nil {
-			return nil, err
-		}
-		return &faultTransport{transport: raw, crashAt: crashAt, mode: mode}, nil
-	}
-	return h.Push(context.Background(), Options{})
+	return f.pushVia(t, Options{}, func(tr transport) transport {
+		return &faultTransport{transport: tr, crashAt: crashAt, mode: mode}
+	})
 }
 
 func (f *mirrorFixture) handler(t *testing.T) *mirrorHandler {
@@ -168,9 +187,18 @@ func (f *mirrorFixture) volumeID(t *testing.T) int64 {
 	return v.ID
 }
 
-// dest is the path of rel under the destination's volume directory.
+// dest is the path of rel under the destination's volume directory, as
+// the destination resolves it.
 func (f *mirrorFixture) dest(rel string) string {
-	return filepath.Join(f.dst, "pics", filepath.FromSlash(rel))
+	return f.onDisk(path.Join("pics", rel))
+}
+
+// onDisk is where the destination keeps name, relative to its root.
+func (f *mirrorFixture) onDisk(name string) string {
+	if f.fold.folds() {
+		name = foldingTransport{disk: f.dst, fold: f.fold}.resolve(name)
+	}
+	return filepath.Join(f.dst, filepath.FromSlash(name))
 }
 
 func (f *mirrorFixture) readDest(t *testing.T, rel string) string {
@@ -243,16 +271,23 @@ func (f *mirrorFixture) checkInvariants(t *testing.T, before map[string]bool) {
 	ctx := context.Background()
 	volID := f.volumeID(t)
 	liveContent := map[string]int64{}
+	disk := diskFolding(t, f.dst)
+	fold := nameFolding{caseless: f.fold.caseless || disk.caseless, normless: f.fold.normless || disk.normless}
+	liveAt := map[string]string{}
 	for _, r := range f.rows(t) {
 		want := f.contentHashOf(t, volID, r)
 		switch r.State {
 		case store.RemotePathLive:
 			liveContent[r.Path] = r.ContentID
+			if other, ok := liveAt[fold.key(r.Path)]; ok {
+				t.Errorf("live %s and %s name the one entry the destination holds there", r.Path, other)
+			}
+			liveAt[fold.key(r.Path)] = r.Path
 			if got := fileHash(t, f.dest(r.Path)); got != want {
 				t.Errorf("live %s holds %s, want %s", r.Path, got, want)
 			}
 		case store.RemotePathDisplaced:
-			p := filepath.Join(f.dst, filepath.FromSlash(historyName("pics", r.DisplacedRunID.Int64, r.Path)))
+			p := f.onDisk(historyName("pics", r.DisplacedRunID.Int64, r.Path))
 			if got := fileHash(t, p); got != want {
 				t.Errorf("displaced %s holds %s at %s, want %s", r.Path, got, p, want)
 			}
@@ -546,7 +581,7 @@ type mirrorCrashCase struct {
 // transports. Each row pins what the crash leaves recorded and how
 // reconcile settles it; afterwards the three invariants hold.
 func TestMirrorCrashTable(t *testing.T) {
-	staged := func(c transportCall) bool { return strings.Contains(c.name, StagingDirName+"/") }
+	staged := func(c transportCall) bool { return strings.Contains(c.name, StagingDirName+"/run-") }
 	intoHistory := func(c transportCall) bool { return c.op == "rename" && strings.Contains(c.to, HistoryDirName+"/") }
 	commitRename := func(c transportCall) bool { return c.op == "rename" && staged(c) }
 	cases := []mirrorCrashCase{

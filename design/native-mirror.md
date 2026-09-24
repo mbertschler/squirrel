@@ -263,7 +263,9 @@ type transport interface {
     name to `.squirrel-history/run-<current run>/` (displacement);
   - under `--init`, before the push holds a run, the marker's own staging:
     it is written to `.squirrel-staging/volume-marker` and renamed onto
-    `.squirrel-volume`, and a stale staged copy may be removed.
+    `.squirrel-volume`, and a stale staged copy may be removed;
+  - for a mirror push holding a run, `Remove` of the name probe,
+    `.squirrel-staging/fold-probe-é` (see "Names the destination folds").
 
   So the marker and the ride-along snapshot land whole or not at all, like
   every path: a write that fails halfway leaves its partial copy in staging,
@@ -356,6 +358,7 @@ The tree keeps the shape it has today and gains two reserved entries:
   .squirrel-index/run-7                  # receipt: run 7's manifest segment
   .squirrel-index/index-…-run-7.db       # ride-along index snapshot
   .squirrel-staging/                     # in-flight writes, squirrel-owned
+  .squirrel-staging/fold-probe-é         # name probe, removed within the push
 ```
 
 `.squirrel-staging` joins the reserved names in `reservedSubtreeFilter`,
@@ -472,6 +475,48 @@ new version is committed, and the new version stays in staging until then.
 Between steps 3 and 4 the live path is briefly empty. That costs availability
 until the next push, never content.
 
+### Names the destination folds
+
+APFS and HFS+ resolve names that differ only by case, or only by Unicode
+normalization (composed `é` against `e` plus a combining accent), to the same
+entry; exFAT and NTFS fold case. A source on a Linux disk can hold both
+spellings as two files, and a case-only rename at any source shows up in the
+index as one path gone and another new. Squirrel's records key on the exact
+spelling, so on such a destination the records alone would let a write of
+`A.jpg` move `a.jpg`'s bytes to history as unrecorded while `a.jpg`'s row
+stayed `live` over the other spelling's bytes, breaking invariant 1.
+
+- **Probe.** Before its first write, each push writes
+  `.squirrel-staging/fold-probe-é`, looks it up by an upper-case and by a
+  decomposed spelling, and removes it again (`sync/mirror_fold.go`). A lookup
+  that finds the file means the destination folds that way. The probe runs on
+  every push that writes, so a disk reformatted between pushes is probed
+  again; one a crashed push left behind is removed by the next probe.
+- **Collisions** (decision 6). On a destination that folds, execute groups
+  every planned path and every `live` row by the folded form of each name
+  along the path. Two present paths clash when one's name folds onto the
+  other's under another spelling where at least one is a file: two files, or
+  a file where the other's parent directory is. The spelling the destination
+  already holds (a `live` row of a present path) wins, then the first by byte
+  order; every other planned path claiming that name is refused. A refused
+  path is never staged and displaces nothing. It fails the run before its
+  seal, as drift does, with a warning naming both spellings, so the watermark
+  holds until one of them is renamed at the source. Two directory spellings
+  never clash: the destination merges them.
+- **Case-only renames.** A `live` row under another spelling whose path is no
+  longer present at the source is displaced as its record before the planned
+  path lands: `a.jpg` moves to `.squirrel-history/run-<id>/a.jpg` and becomes
+  `displaced`, then `A.jpg` is committed. A file in the way of a planned
+  path's directory moves the same way, and a directory displaced because a
+  file replaced it takes every live row under any spelling of it along
+  (`nameFolding.under`).
+- **What stays behind.** A directory keeps the spelling it was created with:
+  after `Photos/` is renamed to `photos/` at the source, the files land under
+  the existing `Photos/` directory. Every lookup by the recorded name finds
+  them, but a restore without an index, which walks the tree, restores them
+  under `Photos/`, as files no receipt names.
+- A dry run doesn't probe, so its preview doesn't show collisions.
+
 ### Crash points
 
 | Crash after | Destination | Reconcile at the next push |
@@ -517,8 +562,8 @@ usual:
     refused for that path, and nothing is displaced.
   - Destinations that ignore Unicode normalization get the same treatment,
     for names that differ only in composed versus decomposed form.
-  - The first push probes the destination's case and normalization behaviour
-    inside staging.
+  - Each push that writes probes the destination's case and normalization
+    behaviour inside staging.
 - **Failures:**
   - the disk fills up or the quota runs out mid-write;
   - the history directory can't be written;

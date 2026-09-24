@@ -77,7 +77,7 @@ func (h *destinationRoot) clearFinishedStaging(ctx context.Context, rep *Report,
 		return fmt.Errorf("list %s: %w", dir, err)
 	}
 	for _, e := range runs {
-		if e.name == markerStagingBase {
+		if e.name == markerStagingBase || isFoldProbe(e.name) {
 			continue
 		}
 		runID, ok := stagingRunID(e)

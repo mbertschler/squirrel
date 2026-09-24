@@ -45,6 +45,24 @@ recorded refuses, unless the root is empty and squirrel holds no records for it.
 So a native mirror starts on a fresh or emptied root: squirrel does not adopt a
 tree some other tool wrote, rclone included.
 
+### Names a disk can't tell apart
+
+Disks formatted APFS or HFS+ (macOS), exFAT or NTFS treat `a.jpg` and `A.jpg`
+as one name, and APFS and HFS+ also treat a composed `é` and an `e` followed by
+a combining accent as one. Before its first write, each push checks how the
+destination compares names with one small file in `.squirrel-staging/`.
+
+- When two of your files have names the destination can't tell apart, or one
+  file's name matches the other's directory, only one of them is written: the
+  one already on the destination, otherwise the first by name. The other is
+  left out and nothing moves for it, every other file still lands, and the run
+  fails with a warning naming both spellings. Rename one of them, index, and
+  sync again.
+- A file you renamed only in case moves from its old spelling into
+  `.squirrel-history/` and lands under the new one.
+- A directory keeps the spelling it was created with: after you rename
+  `Photos/` to `photos/`, the files land inside the existing `Photos/`.
+
 On sftp, squirrel checks the server's host key against `known_hosts` and refuses
 a server it does not know (see [sftp keys](/squirrel/reference/configuration/#sftp)).
 

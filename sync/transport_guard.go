@@ -50,6 +50,8 @@ const (
 //   - Remove of a staging entry, or an emptied staging run directory,
 //     of a run that has finished: <volume>/.squirrel-staging/run-<id>[/<key>];
 //   - Remove of a ride-along snapshot: <volume>/.squirrel-index/index-*.db;
+//   - for a mirror, Remove of the name probe,
+//     <volume>/.squirrel-staging/fold-probe-é;
 //   - Rename from this run's staging onto a snapshot name (the ride-along),
 //     or onto what the layout commits: a live name for a mirror, an
 //     artifact name for a content layout (see artifact);
@@ -114,7 +116,7 @@ func (g nameGuard) snapshot(name string) bool {
 }
 
 func (g nameGuard) removable(name string) bool {
-	if g.snapshot(name) {
+	if g.snapshot(name) || (!g.content && name == foldProbeName(g.volumeDir)) {
 		return true
 	}
 	runID, key, ok := g.stagingParts(name)

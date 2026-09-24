@@ -11,8 +11,9 @@ import (
 // delta path and per repair, and the live records the operations were
 // decided against. execute keeps live current as it moves versions.
 type mirrorOps struct {
-	paths []mirrorPath
-	live  map[string]store.RemotePath // volume-relative path → live row
+	volumeID int64
+	paths    []mirrorPath
+	live     map[string]store.RemotePath // volume-relative path → live row
 	// inSync counts the live rows that hold their path's present content,
 	// in the delta or not: what the report calls already correct.
 	inSync int64
@@ -50,7 +51,7 @@ func (h *mirrorHandler) translate(ctx context.Context, p pushPlan) (*mirrorOps, 
 	if err != nil {
 		return nil, err
 	}
-	ops := &mirrorOps{live: make(map[string]store.RemotePath, len(rows)), inSync: inSync}
+	ops := &mirrorOps{volumeID: p.volumeID, live: make(map[string]store.RemotePath, len(rows)), inSync: inSync}
 	for _, r := range rows {
 		ops.live[r.Path] = r
 	}
