@@ -95,7 +95,7 @@ Indexing by raw path is not supported. See [Indexing](/squirrel/guides/indexing/
 
 ## squirrel sync
 
-**Push configured volumes to their rclone destinations.**
+**Push configured volumes to their destinations.**
 
 ```
 squirrel sync [<volume>]
@@ -108,8 +108,8 @@ Optional single positional. No arg = every `(volume, destination)` pair; one arg
 | Flag | Default | Meaning |
 |---|---|---|
 | `--to` | all | Limit to this destination name. |
-| `--shallow` | `false` | Skip the checksum comparison on mirror destinations; trust rclone's size+mtime comparison. A peer sync hashes every byte on both ends regardless. |
-| `--dry-run` | `false` | Preview rclone actions without transferring; no runs row is written. |
+| `--shallow` | `false` | Skip the checksum comparison on rclone mirror destinations; trust rclone's size+mtime comparison. Refused on a native mirror (`local`, or `sftp` without crypt), which has no comparison to skip. A peer sync hashes every byte on both ends regardless. |
+| `--dry-run` | `false` | Preview what a push would transfer without transferring; no runs row is written. |
 | `--init` | `false` | Authorise first-use destination bootstrap. |
 | `--progress`, `-P` | auto on a TTY | Show live transfer progress (files, bytes, rate, ETA). |
 
@@ -214,22 +214,24 @@ renders the same facts from the same query layer — see
 
 ## squirrel verify
 
-**Re-check recorded offsite objects and packs against their upload fingerprints.**
+**Re-check what squirrel recorded storing on a destination: objects and packs against their upload fingerprints, a native mirror's copies by size and mtime, and on a local disk a rotating tenth of them by BLAKE3.**
 
 ```
 squirrel verify [<destination>]
 ```
 
 Optional single positional. If omitted, verifies every content-addressed or
-packed destination in config (sorted). An explicit destination must have layout
-`content-addressed` or `packed`, else it errors. No flags. See
+packed destination and every native mirror in config (sorted). An explicit
+destination must be one of those, else it errors: a mirror rclone writes records
+nothing to re-check. No flags. See
 [Offsite verification](/squirrel/guides/verification/).
 
 A clean pass does two things beyond reporting: it fills any pending fingerprints
 and then **upgrades the destination's durability vector to a content-verified
 method**, which is what lets [`offload`](#squirrel-offload) accept it. A mismatch
 **latches a standing alarm** on the destination that survives the run and shows
-on every surface until acknowledged.
+on every surface until acknowledged. On a native mirror, a copy found gone or
+changed is also marked lost, and the next push writes it again.
 
 ### squirrel verify ack
 
@@ -313,7 +315,7 @@ Takes no arguments. Lists every kind of run — `index`, `sync`, `restore`,
 
 Under routine cadences most rows are no-ops (a pair checked, nothing to do).
 `--changes` keys on the count of files a run actually changed, so it folds away
-bucket pushes and index runs too, not just peer-sync no-ops. Runs recorded
+destination pushes and index runs too, not just peer-sync no-ops. Runs recorded
 before that count existed are shown rather than silently folded — their change
 count is genuinely unknown.
 
@@ -402,7 +404,7 @@ winner live. Adopting the preserved version instead is a deliberate
 
 ## squirrel restore
 
-**Pull a volume back from one of its rclone destinations.**
+**Pull a volume back from one of its destinations.**
 
 ```
 squirrel restore <volume>
@@ -414,13 +416,18 @@ Exactly one positional — the volume name. See [Restoring](/squirrel/guides/res
 |---|---|---|
 | `--from` | — | Destination name to pull from, or peer node name to filter by content origin. |
 | `--to` | volume's declared path | Local target path. |
-| `--shallow` | `false` | Skip the checksum comparison on the way down (mirror destinations). |
-| `--dry-run` | `false` | Preview rclone actions without transferring. |
+| `--shallow` | `false` | Skip the checksum comparison on the way down from an rclone mirror. Native mirrors and the content-addressed and packed layouts are always re-hashed to BLAKE3. |
+| `--dry-run` | `false` | Preview what the restore would fetch without transferring. |
 | `--in-place` | `false` | Permit restore against a non-empty live path; overwritten files move to `.squirrel-restore-history/run-<id>/`. |
 
-Restore from an [encrypted (`crypt`)](/squirrel/layouts/encrypted/) destination
-is always a size+mtime comparison (recorded shallow) even without `--shallow`,
-because rclone crypt remotes don't expose content hashes.
+A [native mirror](/squirrel/guides/restore/#native-mirrors) restore needs no rclone:
+with an index it checks each path against it, and without one it walks the mirror
+and checks each file against the mirror's receipts.
+
+Restore from an [encrypted (`crypt`)](/squirrel/layouts/encrypted/) mirror is
+always a size+mtime comparison (recorded shallow) even without `--shallow`,
+because rclone crypt remotes don't expose content hashes. An encrypted
+content-addressed or packed restore re-hashes every file to BLAKE3.
 
 ---
 
@@ -477,8 +484,8 @@ On its own it prints help. See [Recovery & disaster runbooks](/squirrel/guides/r
 squirrel destination reset <destination>
 ```
 
-One positional — the destination name. Clears the `remote_objects`/`remote_packs`
-upload ledgers, the durability vector, and the push-freshness rows for the
+One positional — the destination name. Clears the
+`remote_objects`/`remote_packs`/`remote_paths` upload ledgers, the durability vector, and the push-freshness rows for the
 destination, so the next sync treats it as fresh and re-uploads. The runs table
 and the append-only durability advance log are preserved, and the reset is
 recorded as an audit run; the remote bytes are untouched.

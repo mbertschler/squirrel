@@ -106,6 +106,7 @@ func TestListPathDeltaSinceExcludesReservedSubtrees(t *testing.T) {
 		".squirrel-conflicts/run-2/x.txt",
 		".squirrel-restore-history/run-3/y.txt",
 		".squirrel-index/index-snapshot.db",
+		".squirrel-staging/run-4/z",
 	}
 	for i, p := range reserved {
 		if err := s.Upsert(ctx, FileRow{

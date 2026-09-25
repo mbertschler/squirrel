@@ -61,20 +61,26 @@ func TestAnyDestinationNeedsScheduledVerify(t *testing.T) {
 
 	cfg := base()
 	cfg.Destinations["m"] = &config.Destination{Layout: config.LayoutMirror, VerifyEvery: time.Hour}
-	if anyDestinationNeedsScheduledVerify(cfg) {
+	if anyScheduledVerifyNeedsRclone(cfg) {
 		t.Fatalf("mirror layout must never need scheduled verify")
 	}
 
 	cfg = base()
+	cfg.Destinations["usb"] = &config.Destination{Type: "local", Layout: config.LayoutMirror, VerifyEvery: time.Hour}
+	if anyScheduledVerifyNeedsRclone(cfg) {
+		t.Fatalf("a native mirror's scheduled verify must not need rclone")
+	}
+
+	cfg = base()
 	cfg.Destinations["p"] = &config.Destination{Layout: config.LayoutPacked, VerifyEvery: time.Hour}
-	if !anyDestinationNeedsScheduledVerify(cfg) {
+	if !anyScheduledVerifyNeedsRclone(cfg) {
 		t.Fatalf("packed destination with own cadence should need verify")
 	}
 
 	cfg = base()
 	cfg.Agent.VerifyEvery = time.Hour
 	cfg.Destinations["c"] = &config.Destination{Layout: config.LayoutContentAddressed}
-	if !anyDestinationNeedsScheduledVerify(cfg) {
+	if !anyScheduledVerifyNeedsRclone(cfg) {
 		t.Fatalf("agent default should cover a verifiable destination with no own cadence")
 	}
 }
@@ -107,5 +113,25 @@ func TestSchedulerToolsRebuildKeepsRclone(t *testing.T) {
 	}
 	if got := tools.rclone(); got != located {
 		t.Fatalf("rclone() = %p after a reload that needs none, want the located wrapper %p", got, located)
+	}
+}
+
+// TestScheduledSyncToANativeMirrorNeedsNoRclone: squirrel writes a local
+// mirror and a plain sftp mirror itself, so a cadence naming only those
+// runs on a host without rclone; an encrypted sftp mirror still needs it.
+func TestScheduledSyncToANativeMirrorNeedsNoRclone(t *testing.T) {
+	cfg := &config.Config{
+		Volumes: map[string]*config.Volume{"pics": {Name: "pics", SyncEvery: time.Hour, SyncTo: []string{"usb", "box"}}},
+		Destinations: map[string]*config.Destination{
+			"usb": {Name: "usb", Type: "local", Layout: config.LayoutMirror},
+			"box": {Name: "box", Type: "sftp", Layout: config.LayoutMirror},
+		},
+	}
+	if anyVolumeNeedsScheduledSync(cfg) {
+		t.Fatal("a cadence onto native mirrors only must not need rclone")
+	}
+	cfg.Destinations["box"].Crypt = &config.Crypt{Password: "pw"}
+	if !anyVolumeNeedsScheduledSync(cfg) {
+		t.Fatal("an encrypted sftp mirror is written by rclone")
 	}
 }

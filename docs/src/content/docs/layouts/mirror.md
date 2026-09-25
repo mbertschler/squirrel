@@ -12,44 +12,132 @@ destination without a `layout` key.
   pictures/
     2024/cat.jpg
     .squirrel-history/run-7/2024/cat.jpg     # prior content of cat.jpg
+    .squirrel-index/run-12                   # receipt: what run 12 changed (native mirrors)
     .squirrel-index/index-20260604T120000.000Z-run-12.db   # global index snapshot (ride-along)
+    .squirrel-staging/                       # in-flight writes (native mirrors)
   docs/
     invoice.pdf
     .squirrel-history/run-9/invoice.pdf
 ```
 
+## How a mirror is written
+
+On a `local` destination, and on an `sftp` destination without
+[crypt](/squirrel/layouts/encrypted/), squirrel writes the mirror itself: a
+*native* mirror. A push plans from
+the index: it sends the changes recorded since the destination's last confirmed
+run, not what a fresh walk of the disk finds. It writes the changed paths in
+batches of up to 64 files, several at once
+([`concurrency`](/squirrel/reference/configuration/#common-keys)). For each
+batch it:
+
+1. streams every file into `.squirrel-staging/run-<id>/`, hashing the bytes as
+   they go, and refuses a path if they no longer match the index; then it
+   flushes the batch to stable storage;
+2. on a `local` disk, reads every staged copy back through BLAKE3, past the
+   page cache where the system allows, and refuses a path if the disk returns
+   other bytes;
+3. moves whatever each path holds into `.squirrel-history/run-<id>/`;
+4. renames each staged copy onto its path. The rename never replaces a file.
+
+squirrel records each move before making it, and confirms it only once a flush
+has made it durable, so the next push finishes or withdraws whatever a crashed
+or unplugged push, or a power cut, left half done. Every successful
+push leaves a **receipt** at `.squirrel-index/run-<id>`: the run's changes in the
+[manifest segment format](/squirrel/reference/formats/), so the mirror can be
+checked without the index. A push that finds no receipt for the last success it
+recorded refuses, unless the root is empty and squirrel holds no records for it.
+A volume's first push refuses too when its directory already holds files
+squirrel has no record of writing. So a native mirror starts on a fresh or
+emptied root: squirrel does not adopt a tree some other tool wrote, rclone
+included. If the tree is a native mirror whose index you lost, recover the
+index from it with [`squirrel recover --from`](/squirrel/guides/recovery/)
+instead: the index snapshots and receipts on the mirror let the next push carry
+on where the last one stopped.
+
+### Names a disk can't tell apart
+
+Disks formatted APFS or HFS+ (macOS), exFAT or NTFS treat `a.jpg` and `A.jpg`
+as one name, and APFS and HFS+ also treat a composed `é` and an `e` followed by
+a combining accent as one. Before its first write, each push checks how the
+destination compares names with one small file in `.squirrel-staging/`.
+
+- When two of your files have names the destination can't tell apart, or one
+  file's name matches the other's directory, only one of them is written: the
+  one already on the destination, otherwise the first by name. The other is
+  left out and nothing moves for it, every other file still lands, and the run
+  fails with a warning naming both spellings. Rename one of them, index, and
+  sync again.
+- A file you renamed only in case moves from its old spelling into
+  `.squirrel-history/` and lands under the new one.
+- A directory keeps the spelling it was created with: after you rename
+  `Photos/` to `photos/`, the files land inside the existing `Photos/`.
+
+On sftp, squirrel checks the server's host key against `known_hosts` and refuses
+a server it does not know (see [sftp keys](/squirrel/reference/configuration/#sftp)).
+
+Encrypted mirrors, and mirrors on `s3`, `b2` and `gcs`, are written by rclone,
+which compares both trees and moves overwritten files into its `--backup-dir`.
+
 ## Append-only history
 
-`.squirrel-history/run-<run-id>/` is rclone's `--backup-dir` target for that
-sync run. When a file at the destination is about to be overwritten, its prior
-bytes are moved here first — never deleted.
+`.squirrel-history/run-<run-id>/` holds the prior bytes of every file a sync run
+replaced. They are moved there first, never deleted.
 
+- On a native mirror, anything found at a path squirrel is about to write moves
+  there, including bytes squirrel did not write. The run names each one in a
+  warning and in its audit trail.
 - It is **filtered out** of all subsequent comparisons, so it does not grow
-  rclone's listing time or get uploaded back.
+  listing time or get uploaded back.
 - A directory literally called `.squirrel-history` in your source volume is also
   filtered (with a warning), to keep the reserved name out of the destination
   tree by accident.
 
-Sync runs do **not** pass `--delete-*` to rclone. Files removed locally remain
-at the destination.
+Files removed locally remain at the destination.
 
 ## Verification
 
-Sync compares every file with its copy by checksum (rclone's `--checksum`),
-under the first hash both ends support — MD5 on local disks and S3, independent
+A native mirror push hashes every file with BLAKE3 as it streams out and
+confirms each written path's size and mtime. What else backs it depends on
+where the mirror lives:
+
+- **On a `local` disk**, every copy is flushed to the disk, then read back in
+  full through BLAKE3 before it is committed, and the match is recorded as the
+  copy's fingerprint. Once every
+  file of the volume has such a copy, the run advances the destination's
+  durability evidence as `fingerprint-verified`. A local mirror can therefore be
+  named in [`offload_requires`](/squirrel/guides/offloading/).
+- **On sftp**, nothing is read back: a mirror's paths are your own file names,
+  and squirrel never puts them on a server command line to hash them there. The
+  run advances as `presence+size`, and an sftp mirror cannot gate offload. Use a
+  [content-addressed](/squirrel/layouts/content-addressed/) or
+  [packed](/squirrel/layouts/packed/) sftp destination for that.
+
+[`squirrel verify`](/squirrel/guides/verification/) re-checks a native mirror,
+on demand or on the agent's `verify_every` cadence. Each pass checks every copy
+squirrel stored — the live ones and those in `.squirrel-history` — by size and
+mtime. On a local disk it also re-reads the least recently checked copies, a
+tenth of the stored bytes per pass, so every byte is read again within about ten
+passes. A copy found gone or changed stops counting as evidence, raises the
+destination's alarm, and is written again by the next push while the index still
+holds that file.
+
+`--shallow` is refused on a native mirror: there is no comparison to switch off.
+
+An rclone mirror compares every file with its copy by checksum (rclone's
+`--checksum`), under the first hash both ends support — MD5 on S3, independent
 of the BLAKE3 in the index. A copy that fails the check after transfer is an
-error, so the run is not marked success. The run advances the destination's
-durability evidence under the `checksum` method, which
-[`squirrel status`](/squirrel/reference/cli/) shows but the offload gate does not
-accept: a mirror cannot be named in
-[`offload_requires`](/squirrel/guides/offloading/). See
-[Syncing & first use](/squirrel/guides/syncing/).
+error, so the run is not marked success, and the run advances the evidence under
+the `checksum` method. [`squirrel status`](/squirrel/reference/cli/) shows it,
+but the offload gate refuses it, and an rclone mirror cannot be named in
+`offload_requires`. See [Syncing & first use](/squirrel/guides/syncing/).
 
 ## Index snapshots
 
 `.squirrel-index/` holds the [index snapshots](/squirrel/configuration/index-snapshots/)
-ridden along after each successful sync. Like `.squirrel-history`, it is filtered
-out of all sync and restore transfers and from peer-sync.
+ridden along after each successful sync, and a native mirror's receipts. Like
+`.squirrel-history`, it is filtered out of all sync and restore transfers and
+from peer-sync.
 
 ## When to use another layout
 

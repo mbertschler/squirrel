@@ -105,13 +105,17 @@ func algoHashType(algo string) string {
 	return algo
 }
 
-// checkersArgs renders dest's optional concurrent-checkers cap as rclone
-// argv.
-func checkersArgs(dest *config.Destination) []string {
-	if dest.Checkers <= 0 {
-		return nil
+// concurrencyArgs renders dest's optional caps on rclone's concurrent
+// checkers and transfers as rclone argv.
+func concurrencyArgs(dest *config.Destination) []string {
+	var args []string
+	if dest.Checkers > 0 {
+		args = append(args, "--checkers", strconv.Itoa(dest.Checkers))
 	}
-	return []string{"--checkers", strconv.Itoa(dest.Checkers)}
+	if dest.Concurrency > 0 {
+		args = append(args, "--transfers", strconv.Itoa(dest.Concurrency))
+	}
+	return args
 }
 
 // underlyingDirURI addresses a destination-root directory (objects/ or

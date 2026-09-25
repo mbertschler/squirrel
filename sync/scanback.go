@@ -32,7 +32,7 @@ type captureTarget struct {
 // fingerprint left pending. The content-addressed object path and the
 // packed pack path share this surface, differing only in the dirName they
 // scan and the record closure each target carries.
-func (h *contentPusher) captureScanBackFingerprints(ctx context.Context, rep *Report, dirName string, targets []captureTarget) {
+func (h *rcloneArtifacts) captureScanBackFingerprints(ctx context.Context, rep *Report, dirName string, targets []captureTarget) {
 	// A run that uploaded nothing new has nothing to fingerprint; return
 	// before the s3 path would otherwise list the whole prefix (and possibly
 	// warn on a transient failure) for an empty batch.
@@ -49,11 +49,11 @@ func (h *contentPusher) captureScanBackFingerprints(ctx context.Context, rep *Re
 // captureScanBackRclone reads provider checksums via `rclone lsjson
 // --hash`, batched into one invocation per chunk and scoped by --include
 // filters so the backend hashes only this run's uploads.
-func (h *contentPusher) captureScanBackRclone(ctx context.Context, rep *Report, dirName string, targets []captureTarget) {
+func (h *rcloneArtifacts) captureScanBackRclone(ctx context.Context, rep *Report, dirName string, targets []captureTarget) {
 	dirURI := underlyingDirURI(h.dest, dirName)
 	types := captureHashTypes(h.dest)
 	for batch := range slices.Chunk(targets, fingerprintBatchSize) {
-		extra := checkersArgs(h.dest)
+		extra := concurrencyArgs(h.dest)
 		for _, t := range batch {
 			extra = append(extra, "--include", listedRemoteName(h.dest, t.name))
 		}
@@ -79,7 +79,7 @@ func (h *contentPusher) captureScanBackRclone(ctx context.Context, rep *Report, 
 // every fingerprint pending with a warning — capture is not on the
 // durability critical path (the bytes are already confirmed), so `squirrel
 // verify` is the backstop.
-func (h *contentPusher) captureScanBackS3(ctx context.Context, rep *Report, dirName string, targets []captureTarget) {
+func (h *rcloneArtifacts) captureScanBackS3(ctx context.Context, rep *Report, dirName string, targets []captureTarget) {
 	reader, err := newS3ETagReader(h.dest, dirName)
 	if err == nil {
 		var etags map[string]string
@@ -103,7 +103,7 @@ func (h *contentPusher) captureScanBackS3(ctx context.Context, rep *Report, dirN
 // listing (byName, present). A target absent from the listing or exposing
 // no usable checksum stays pending with a warning; the fingerprint is never
 // fabricated. Each recorded checksum counts toward rep.Fingerprints.
-func (h *contentPusher) recordScanBack(ctx context.Context, rep *Report, targets []captureTarget, byName map[string]map[string]string, present map[string]bool) {
+func (h *rcloneArtifacts) recordScanBack(ctx context.Context, rep *Report, targets []captureTarget, byName map[string]map[string]string, present map[string]bool) {
 	for _, t := range targets {
 		if !present[t.name] {
 			rep.Warnings = append(rep.Warnings, fmt.Sprintf("%s %s on %q: not yet returned by the remote listing; fingerprint stays pending", t.label, t.name, h.dest.Name))

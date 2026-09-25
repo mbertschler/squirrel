@@ -26,7 +26,7 @@ func newSyncCmd() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "sync [<volume>]",
-		Short: "Push configured volumes to their rclone destinations",
+		Short: "Push configured volumes to their destinations",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			volumeName := ""
@@ -41,8 +41,8 @@ func newSyncCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&to, "to", "", "limit to this destination name (default: every destination declared on the volume)")
-	cmd.Flags().BoolVar(&shallow, "shallow", false, "skip the checksum comparison; trust rclone's default size+mtime comparison")
-	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview rclone actions without transferring; no runs row is written")
+	cmd.Flags().BoolVar(&shallow, "shallow", false, "skip the checksum comparison on an rclone mirror; trust rclone's default size+mtime comparison (refused on a native mirror: local, or sftp without crypt)")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview what a push would transfer without transferring; no runs row is written")
 	cmd.Flags().BoolVar(&initDst, "init", false, "authorise first-use destination bootstrap: write a .squirrel-volume marker, or create a kopia repository when connect finds none (refused without --init so a typo or outage can't mint a fresh empty target)")
 	cmd.Flags().BoolVarP(&progress, "progress", "P", false, "show live transfer progress (auto-enabled on a terminal; use --progress=false to force off)")
 	return cmd
@@ -91,7 +91,7 @@ func runSync(cmd *cobra.Command, volumeName, destinationName string, progress bo
 	// for dry-run (no run rows to snapshot against) and when [backups] is
 	// turned off.
 	if !opts.DryRun && cfg.Backups.Enabled {
-		opts.Snapshot = sync.NewSnapshotter(s, rcl, snapshotConfig(cfg, s.Path()))
+		opts.Snapshot = sync.NewSnapshotter(s, snapshotConfig(cfg, s.Path()))
 	}
 
 	// Progress renders to stderr (leaving stdout for the summary lines). A
@@ -150,6 +150,23 @@ const shallowSyncWarning = "warning: shallow mode: skipping the checksum compari
 // squirrel rewrites the file only when that derived content changes.
 func rcloneConfigPathFor(cfg *config.Config) string {
 	return filepath.Join(filepath.Dir(cfg.Path), "rclone.conf")
+}
+
+// rcloneFor locates rclone and renders its config for reading dest. A
+// native destination is read through squirrel's own transport, so it gets
+// a nil wrapper and no rclone preamble.
+func rcloneFor(cmd *cobra.Command, cfg *config.Config, dest *config.Destination) (*sync.Rclone, error) {
+	if dest.Native() {
+		return nil, nil
+	}
+	rcl, err := sync.Find(cmd.Context())
+	if err != nil {
+		return nil, err
+	}
+	if err := writeRcloneConfigLogged(cmd.OutOrStdout(), rcl, cfg); err != nil {
+		return nil, err
+	}
+	return rcl, nil
 }
 
 // writeRcloneConfigLogged renders the rclone.conf and logs a single line
@@ -264,8 +281,8 @@ func printSyncReport(w io.Writer, rep sync.Report, runErr error, reverse bool) {
 // an empty one — transferred=0 alone is ambiguous (friction F7).
 func printSyncSummaryLine(w io.Writer, rep sync.Report, src, dst string) {
 	r := rep.RcloneResult
-	switch rep.Verification.Method {
-	case sync.VerifyMethodKopia:
+	switch {
+	case rep.Verification.Method == sync.VerifyMethodKopia:
 		// Kopia pushes have no rclone counters; render the snapshot's
 		// own numbers instead.
 		fmt.Fprintf(w, "%s → %s  status=%s files=%d bytes=%d snapshot=%s verified=%t run=%d\n",
@@ -273,7 +290,7 @@ func printSyncSummaryLine(w io.Writer, rep sync.Report, src, dst string) {
 			rep.Verification.Files, rep.Verification.Bytes,
 			rep.Verification.SnapshotID, rep.Verification.Verified(), rep.RunID,
 		)
-	case sync.VerifyMethodPresenceSize:
+	case rep.Layout == config.LayoutContentAddressed || rep.Layout == config.LayoutPacked:
 		// Content-addressed pushes count objects, with skipped = hashes
 		// the destination already recorded, entries = manifest segment
 		// lines, and fingerprints = provider checksums captured for the

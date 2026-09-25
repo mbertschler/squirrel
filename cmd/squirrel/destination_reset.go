@@ -107,11 +107,11 @@ func printResetPreview(out io.Writer, name string, c store.DestinationResetCount
 func printResetResult(out io.Writer, name string, c store.DestinationResetCounts, runID int64) {
 	fmt.Fprintf(out, "reset destination %q (run %d):\n", name, runID)
 	printResetCounts(out, c)
-	fmt.Fprintf(out, "next: the next sync re-uploads to %q; for a content-addressed or packed layout, wipe or repoint the remote root so the layout guard sees a fresh start\n", name)
+	fmt.Fprintf(out, "next: the next sync re-uploads to %q; for a content-addressed, packed or native mirror layout, wipe or repoint the remote root so the layout guard sees a fresh start\n", name)
 }
 
 func printResetCounts(out io.Writer, c store.DestinationResetCounts) {
-	fmt.Fprintf(out, "  upload records: %d objects, %d packs\n", c.RemoteObjects, c.RemotePacks)
+	fmt.Fprintf(out, "  upload records: %d objects, %d packs, %d mirror paths\n", c.RemoteObjects, c.RemotePacks, c.RemotePaths)
 	fmt.Fprintf(out, "  durability vector: %d component(s)\n", c.VectorComponents)
 	fmt.Fprintf(out, "  push freshness: %d row(s)\n", c.FreshnessRows)
 }

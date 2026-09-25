@@ -958,7 +958,12 @@ extended enforcement to remote rclone destinations (`sftp`, `s3`, `b2`,
 the mirror, content-addressed, and packed layouts, with the marker filtered
 out of every transfer, comparison, and restore. A read that fails for any
 reason other than a definite "not found" refuses without writing, so a
-reachability blip cannot be mistaken for a fresh root.
+reachability blip cannot be mistaken for a fresh root. Since
+[#217](https://github.com/mbertschler/squirrel/pull/217), a `local`
+destination and an `sftp` one without crypt read and write the marker
+through squirrel's own transport, staged and renamed onto its name, in every
+layout; a volume that synced there before is refused as a disk that is most
+likely not mounted rather than steered toward `--init`.
 
 **Issue:** [#64 — sync: require .squirrel-volume markers on destination and source to gate against misconfiguration](https://github.com/mbertschler/squirrel/issues/64); [#150 — sync: enforce .squirrel-volume markers on remote rclone destinations](https://github.com/mbertschler/squirrel/issues/150)
 
@@ -1019,7 +1024,12 @@ local and s3 — and runs were recorded as `blake3` all the same.
 records such a run as `checksum`, relabels the components already stored,
 and stops the offload gate from accepting it, so a mirror can no longer be
 named in `offload_requires`. The shallow warning now says "skipping the
-checksum comparison".
+checksum comparison". The native mirror
+([#217](https://github.com/mbertschler/squirrel/pull/217)) earns the evidence
+back on a `local` disk: it refuses `--shallow`, hashes every file as it
+streams, reads each copy back through BLAKE3 before committing it, and
+`squirrel verify` re-checks its copies, so a local mirror may gate offload
+again. rclone mirrors and native sftp mirrors still may not.
 
 **Issue:** `sync: surface --shallow trade-off in logs and persist it on the runs row`
 → tracked in [#79](https://github.com/mbertschler/squirrel/issues/79),
@@ -1620,7 +1630,13 @@ proves — `presence+size` is explicitly **not** content-verified, and
 `store.ContentVerifiedMethod`). So the *consequence* the finding worried
 about — a presence-only advance gating an offload — is gone.
 
-The narrow original gap remains: nothing downloads an object back through
+Since [#217](https://github.com/mbertschler/squirrel/pull/217), a
+destination without crypt that squirrel writes itself closes the gap: each
+artifact is staged, read back through BLAKE3 on a local disk or hashed by
+the server's command on sftp, and only then renamed onto its name. The gap
+stays for crypt destinations, which rclone writes.
+
+The narrow original gap remains there: nothing downloads an object back through
 the crypt overlay and BLAKE3s the plaintext, so a wrong-at-upload object
 that happens to preserve decrypted size is still theoretically undetected.
 No `--verify` mode exists. This stays a deliberate non-decision rather than

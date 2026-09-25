@@ -221,9 +221,9 @@ func (h *kopiaHandler) Push(ctx context.Context, opts Options) (Report, error) {
 	err = h.snapshotAndVerify(ctx, &rep, opts.Init)
 	finishHandlerRun(ctx, h.store, &rep, err)
 	// Local index snapshot only: the repository is kopia's own format,
-	// so the rclone ride-along stays out of it (dest=nil, mirroring the
-	// peer flow).
-	opts.Snapshot.afterSync(ctx, &rep, h.vol, nil)
+	// so the ride-along stays out of it (no shelf, mirroring the peer
+	// flow).
+	opts.Snapshot.afterSync(ctx, &rep, nil)
 	return rep, err
 }
 

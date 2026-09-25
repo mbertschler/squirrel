@@ -21,10 +21,11 @@ The agent requires an `[agent]` block in config.
 - **Scheduled audits** — runs [`audit`](/squirrel/guides/auditing/) passes on a
   schedule.
 - **Scheduled verify** — re-checks each content-addressed/packed destination's
-  recorded objects and packs against their upload fingerprints on its
-  `verify_every` cadence (per-destination, or an `[agent]` default) — the same
-  pass as [`squirrel verify`](/squirrel/guides/verification/), recorded as an
-  `audit` run. Offsite bitrot detection stops depending on anyone typing it.
+  recorded objects and packs against their upload fingerprints, and each native
+  mirror's recorded copies, on its `verify_every` cadence (per-destination, or
+  an `[agent]` default) — the same pass as
+  [`squirrel verify`](/squirrel/guides/verification/), recorded as an `audit`
+  run. Offsite bitrot detection stops depending on anyone typing it.
 - **Scheduled durability pull** — refreshes a peer's relayed durability
   evidence on its `pull_durability_every` cadence, independent of any sync. A
   receive-only node keeps its [offload](/squirrel/guides/offloading/) gate
@@ -44,8 +45,9 @@ Syncs are dispatched **per destination**, so a cloud target that has gone dark
 does not hold up local NAS→HTPC replication behind it. Two bounds keep a sick
 destination from occupying its own worker forever:
 
-- every automatic rclone transfer runs with connect and I/O timeouts, so a dead
-  endpoint fails rather than hanging;
+- every automatic transfer has a connect bound — rclone's connect and I/O
+  timeouts, or a one-minute connect and handshake limit on an sftp destination
+  squirrel writes itself — so a dead endpoint fails rather than hanging;
 - a **stall timeout** (10 minutes without progress by default) covers the case
   those miss — an endpoint that is live but stuck, accepting the connection and
   then never moving bytes.

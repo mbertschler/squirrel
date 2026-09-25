@@ -14,6 +14,9 @@ each time.
   every supported destination type in play.
 - [`testbed.md`](testbed.md) — how the reference setup is simulated on
   one development machine with real commands and no containers.
+- [`native-mirror.md`](native-mirror.md) — *implemented in #217*: one
+  planner shared by every layout, a small transport, and every `local` and
+  plain `sftp` destination written without rclone.
 
 ## How to use this folder
 

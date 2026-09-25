@@ -70,6 +70,7 @@ type recoverOptions struct {
 // before agreeing to its first step.
 type recoverPlan struct {
 	dest      *config.Destination
+	rcl       *sync.Rclone // nil for a native destination, which squirrel reads itself
 	volumes   []string
 	snapshots []sync.IndexSnapshot
 	chosen    sync.IndexSnapshot
@@ -123,14 +124,11 @@ func discoverRecovery(cmd *cobra.Command, cfg *config.Config, opts recoverOption
 			cfg.Path, opts.From)
 	}
 
-	rcl, err := sync.Find(cmd.Context())
-	if err != nil {
+	var err error
+	if plan.rcl, err = rcloneFor(cmd, cfg, dest); err != nil {
 		return recoverPlan{}, err
 	}
-	if err := writeRcloneConfigLogged(cmd.OutOrStdout(), rcl, cfg); err != nil {
-		return recoverPlan{}, err
-	}
-	plan.snapshots, err = sync.DiscoverIndexSnapshots(cmd.Context(), rcl, dest, plan.volumes)
+	plan.snapshots, err = sync.DiscoverIndexSnapshots(cmd.Context(), plan.rcl, dest, plan.volumes)
 	if err != nil {
 		return recoverPlan{}, err
 	}
@@ -242,10 +240,6 @@ func recoverIndexPhase(cmd *cobra.Command, plan recoverPlan, opts recoverOptions
 		return false, nil
 	}
 
-	rcl, err := sync.Find(cmd.Context())
-	if err != nil {
-		return false, err
-	}
 	dir, err := os.MkdirTemp("", "squirrel-recover-")
 	if err != nil {
 		return false, fmt.Errorf("create staging directory: %w", err)
@@ -254,7 +248,7 @@ func recoverIndexPhase(cmd *cobra.Command, plan recoverPlan, opts recoverOptions
 	staged := filepath.Join(dir, plan.chosen.Name)
 
 	fmt.Fprintf(out, "fetching %s …\n", plan.chosen.Name)
-	if err := sync.FetchIndexSnapshot(cmd.Context(), rcl, plan.dest, plan.chosen, staged); err != nil {
+	if err := sync.FetchIndexSnapshot(cmd.Context(), plan.rcl, plan.dest, plan.chosen, staged); err != nil {
 		return false, err
 	}
 	// runDBRestore preflights the schema version, refuses to clobber a live

@@ -61,7 +61,7 @@ func (t *schedulerTools) rclone() *sync.Rclone { return t.rcl.Load() }
 // destinations the kick was planned against.
 func (t *schedulerTools) rebuild(ctx context.Context, cfg *config.Config) error {
 	needsSync := anyVolumeNeedsScheduledSync(cfg)
-	needsVerify := anyDestinationNeedsScheduledVerify(cfg)
+	needsVerify := anyScheduledVerifyNeedsRclone(cfg)
 	if !needsSync && !needsVerify {
 		return nil
 	}
@@ -82,9 +82,9 @@ func (t *schedulerTools) rebuild(ctx context.Context, cfg *config.Config) error 
 
 // anyVolumeNeedsScheduledSync reports whether a scheduled sync will
 // invoke rclone. Only rclone-backed destinations count: a peer node
-// streams its bytes over the sync API and a kopia destination drives its
-// own binary, so a cadence naming only those runs its whole schedule on a
-// host with no rclone installed.
+// streams its bytes over the sync API, a kopia destination drives its own
+// binary, and squirrel writes a native destination itself, so a cadence naming
+// only those runs its whole schedule on a host with no rclone installed.
 func anyVolumeNeedsScheduledSync(cfg *config.Config) bool {
 	for _, v := range cfg.Volumes {
 		if v.SyncEvery <= 0 {
@@ -108,21 +108,22 @@ func targetNeedsRclone(cfg *config.Config, target string) bool {
 	if _, isNode := cfg.Nodes[target]; isNode {
 		return false
 	}
-	if dest, ok := cfg.Destinations[target]; ok && dest.Type == "kopia" {
-		return false
+	if dest, ok := cfg.Destinations[target]; ok {
+		return sync.Pair{Destination: dest}.DrivesRclone()
 	}
 	return true
 }
 
-// anyDestinationNeedsScheduledVerify reports whether any verifiable
-// destination has an effective verify cadence — its own verify_every, or the
-// [agent] verify_every default. Mirrors the scheduler's own resolution so
-// the rclone/runner wiring lines up with what the scheduler will actually
-// fire.
-func anyDestinationNeedsScheduledVerify(cfg *config.Config) bool {
+// anyScheduledVerifyNeedsRclone reports whether any verifiable destination
+// squirrel reaches through rclone has an effective verify cadence — its own
+// verify_every, or the [agent] verify_every default. Mirrors the scheduler's
+// own resolution so the rclone wiring lines up with what the scheduler will
+// actually fire; a native destination is verified through squirrel's own
+// transport.
+func anyScheduledVerifyNeedsRclone(cfg *config.Config) bool {
 	agentDefault := cfg.AgentVerifyEvery() > 0
 	for _, d := range cfg.Destinations {
-		if d.Layout != config.LayoutContentAddressed && d.Layout != config.LayoutPacked {
+		if !d.Verifiable() || !(sync.Pair{Destination: d}).DrivesRclone() {
 			continue
 		}
 		if d.VerifyEvery > 0 || agentDefault {
@@ -159,7 +160,7 @@ func buildSchedulerSyncRunner(live *config.Live, s *store.Store, tools *schedule
 			return agent.SyncRunReport{Err: err}
 		}
 		rcl := tools.rclone()
-		if rcl == nil && !pair.IsNode() {
+		if rcl == nil && pair.DrivesRclone() {
 			return agent.SyncRunReport{Err: errors.New("scheduled sync needs rclone, which the configuration in force did not call for")}
 		}
 		// Per-kick because the kopia lookup belongs to the kicks that
@@ -174,7 +175,7 @@ func buildSchedulerSyncRunner(live *config.Live, s *store.Store, tools *schedule
 		// a single pair, so a fresh Snapshotter per kick is the right unit.
 		opts := sync.Options{}
 		if cfg.Backups.Enabled {
-			opts.Snapshot = sync.NewSnapshotter(s, rcl, snapshotConfig(cfg, s.Path()))
+			opts.Snapshot = sync.NewSnapshotter(s, snapshotConfig(cfg, s.Path()))
 		}
 		rep, runErr := sync.RunPair(ctx, s, syncTools, pair, opts)
 		return agent.SyncRunReport{
@@ -205,13 +206,13 @@ func schedulerPairFor(cfg *config.Config, vol *config.Volume, destName string) (
 // never reaches it.
 func buildSchedulerVerifyRunner(live *config.Live, s *store.Store, tools *schedulerTools) agent.VerifyRunner {
 	return func(ctx context.Context, destName string) agent.VerifyRunReport {
-		rcl := tools.rclone()
-		if rcl == nil {
-			return agent.VerifyRunReport{Status: store.RunStatusFailed, Err: errors.New("scheduled verify needs rclone, which the configuration in force did not call for")}
-		}
 		dest, ok := live.Get().Destinations[destName]
 		if !ok {
 			return agent.VerifyRunReport{Status: store.RunStatusFailed, Err: fmt.Errorf("destination %q is not declared in config", destName)}
+		}
+		rcl := tools.rclone()
+		if rcl == nil && (sync.Pair{Destination: dest}).DrivesRclone() {
+			return agent.VerifyRunReport{Status: store.RunStatusFailed, Err: errors.New("scheduled verify needs rclone, which the configuration in force did not call for")}
 		}
 		rep, err := sync.VerifyRemote(ctx, s, rcl, dest)
 		return agent.VerifyRunReport{RunID: rep.RunID, Status: verifyRunStatus(rep, err), Err: err}

@@ -53,8 +53,12 @@ run programs, so it is a dumb **destination**; the NAS can, so it is a
    ▲                      │
    └──── durability evidence flows back out to the edges ────┘
 
- homepc ──rclone──▶ usb (local destination, .squirrel-volume marker)
+ homepc ──native──▶ usb (local mirror, .squirrel-volume marker)
 ```
+
+`native` is squirrel's own transport ([native-mirror.md](native-mirror.md)):
+every `local` destination and every `sftp` one without crypt, in any layout.
+`rclone` carries the encrypted destinations and the buckets.
 
 Initiation direction follows availability: the intermittently-awake
 machines (laptop, homepc) initiate toward the always-on nas; the nas
@@ -70,21 +74,22 @@ so nothing ever tries.
 | **media** | nas (master), htpc | nas → htpc; nas → cloudbox + s3archive | htpc offloads watched items once s3archive holds them |
 
 Offload gates may name only targets that *produce durability evidence*.
-Three shapes do: content-addressed and packed destinations (presence+size,
-upgraded to content-verified by the scan-back fingerprint), peer nodes the
-offloading machine itself pushes to (`peer-blake3`), and kopia repositories
-(`kopia-verify`). A **mirror** — cloudbox, usb — never yields evidence the
-gate accepts. A plain mirror's sync is rclone's `--checksum` compare, which
-runs under the first hash both backends support (MD5 on local and s3), never
-against the index's BLAKE3; it advances the vector with the `checksum` method
-so `status` can show how current the copy is, but the gate refuses it (#211;
-#156 had accepted it believing the compare was BLAKE3). A crypt mirror is
-weaker still: the overlay hides the content hash, so rclone falls back to
-size+mtime (friction log F21). Neither layout keeps a fingerprint a verify
-pass could upgrade. Naming a locally-configured mirror in `offload_requires`
-is therefore rejected at config load as an unsatisfiable policy —
-fail-early, not the wait-forever gate the walk hit with the laptop gating on
-the crypt-mirror cloudbox.
+Four shapes do: content-addressed and packed destinations (presence+size,
+upgraded to content-verified by the scan-back fingerprint), a mirror squirrel
+writes itself on a local disk — usb — which reads every copy back through
+BLAKE3 before committing it and advances as `fingerprint-verified`, peer nodes
+the offloading machine itself pushes to (`peer-blake3`), and kopia
+repositories (`kopia-verify`). Every other **mirror** never yields evidence
+the gate accepts. The crypt mirror cloudbox is written by rclone: the overlay
+hides the content hash, so rclone compares by size+mtime (friction log F21),
+and a plain rclone mirror's `--checksum` compare runs under the first hash
+both backends support, never against the index's BLAKE3 (#211). A native sftp
+mirror reads nothing back, and squirrel never puts its paths — the volume's
+own file names — on a server command line. None of those keeps a fingerprint a
+verify pass could upgrade. Naming one in `offload_requires` is therefore
+rejected at config load as an unsatisfiable policy — fail-early, not the
+wait-forever gate the walk hit with the laptop gating on the crypt-mirror
+cloudbox.
 
 A receive-only node (htpc) cannot credit its *upstream* peer, so its gate
 rests on the offsites the hub pushes to, reached via the durability pull.
@@ -112,6 +117,16 @@ depend on squirrel being correct — a disjoint implementation walking
 the same disk, with its own end-to-end verification (`snapshot
 verify`) on every sync, recorded in squirrel's runs table like any
 other destination.
+
+For usb the shared walker is literal: a native mirror plans from the
+index, as the content layouts always did, so a file the indexer misses
+never reaches it. An rclone mirror walked the source itself, which let a missed file
+still reach it; of the household's copies only cloudbox keeps that until
+crypt moves to the native transport, and then none does. What an
+independent walk covered is kopia-mirror's job alone, and it covers only
+photos and docs. A periodic check comparing a plain directory walk with
+the index is the candidate that would give every layout some of that
+back (native-mirror.md, decision 7).
 
 Because its purpose is *implementation* redundancy, not geo redundancy
 (cloudbox and s3archive cover that twice), living on the nas's second

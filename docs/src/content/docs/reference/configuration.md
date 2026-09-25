@@ -25,7 +25,7 @@ table resolved at load time.
 | `sync_to` | no | List of destination names to push to. |
 | `sync_every` | no | Duration; the [agent](/squirrel/guides/agent/) syncs this volume to every target in `sync_to` on this cadence. Absent = no scheduled sync. |
 | `index_every` | no | Duration; cadence for *standalone* index passes between syncs (a sync indexes first anyway). Absent = no extra indexing. |
-| `offload_requires` | no | List of targets whose durability must cover a file before its local bytes may be [offloaded](/squirrel/guides/offloading/). A volume without this key refuses to offload. Naming a mirror destination is a config error: a mirror can never produce evidence the gate accepts. |
+| `offload_requires` | no | List of targets whose durability must cover a file before its local bytes may be [offloaded](/squirrel/guides/offloading/). A volume without this key refuses to offload. Naming a mirror destination is a config error, except a native mirror on a `local` disk: every other mirror can never produce evidence the gate accepts. |
 | `offload_max_evidence_age` | no | Duration; a target whose durability evidence was last re-verified longer ago than this refuses the offload. Default disabled. |
 
 ### `[volumes.<name>.hook]`
@@ -46,7 +46,8 @@ See [Hooks](/squirrel/guides/hooks/).
 |---|---|---|
 | `type` | all | `local`, `sftp`, `s3`, `b2`, `gcs`, or `kopia`. |
 | `root` | all | Base path (or bucket sub-path) at the destination. |
-| `layout` | rclone remotes | `mirror` (default), `content-addressed`, or `packed`. |
+| `layout` | every type but kopia | `mirror` (default), `content-addressed`, or `packed`. |
+| `concurrency` | every type but kopia | How many files a push writes at once (optional; a positive integer). On a destination squirrel writes itself the default is `4` on `local` and `8` on `sftp`, where every file in flight shares one SSH connection; lower it for a slow disk or USB bridge, or a server that answers one request at a time. On a destination rclone writes (crypt, `s3`, `b2`, `gcs`) it caps rclone's concurrent transfers (`--transfers`), whose default applies otherwise. |
 
 ### `local`
 
@@ -59,13 +60,30 @@ See [Hooks](/squirrel/guides/hooks/).
 | Key | Meaning |
 |---|---|
 | `host` | Server hostname. |
-| `port` | SSH port (optional; rclone's default when omitted). |
+| `port` | SSH port (optional; `22` when omitted). |
 | `user` | SSH user. |
 | `password` | Secret (literal or `{ env }`). |
-| `key_file` | Path to a private key file, as an alternative to `password` (optional). |
+| `key_file` | Path to a private key file, as an alternative to `password` (optional; a leading `~/` is expanded). A passphrase-protected key goes through ssh-agent instead. |
 | `root` | Base path on the server. |
-| `known_hosts_file` | Path to a known_hosts file; **validates the server host key** (recommended). Without it, rclone connects to whatever host answers. |
+| `known_hosts_file` | Path to a known_hosts file holding the server's host key (a leading `~/` is expanded). |
 | `host_key_algorithms` | Space-separated list pinning accepted host-key algorithms (optional). |
+
+With neither `password` nor `key_file` set, squirrel logs in with the keys of the
+running ssh-agent (`SSH_AUTH_SOCK`).
+
+An sftp destination without [crypt](/squirrel/layouts/encrypted/), in any
+layout, is written by squirrel itself: it connects to the server, and **always
+checks its host key**, against `known_hosts_file` or `~/.ssh/known_hosts` when
+that is unset. A server whose key the file does not hold is refused; the message
+gives the key's fingerprint and the known_hosts line that trusts it, to add once
+you have confirmed it. A key that differs from the pinned one is refused too.
+Unless `host_key_algorithms` is set, squirrel asks the server for the key types
+the file holds for it. `checkers` tunes rclone, so these destinations reject it,
+and a mirror rejects `hash_algo`, since it runs no command on the server.
+
+An encrypted sftp destination is written by rclone, which checks the host key
+against `known_hosts_file` and accepts whatever key the server presents when it
+is unset.
 
 ### `s3`
 
@@ -134,13 +152,13 @@ For `layout = "content-addressed"` or `layout = "packed"` destinations. See
 
 | Key | Applies to | Default | Meaning |
 |---|---|---|---|
-| `hash_algo` | sftp | `sha256` | Which server-side hash the [scan-back fingerprint](/squirrel/guides/verification/) uses. |
-| `checkers` | rclone remotes | rclone default | Cap rclone's concurrent checkers (`--checkers`). |
+| `hash_algo` | sftp, except a mirror without crypt | `sha256` | Which server-side hash the [fingerprint](/squirrel/guides/verification/) uses. On a content-addressed or packed destination without crypt it names the command squirrel runs on the server — `md5` (`md5sum`), `sha1` (`sha1sum`), `sha256` (`sha256sum`) or `blake3` (`b3sum`) — and squirrel checks its answer against the bytes it sent. Behind crypt rclone runs it, and `crc32`, `xxh3` and `xxh128` are valid too; there the default applies to content-addressed only. A plain sftp mirror runs no command on the server, so the key is rejected there. |
+| `checkers` | rclone remotes | rclone default | Cap rclone's concurrent checkers (`--checkers`). Rejected on every `local` destination and every `sftp` one without crypt: squirrel writes those itself, without rclone. |
 | `force_path_style` | s3 | `false` | Path-style bucket addressing for squirrel's own ETag reader (not the rclone transport). |
 | `pack_threshold` | packed | — | Files smaller than this are packed; at/above land as objects (e.g. `1MiB`). |
 | `pack_size` | packed | — | Target size of one pack before it is closed (e.g. `512MiB`). |
 | `zstd_level` | packed | — | zstd compression level, `1` fastest … `4` best. |
-| `verify_every` | content-addressed / packed | off | Cadence for the agent to re-check this destination's recorded objects and packs against their upload fingerprints — the same pass as [`squirrel verify`](/squirrel/guides/verification/), recorded as an `audit` run. Falls back to `[agent] verify_every`. Read-only; the agent never writes to the destination. |
+| `verify_every` | content-addressed / packed, native mirror | off | Cadence for the agent to re-check what squirrel recorded storing on this destination — objects and packs against their upload fingerprints, a native mirror's copies by size, mtime and (on a local disk) BLAKE3 — the same pass as [`squirrel verify`](/squirrel/guides/verification/), recorded as an `audit` run. Falls back to `[agent] verify_every`. Read-only; the agent never writes to the destination. Rejected on a mirror rclone writes. |
 
 ## `[backups]`
 
@@ -178,7 +196,7 @@ optional. See [The agent](/squirrel/guides/agent/#listener-less-cadence-only-mac
 | `auth.peers.<name>.bearer` | no | Per-peer bearer token this agent accepts from node `<name>`. Must equal that node's `[nodes.<this node>].auth.bearer`; [`squirrel node pair`](/squirrel/guides/peer-sync/) emits both halves so they match by construction. |
 | `scan_interval` | no | Drift-scan cadence over every hosted volume. Off when absent. |
 | `scan_strategy` | no | `shallow` (default) or `deep` (re-hash everything — bit-rot detection). |
-| `verify_every` | no | Fleet-wide default verify cadence applied to every content-addressed/packed destination that declares no `verify_every` of its own. Off when absent. |
+| `verify_every` | no | Fleet-wide default verify cadence applied to every content-addressed, packed or native mirror destination that declares no `verify_every` of its own. Off when absent. |
 
 ## `[nodes.<name>]`
 

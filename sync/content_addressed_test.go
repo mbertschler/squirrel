@@ -228,19 +228,6 @@ password = "obscured-pw"
 	return f
 }
 
-// setupPlainContentAddressedFixture is setupContentAddressedFixture
-// without the crypt block.
-func setupPlainContentAddressedFixture(t *testing.T) *caFixture {
-	t.Helper()
-	return setupCAFixture(t, `[destinations.offsite]
-type   = "sftp"
-host   = "remote.invalid"
-user   = "u"
-root   = "/data"
-layout = "content-addressed"
-`, "/data")
-}
-
 // setupCAFixture is the destination-configurable body of
 // setupContentAddressedFixture. destBlock declares the `offsite`
 // destination; strip is the destination root the shim removes from
@@ -340,7 +327,7 @@ func (f *caFixture) seedMarker(t *testing.T, volumes ...string) {
 // push established.
 func (f *caFixture) seedNamingMarker(t *testing.T) {
 	t.Helper()
-	h := &contentPusher{store: f.store, rcl: f.rcl, dest: f.cfg.Destinations["offsite"]}
+	h := &rcloneArtifacts{store: f.store, rcl: f.rcl, dest: f.cfg.Destinations["offsite"]}
 	if err := h.writeNamingMarker(context.Background()); err != nil {
 		t.Fatalf("seed %s: %v", namingMarkerName, err)
 	}

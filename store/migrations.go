@@ -10,7 +10,7 @@ import (
 )
 
 // SchemaVersion is the schema version this binary writes and reads.
-const SchemaVersion = 31
+const SchemaVersion = 33
 
 // freshSchemaBaseline is the version applied to a brand-new database. The
 // chain in `migrations` continues from here. v1 is no longer reachable from
@@ -74,6 +74,8 @@ func buildMigrations(mctx migrationCtx) []migration {
 		{version: 29, up: migrateV28ToV29},
 		{version: 30, up: migrateV29ToV30},
 		{version: 31, up: migrateV30ToV31},
+		{version: 32, up: migrateV31ToV32},
+		{version: 33, up: migrateV32ToV33},
 	}
 }
 
@@ -2448,4 +2450,86 @@ func relabelBlake3ComponentsV31(ctx context.Context, tx *sql.Tx) error {
 		return fmt.Errorf("relabel blake3 components as checksum: %w", err)
 	}
 	return nil
+}
+
+// --- v31 → v32 ---
+
+// migrateV31ToV32 adds remote_paths, the native mirror's destination
+// record and its counterpart of remote_objects: one row per version
+// squirrel wrote at a mirror path, keyed on the files row it came from.
+// The state column records each move before it happens (committing →
+// live, live → displacing → displaced, anything → lost), so a push that
+// crashed mid-move is settled by the next one from where the bytes are.
+// A displaced version's location is derived:
+// .squirrel-history/run-<displaced_run_id>/<path>.
+//
+// At most one committing-or-live row per (destination, path), enforced by
+// a partial unique index; the unsettled index serves the reconcile at push
+// start, which reads only committing and displacing rows. STRICT per the
+// new-table convention; additive, so no existing table is rebuilt.
+func migrateV31ToV32(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`CREATE TABLE remote_paths (
+		id               INTEGER PRIMARY KEY,
+		destination      TEXT    NOT NULL,
+		folder_id        INTEGER NOT NULL,
+		name             TEXT    NOT NULL,
+		content_id       INTEGER NOT NULL,
+		written_run_id   INTEGER NOT NULL REFERENCES runs(id),
+		state            TEXT    NOT NULL
+		                 CHECK (state IN ('committing', 'live', 'displacing', 'displaced', 'lost')),
+		displaced_run_id INTEGER REFERENCES runs(id),
+		mtime_ns         INTEGER NOT NULL,
+		checksum_algo    TEXT,
+		checksum         TEXT,
+		verified_at_ns   INTEGER,
+		FOREIGN KEY (folder_id, name, content_id) REFERENCES files (folder_id, name, content_id),
+		CHECK (state NOT IN ('committing', 'live') OR displaced_run_id IS NULL),
+		CHECK (state NOT IN ('displacing', 'displaced') OR displaced_run_id IS NOT NULL),
+		CHECK ((checksum_algo IS NULL) = (checksum IS NULL))
+	) STRICT`,
+		`CREATE UNIQUE INDEX uniq_remote_paths_live ON remote_paths (destination, folder_id, name)
+		WHERE state IN ('committing', 'live')`,
+		`CREATE INDEX idx_remote_paths_unsettled ON remote_paths (destination)
+		WHERE state IN ('committing', 'displacing')`,
+		`INSERT INTO schema_version (version) VALUES (32)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migrate to schema v32: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// --- v32 → v33 ---
+
+// migrateV32ToV33 indexes remote_paths for the reads the mirror's evidence
+// adds: by content, for the offload gate's per-content fingerprint check
+// and the pending-fingerprint tally, and the lost rows of a destination,
+// which a push plans again as repairs. Additive.
+func migrateV32ToV33(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`CREATE INDEX idx_remote_paths_content ON remote_paths (content_id)`,
+		`CREATE INDEX idx_remote_paths_lost ON remote_paths (destination) WHERE state = 'lost'`,
+		`INSERT INTO schema_version (version) VALUES (33)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migrate to schema v33: %w", err)
+		}
+	}
+	return tx.Commit()
 }

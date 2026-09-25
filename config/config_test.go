@@ -323,24 +323,50 @@ offload_requires = ["cloudbox"]
 	}
 }
 
-// TestLoadRejectsPlainMirrorOffloadRequires: a plain mirror's sync is
-// compared by rclone's checksum under a hash rclone picks, never the
-// index's BLAKE3, so it can no more gate offload than a crypt mirror can
-// (#211). Naming one fails at load.
-func TestLoadRejectsPlainMirrorOffloadRequires(t *testing.T) {
+// TestLoadRejectsSFTPMirrorOffloadRequires: a native sftp mirror reads
+// nothing back and never hashes a mirror path on the server, so it can no
+// more gate offload than a crypt mirror can. Naming one fails at load, and
+// the reason says why.
+func TestLoadRejectsSFTPMirrorOffloadRequires(t *testing.T) {
+	p := writeConfig(t, `
+[destinations.box]
+type = "sftp"
+host = "host.example"
+user = "u"
+root = "/data"
+
+[volumes.docs]
+path = "/tmp/docs"
+sync_to = ["box"]
+offload_requires = ["box"]
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "can never satisfy the durability gate") || !strings.Contains(err.Error(), "reads nothing back") {
+		t.Fatalf("expected sftp-mirror offload_requires rejection naming the reason, got %v", err)
+	}
+}
+
+// TestLoadAcceptsLocalMirrorOffloadRequires: a native local mirror reads
+// every copy back through BLAKE3, so it may gate offload, with a verify
+// cadence re-reading its copies.
+func TestLoadAcceptsLocalMirrorOffloadRequires(t *testing.T) {
 	p := writeConfig(t, `
 [destinations.usb]
-type = "local"
-root = "/media/usb"
+type         = "local"
+root         = "/media/usb"
+verify_every = "168h"
 
 [volumes.docs]
 path = "/tmp/docs"
 sync_to = ["usb"]
 offload_requires = ["usb"]
 `)
-	_, err := Load(p)
-	if err == nil || !strings.Contains(err.Error(), "can never satisfy the durability gate") {
-		t.Fatalf("expected plain-mirror offload_requires rejection, got %v", err)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.VerifyCadencedTargets([]string{"usb"})["usb"] {
+		t.Fatal("the local mirror's verify cadence does not count for the gate")
 	}
 }
 
@@ -1596,14 +1622,20 @@ secret_access_key = { env = "K" }
 	}
 }
 
-// TestLoadRejectsVerifyEveryOnMirror rejects verify_every on a layout that
-// keeps no per-object fingerprints — verify has nothing to re-check there.
+// TestLoadRejectsVerifyEveryOnMirror rejects verify_every on an rclone
+// mirror, which keeps no records of what it stored — verify has nothing to
+// re-check there.
 func TestLoadRejectsVerifyEveryOnMirror(t *testing.T) {
 	p := writeConfig(t, `
-[destinations.usb]
-type         = "local"
-root         = "/media/usb"
+[destinations.cloudbox]
+type         = "sftp"
+host         = "host.example"
+user         = "u"
+root         = "/data"
 verify_every = "168h"
+
+[destinations.cloudbox.crypt]
+password = "obscured-pw"
 `)
 	_, err := Load(p)
 	if err == nil || !strings.Contains(err.Error(), "verify_every requires") {

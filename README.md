@@ -16,7 +16,7 @@ Squirrel works the same at any size: one machine backing up to one destination, 
 
 ## Under the hood
 
-Squirrel indexes a local file tree by BLAKE3 content hash and syncs it to one or more remote destinations (NAS, S3, B2, GCS, SFTP, …) via rclone. Peer syncs are BLAKE3-verified end-to-end; every other destination is checked by the strongest comparison it supports, and the index records which one ran. Destinations are append-only: an overwrite at the destination moves the prior bytes into `.squirrel-history/run-<id>/`, never deletes them.
+Squirrel indexes a local file tree by BLAKE3 content hash and syncs it to one or more destinations (a local disk, a NAS, SFTP, S3, B2, GCS, …): it writes local disks and plain SFTP servers itself, and reaches buckets and encrypted destinations through rclone. Peer syncs are BLAKE3-verified end-to-end; every other destination is checked by the strongest comparison it supports, and the index records which one ran. Destinations are append-only: an overwrite at the destination moves the prior bytes into `.squirrel-history/run-<id>/`, never deletes them.
 
 ## Principle
 
@@ -49,7 +49,7 @@ go install github.com/mbertschler/squirrel/cmd/squirrel@latest
 
 A source build reports its version as `0.0.0-dev` — the version is only stamped into the released binaries at build time.
 
-You will also need [rclone](https://rclone.org) ≥ 1.71 on `PATH` to sync or restore against a **bucket destination** (1.71 added the sftp `hashes` option that [`hash_algo`](#offsite-verification-squirrel-verify) sets). Syncing to a **peer node** does not use it — those bytes stream over the peer's own sync API — so a machine whose only targets are peers needs no rclone at all:
+You will also need [rclone](https://rclone.org) ≥ 1.71 on `PATH` to sync or restore against a **bucket destination** (`s3`, `b2`, `gcs`) or an **encrypted** one (1.71 added the sftp `hashes` option that [`hash_algo`](#offsite-verification-squirrel-verify) sets there). A `local` disk and a plain `sftp` server need no rclone — squirrel writes them itself — and neither does a **peer node**, whose bytes stream over the peer's own sync API, so a machine whose only targets are those needs no rclone at all:
 
 ```
 brew install rclone     # macOS
@@ -88,11 +88,11 @@ bucket            = "squirrel-backup"
 root              = "/squirrel"
 ```
 
-Supported destination types: `local`, `sftp`, `s3`, `b2`, `gcs` (rclone-backed), and `kopia` (see [kopia destinations](#kopia-destinations)). Secrets accept either a literal string or an inline `{ env = "VAR_NAME" }` table that is resolved at load time. Unknown fields, missing required fields, and unset env vars are rejected immediately — squirrel will not invoke rclone with a misconfigured destination.
+Supported destination types: `local`, `sftp`, `s3`, `b2`, `gcs`, and `kopia` (see [kopia destinations](#kopia-destinations)). squirrel writes `local` and `sftp` destinations itself, and rclone writes `s3`, `b2`, `gcs` and every encrypted destination. Secrets accept either a literal string or an inline `{ env = "VAR_NAME" }` table that is resolved at load time. Unknown fields, missing required fields, and unset env vars are rejected immediately — squirrel will not start a transfer to a misconfigured destination.
 
 Some optional params are specific to one backend type and rejected on the others (as an unknown field):
 
-- **`sftp` host-key validation** — `known_hosts_file` points rclone at a known_hosts file so it validates the server's host key before transferring; `host_key_algorithms` is rclone's space-separated list pinning the accepted host-key algorithms. Both map to the rclone sftp options of the same name. **Without `known_hosts_file`, rclone does not validate the server's host key** and will connect to whatever host answers — set it (recommended) so a redirected or impersonated server is rejected.
+- **`sftp` host-key validation** — `known_hosts_file` names a known_hosts file holding the server's host key; `host_key_algorithms` is a space-separated list pinning the accepted host-key algorithms. squirrel checks the key of every sftp destination it writes — every one without `crypt` — against `known_hosts_file`, or `~/.ssh/known_hosts` when unset, and refuses a server the file does not hold. On an encrypted sftp destination both map to the rclone sftp options of the same name, and **without `known_hosts_file`, rclone does not validate the server's host key** and will connect to whatever host answers — set it so a redirected or impersonated server is rejected.
 
   ```toml
   [destinations.nas]
@@ -114,7 +114,7 @@ Some optional params are specific to one backend type and rejected on the others
   storage_class = "<provider archive tier>"   # archive tiers cost less to store, more to read
   ```
 
-Squirrel writes its own `rclone.conf` next to the config (`~/.squirrel/rclone.conf`, mode 0600) on every sync invocation. You do not run `rclone config` and you should not edit `rclone.conf` by hand.
+For the destinations rclone writes, squirrel writes its own `rclone.conf` next to the config (`~/.squirrel/rclone.conf`, mode 0600) on every sync invocation. You do not run `rclone config` and you should not edit `rclone.conf` by hand.
 
 ### Encrypted destinations
 
@@ -158,7 +158,7 @@ Properties that differ from rclone destinations:
 
 ### Content-addressed destinations
 
-By default a destination mirrors the volume's tree (see [Destination layout](#destination-layout)). Any rclone-remote destination — with or without a `crypt` block — can instead opt into an **append-only, content-addressed** layout, built for cold archive storage where objects should never be rewritten or moved:
+By default a destination mirrors the volume's tree (see [Destination layout](#destination-layout)). Any destination but kopia — with or without a `crypt` block — can instead opt into an **append-only, content-addressed** layout, built for cold archive storage where objects should never be rewritten or moved. squirrel writes it itself on a `local` disk and on `sftp` without `crypt`: each object is staged, confirmed (read back through BLAKE3 locally, hashed by the server's `hash_algo` command on sftp) and only then renamed onto its name, never over a file already there. rclone writes the others:
 
 ```toml
 [destinations.archive]
@@ -182,7 +182,7 @@ Properties that differ from mirrored destinations:
 
 - **Verification is presence+size**, recorded as such: each object is re-hashed with BLAKE3 before upload and confirmed present at the expected size after it, but its stored bytes are not compared at transfer time (and `crypt` remotes expose no hashes at all), so the runs row is recorded shallow and the push never claims content verification. On top of that, each upload's provider-side ciphertext fingerprint is recorded in the index and re-checked by [`squirrel verify`](#offsite-verification-squirrel-verify).
 - **Pick the layout when the destination is first used.** Switching an existing mirrored destination to `content-addressed` (or back) is not supported — point the new layout at a fresh destination or root. The push detects a mirrored history (a recorded successful sync without its manifest segment) and refuses.
-- **`squirrel restore` restores the layout**: it resolves each present path to its content hash from the local index, fetches the per-hash object through the same rclone (`crypt`) read path the push uses, and re-hashes every fetched object before writing. When the *local index itself* is lost, the format is deliberately simple enough to recover without squirrel — see below.
+- **`squirrel restore` restores the layout**: it resolves each present path to its content hash from the local index, fetches the per-hash object through the same read path the push uses (squirrel's own on a `local` disk and plain `sftp`, rclone and its `crypt` overlay otherwise), and re-hashes every fetched object before writing. When the *local index itself* is lost, the format is deliberately simple enough to recover without squirrel — see below.
 - `--dry-run` is not supported yet on the push (it previews restore).
 
 #### Offsite verification (`squirrel verify`)
@@ -192,7 +192,8 @@ Cold archive storage is exactly the copy you can't cheaply re-download and re-ha
 What gets recorded depends on the backend type:
 
 - **`s3`** — the object **ETag**, recorded as `etag-md5` for a single-part upload's whole-object MD5, or `etag-md5-composite` for a multipart object's `<hex>-<parts>` value, stored verbatim either way. The ETag is read straight from the S3 API with a paginated `ListObjectsV2` over the `objects/` prefix, *not* through rclone: rclone funnels every hash read through `Object.Hash(MD5)`, which returns an empty string for a composite ETag, so a multipart (or client-encrypted, always-streamed) object would otherwise never expose a fingerprint at all. Listing is archive-tier-safe (no per-object `HEAD`, no restore), and the composite ETag is fixed at upload time and unaffected by later storage-class transitions or server-side encryption, so the recorded value stays stable for the life of the object. This read is the counterpart to the (deferred) write-side use of S3 additional checksums; capturing the ETag needs no upload-side change. For S3-compatible providers whose endpoint the client addresses wrongly, set `force_path_style = true` (see below).
-- **`sftp`** — the checksum computed server-side by the remote's hash command. Content-addressed sftp destinations default to **SHA-256** (`hash_algo = "sha256"`, rendered as rclone's sftp `hashes` option so the selection is explicit rather than rclone's md5/sha1 preference); set `hash_algo` if your server only offers another type.
+- **`local`** — the BLAKE3 of the stored bytes, read back by squirrel itself as each object lands and again on every verify pass; it must equal the object's name.
+- **`sftp`** — the checksum computed server-side by the remote's hash command. Content-addressed sftp destinations default to **SHA-256** (`hash_algo = "sha256"`); set `hash_algo` if your server only offers another type. Without `crypt` squirrel runs the command itself (`md5sum`, `sha1sum`, `sha256sum` or `b3sum`) and checks its answer against the bytes it sent; behind `crypt` rclone runs it, through its sftp `hashes` option.
 - **other backends** — whatever hash `rclone lsjson --hash` exposes, recorded under its rclone hash name (e.g. `sha1` on b2). A backend exposing no checksum leaves the fingerprint pending, with a warning in the sync output.
 
 Re-verify a destination (or all content-addressed destinations) at any time:
@@ -384,7 +385,7 @@ squirrel sync pictures --to nas     # just one
 squirrel sync                       # every (volume, destination) pair in config
 ```
 
-Sync compares every file with its copy on a mirror destination by checksum (rclone's `--checksum`), under the first hash both ends support — MD5 on local disks and S3, independent of the BLAKE3 in the index. A copy that fails the check after transfer is an error, so the runs row is not marked success. The run records the `checksum` method, which the offload gate does not accept: a mirror can never be named in `offload_requires`. Use `--shallow` to fall back to rclone's default size+mtime comparison if you want speed over integrity for a big initial push. Encrypted (`crypt`) destinations always use the size+mtime comparison (see [Encrypted destinations](#encrypted-destinations)).
+A mirror on a `local` disk is written by squirrel itself: it hashes every file with BLAKE3 as it streams out, reads each copy back through BLAKE3 before committing it, and records the run as `fingerprint-verified` once every file has such a copy, so it can be named in `offload_requires`; `--shallow` is refused there, since there is no comparison to skip. A native sftp mirror (no crypt) is written the same way, without the read-back. Sync compares every file with its copy on a mirror rclone writes (encrypted, or on s3, b2 or gcs) by checksum (rclone's `--checksum`), under the first hash both ends support — MD5 on S3, independent of the BLAKE3 in the index. A copy that fails the check after transfer is an error, so the runs row is not marked success, and the run records the `checksum` method, which the offload gate refuses: such a mirror can never be named in `offload_requires`, and neither can a native sftp mirror, which reads nothing back. Use `--shallow` to fall back to rclone's default size+mtime comparison on an rclone mirror if you want speed over integrity for a big initial push. Encrypted (`crypt`) destinations always use the size+mtime comparison (see [Encrypted destinations](#encrypted-destinations)).
 
 ### First use and the `.squirrel-volume` marker
 
@@ -470,13 +471,15 @@ Each mirrored destination (`layout = "mirror"`, the default) is a tree shaped li
   pictures/
     2024/cat.jpg
     .squirrel-history/run-7/2024/cat.jpg     # prior content of cat.jpg
+    .squirrel-index/run-12                   # receipt for run 12 (local disks)
     .squirrel-index/index-20260604T120000.000Z-run-12.db   # global index snapshot (ride-along)
+    .squirrel-staging/                       # in-flight writes (local disks)
   docs/
     invoice.pdf
     .squirrel-history/run-9/invoice.pdf
 ```
 
-`.squirrel-history/run-<run-id>/` is rclone's `--backup-dir` target for that sync run. It is filtered out of all subsequent comparisons so it does not grow rclone's listing time or get uploaded back. A directory literally called `.squirrel-history` in your source volume is also filtered (with a warning), to keep the reserved name out of the destination tree by accident.
+`.squirrel-history/run-<run-id>/` holds the prior bytes of every file that sync run replaced, moved there first and never deleted. On a local disk squirrel writes the mirror itself: each file is staged under `.squirrel-staging/`, whatever its path held moves into history, and the staged copy is renamed into place; each run leaves a receipt of its changes at `.squirrel-index/run-<id>`, and a local mirror starts on a fresh or emptied root. Remote mirrors are written by rclone, with history as its `--backup-dir`. History is filtered out of all subsequent comparisons so it does not grow listing time or get uploaded back. A directory literally called `.squirrel-history` in your source volume is also filtered (with a warning), to keep the reserved name out of the destination tree by accident.
 
 `.squirrel-index/` holds the index snapshots ridden along after each successful sync (see [Index snapshots](#index-snapshots)). Like `.squirrel-history`, it is filtered out of all sync and restore transfers and from peer-sync, so a snapshot is never mistaken for user content.
 

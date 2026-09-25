@@ -51,16 +51,14 @@ func TestKeyedNamesDiscloseNothing(t *testing.T) {
 // no key to derive from, so the append-only layouts name artifacts by
 // content hash and write no naming marker.
 func TestPlainDestinationKeepsContentHashNames(t *testing.T) {
-	f := setupPlainContentAddressedFixture(t)
+	f := setupNativeContentFixture(t, localContent, config.LayoutContentAddressed)
 	f.write(t, "a.txt", "alpha")
 	f.index(t)
-	if _, err := f.sync(t); err != nil {
-		t.Fatalf("sync: %v", err)
-	}
-	if _, err := os.Stat(f.remotePath(ObjectsDirName, blake3Hex("alpha"))); err != nil {
+	f.mustPush(t)
+	if _, err := os.Stat(f.objectPath("alpha")); err != nil {
 		t.Fatalf("object not at its content-hash name: %v", err)
 	}
-	if _, err := os.Stat(f.remotePath(namingMarkerName)); err == nil {
+	if _, err := os.Stat(filepath.Join(f.dst, namingMarkerName)); err == nil {
 		t.Fatalf("an unencrypted destination wrote a %s marker", namingMarkerName)
 	}
 }
@@ -369,7 +367,7 @@ func TestKeyedVolumeDirFoundByRecovery(t *testing.T) {
 	f := setupContentAddressedFixture(t)
 	f.write(t, "a.txt", "alpha")
 	f.index(t)
-	sn := NewSnapshotter(f.store, f.rcl, SnapshotConfig{Dir: t.TempDir(), Keep: 7, Cloud: true, CloudKeep: 7})
+	sn := NewSnapshotter(f.store, SnapshotConfig{Dir: t.TempDir(), Keep: 7, Cloud: true, CloudKeep: 7})
 	rep, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, f.pair, Options{Snapshot: sn})
 	if err != nil {
 		t.Fatalf("sync: %v", err)

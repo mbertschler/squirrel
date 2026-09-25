@@ -97,6 +97,13 @@ const (
 	// recovered, and the volume restores that follow would appear in the
 	// history with no explanation of where the catalog came from.
 	TransitionRecoverIndex = "recover-index"
+	// TransitionDisplaceUnrecorded records bytes a native mirror push found
+	// at a path it was about to write and moved into history although
+	// squirrel had not written them there: a foreign write, a tree another
+	// tool wrote, or a recorded version changed behind squirrel's back. The
+	// note carries the path and where the bytes now are, so the trail lists
+	// what squirrel preserved without vouching for it.
+	TransitionDisplaceUnrecorded = "displace-unrecorded"
 )
 
 // RunAudit is one row of the insert-only runs_audit log: a single

@@ -146,11 +146,12 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 	if err != nil {
 		return nil, err
 	}
-	hashAlgo, err := resolveHashAlgo(raw, typ, layout)
+	native := isNative(typ, crypt != nil)
+	hashAlgo, err := resolveHashAlgo(raw, typ, layout, native)
 	if err != nil {
 		return nil, err
 	}
-	checkers, err := resolveCheckers(raw, typ)
+	checkers, concurrency, err := resolveParallelism(raw, typ, native)
 	if err != nil {
 		return nil, err
 	}
@@ -162,7 +163,7 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 	if err != nil {
 		return nil, err
 	}
-	verifyEvery, err := resolveVerifyEvery(raw, layout)
+	verifyEvery, err := resolveVerifyEvery(raw, verifiable(layout, native && isMirrorLayout(layout)))
 	if err != nil {
 		return nil, err
 	}
@@ -172,7 +173,7 @@ func resolveDestination(name string, raw map[string]any) (*Destination, error) {
 	}
 	return &Destination{
 		Name: name, Type: typ, Root: root, Layout: layout, Params: params,
-		Crypt: crypt, HashAlgo: hashAlgo, Checkers: checkers, PathStyle: pathStyle,
+		Crypt: crypt, HashAlgo: hashAlgo, Checkers: checkers, Concurrency: concurrency, PathStyle: pathStyle,
 		PackThreshold: pack.threshold, PackSize: pack.size, ZstdLevel: pack.zstdLevel,
 		VerifyEvery: verifyEvery,
 	}, nil
@@ -232,13 +233,13 @@ func resolveCryptAndLayout(raw map[string]any, typ string) (*Crypt, string, erro
 
 // resolveVerifyEvery validates the optional per-destination `verify_every`
 // cadence that drives the agent's scheduled re-check of this destination's
-// recorded objects and packs (the same pass as `squirrel verify`). It is
-// meaningful only on the content-addressed and packed layouts that keep
-// per-artifact fingerprints, so a present key on any other layout is
-// rejected rather than silently ignored — a mirror destination has nothing
-// for verify to re-check. Empty stays zero: no per-destination cadence, an
-// [agent] verify_every default may still apply.
-func resolveVerifyEvery(raw map[string]any, layout string) (time.Duration, error) {
+// records (the same pass as `squirrel verify`). It is meaningful only where
+// squirrel records what it stored — the content-addressed and packed
+// layouts' objects and packs, a native mirror's copies — so a present key
+// on an rclone mirror is rejected rather than silently ignored. Empty stays
+// zero: no per-destination cadence, an [agent] verify_every default may
+// still apply.
+func resolveVerifyEvery(raw map[string]any, verifiable bool) (time.Duration, error) {
 	v, err := optionalString(raw, "verify_every")
 	if err != nil {
 		return 0, err
@@ -246,59 +247,103 @@ func resolveVerifyEvery(raw map[string]any, layout string) (time.Duration, error
 	if v == "" {
 		return 0, nil
 	}
-	if layout != LayoutContentAddressed && layout != LayoutPacked {
-		return 0, fmt.Errorf("verify_every requires the %q or %q layout; layout %q keeps no per-object fingerprints to re-check", LayoutContentAddressed, LayoutPacked, layout)
+	if !verifiable {
+		return 0, fmt.Errorf("verify_every requires the %q or %q layout, or a mirror squirrel writes itself (local, or sftp without crypt): an rclone mirror keeps no records of what it stored to re-check", LayoutContentAddressed, LayoutPacked)
 	}
 	return parseVolumeCadence("verify_every", v)
 }
 
 // sftpHashAlgos are the checksum types rclone's sftp backend can read
-// via a server-side sum command, the valid values for `hash_algo`.
+// via a server-side sum command, the valid values for `hash_algo` on an
+// sftp destination rclone writes.
 var sftpHashAlgos = map[string]bool{
 	"md5": true, "sha1": true, "sha256": true, "crc32": true,
 	"blake3": true, "xxh3": true, "xxh128": true,
 }
 
-// resolveHashAlgo validates the optional `hash_algo` key. sftp is the
-// one backend where rclone must be told which server-side hash command
-// to run; every other type exposes a fixed checksum, so the key is
-// rejected there. Content-addressed sftp destinations default to
-// "sha256" so scan-back fingerprints get a strong checksum without
-// relying on rclone's md5/sha1 preference.
-func resolveHashAlgo(raw map[string]any, typ, layout string) (string, error) {
+// nativeHashAlgos are the valid values for `hash_algo` on a content-
+// addressed or packed sftp destination squirrel writes itself: the hashes
+// whose server command (md5sum, sha1sum, sha256sum, b3sum) squirrel runs,
+// and which it computes itself to check the server's answer.
+var nativeHashAlgos = map[string]bool{"md5": true, "sha1": true, "sha256": true, "blake3": true}
+
+// resolveHashAlgo validates the optional `hash_algo` key: which hash
+// command the sftp server runs to fingerprint what squirrel stored. Every
+// other type exposes a fixed checksum, so the key is rejected there, and
+// so is it on a native sftp mirror, which runs no command on the server.
+// Content-addressed sftp destinations, and packed ones squirrel writes
+// itself, default to "sha256" so fingerprints get a strong checksum.
+func resolveHashAlgo(raw map[string]any, typ, layout string, native bool) (string, error) {
 	v, err := optionalString(raw, "hash_algo")
 	if err != nil {
 		return "", err
 	}
 	if v == "" {
-		if typ == "sftp" && layout == LayoutContentAddressed {
+		if typ == "sftp" && (layout == LayoutContentAddressed || (native && layout == LayoutPacked)) {
 			return "sha256", nil
 		}
 		return "", nil
 	}
-	if typ != "sftp" {
+	allowed := sftpHashAlgos
+	switch {
+	case typ != "sftp":
 		return "", fmt.Errorf(`hash_algo is only supported on type "sftp" destinations; type %q exposes a fixed checksum`, typ)
+	case native && isMirrorLayout(layout):
+		return "", errors.New("hash_algo names the hash command run on the sftp server, and a mirror without crypt runs none: squirrel writes it itself and hashes every file as it sends it")
+	case native:
+		allowed = nativeHashAlgos
 	}
-	if !sftpHashAlgos[v] {
-		return "", fmt.Errorf("unknown hash_algo %q (supported: %v)", v, sortedKeys(sftpHashAlgos))
+	if !allowed[v] {
+		return "", fmt.Errorf("unknown hash_algo %q (supported: %v)", v, sortedKeys(allowed))
 	}
 	return v, nil
 }
 
 // resolveCheckers validates the optional `checkers` key: a positive
-// integer cap on rclone's concurrent checkers for this destination.
-func resolveCheckers(raw map[string]any, typ string) (int, error) {
+// integer cap on rclone's concurrent checkers for this destination. A
+// native destination runs no rclone, so the key is rejected there.
+func resolveCheckers(raw map[string]any, typ string, native bool) (int, error) {
 	v, ok := raw["checkers"]
 	if !ok {
 		return 0, nil
 	}
-	switch typ {
-	case "local", "kopia":
+	switch {
+	case native:
+		return 0, fmt.Errorf("checkers caps rclone's checkers, and a type %q destination without crypt is written by squirrel itself, without rclone", typ)
+	case typ == "kopia":
 		return 0, fmt.Errorf("checkers requires an rclone-remote destination type, not %q", typ)
 	}
 	n, isInt := v.(int64)
 	if !isInt || n <= 0 {
 		return 0, errors.New("checkers must be a positive integer")
+	}
+	return int(n), nil
+}
+
+// resolveParallelism validates the keys that cap how much a push does at
+// once: `checkers` and `concurrency`.
+func resolveParallelism(raw map[string]any, typ string, native bool) (checkers, concurrency int, err error) {
+	if checkers, err = resolveCheckers(raw, typ, native); err != nil {
+		return 0, 0, err
+	}
+	concurrency, err = resolveConcurrency(raw, typ)
+	return checkers, concurrency, err
+}
+
+// resolveConcurrency validates the optional `concurrency` key: a positive
+// integer, how many files a push writes at once. Kopia drives its own
+// parallelism, so the key is rejected there.
+func resolveConcurrency(raw map[string]any, typ string) (int, error) {
+	v, ok := raw["concurrency"]
+	if !ok {
+		return 0, nil
+	}
+	if typ == "kopia" {
+		return 0, errors.New("concurrency sets how many files squirrel or rclone writes at once, and a kopia destination is written by kopia")
+	}
+	n, isInt := v.(int64)
+	if !isInt || n <= 0 {
+		return 0, errors.New("concurrency must be a positive integer")
 	}
 	return int(n), nil
 }
@@ -333,9 +378,8 @@ func sortedKeys(m map[string]bool) []string {
 
 // resolveLayout validates the optional `layout` key of a destination. An
 // absent key resolves to LayoutMirror. LayoutContentAddressed and
-// LayoutPacked drive squirrel's own rclone transfers, so both require an
-// rclone-remote type: type "local" is addressed by filesystem path, and
-// "kopia" repositories already use kopia's own content-addressed format.
+// LayoutPacked are squirrel's own formats, on any type but "kopia", whose
+// repositories already use kopia's own content-addressed format.
 func resolveLayout(raw map[string]any, typ string) (string, error) {
 	v, err := optionalString(raw, "layout")
 	if err != nil {
@@ -345,28 +389,13 @@ func resolveLayout(raw map[string]any, typ string) (string, error) {
 	case "", LayoutMirror:
 		return LayoutMirror, nil
 	case LayoutContentAddressed, LayoutPacked:
-		if err := requireRcloneRemote(v, typ); err != nil {
-			return "", err
+		if typ == "kopia" {
+			return "", fmt.Errorf(`layout %q does not apply to type "kopia": kopia repositories are content-addressed by kopia itself`, v)
 		}
 		return v, nil
 	default:
 		return "", fmt.Errorf("unknown layout %q (supported: %q, %q, %q)", v, LayoutMirror, LayoutContentAddressed, LayoutPacked)
 	}
-}
-
-// requireRcloneRemote rejects the two rclone-remote-only layouts on the
-// destination types that can't drive per-object squirrel transfers: type
-// "local" is a filesystem path, and "kopia" runs its own content-addressed
-// binary. Shared by the LayoutContentAddressed and LayoutPacked branches so
-// both give the same guardrail message.
-func requireRcloneRemote(layout, typ string) error {
-	switch typ {
-	case "local":
-		return fmt.Errorf(`layout %q requires an rclone-remote destination; type "local" is addressed by filesystem path`, layout)
-	case "kopia":
-		return fmt.Errorf(`layout %q requires an rclone-remote destination; type "kopia" repositories are content-addressed by kopia itself`, layout)
-	}
-	return nil
 }
 
 // Pack-layout knob defaults, applied when a LayoutPacked destination omits
@@ -602,7 +631,7 @@ func validateCryptRemoteNames(dests map[string]*Destination) error {
 // unknown-field check that consumes them.
 var universalDestKeys = []string{
 	"type", "root", "crypt", "layout",
-	"hash_algo", "checkers", "force_path_style",
+	"hash_algo", "checkers", "concurrency", "force_path_style",
 	"pack_threshold", "pack_size", "zstd_level",
 	"verify_every",
 }
@@ -825,6 +854,37 @@ func sortedSubset(in []string) []string {
 	return out
 }
 
+// Native reports whether squirrel writes this destination itself, through
+// its own transport, in any layout: a local disk, or an sftp server without
+// crypt. rclone writes every other destination but kopia.
+func (d *Destination) Native() bool {
+	return isNative(d.Type, d.Crypt != nil)
+}
+
+func isNative(typ string, crypt bool) bool {
+	return !crypt && (typ == "local" || typ == "sftp")
+}
+
+// NativeMirror reports whether this is a mirror squirrel writes itself.
+func (d *Destination) NativeMirror() bool {
+	return d.Native() && isMirrorLayout(d.Layout)
+}
+
+func isMirrorLayout(layout string) bool {
+	return layout != LayoutContentAddressed && layout != LayoutPacked
+}
+
+// Verifiable reports whether `squirrel verify` re-checks this destination:
+// squirrel records what it stored there, as the content-addressed and
+// packed layouts' objects and packs, or as a native mirror's copies.
+func (d *Destination) Verifiable() bool {
+	return verifiable(d.Layout, d.NativeMirror())
+}
+
+func verifiable(layout string, nativeMirror bool) bool {
+	return layout == LayoutContentAddressed || layout == LayoutPacked || nativeMirror
+}
+
 // HidesArtifactNames reports whether this destination names its content
 // objects, packs, and per-volume directories by a keyed BLAKE3 hash derived
 // from its crypt passwords, so the remote discloses neither a path nor a
@@ -842,35 +902,38 @@ func layoutHidesArtifactNames(layout string) bool {
 
 // CanEverGateOffload reports whether a durability push to this destination
 // can ever advance its vector with a component the offload gate will accept
-// — one that is content-verified, either natively or after a scan-back
-// fingerprint upgrades a presence+size component. When it returns false,
-// reason names the structural gap for the caller's message; it is empty
-// when capable.
+// — one that is content-verified, either natively or after a fingerprint
+// upgrades a presence+size component. When it returns false, reason names
+// the structural gap for the caller's message; it is empty when capable.
 //
-// The structurally-incapable shape is an rclone mirror, plain or crypt. Its
-// sync compares source against destination by rclone's --checksum — under
-// a hash rclone picks, unrelated to the index's BLAKE3 — or, behind a crypt
-// overlay, by size+mtime alone (sync.EffectiveShallow); and the mirror
-// layout records no scan-back fingerprint that a later `squirrel verify`
-// could upgrade (#211). The content-addressed and packed layouts, by
-// contrast, advance with presence+size but stay upgradable — their
-// fingerprint is read back over the stored ciphertext, so a crypt overlay
-// does not block it — and kopia's own repository verification is capable
-// outright.
+// The content-addressed and packed layouts advance with presence+size but
+// stay upgradable — their fingerprint is read back over the stored
+// ciphertext, so a crypt overlay does not block it — and kopia's own
+// repository verification is capable outright. So is a native local mirror:
+// every copy it writes is read back through BLAKE3 before it is committed,
+// and `squirrel verify` re-reads them. The incapable shapes are the other
+// mirrors. A native sftp mirror reads nothing back, and its paths — the
+// volume's own file names — never go on a server command line, so its
+// evidence stays presence+size. An rclone mirror compares source against
+// destination by rclone's --checksum — under a hash rclone picks, unrelated
+// to the index's BLAKE3 — or, behind a crypt overlay, by size+mtime alone
+// (sync.EffectiveShallow), and records nothing a later `squirrel verify`
+// could upgrade (#211).
 func (d *Destination) CanEverGateOffload() (bool, string) {
-	if d.Type == "kopia" {
+	switch {
+	case d.Type == "kopia", d.Layout == LayoutContentAddressed || d.Layout == LayoutPacked:
 		return true, ""
-	}
-	switch d.Layout {
-	case LayoutContentAddressed, LayoutPacked:
+	case d.NativeMirror() && d.Type == "local":
 		return true, ""
+	case d.NativeMirror():
+		return false, "sftp mirror destination: a push reads nothing back, and its paths are the volume's own file names, which squirrel never puts on a server command line, so no copy is fingerprinted and its evidence stays presence+size, which is not content-verified; a local mirror, or a content-addressed or packed sftp destination, can gate"
 	}
-	return false, "mirror destination: a sync compares it with the source by rclone's checksum or by size+mtime, never against the index's BLAKE3, and the mirror layout records no scan-back fingerprint to upgrade"
+	return false, "mirror destination: a sync compares it with the source by rclone's checksum or by size+mtime, never against the index's BLAKE3, and records nothing a later verify could upgrade"
 }
 
 // VerifyCadencedTargets marks the required targets that carry an effective
 // local verify cadence — a per-destination verify_every, or the [agent]
-// verify_every default applied to a content-addressed/packed destination.
+// verify_every default applied to a verifiable destination.
 // The offload gate accepts a locally-advanced fingerprint-verified
 // component as content-verified only for a target in this set, so the
 // provider-fingerprint evidence keeps being re-confirmed for as long as
@@ -890,10 +953,7 @@ func (c *Config) VerifyCadencedTargets(require []string) map[string]bool {
 	out := make(map[string]bool, len(require))
 	for _, name := range require {
 		d, ok := c.Destinations[name]
-		if !ok {
-			continue
-		}
-		if d.Layout != LayoutContentAddressed && d.Layout != LayoutPacked {
+		if !ok || !d.Verifiable() {
 			continue
 		}
 		eff := d.VerifyEvery

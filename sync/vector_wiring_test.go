@@ -2,8 +2,6 @@ package sync
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/mbertschler/squirrel/store"
@@ -26,55 +24,6 @@ func volumeComponents(t *testing.T, s *store.Store, volName, dest string) []stor
 		}
 	}
 	return out
-}
-
-// TestRunPairAdvancesVectorOnVerifiedPush: a checksum-verified successful
-// mirror push advances the destination's durability vector for the
-// volume's origins.
-func TestRunPairAdvancesVectorOnVerifiedPush(t *testing.T) {
-	f := setupFixture(t)
-	if err := os.WriteFile(filepath.Join(f.vol.Path, "a.txt"), []byte("alpha"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	f.runIndex(t)
-
-	p := Pair{Volume: f.vol, Destination: f.dest}
-	rep, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, p, Options{})
-	if err != nil {
-		t.Fatalf("RunPair: %v (rep=%+v)", err, rep)
-	}
-	if !rep.Verification.Verified() {
-		t.Fatalf("Verification = %+v, want verified", rep.Verification)
-	}
-	comps := volumeComponents(t, f.store, f.vol.Name, f.dest.Name)
-	if len(comps) != 1 {
-		t.Fatalf("components = %+v, want exactly one self component", comps)
-	}
-	if comps[0].OriginRunID < 1 {
-		t.Fatalf("origin_run_id = %d, want >= 1", comps[0].OriginRunID)
-	}
-}
-
-// TestRunPairShallowPushLeavesVectorAlone: a shallow push is not
-// content-verified, so the vector keeps its prior state.
-func TestRunPairShallowPushLeavesVectorAlone(t *testing.T) {
-	f := setupFixture(t)
-	if err := os.WriteFile(filepath.Join(f.vol.Path, "a.txt"), []byte("alpha"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	f.runIndex(t)
-
-	p := Pair{Volume: f.vol, Destination: f.dest}
-	rep, err := RunPair(context.Background(), f.store, Tools{Rclone: f.rcl}, p, Options{Shallow: true})
-	if err != nil {
-		t.Fatalf("RunPair: %v (rep=%+v)", err, rep)
-	}
-	if rep.Verification.Verified() {
-		t.Fatalf("Verification = %+v, want unverified for shallow", rep.Verification)
-	}
-	if comps := volumeComponents(t, f.store, f.vol.Name, f.dest.Name); len(comps) != 0 {
-		t.Fatalf("components = %+v, want none after shallow push", comps)
-	}
 }
 
 // TestKopiaPushAdvancesVector: a kopia push whose snapshot verify

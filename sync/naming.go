@@ -123,7 +123,7 @@ const (
 // always on a root proven to be keyed under this destination's key. A
 // fresh root without init is left untouched for the volume-marker gate to
 // refuse.
-func (h *contentPusher) ensureNamingScheme(ctx context.Context, init bool) error {
+func (h *rcloneArtifacts) ensureNamingScheme(ctx context.Context, init bool) error {
 	stamp, err := h.checkNamingScheme(ctx)
 	if err != nil {
 		return err
@@ -137,12 +137,12 @@ func (h *contentPusher) ensureNamingScheme(ctx context.Context, init bool) error
 // checkNamingScheme refuses a push to a root whose artifacts are named under
 // any other scheme, and reports what the root still needs stamped.
 // Read-only, so a dry run asks it too.
-func (h *contentPusher) checkNamingScheme(ctx context.Context) (namingStamp, error) {
+func (h *rcloneArtifacts) checkNamingScheme(ctx context.Context) (namingStamp, error) {
 	if !h.dest.HidesArtifactNames() {
 		return stampNone, nil
 	}
 	uri := remoteSubpathURI(h.dest, namingMarkerName)
-	present, err := h.rcl.statRemoteExists(ctx, uri, checkersArgs(h.dest)...)
+	present, err := h.rcl.statRemoteExists(ctx, uri, concurrencyArgs(h.dest)...)
 	if err != nil {
 		return stampNone, fmt.Errorf("destination %q: stat %s at %s: %w", h.dest.Name, namingMarkerName, uri, err)
 	}
@@ -158,9 +158,9 @@ func (h *contentPusher) checkNamingScheme(ctx context.Context) (namingStamp, err
 // keyed directory was named some other way — or under other crypt
 // passwords — and adding keyed names beside it would leave it disclosing
 // what it always did.
-func (h *contentPusher) classifyUnmarkedRoot(ctx context.Context) (namingStamp, error) {
+func (h *rcloneArtifacts) classifyUnmarkedRoot(ctx context.Context) (namingStamp, error) {
 	rootURI := underlyingDirURI(h.dest, "")
-	empty, err := h.rcl.remoteRootEmpty(ctx, rootURI, nil, checkersArgs(h.dest)...)
+	empty, err := h.rcl.remoteRootEmpty(ctx, rootURI, nil, concurrencyArgs(h.dest)...)
 	if err != nil {
 		return stampNone, fmt.Errorf("destination %q: list %s: %w", h.dest.Name, rootURI, err)
 	}
@@ -178,9 +178,9 @@ func (h *contentPusher) classifyUnmarkedRoot(ctx context.Context) (namingStamp, 
 		h.dest.Name, rootURI, namingMarkerName, h.vol.Name, h.dest.Name, ErrRefused)
 }
 
-func (h *contentPusher) holdsKeyedVolumeMarker(ctx context.Context) (bool, error) {
+func (h *rcloneArtifacts) holdsKeyedVolumeMarker(ctx context.Context) (bool, error) {
 	uri := remoteSubpathURI(h.dest, path.Join(h.names().volumeDir(h.vol.Name), volmark.MarkerName))
-	present, err := h.rcl.statRemoteExists(ctx, uri, checkersArgs(h.dest)...)
+	present, err := h.rcl.statRemoteExists(ctx, uri, concurrencyArgs(h.dest)...)
 	if err != nil {
 		return false, fmt.Errorf("destination %q: stat %s at %s: %w", h.dest.Name, volmark.MarkerName, uri, err)
 	}
@@ -190,7 +190,7 @@ func (h *contentPusher) holdsKeyedVolumeMarker(ctx context.Context) (bool, error
 // validateNamingScheme refuses the marker at uri when it will not parse or
 // records a scheme this binary does not write.
 func validateNamingScheme(ctx context.Context, rcl *Rclone, dest *config.Destination, uri string) error {
-	data, err := rcl.catRemote(ctx, uri, checkersArgs(dest)...)
+	data, err := rcl.catRemote(ctx, uri, concurrencyArgs(dest)...)
 	if err != nil {
 		return fmt.Errorf("destination %q: read %s at %s — a root written under other crypt passwords cannot be read with these: %w", dest.Name, namingMarkerName, uri, err)
 	}
@@ -206,7 +206,7 @@ func validateNamingScheme(ctx context.Context, rcl *Rclone, dest *config.Destina
 }
 
 // writeNamingMarker stamps the scheme on a fresh destination root.
-func (h *contentPusher) writeNamingMarker(ctx context.Context) error {
+func (h *rcloneArtifacts) writeNamingMarker(ctx context.Context) error {
 	body, err := json.Marshal(namingMarker{
 		Naming:    namingSchemeKeyed,
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
@@ -214,5 +214,5 @@ func (h *contentPusher) writeNamingMarker(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("encode %s: %w", namingMarkerName, err)
 	}
-	return h.uploadBytes(ctx, body, remoteSubpathURI(h.dest, namingMarkerName), namingMarkerName)
+	return putBytes(ctx, h, 0, namingMarkerName, body, namingMarkerName)
 }

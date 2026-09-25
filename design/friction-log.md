@@ -296,6 +296,14 @@ advance the vector, now as `checksum`, but the gate refuses that method and
 config load rejects every mirror in `offload_requires`, plain or crypt. The
 fail-fast half stands and now covers both.
 
+*Revised again in the native mirror PR (#217).* A mirror squirrel writes on a
+`local` disk reads every copy back through BLAKE3 before committing it, records
+that as the copy's fingerprint, and advances the vector as
+`fingerprint-verified`; `squirrel verify` re-checks its copies. Such a mirror
+may be named in `offload_requires` again. Every other mirror is still rejected
+at load: an rclone mirror (crypt, or on s3, b2, gcs) compares by checksum or
+size+mtime, and a native sftp mirror reads nothing back.
+
 ## Checkpoints 4–5 — trip return + offload day
 
 **F22 · S2 — ~~gate refusals are per-file walls of jargon that can't
@@ -559,6 +567,60 @@ A machine that never receives (laptop) runs the HTTP listener and
 must configure `[agent] listen` + auth token anyway, because the
 scheduler lives inside the agent. A listener that exists to be unused
 is config noise and attack surface.
+
+## Native mirror walk (2026-09-24, #217)
+
+A second, shorter walk: the native mirror's lifecycle on `homepc`'s seat —
+bootstrap, steady state, changes, verify, an unplugged disk, restore with
+and without the index, recover, the offload gate — against an exFAT disk
+image on macOS and a plain sftp destination on `rclone serve sftp`, plus a
+benchmark against `main`'s rclone mirrors
+([native-mirror.md](native-mirror.md), section 8). The bootstrap refusals,
+the host-key refusal (it prints the known_hosts line to add), repairs of a
+copy verify found gone, and a rename that changed only case all behaved.
+
+**F36 · S1 — ~~a fresh index took over a tree it never wrote.~~ (fixed in
+#217)** With no sync of the volume in the index, a push to a native mirror
+started from nothing over whatever the volume's directory held: pointed at
+a tree rclone wrote, it moved all 4690 files into history and wrote them
+again, doubling what the disk holds, where the design refuses existing
+trees. A volume's first push now refuses a directory that holds files
+squirrel has no record of writing, and points at `squirrel recover --from`
+for a native mirror whose index is gone.
+
+**F37 · S2 — ~~macOS's `._` files read as foreign.~~ (fixed in #217)** On
+exFAT, macOS keeps every file's extended attributes in a `._<name>`
+companion. Every push warned about the last run's `._run-<id>` in staging,
+and an index-less restore brought back 619 `._` files as unchecked,
+including those of `.squirrel-history` and the marker. A `._X` beside `X`
+is now `X`'s.
+
+**F38 · S2 — ~~an unplugged disk was told to re-run with `--init`.~~ (fixed
+in #217)** The refusal for a missing root or marker led with `--init` even
+for a disk the volume had synced to, where `--init` would bootstrap an empty
+destination on the bare mountpoint. It now says the disk is most likely not
+mounted; `squirrel verify` on a missing root says the same instead of a raw
+open error.
+
+**F39 · S4 — ~~the unsatisfiable-gate refusal forgot the local mirror.~~
+(fixed in #217)** Rejecting an sftp mirror in `offload_requires` listed every
+target that can gate but the local mirror, which the same message's reason
+names.
+
+**F40 · S1 — ~~native pushes that write are several times slower than
+rclone.~~ (fixed in #217)** A first push took 116 s against rclone's 13 s on
+the exFAT image, and 432 s against 45 s over sftp at a 20 ms round trip;
+unchanged pushes are faster. The cost was three full flushes per file on a
+local disk and 27 sequential requests per path over sftp. Decision 8 in
+native-mirror.md flushes once per batch and writes several paths at once
+(`concurrency`), and a scan that made a first push quadratic in its file
+count is gone. Rerun, a first push to the exFAT image takes 15–29 s against
+rclone's 19–25 s, and 50 s against 47 s at a 20 ms round trip.
+
+Observed, by design: a copy corrupted in place on the local mirror, size and
+mtime kept, passed two verify passes because each re-reads only a tenth of
+the bytes; the restore's BLAKE3 refused it. Until its turn in the rotation,
+the offload gate would count it.
 
 ## Summary and priority
 

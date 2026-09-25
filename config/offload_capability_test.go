@@ -6,9 +6,10 @@ import (
 )
 
 // TestCanEverGateOffload pins the structural capability predicate the
-// offload fail-fast reads: the incapable shape is an rclone mirror, plain or
-// crypt (checksum or size+mtime, no fingerprint to upgrade it); every other
-// shape can eventually contribute a content-verified component.
+// offload fail-fast reads: the incapable shapes are an rclone mirror (a
+// crypt one: checksum or size+mtime, no fingerprint to upgrade it) and a
+// native sftp mirror (nothing read back); every other shape, a native local
+// mirror included, can eventually contribute a content-verified component.
 func TestCanEverGateOffload(t *testing.T) {
 	crypt := &Crypt{Password: "obscured"}
 	cases := []struct {
@@ -16,13 +17,15 @@ func TestCanEverGateOffload(t *testing.T) {
 		dest        Destination
 		wantCapable bool
 	}{
-		{"mirror plain", Destination{Type: "sftp", Layout: LayoutMirror}, false},
+		{"sftp mirror", Destination{Type: "sftp", Layout: LayoutMirror}, false},
 		{"mirror crypt", Destination{Type: "sftp", Layout: LayoutMirror, Crypt: crypt}, false},
+		{"local mirror crypt", Destination{Type: "local", Layout: LayoutMirror, Crypt: crypt}, false},
+		{"b2 mirror", Destination{Type: "b2", Layout: LayoutMirror}, false},
 		{"content-addressed plain", Destination{Type: "sftp", Layout: LayoutContentAddressed}, true},
 		{"content-addressed crypt", Destination{Type: "s3", Layout: LayoutContentAddressed, Crypt: crypt}, true},
 		{"packed plain", Destination{Type: "s3", Layout: LayoutPacked}, true},
 		{"packed crypt", Destination{Type: "s3", Layout: LayoutPacked, Crypt: crypt}, true},
-		{"local mirror", Destination{Type: "local", Layout: LayoutMirror}, false},
+		{"local mirror", Destination{Type: "local", Layout: LayoutMirror}, true},
 		{"kopia mirror", Destination{Type: "kopia", Layout: LayoutMirror}, true},
 	}
 	for _, c := range cases {

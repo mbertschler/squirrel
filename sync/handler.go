@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"path/filepath"
 
 	"github.com/mbertschler/squirrel/config"
@@ -125,21 +126,67 @@ func HandlerFor(s *store.Store, tools Tools, p Pair) (Handler, error) {
 		}
 		return &kopiaHandler{store: s, kopia: tools.Kopia, vol: p.Volume, dest: p.Destination}, nil
 	case p.Destination.Layout == config.LayoutPacked:
-		if tools.Rclone == nil {
-			return nil, fmt.Errorf("destination %q: rclone wrapper is required", p.Destination.Name)
+		pusher, err := contentPusherFor(s, tools, p)
+		if err != nil {
+			return nil, err
 		}
-		return &packedHandler{contentPusher{store: s, rcl: tools.Rclone, vol: p.Volume, dest: p.Destination}}, nil
+		return &packedHandler{pusher}, nil
 	case p.Destination.Layout == config.LayoutContentAddressed:
-		if tools.Rclone == nil {
-			return nil, fmt.Errorf("destination %q: rclone wrapper is required", p.Destination.Name)
+		pusher, err := contentPusherFor(s, tools, p)
+		if err != nil {
+			return nil, err
 		}
-		return &contentAddressedHandler{contentPusher{store: s, rcl: tools.Rclone, vol: p.Volume, dest: p.Destination}}, nil
+		return &contentAddressedHandler{pusher}, nil
+	case p.Destination.NativeMirror():
+		return &mirrorHandler{destinationRoot: newDestinationRoot(s, p.Destination, p.Volume.Name), vol: p.Volume}, nil
 	default:
 		if tools.Rclone == nil {
 			return nil, fmt.Errorf("destination %q: rclone wrapper is required", p.Destination.Name)
 		}
 		return &rcloneHandler{store: s, rcl: tools.Rclone, vol: p.Volume, dest: p.Destination}, nil
 	}
+}
+
+// contentPusherFor is a content layout's push: through squirrel's own
+// transport onto a native destination, through rclone onto any other.
+func contentPusherFor(s *store.Store, tools Tools, p Pair) (contentPusher, error) {
+	pusher := contentPusher{store: s, vol: p.Volume, dest: p.Destination}
+	switch {
+	case p.Destination.Native():
+		pusher.art = &transportArtifacts{destinationRoot: newDestinationRoot(s, p.Destination, p.Volume.Name)}
+	case tools.Rclone == nil:
+		return contentPusher{}, fmt.Errorf("destination %q: rclone wrapper is required", p.Destination.Name)
+	default:
+		pusher.art = &rcloneArtifacts{store: s, rcl: tools.Rclone, vol: p.Volume, dest: p.Destination}
+	}
+	return pusher, nil
+}
+
+// openDestinationTransport opens a native destination's root: a directory
+// on this machine, or on an sftp server.
+func openDestinationTransport(ctx context.Context, dest *config.Destination) (transport, error) {
+	if dest.Type == "sftp" {
+		return dialSFTP(ctx, dest)
+	}
+	return openLocalTransport(dest.Root)
+}
+
+// openReadOnly opens a native destination's root for reading alone: the name
+// guard, held by no run, refuses every move and removal, and every call is
+// bounded by progress.
+func openReadOnly(ctx context.Context, dest *config.Destination) (transport, error) {
+	raw, err := openDestinationTransport(ctx, dest)
+	if dest.Type == "local" && errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("destination %q has no root at %s — the disk may not be mounted, or the root is wrong: %w", dest.Name, dest.Root, err)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return stallTransport{
+		transport: guardedTransport{transport: raw},
+		timeout:   DefaultStallTimeout,
+		stalled:   stalledCounter(dest.Name),
+	}, nil
 }
 
 // rcloneHandler pushes to an rclone-backed bucket destination via Sync.

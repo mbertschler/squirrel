@@ -113,15 +113,15 @@ func (s *scheduler) refresh() {
 	s.pullEvery = resolvePullCadences(cur.Nodes)
 }
 
-// resolveVerifyCadences maps each verifiable (content-addressed or packed)
-// destination to its effective verify cadence: the destination's own
+// resolveVerifyCadences maps each verifiable destination (content-addressed,
+// packed, or a native mirror) to its effective verify cadence: the destination's own
 // verify_every when set, otherwise the [agent] verify_every default. Only
 // destinations with a positive resulting cadence are included, so a config
 // with neither knob set yields an empty map and no verify activity.
 func resolveVerifyCadences(dests map[string]*config.Destination, def time.Duration) map[string]time.Duration {
 	out := make(map[string]time.Duration)
 	for name, d := range dests {
-		if d.Layout != config.LayoutContentAddressed && d.Layout != config.LayoutPacked {
+		if !d.Verifiable() {
 			continue
 		}
 		eff := d.VerifyEvery
@@ -252,10 +252,12 @@ func (s *scheduler) tick(ctx context.Context) {
 	}
 	// The verify and durability-pull cadences key on destinations and peer
 	// nodes rather than volumes, so they run after the per-volume loop as
-	// their own phases. Both are read-only / metadata-only and take no
-	// volume lock: verify touches only the remote-object bookkeeping, and a
-	// durability pull only merges peer-supplied vectors — neither races the
-	// per-volume index/sync/audit work the loop above coordinates.
+	// their own phases. Both only read the destination and take no volume
+	// lock: verify updates only squirrel's records of what the destination
+	// holds, a mirror copy's only while its row is still where the pass
+	// read it, and a durability pull only merges peer-supplied vectors — so
+	// neither is confused by the per-volume index/sync/audit work the loop
+	// above coordinates.
 	s.evaluateVerify(ctx)
 	s.evaluateDurabilityPulls(ctx)
 }

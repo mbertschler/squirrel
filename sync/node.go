@@ -50,9 +50,9 @@ func SyncNode(ctx context.Context, s *store.Store, vol *config.Volume, node *con
 	// runNodeSession's deferred finishRun has committed the run's
 	// terminal state by now, so the snapshot reflects this run's own row.
 	// Peer-sync takes the local snapshot only — there is no ride-along to
-	// peer nodes (dest=nil), and the Snapshotter no-ops on non-terminal
+	// peer nodes (no shelf), and the Snapshotter no-ops on non-terminal
 	// states and dry-run.
-	opts.Snapshot.afterSync(ctx, &rep, vol, nil)
+	opts.Snapshot.afterSync(ctx, &rep, nil)
 	return rep, err
 }
 
@@ -662,7 +662,8 @@ func isReservedSyncPath(p string) bool {
 	return strings.HasPrefix(p, HistoryDirName+"/") ||
 		strings.HasPrefix(p, ConflictsDirName+"/") ||
 		strings.HasPrefix(p, RestoreHistoryDirName+"/") ||
-		strings.HasPrefix(p, IndexDirName+"/")
+		strings.HasPrefix(p, IndexDirName+"/") ||
+		strings.HasPrefix(p, StagingDirName+"/")
 }
 
 // isReservedFolderPath is the folder-path variant of
@@ -674,7 +675,7 @@ func isReservedSyncPath(p string) bool {
 // rejects, aborting the whole walk.
 func isReservedFolderPath(p string) bool {
 	return p == HistoryDirName || p == ConflictsDirName || p == RestoreHistoryDirName ||
-		p == IndexDirName || isReservedSyncPath(p)
+		p == IndexDirName || p == StagingDirName || isReservedSyncPath(p)
 }
 
 // phaseTransfer streams every content object the plan asked for to the

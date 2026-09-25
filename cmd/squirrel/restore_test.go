@@ -17,7 +17,7 @@ import (
 // remove the local copy, restore from the destination, and verify the
 // contents match.
 func TestCLIRestoreRoundTrip(t *testing.T) {
-	requireRcloneCLI(t)
+	withoutRclone(t)
 	f := writeSyncFixture(t)
 	writeTestFile(t, filepath.Join(f.volumeDir, "a.txt"), "alpha")
 	writeTestFile(t, filepath.Join(f.volumeDir, "b.txt"), "beta")
@@ -63,7 +63,7 @@ func TestCLIRestoreRoundTrip(t *testing.T) {
 // TestCLIRestoreToPathOverridesVolumePath confirms --to writes to the
 // override directory rather than the volume's declared path.
 func TestCLIRestoreToPathOverridesVolumePath(t *testing.T) {
-	requireRcloneCLI(t)
+	withoutRclone(t)
 	f := writeSyncFixture(t)
 	writeTestFile(t, filepath.Join(f.volumeDir, "a.txt"), "alpha")
 
@@ -92,7 +92,7 @@ func TestCLIRestoreToPathOverridesVolumePath(t *testing.T) {
 // TestCLIRestoreRecordsRunsRowWithKindRestore verifies that the restore
 // command produces a runs row distinguishable from sync runs.
 func TestCLIRestoreRecordsRunsRowWithKindRestore(t *testing.T) {
-	requireRcloneCLI(t)
+	withoutRclone(t)
 	f := writeSyncFixture(t)
 	writeTestFile(t, filepath.Join(f.volumeDir, "a.txt"), "alpha")
 	runCLI(t, "--config", f.configPath, "index", f.volumeName)
@@ -110,7 +110,7 @@ func TestCLIRestoreRecordsRunsRowWithKindRestore(t *testing.T) {
 // candidate is picked automatically. This is the common case and the
 // counterpart to TestCLIRestoreNeedsExplicitFromWhenAmbiguous.
 func TestCLIRestoreInfersDestinationWhenUnambiguous(t *testing.T) {
-	requireRcloneCLI(t)
+	withoutRclone(t)
 	f := writeSyncFixture(t)
 	writeTestFile(t, filepath.Join(f.volumeDir, "a.txt"), "alpha")
 
@@ -137,7 +137,7 @@ func TestCLIRestoreInfersDestinationWhenUnambiguous(t *testing.T) {
 // introduction), and syncs the tree. Restoring with --from peer-a
 // should land only the from-a path in the target tree.
 func TestCLIRestoreFromNodeFiltersByAttribution(t *testing.T) {
-	requireRcloneCLI(t)
+	withoutRclone(t)
 	f := writeSyncFixture(t)
 	writeTestFile(t, filepath.Join(f.volumeDir, "local.txt"), "local")
 

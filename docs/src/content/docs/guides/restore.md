@@ -1,9 +1,9 @@
 ---
 title: Restoring
-description: Pull a volume back from one of its rclone destinations, with content verification on the way down (BLAKE3 for archive layouts, a checksum comparison for mirrors).
+description: Pull a volume back from one of its destinations, with content verification on the way down (BLAKE3 for native mirrors and archive layouts, a checksum comparison for rclone mirrors).
 ---
 
-`squirrel restore` pulls a volume back from one of its rclone destinations.
+`squirrel restore` pulls a volume back from one of its destinations.
 
 ```sh
 squirrel restore pictures --from nas
@@ -18,22 +18,29 @@ It takes exactly one positional argument — the **volume name**.
 |---|---|---|
 | `--from <name>` | — | Destination name to pull from, **or** peer node name to filter by content origin (names are unique across both kinds). |
 | `--to <path>` | volume's declared path | Local target path. |
-| `--shallow` | off | Skip the checksum comparison on the way down (mirror destinations). |
-| `--dry-run` | off | Preview rclone actions without transferring. |
+| `--shallow` | off | Skip the checksum comparison on the way down from an rclone mirror. Every other destination's bytes are re-hashed regardless. |
+| `--dry-run` | off | Preview what the restore would fetch without transferring. |
 | `--in-place` | off | Permit restore against a non-empty live `vol.Path`; overwritten files are moved to `.squirrel-restore-history/run-<id>/`. |
 
 ## Verification on the way down
 
-By default, a mirror restore compares each file with its copy by checksum as it
-arrives, the same comparison [`sync`](/squirrel/guides/syncing/) uses on the way
-up. Pass `--shallow` to skip it. Content-addressed and packed restores re-hash
-everything they extract to BLAKE3 regardless (see below).
+A [native mirror](#native-mirrors) restore and a content-addressed or packed
+restore hash every byte to BLAKE3 as it arrives and refuse what does not match
+(see below). A restore from an rclone mirror compares each file with its copy by
+checksum as it arrives, the same comparison [`sync`](/squirrel/guides/syncing/)
+uses on the way up; pass `--shallow` to skip it.
 
-:::note[Encrypted destinations are always size+mtime]
-[Encrypted (`crypt`)](/squirrel/layouts/encrypted/) destinations cannot expose
+Every restored file lands through a temporary file beside its path, which is
+flushed and then renamed over it, so a restore that stops halfway never leaves a
+truncated file behind.
+
+:::note[Encrypted mirrors are always size+mtime]
+An [encrypted (`crypt`)](/squirrel/layouts/encrypted/) mirror cannot expose
 content hashes through rclone, so restore from one falls back to a size+mtime
 comparison — recorded as shallow — **even without** `--shallow`, exactly as sync
-does. Passing `--shallow` changes nothing for these destinations.
+does. Passing `--shallow` changes nothing there. An encrypted content-addressed
+or packed destination is different: its restore re-hashes every file to BLAKE3,
+with or without crypt.
 :::
 
 ## Restoring in place
@@ -43,6 +50,27 @@ clobbering current data. `--in-place` permits it — and any file it would
 overwrite is first moved to `.squirrel-restore-history/run-<id>/`, mirroring the
 append-only [`.squirrel-history`](/squirrel/layouts/mirror/) behavior on the sync
 side. Nothing is destroyed.
+
+## Native mirrors
+
+A [native mirror](/squirrel/layouts/mirror/#how-a-mirror-is-written) — `local`,
+or `sftp` without crypt — is read through squirrel's own transport; no rclone is
+involved.
+
+- **With an index** that holds present files for the volume, each present path
+  is fetched by its path and its bytes are checked against the index's BLAKE3
+  as they stream; a file whose bytes differ is refused, not written. A path that
+  already holds its indexed bytes is left alone and counted as already correct.
+- **Without one** — a fresh machine, before or instead of
+  [`squirrel recover`](/squirrel/guides/recovery/) — restore walks the mirrored
+  tree, leaving out `.squirrel-history/`, `.squirrel-index/`,
+  `.squirrel-staging/` and the marker. The mirror's
+  [receipts](/squirrel/layouts/mirror/#how-a-mirror-is-written) name the content
+  each path last held, so every file a receipt names is checked against it and
+  refused if it differs. A file no receipt names (one squirrel did not write) is
+  restored unchecked, and the run's warnings count them. The `._` files macOS
+  keeps beside each file on an exFAT or FAT disk hold that file's extended
+  attributes; restore leaves them out and counts them in one warning.
 
 ## Content-addressed and packed destinations
 
@@ -55,9 +83,11 @@ copy, so restore works from the **local index** instead:
 2. The bytes are located per content: a per-hash object under `objects/`, or a
    member of a `tar.zst` pack under `packs/` (`pack_members` carries its
    offset and length).
-3. Objects and packs are fetched through the same rclone (`crypt`) read path the
-   push uses. **Packs are fetched once** — one download serves every requested
-   member of that pack, never one fetch per file.
+3. Objects and packs are fetched through the same read path the push uses:
+   squirrel's own transport on a `local` disk and on `sftp` without crypt, with
+   no rclone involved, and rclone (and its `crypt` overlay) elsewhere. **Packs
+   are fetched once** — one download serves every requested member of that
+   pack, never one fetch per file.
 4. Every fetched object and extracted pack member is **re-hashed to BLAKE3 and
    compared** before it is written, so a misplaced or corrupted byte is refused
    rather than restored. (Because of this, `--shallow` does not weaken an
@@ -90,7 +120,7 @@ restore goes through the kopia CLI (`kopia snapshot restore`) instead.
 ## Restoring the index too
 
 For a full disaster-recovery scenario, remember that squirrel rides an
-[index snapshot](/squirrel/configuration/index-snapshots/) along to destination
-buckets under `.squirrel-index/`. A restore-from-cloud yields the data *and* the
-index that explains it — use [`squirrel db restore`](/squirrel/reference/cli/#squirrel-db)
+[index snapshot](/squirrel/configuration/index-snapshots/) along to its
+destinations under `.squirrel-index/`. A restore from a destination yields the
+data *and* the index that explains it — use [`squirrel db restore`](/squirrel/reference/cli/#squirrel-db)
 to swap that snapshot in as the live index.

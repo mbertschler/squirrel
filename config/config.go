@@ -186,6 +186,10 @@ type Destination struct {
 	// invocations against this destination, for providers that cap
 	// simultaneous connections. Zero leaves rclone's default in force.
 	Checkers int
+	// Concurrency is how many files a push writes at once: squirrel's own
+	// paths in flight on a local or plain sftp destination, rclone's
+	// --transfers on one rclone writes. Zero leaves the default in force.
+	Concurrency int
 	// PathStyle forces path-style bucket addressing (bucket in the URL
 	// path, not the host) for the direct S3 client that reads scan-back
 	// ETags. Settable on s3 destinations only, for S3-compatible providers
@@ -531,7 +535,7 @@ func rejectUnsatisfiableOffloadRequires(names []string, dests map[string]*Destin
 			continue
 		}
 		if capable, reason := d.CanEverGateOffload(); !capable {
-			return fmt.Errorf("offload_requires names %q, which can never satisfy the durability gate (%s); require a content-addressed or packed destination, a kopia repository, or a peer node instead", n, reason)
+			return fmt.Errorf("offload_requires names %q, which can never satisfy the durability gate (%s); require a local mirror, a content-addressed or packed destination, a kopia repository, or a peer node instead", n, reason)
 		}
 	}
 	return nil

@@ -32,7 +32,7 @@ func newRestoreCmd() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "restore <volume>",
-		Short: "Pull a volume back from one of its rclone destinations",
+		Short: "Pull a volume back from one of its destinations",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runRestore(cmd, args[0], from, sync.RestoreOptions{
@@ -45,8 +45,8 @@ func newRestoreCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&from, "from", "", "destination name to pull from, or peer node name to filter by content origin (overloaded; names are unique across both kinds)")
 	cmd.Flags().StringVar(&to, "to", "", "local target path (default: the volume's declared path)")
-	cmd.Flags().BoolVar(&shallow, "shallow", false, "skip the checksum comparison on the way down")
-	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview rclone actions without transferring")
+	cmd.Flags().BoolVar(&shallow, "shallow", false, "skip the checksum comparison on the way down from an rclone mirror (every other destination's bytes are always re-hashed)")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview what the restore would fetch without transferring")
 	cmd.Flags().BoolVar(&inPlace, "in-place", false, "permit restore against a non-empty live vol.Path; overwritten files are moved to .squirrel-restore-history/run-<id>/")
 	return cmd
 }
@@ -84,16 +84,13 @@ func runRestore(cmd *cobra.Command, volumeName, fromName string, opts sync.Resto
 		opts.IncludeFromFile = includeFile
 	}
 
-	rcl, err := sync.Find(cmd.Context())
+	rcl, err := rcloneFor(cmd, cfg, dest)
 	if err != nil {
 		return err
 	}
 	out := cmd.OutOrStdout()
-	if opts.Shallow {
+	if opts.Shallow && rcl != nil {
 		fmt.Fprintln(out, shallowSyncWarning)
-	}
-	if err := writeRcloneConfigLogged(out, rcl, cfg); err != nil {
-		return err
 	}
 
 	rep, runErr := sync.Restore(cmd.Context(), s, rcl, vol, dest, opts)

@@ -38,18 +38,19 @@ const HistoryDirName = ".squirrel-history"
 // (conflicts) without parsing run-id semantics.
 const ConflictsDirName = ".squirrel-conflicts"
 
-// RestoreHistoryDirName and IndexDirName mirror sync.RestoreHistoryDirName
-// and sync.IndexDirName at the agent side (lowercase-duplicated for the
-// same reason as HistoryDirName). The receiver never writes into either
-// itself, but a peer's wire path can name them; the path validators
-// reject them so the initiator-side reserved filter
-// (sync.isReservedSyncPath / isReservedFolderPath) and the receiver
-// allow-list cover the same four names. A wire path under
+// RestoreHistoryDirName, IndexDirName and StagingDirName mirror their sync
+// package namesakes at the agent side (duplicated for the same reason as
+// HistoryDirName). The receiver never writes into any of them itself, but
+// a peer's wire path can name them; the path validators reject them so the
+// initiator-side reserved filter (sync.isReservedSyncPath /
+// isReservedFolderPath) and the receiver allow-list cover the same five
+// names. A wire path under
 // .squirrel-restore-history could otherwise overwrite the receiver's
 // only pre-restore backup.
 const (
 	RestoreHistoryDirName = ".squirrel-restore-history"
 	IndexDirName          = ".squirrel-index"
+	StagingDirName        = ".squirrel-staging"
 )
 
 // maxPlanBodyBytes caps a decoded request body. decodeJSON applies it to
@@ -807,14 +808,14 @@ func validateRelPath(p string) error {
 }
 
 // isReservedSyncDir reports whether a cleaned, slash-separated path is
-// one of the four reserved sync directories or lives under one. The
+// one of the five reserved sync directories or lives under one. The
 // allow-list matches the initiator-side filter
 // (sync.isReservedSyncPath / isReservedFolderPath) so the receiver
 // can't be made to write where the initiator would never publish —
 // including .squirrel-restore-history, whose contents are the
 // receiver's only pre-restore backup.
 func isReservedSyncDir(cleaned string) bool {
-	for _, dir := range []string{HistoryDirName, ConflictsDirName, RestoreHistoryDirName, IndexDirName} {
+	for _, dir := range []string{HistoryDirName, ConflictsDirName, RestoreHistoryDirName, IndexDirName, StagingDirName} {
 		if cleaned == dir || strings.HasPrefix(cleaned, dir+"/") {
 			return true
 		}
