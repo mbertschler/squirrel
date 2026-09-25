@@ -185,7 +185,7 @@ func (w *mirrorWriter) foldGroups(ops *mirrorOps) map[string][]foldMember {
 		}
 		interest[key] = true
 	}
-	for rel := range w.live {
+	for rel := range w.live.byPath {
 		if c, ok := claims[rel]; ok {
 			c.live = true
 			continue

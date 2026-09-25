@@ -42,7 +42,7 @@ type mirrorWriter struct {
 	total    int
 
 	mu   gosync.Mutex
-	live map[string]store.RemotePath
+	live *liveRecords
 	// displacing is the rows this batch moved into history, which the
 	// batch's flush lets it record as displaced; movedAside counts every
 	// move into history, recorded or not.
@@ -63,7 +63,7 @@ func (h *mirrorHandler) execute(ctx context.Context, rep *Report, runID int64, o
 	if err != nil {
 		return err
 	}
-	w := &mirrorWriter{h: h, rep: rep, runID: runID, volumeID: ops.volumeID, tr: tr, live: ops.live,
+	w := &mirrorWriter{h: h, rep: rep, runID: runID, volumeID: ops.volumeID, tr: tr,
 		concurrency: pushConcurrency(h.dest), progress: h.progress, total: len(ops.paths)}
 	rep.AlreadyCorrect = ops.inSync
 	if ops.repairs > 0 {
@@ -95,15 +95,19 @@ func writtenBytes(p mirrorPath) int64 {
 }
 
 // learnNames probes how the destination compares names before the first
-// path lands, and on a destination that folds them plans around the
-// collisions that causes.
+// path lands, keys the live records the way it does, and on a destination
+// that folds them plans around the collisions that causes.
 func (w *mirrorWriter) learnNames(ctx context.Context, ops *mirrorOps) error {
 	if len(ops.paths) == 0 {
 		return nil
 	}
 	var err error
-	if w.fold, err = w.probeFolding(ctx); err != nil || !w.fold.folds() {
+	if w.fold, err = w.probeFolding(ctx); err != nil {
 		return err
+	}
+	w.live = newLiveRecords(w.fold, ops.live)
+	if !w.fold.folds() {
+		return nil
 	}
 	w.names, err = w.planFolding(ctx, ops)
 	return err
@@ -516,11 +520,10 @@ func (w *mirrorWriter) moveRecorded(ctx context.Context, rel string, ids []int64
 	defer w.mu.Unlock()
 	w.displacing = append(w.displacing, ids...)
 	w.movedAside++
-	for r := range w.live {
-		if r == rel || w.fold.under(r, rel) {
-			delete(w.live, r)
-		}
+	for _, r := range w.live.under(rel) {
+		w.live.remove(r.Path)
 	}
+	w.live.remove(rel)
 	return nil
 }
 
@@ -574,8 +577,8 @@ func (w *mirrorWriter) commit(ctx context.Context, l *landing) error {
 	}
 	l.commitID = id
 	w.mu.Lock()
-	w.live[d.Path] = store.RemotePath{ID: id, ContentID: d.ContentID, WrittenRunID: w.runID, State: store.RemotePathLive,
-		MtimeNs: staged.mtime.UnixNano(), Path: d.Path, SizeBytes: d.SizeBytes}
+	w.live.set(store.RemotePath{ID: id, ContentID: d.ContentID, WrittenRunID: w.runID, State: store.RemotePathLive,
+		MtimeNs: staged.mtime.UnixNano(), Path: d.Path, SizeBytes: d.SizeBytes})
 	w.mu.Unlock()
 	return nil
 }
@@ -604,7 +607,7 @@ func (w *mirrorWriter) loseRecord(ctx context.Context, live store.RemotePath, wh
 		return err
 	}
 	w.mu.Lock()
-	delete(w.live, live.Path)
+	w.live.remove(live.Path)
 	w.mu.Unlock()
 	w.warn(fmt.Sprintf("destination %q: %s %s — it was changed behind squirrel's back, so its record no longer counts as a copy, and a push writes it again while the index holds it", w.h.dest.Name, live.Path, why))
 	return nil
@@ -614,8 +617,7 @@ func (w *mirrorWriter) loseRecord(ctx context.Context, live store.RemotePath, wh
 func (w *mirrorWriter) liveAt(rel string) (store.RemotePath, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	live, ok := w.live[rel]
-	return live, ok
+	return w.live.at(rel)
 }
 
 // liveUnder is every live record below dir, as the destination resolves
@@ -623,13 +625,7 @@ func (w *mirrorWriter) liveAt(rel string) (store.RemotePath, bool) {
 func (w *mirrorWriter) liveUnder(dir string) []store.RemotePath {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	var out []store.RemotePath
-	for rel, live := range w.live {
-		if w.fold.under(rel, dir) {
-			out = append(out, live)
-		}
-	}
-	return out
+	return w.live.under(dir)
 }
 
 func (w *mirrorWriter) warn(msg string) {
