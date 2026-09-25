@@ -613,9 +613,9 @@ the exFAT image, and 432 s against 45 s over sftp at a 20 ms round trip;
 unchanged pushes are faster. The cost was three full flushes per file on a
 local disk and 27 sequential requests per path over sftp. Decision 8 in
 native-mirror.md flushes once per batch and writes several paths at once
-(`concurrency`); rerun, the first push takes 42 s against rclone's 19–24 s
-on the exFAT image, where reading every byte back is the remaining cost,
-and 50 s against 47 s at a 20 ms round trip.
+(`concurrency`), and a scan that made a first push quadratic in its file
+count is gone. Rerun, a first push to the exFAT image takes 15–29 s against
+rclone's 19–25 s, and 50 s against 47 s at a 20 ms round trip.
 
 Observed, by design: a copy corrupted in place on the local mirror, size and
 mtime kept, passed two verify passes because each re-reads only a tenth of

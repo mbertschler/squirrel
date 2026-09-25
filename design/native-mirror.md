@@ -992,15 +992,38 @@ seconds:
   paths in flight: 49.7 s against 46.9 s, from 409 s. The instrumented push
   measured 91.5 ms per path at 8, 56.5 at 16 and 37.4 at 32, so a
   destination on a slow link can go past rclone by raising `concurrency`.
-- **A local disk is 2–3 times faster than before, and about twice rclone's
-  time on the exFAT image.** The instrumented push went from 27.6 to 5.3 ms
-  per file there (19 to 1.2 on the internal disk). What is left is the
-  evidence — writing past the cache and reading every byte back — and exFAT's
-  slow file calls. More paths in flight don't help that disk: 9.2 ms per
+- **A local disk is several times faster than before.** The instrumented
+  push went from 27.6 to 5.3 ms per file on the exFAT image (19 to 1.2 on
+  the internal disk). More paths in flight don't help that disk: 9.2 ms per
   file at 1, 5.3 at 4, 5.7 at 8, which is why a local disk defaults to 4.
+  The `usb` "after" column overstates native's time: each of those runs
+  followed the old build's, and the host disk was still working off their
+  flushes (below).
 - **Unchanged pushes stay faster than rclone everywhere, and so do changed
-  ones** except on the exFAT image, where a changed push takes about 1.4
-  times rclone's time.
+  ones** except on the exFAT image, where a changed push took about 1.4
+  times rclone's time in those runs.
+
+**exFAT, settled** (2026-09-25 afternoon). A timed build broke the first
+push to a fresh image into its steps, with the host disk left 30 s to settle
+before each run. Staging writes swing between runs (7–25 s) with the host
+disk, and so does rclone; the other steps hold still:
+
+| First push, `pics` to a fresh exFAT image | seconds |
+|---|---|
+| rclone (`main`) | 18.9–24.9 |
+| native, as benchmarked above | 18.5–31.8 |
+| native, without the read-back | 19.9–29.9 |
+| native, with the live-record fix | 15.4–29.1 (15.4 twice, against rclone's 22.4–22.6) |
+
+- **The read-back costs about 2 s** of the push (1.7–2.1 s for 716 MB), a
+  tenth; the per-call symlink checks cost nothing measurable, and renaming
+  staged copies onto their paths about 5 s.
+- **A quadratic scan cost 2.3 s.** For every path with nothing at it, the
+  writer looked through every live record for records below it, under the
+  lock the paths in flight share. The writer now counts the live records
+  below every directory (`sync/mirror_live.go`), so that question is one
+  lookup: at 30,000 files the displace step fell from 62 s to 0.6 s, and the
+  whole first push from 81 s to 17 s.
 
 - **A new dependency:** `github.com/pkg/sftp`.
 
