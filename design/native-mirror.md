@@ -35,10 +35,10 @@ plugs in as a third layout.
 
 **Out of scope, and still on rclone:**
 
-- **Crypt mirrors, including cloudbox.** They wait for the crypt
-  byte-compatibility decision (open question 1). In this design, crypt is a
-  wrapper around a transport. So that decision changes neither the planner nor
-  the layout.
+- **Crypt mirrors, including cloudbox.** They waited for the crypt
+  byte-compatibility decision (open question 1). It was decided in
+  [native-crypt.md](native-crypt.md): crypt is refused on mirrors, and cloudbox
+  becomes an encrypted packed destination.
 - **Mirrors on s3, b2 and gcs.** A mirror needs rename, and object stores have
   none (see "Transport").
 - **Peer sync.** It keeps its negotiated plan, where the receiver decides.
@@ -1100,7 +1100,9 @@ Decided on 2026-09-24:
 
 Open:
 
-1. **Crypt byte-compatibility with rclone.** This blocks cloudbox only, and is
-   to be discussed separately.
+1. ~~**Crypt byte-compatibility with rclone.**~~ Decided on 2026-09-26 in
+   [native-crypt.md](native-crypt.md): squirrel writes age, not rclone's
+   format, and crypt is refused on mirrors, so cloudbox becomes an encrypted
+   packed destination.
 2. ~~**Throughput of pushes that write.**~~ Decided on 2026-09-24:
    decision 8.

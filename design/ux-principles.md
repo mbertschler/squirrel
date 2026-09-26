@@ -31,6 +31,16 @@ specific keys rather than the whole file. A restart is no longer a
 routine step, only the residue of one narrow class of edit, and the
 agent says precisely when that class is what you typed.)
 
+**One deliberate exception: the recovery drill.** An encrypted backup
+nobody can open is worse than none, and whether the recovery kit still
+exists is a question only a human can answer, because the agent never
+holds the kit ([`native-crypt.md`](native-crypt.md)). So squirrel asks
+for the drill monthly by default: a reminder on the surfaces the human
+already reads, never a latch and never a failure. It can be turned off
+per destination, and a destination that has turned it off says so. A
+new routine human act needs the same bar: something the agent
+structurally cannot do, whose absence can lose data.
+
 ## 2. The CLI is for change and for questions — never for operations
 
 Every squirrel command belongs to one of two families:

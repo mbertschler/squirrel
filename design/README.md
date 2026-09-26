@@ -17,6 +17,9 @@ each time.
 - [`native-mirror.md`](native-mirror.md) — *implemented in #217*: one
   planner shared by every layout, a small transport, and every `local` and
   plain `sftp` destination written without rclone.
+- [`native-crypt.md`](native-crypt.md) — *proposed*: age encryption with a
+  required recovery key, rclone crypt removed, packed as the one content
+  layout, and seekable packs.
 
 ## How to use this folder
 
